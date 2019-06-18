@@ -93,15 +93,15 @@ fn main() {
         comms.close();
         forum.close();
 
-        let mut sources = std::collections::HashSet::new();
-        let mut targets = std::collections::HashSet::new();
+        let mut sources = std::collections::HashMap::new();
+        let mut targets = std::collections::HashMap::new();
         if worker.index() == 0 {
             let filename = format!("{}person_knows_person_0_0.csv", path);
             let edges = read_edges(&filename);
             let edges_len = edges.len();
             for (src,dst) in edges {
-                sources.insert(src);
-                targets.insert(dst);
+                *sources.entry(src).or_insert(0) += 1;
+                *targets.entry(dst).or_insert(0) += 1;
                 knows.insert((src,dst));
             }
             println!("performing Bi-directional Dijkstra on ({},{}) nodes, {} edges:", sources.len(), targets.len(), edges_len);
@@ -115,9 +115,11 @@ fn main() {
 
         println!("{:?}\tstable", timer.elapsed());
 
+        let mut sources = sources.into_iter().collect::<Vec<_>>(); sources.sort_by(|x,y| x.1.cmp(&y.1));
+        let mut targets = targets.into_iter().collect::<Vec<_>>(); targets.sort_by(|x,y| x.1.cmp(&y.1));
+
         let mut prev = None;
-        for (round, (src, tgt)) in sources.into_iter().zip(targets).enumerate() {
-            println!("{:?}\tquery ({} -> {})", timer.elapsed(), src, tgt);
+        for (round, ((src,_), (tgt,_))) in sources.into_iter().zip(targets).enumerate() {
             query.insert((src, tgt,0,0));
             if let Some((src,tgt)) = prev {
                 query.remove((src,tgt,0,0));
@@ -126,7 +128,7 @@ fn main() {
             query.advance_to(round + 2); query.flush();
             knows.advance_to(round + 2); knows.flush();
             worker.step_while(|| probe.less_than(query.time()));
-            println!("{:?}\tround {}", timer.elapsed(), round);
+            println!("{:?}\tround {} (query: {} -> {})", timer.elapsed(), round, src, tgt);
         }
 
         println!("finished; elapsed: {:?}", timer.elapsed());
@@ -275,7 +277,9 @@ where
         forward.set(&forward_next.concat(&goals.map(|(x, _)| ((x,x),(x,0)))));
         reverse.set(&reverse_next.concat(&goals.map(|(_, y)| ((y,y),(y,0)))));
 
-        short.leave()
+        short
+            .filter(|(_,(x,y))| x != y)
+            .leave()
     })
 }
 
@@ -333,6 +337,7 @@ where
         .join_map(&posts, |_post,&edge,&(_, forum)| (edge, forum))
         .concat(&comm_post)
         .concat(&comm_post)
+        .consolidate()
         ;
 
     scores
