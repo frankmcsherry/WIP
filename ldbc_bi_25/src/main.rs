@@ -22,6 +22,7 @@ fn main() {
     args.next(); // remove binary name.
 
     let path = args.next().expect("Must specify path to data files");
+    let thresh: usize = args.next().expect("Must specify a threshold").parse().expect("Threshold must be an integer");
     let inspect: bool = args.next().expect("Must indicate inspect-y-ness").parse().expect("Inspect argument must be boolean");
 
     // define a new computational scope, in which to run BFS
@@ -115,11 +116,11 @@ fn main() {
 
         println!("{:?}\tstable", timer.elapsed());
 
-        let mut sources = sources.into_iter().collect::<Vec<_>>(); sources.sort_by(|x,y| x.1.cmp(&y.1));
-        let mut targets = targets.into_iter().collect::<Vec<_>>(); targets.sort_by(|x,y| x.1.cmp(&y.1));
+        let mut sources = sources.into_iter().filter(|(_,d)| d > &thresh).map(|(x,y)| (y,x)).collect::<Vec<_>>(); sources.sort();
+        let mut targets = targets.into_iter().filter(|(_,d)| d > &thresh).map(|(x,y)| (y,x)).collect::<Vec<_>>(); targets.sort();
 
         let mut prev = None;
-        for (round, ((src,_), (tgt,_))) in sources.into_iter().zip(targets).enumerate() {
+        for (round, ((_,src), (_,tgt))) in sources.into_iter().zip(targets).enumerate() {
             query.insert((src, tgt,0,0));
             if let Some((src,tgt)) = prev {
                 query.remove((src,tgt,0,0));
