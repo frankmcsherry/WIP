@@ -15,6 +15,15 @@ type Node = usize;  // identifies a person.
 type Text = usize;  // identifies a post or comment.
 type Forum = usize; // identifies a forum.
 type Edge = (Node, Node);
+type Time = usize;
+
+enum Event {
+    Query(((Node, Node),(Time,Time))),
+    Knows(Edge),
+    Comms((Text, (Node, Text))),
+    Posts((Text, (Node, Forum))),
+    Forum((Forum, Time)),
+}
 
 fn main() {
 
@@ -22,39 +31,61 @@ fn main() {
     args.next(); // remove binary name.
 
     let path = args.next().expect("Must specify path to data files");
-    let thresh: usize = args.next().expect("Must specify a threshold").parse().expect("Threshold must be an integer");
-    let inspect: bool = args.next().expect("Must indicate inspect-y-ness").parse().expect("Inspect argument must be boolean");
+    let batch: usize = args.next().expect("Must specify a batch size").parse().expect("Batch size must be an integer");
 
     // define a new computational scope, in which to run BFS
     timely::execute_from_args(std::env::args(), move |worker| {
 
         let timer = worker.timer();
+        let index = worker.index();
+        let peers = worker.peers();
+
         let mut probe = Handle::new();
 
         let (mut query, mut knows, mut posts, mut comms, mut forum) = worker.dataflow(|scope| {
 
             // Create various input handles and collections.
-            let (query_input, query) = scope.new_collection::<(Node,Node,usize,usize),isize>();
+            let (query_input, query) = scope.new_collection::<((Node,Node),(Time,Time)),isize>();
             let (knows_input, knows) = scope.new_collection::<Edge,isize>();
             let (posts_input, posts) = scope.new_collection::<(Text, (Node, Forum)),isize>();
             let (comms_input, comms) = scope.new_collection::<(Text, (Node, Text)),isize>();
-            let (forum_input, forum) = scope.new_collection::<(Forum, usize),isize>();
+            let (forum_input, forum) = scope.new_collection::<(Forum, Time),isize>();
 
             // 1. Determine edges in shortest paths, for each query.
-            let goals = query.map(|(src,dst,_,_)| (src,dst));
+            let goals = query.map(|(goal,_bounds)| goal).distinct();
             let shortest_edges: Collection<_,((Node, Node), Edge)>
                 = shortest_paths(&knows, &goals)
                     .inspect(|x| println!("SHORTEDGE: {:?}", x))
                 ;
 
             // 2. Score each edge, broken down by the root post.
-            let relevant_edges = shortest_edges.map(|(_,x)| x).distinct();
-            let mut edge_scores: Collection<_, (Edge, Text)>
+            let relevant_edges = shortest_edges.map(|(_,(x,y))| {
+                let min = std::cmp::min(x, y);
+                let max = std::cmp::max(x, y);
+                (min, max)
+            }).distinct();
+            let edge_scores: Collection<_, (Edge, Text)>
                 = score_edges(&relevant_edges, &posts, &comms)
                     .inspect(|x| println!("EDGESCORE: {:?}", x))
                 ;
 
-            // // 3. Merge queries and scores, filter by start and end dates.
+
+
+
+            // 3. Merge queries and scores, filter by start and end dates.
+            let _scored_edges =
+            query
+                .join_map(&shortest_edges, |&goal, &edge, &bounds| (edge, (goal, bounds)))
+                .join_map(&edge_scores, |&edge, &(goal, bounds), &forum| (forum, (goal, edge, bounds)))
+                .join_map(&forum, |_forum, &(goal, edge, bounds), &time| 
+                    (time >= bounds.0 && time <= bounds.1, goal, edge)
+                )
+                .filter(|x| x.0)
+                .map(|(_, goal, edge)| (goal, edge))
+                .inspect(|x| println!("SCORED: {:?}", x))
+                .probe_with(&mut probe)
+                ;
+
             // let filtered_edges: Collection<_, ((Node, Node), (Edge, usize))>
             //     = unimplemented!();
 
@@ -65,74 +96,60 @@ fn main() {
             // 5. Announce massive success!
             // shortest_edges.inspect(|x| println!("WOW:\t{:?}", x));
 
-            let mut result = edge_scores.clone();
-            if !inspect {
-                result = result.filter(|_| false);
-            }
-
-            result
-                .inspect(move |x| println!("{:?}\tWOW\t{:?}", timer.elapsed(), x))
-                .probe_with(&mut probe);
-
             (query_input, knows_input, posts_input, comms_input, forum_input)
         });
 
-        let filename = format!("{}comment_0_0.csv", path);
-        for comm in read_comms(&filename) {
-            comms.insert(comm);
-        }
+        let query_data = read_query(&format!("{}../substitution_parameters/bi_25_param.txt", path), index, peers);
+        let knows_data = read_knows(&format!("{}person_knows_person_0_0.csv", path), index, peers);
+        let comms_data = read_comms(&format!("{}comment_0_0.csv", path), index, peers);
+        let posts_data = read_posts(&format!("{}post_0_0.csv", path), index, peers);
+        let forum_data = read_forum(&format!("{}forum_0_0.csv", path), index, peers);
 
-        let filename = format!("{}post_0_0.csv", path);
-        for post in read_posts(&filename) {
-            posts.insert(post);
-        }
-
-        
-
-
-        posts.close();
-        comms.close();
-        forum.close();
-
-        let mut sources = std::collections::HashMap::new();
-        let mut targets = std::collections::HashMap::new();
-        if worker.index() == 0 {
-            let filename = format!("{}person_knows_person_0_0.csv", path);
-            let edges = read_edges(&filename);
-            let edges_len = edges.len();
-            for (src,dst) in edges {
-                *sources.entry(src).or_insert(0) += 1;
-                *targets.entry(dst).or_insert(0) += 1;
-                knows.insert((src,dst));
-            }
-            println!("performing Bi-directional Dijkstra on ({},{}) nodes, {} edges:", sources.len(), targets.len(), edges_len);
-        }
+        let mut events = Vec::new();
+        for (query, time, diff) in query_data { events.push((Event::Query(query), time, diff)); }
+        for (knows, time, diff) in knows_data { events.push((Event::Knows(knows), time, diff)); }
+        for (comms, time, diff) in comms_data { events.push((Event::Comms(comms), time, diff)); }
+        for (posts, time, diff) in posts_data { events.push((Event::Posts(posts), time, diff)); }
+        for (forum, time, diff) in forum_data { events.push((Event::Forum(forum), time, diff)); }
+        events.sort_by(|x,y| x.1.cmp(&y.1));
 
         println!("{:?}\tloaded", timer.elapsed());
 
+        // Advance inputs and settle computation.
         query.advance_to(1); query.flush();
         knows.advance_to(1); knows.flush();
+        comms.advance_to(1); comms.flush();
+        posts.advance_to(1); posts.flush();
+        forum.advance_to(1); forum.flush();
         worker.step_while(|| probe.less_than(query.time()));
 
         println!("{:?}\tstable", timer.elapsed());
 
-        let mut sources = sources.into_iter().filter(|(_,d)| d > &thresh).map(|(x,y)| (y,x)).collect::<Vec<_>>(); sources.sort();
-        let mut targets = targets.into_iter().filter(|(_,d)| d > &thresh).map(|(x,y)| (y,x)).collect::<Vec<_>>(); targets.sort();
+        for (steps, (event, time, diff)) in events.into_iter().enumerate() {
 
-        let mut prev = None;
-        for (round, ((_,src), (_,tgt))) in sources.into_iter().zip(targets).enumerate() {
-            query.insert((src, tgt,0,0));
-            if let Some((src,tgt)) = prev {
-                query.remove((src,tgt,0,0));
+            // Periodically advance and flush inputs.
+            if steps % batch == (batch-1) {
+                query.advance_to(time); query.flush();
+                knows.advance_to(time); knows.flush();
+                comms.advance_to(time); comms.flush();
+                posts.advance_to(time); posts.flush();
+                forum.advance_to(time); forum.flush();
+                while probe.less_than(&time) { worker.step(); }
+                println!("{:?}\tProcessed {} events", timer.elapsed(), steps);
             }
-            prev = Some((src, tgt));
-            query.advance_to(round + 2); query.flush();
-            knows.advance_to(round + 2); knows.flush();
-            worker.step_while(|| probe.less_than(query.time()));
-            println!("{:?}\tround {} (query: {} -> {})", timer.elapsed(), round, src, tgt);
+
+            // Insert the new events
+            match event {
+                Event::Query(q) => query.update_at(q, time, diff),
+                Event::Knows(k) => knows.update_at(k, time, diff),
+                Event::Comms(c) => comms.update_at(c, time, diff),
+                Event::Posts(p) => posts.update_at(p, time, diff),
+                Event::Forum(f) => forum.update_at(f, time, diff),
+            };
         }
 
         println!("finished; elapsed: {:?}", timer.elapsed());
+
     })
     .unwrap();
 }
@@ -302,32 +319,32 @@ where
     G: Scope,
     G::Timestamp: Lattice + Ord,
 {
-    // We have a cyclic join to perform:
-    // Counts(post1, post2) :=
-    //   edges(auth1, auth2), post(post1, auth1, _), post(post2, auth2, Some(post1)),
-    //   edges(auth2, auth1), post(post1, auth1, _), post(post2, auth2, Some(post1)).
-
-    // We "know" that the link relation is a primary key, and so will not expand the
-    // set of results. Therefore, we first join on it, and later join with edges.
-
+    // Perhaps a comment links to a post ...
     let comm_post: Collection<_,(Edge,Forum)> =
     comms.map(|(id, (auth, link))| (link, (id, auth)))
-         .join_map(&posts, |_post, &(_id,auth_c), &(auth_p, forum)|
-             ((auth_c, auth_p), forum)
-         )
+         .join_map(&posts, |_post, &(_id,auth_c), &(auth_p, forum)| {
+             let min = std::cmp::min(auth_c, auth_p);
+             let max = std::cmp::max(auth_c, auth_p);
+             ((min, max), forum)
+         })
          .semijoin(&edges);
 
+    // Perhaps a comment links to a comment ...
     let comm_comm: Collection<_,(Edge,Text)> =
     comms.map(|(id, (auth, link))| (link, (id, auth)))
-         .join_map(&comms, |_comm, &(_id,auth_c), &(auth_p,link)|
-             ((auth_c, auth_p), link)
-         )
+         .join_map(&comms, |_comm, &(_id,auth_c), &(auth_p,link)| {
+             let min = std::cmp::min(auth_c, auth_p);
+             let max = std::cmp::max(auth_c, auth_p);
+             ((min, max), link)
+         })
          .semijoin(&edges);
 
+    // All comment -> parent links.
     let links =
     comms.map(|(id, (_, link))| (id, link))
          .concat(&posts.map(|(id, _)| (id, id)));
 
+    // unroll 
     let scores =
     comm_comm
         .map(|(edge, link)| (link, edge))
@@ -345,36 +362,79 @@ where
 }
 
 /// Reads lines of text into pairs of integers.
-fn read_edges(filename: &str) -> Vec<(Node, Node)> {
-
-    // let mut mapping = std::collections::HashMap::new();
+fn read_query(filename: &str, index: usize, peers: usize) -> Vec<(((Node, Node),(Time,Time)), Time, isize)> {
 
     use std::io::{BufRead, BufReader};
     use std::fs::File;
 
-    let mut graph = Vec::new();
+    let mut query = Vec::new();
     let file = BufReader::new(File::open(filename).unwrap());
     let mut lines = file.lines();
     lines.next();
-    for readline in lines {
-        let line = readline.ok().expect("read error");
-        if !line.starts_with('#') {
-            let mut elts = line[..].split('|');
-            let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
-            let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
-            // let len = mapping.len();
-            // let src = *mapping.entry(src).or_insert(len);
-            // let len = mapping.len();
-            // let dst = *mapping.entry(dst).or_insert(len);
-            graph.push((src, dst));
+    for (count, readline) in lines.enumerate() {
+        if count % peers == index {
+            let line = readline.ok().expect("read error");
+            if !line.starts_with('#') {
+                let mut elts = line[..].split('|');
+                let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
+                let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
+                let date = elts.next().expect("line missing start date");
+                let start_date = date.parse::<usize>().expect("failed to parse milliseconds");
+                // let mut date = date.to_string();
+                // let len = date.len();
+                // date.insert(len - 2, ':');
+                // println!("Q1PARSING DATE: {:?}", date);
+                // let start_date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                let date = elts.next().expect("line missing end date");
+                // let mut date = date.to_string();
+                // let len = date.len();
+                // date.insert(len - 2, ':');
+                // println!("Q2PARSING DATE: {:?}", date);
+                // let end_date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                let end_date = date.parse::<usize>().expect("failed to parse milliseconds");
+                query.push((((src, dst), (start_date, end_date)), 1, 1));
+            }
         }
     }
-    println!("knows: read {} lines", graph.len());
-    graph
+    println!("query: read {} lines", query.len());
+    query.sort_by(|x,y| x.1.cmp(&y.1));
+    query
 }
 
 /// Reads lines of text into pairs of integers.
-fn read_comms(filename: &str) -> Vec<(Text, (Node, Text))> {
+fn read_knows(filename: &str, index: usize, peers: usize) -> Vec<((Node, Node), Time, isize)> {
+
+    use std::io::{BufRead, BufReader};
+    use std::fs::File;
+
+    let mut knows = Vec::new();
+    let file = BufReader::new(File::open(filename).unwrap());
+    let mut lines = file.lines();
+    lines.next();
+    for (count, readline) in lines.enumerate() {
+        if count % peers == index {
+            let line = readline.ok().expect("read error");
+            if !line.starts_with('#') {
+                let mut elts = line[..].split('|');
+                let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
+                let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
+                let date = elts.next().expect("line missing creation date");
+                let mut date = date.to_string();
+                let len = date.len();
+                date.insert(len - 2, ':');
+                // println!("KPARSING DATE: {:?}", date);
+                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                knows.push(((src, dst), date, 1));
+            }
+        }
+    }
+    println!("knows: read {} lines", knows.len());
+    knows.sort_by(|x,y| x.1.cmp(&y.1));
+    knows
+}
+
+/// Reads lines of text into pairs of integers.
+fn read_comms(filename: &str, index: usize, peers: usize) -> Vec<((Text, (Node, Text)), Time, isize)> {
 
     // Field zero is "id"
     // Field six is "creator"
@@ -389,40 +449,48 @@ fn read_comms(filename: &str) -> Vec<(Text, (Node, Text))> {
     let file = BufReader::new(File::open(filename).unwrap());
     let mut lines = file.lines();
     lines.next();
-    for readline in lines {
+    for (count, readline) in lines.enumerate() {
+        if count % peers == index {
         let line = readline.ok().expect("read error");
-        if !line.starts_with('#') {
-            let mut elts = line[..].split('|');
-            let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
-            elts.next();
-            elts.next();
-            elts.next();
-            elts.next();
-            elts.next();
-            let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
-            elts.next();
-            let post = elts.next().expect("line missing post field");
-            let comment = elts.next().expect("line missing comment field");
+            if !line.starts_with('#') {
+                let mut elts = line[..].split('|');
+                let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
+                let date = elts.next().expect("line missing creation date");
+                let mut date = date.to_string();
+                let len = date.len();
+                date.insert(len - 2, ':');
+                // println!("CPARSING DATE: {:?}", date);
+                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                elts.next();
+                elts.next();
+                elts.next();
+                elts.next();
+                let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
+                elts.next();
+                let post = elts.next().expect("line missing post field");
+                let comment = elts.next().expect("line missing comment field");
 
-            let link =
-            if let Ok(post) = post.parse::<Text>() {
-                post
-            } else if let Ok(comment) = comment.parse::<Text>() {
-                comment
+                let link =
+                if let Ok(post) = post.parse::<Text>() {
+                    post
+                } else if let Ok(comment) = comment.parse::<Text>() {
+                    comment
+                }
+                else {
+                    panic!("Failed to parse either parent post or comment");
+                };
+
+                comms.push(((id, (creator, link)), date, 1));
             }
-            else {
-                panic!("Failed to parse either parent post or comment");
-            };
-
-            comms.push((id, (creator, link)));
         }
     }
     println!("comms: read {} lines", comms.len());
+    comms.sort_by(|x,y| x.1.cmp(&y.1));
     comms
 }
 
 /// Reads lines of text into pairs of integers.
-fn read_posts(filename: &str) -> Vec<(Text, (Node, Forum))> {
+fn read_posts(filename: &str, index: usize, peers: usize) -> Vec<((Text, (Node, Forum)), Time, isize)> {
 
     // Field zero is "id"
     // Field 8 is "creator"
@@ -435,24 +503,68 @@ fn read_posts(filename: &str) -> Vec<(Text, (Node, Forum))> {
     let file = BufReader::new(File::open(filename).unwrap());
     let mut lines = file.lines();
     lines.next();
-    for readline in lines {
-        let line = readline.ok().expect("read error");
-        if !line.starts_with('#') {
-            let mut elts = line[..].split('|');
-            let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
-            elts.next();
-            elts.next();
-            elts.next();
-            elts.next();
-            elts.next();
-            elts.next();
-            elts.next();
-            let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
-            let forum: Forum = elts.next().expect("line missing post field").parse().expect("malformed forum");
+    for (count, readline) in lines.enumerate() {
+        if count % peers == index {
+            let line = readline.ok().expect("read error");
+            if !line.starts_with('#') {
+                let mut elts = line[..].split('|');
+                let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
+                elts.next();
+                let date = elts.next().expect("line missing creation date");
+                let mut date = date.to_string();
+                let len = date.len();
+                date.insert(len - 2, ':');
+                // println!("PPARSING DATE: {:?}", date);
+                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                elts.next();
+                elts.next();
+                elts.next();
+                elts.next();
+                elts.next();
+                let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
+                let forum: Forum = elts.next().expect("line missing post field").parse().expect("malformed forum");
 
-            posts.push((id, (creator, forum)));
+                posts.push(((id, (creator, forum)), date, 1));
+            }
         }
     }
     println!("posts: read {} lines", posts.len());
+    posts.sort_by(|x,y| x.1.cmp(&y.1));
     posts
+}
+
+
+/// Reads lines of text into pairs of integers.
+fn read_forum(filename: &str, index: usize, peers: usize) -> Vec<((Forum, Time), Time, isize)> {
+
+    // Field zero is "id"
+    // Field two is creation date.
+    
+    use std::io::{BufRead, BufReader};
+    use std::fs::File;
+
+    let mut forum = Vec::new();
+    let file = BufReader::new(File::open(filename).unwrap());
+    let mut lines = file.lines();
+    lines.next();
+    for (count, readline) in lines.enumerate() {
+        if count % peers == index {
+            let line = readline.ok().expect("read error");
+            if !line.starts_with('#') {
+                let mut elts = line[..].split('|');
+                let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
+                elts.next();
+                let date = elts.next().expect("line missing creation date");
+                let mut date = date.to_string();
+                let len = date.len();
+                date.insert(len - 2, ':');
+                // println!("FPARSING DATE: {:?}", date);
+                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                forum.push(((id, date), date, 1));
+            }
+        }
+    }
+    println!("forum: read {} lines", forum.len());
+    forum.sort_by(|x,y| x.1.cmp(&y.1));
+    forum
 }
