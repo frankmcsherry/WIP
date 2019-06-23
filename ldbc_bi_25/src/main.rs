@@ -318,25 +318,31 @@ where
     G: Scope,
     G::Timestamp: Lattice + Ord,
 {
+
+    use differential_dataflow::operators::arrange::ArrangeByKey;
+    let comms_by_link = 
+    comms.map(|(_id, (auth, link))| (link, auth))
+         .arrange_by_key();
+
     // Perhaps a comment links to a post ...
     let comm_post: Collection<_,(Edge,Forum)> =
-    comms.map(|(id, (auth, link))| (link, (id, auth)))
-         .join_map(&posts, |_post, &(_id,auth_c), &(auth_p, forum)| {
-             let min = std::cmp::min(auth_c, auth_p);
-             let max = std::cmp::max(auth_c, auth_p);
-             ((min, max), forum)
-         })
-         .semijoin(&edges);
+    comms_by_link
+        .join_map(&posts, |_post, &auth_c, &(auth_p, forum)| {
+            let min = std::cmp::min(auth_c, auth_p);
+            let max = std::cmp::max(auth_c, auth_p);
+            ((min, max), forum)
+        })
+        .semijoin(&edges);
 
     // Perhaps a comment links to a comment ...
     let comm_comm: Collection<_,(Edge,Text)> =
-    comms.map(|(id, (auth, link))| (link, (id, auth)))
-         .join_map(&comms, |_comm, &(_id,auth_c), &(auth_p,link)| {
-             let min = std::cmp::min(auth_c, auth_p);
-             let max = std::cmp::max(auth_c, auth_p);
-             ((min, max), link)
-         })
-         .semijoin(&edges);
+    comms_by_link
+        .join_map(&comms, |_comm, &auth_c, &(auth_p,link)| {
+            let min = std::cmp::min(auth_c, auth_p);
+            let max = std::cmp::max(auth_c, auth_p);
+            ((min, max), link)
+        })
+        .semijoin(&edges);
 
     // All comment -> parent links.
     let links =
