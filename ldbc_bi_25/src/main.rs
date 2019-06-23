@@ -54,34 +54,33 @@ fn main() {
             // 1. Determine edges in shortest paths, for each query.
             let goals = query.map(|(goal,_bounds)| goal).distinct();
             let shortest_edges: Collection<_,((Node, Node), Edge)>
-                = shortest_paths(&knows, &goals)
-                    .inspect(|x| println!("SHORTEDGE: {:?}", x))
-                ;
+                = shortest_paths(&knows, &goals);
 
             // 2. Score each edge, broken down by the root post.
-            let relevant_edges = shortest_edges.map(|(_,(x,y))| {
+            let oriented_edges = shortest_edges.map(|(_,(x,y))| {
                 let min = std::cmp::min(x, y);
                 let max = std::cmp::max(x, y);
                 (min, max)
             }).distinct();
             let edge_scores: Collection<_, (Edge, Text)>
-                = score_edges(&relevant_edges, &posts, &comms)
-                    .inspect(|x| println!("EDGESCORE: {:?}", x))
-                ;
+                = score_edges(&oriented_edges, &posts, &comms);
 
-
-
+            // orient edges in both directions
+            let edge_scores = edge_scores.map(|((x,y),f)| ((y,x),f)).concat(&edge_scores);
 
             // 3. Merge queries and scores, filter by start and end dates.
             let _scored_edges =
             query
-                .join_map(&shortest_edges, |&goal, &edge, &bounds| (edge, (goal, bounds)))
+                .join_map(&shortest_edges, |&goal, &bounds, &edge| (edge, (goal, bounds)))
                 .join_map(&edge_scores, |&edge, &(goal, bounds), &forum| (forum, (goal, edge, bounds)))
                 .join_map(&forum, |_forum, &(goal, edge, bounds), &time| 
                     (time >= bounds.0 && time <= bounds.1, goal, edge)
                 )
                 .filter(|x| x.0)
                 .map(|(_, goal, edge)| (goal, edge))
+                .concat(&shortest_edges)
+                .count()
+                .map(|(x,c)| (x,c-1))
                 .inspect(|x| println!("SCORED: {:?}", x))
                 .probe_with(&mut probe)
                 ;
@@ -99,11 +98,11 @@ fn main() {
             (query_input, knows_input, posts_input, comms_input, forum_input)
         });
 
-        let query_data = read_query(&format!("{}../substitution_parameters/bi_25_param.txt", path), index, peers);
-        let knows_data = read_knows(&format!("{}person_knows_person_0_0.csv", path), index, peers);
-        let comms_data = read_comms(&format!("{}comment_0_0.csv", path), index, peers);
-        let posts_data = read_posts(&format!("{}post_0_0.csv", path), index, peers);
-        let forum_data = read_forum(&format!("{}forum_0_0.csv", path), index, peers);
+        let query_data = input::read_query(&format!("{}../substitution_parameters/bi_25_param.txt", path), index, peers);
+        let knows_data = input::read_knows(&format!("{}person_knows_person_0_0.csv", path), index, peers);
+        let comms_data = input::read_comms(&format!("{}comment_0_0.csv", path), index, peers);
+        let posts_data = input::read_posts(&format!("{}post_0_0.csv", path), index, peers);
+        let forum_data = input::read_forum(&format!("{}forum_0_0.csv", path), index, peers);
 
         let mut events = Vec::new();
         for (query, time, diff) in query_data { events.push((Event::Query(query), time, diff)); }
@@ -312,7 +311,7 @@ where
 /// One may filter by post and accumulate to get a final score.
 fn score_edges<G>(
     edges: &Collection<G, Edge>,                    // (source, target)
-    posts: &Collection<G, (Text, (Node, Forum))>,    // (id, author, in_forum)
+    posts: &Collection<G, (Text, (Node, Forum))>,   // (id, author, in_forum)
     comms: &Collection<G, (Text, (Node, Text))>,    // (id, author, reply_to)
 ) -> Collection<G, (Edge, Forum)>
 where
@@ -361,210 +360,215 @@ where
     scores
 }
 
-/// Reads lines of text into pairs of integers.
-fn read_query(filename: &str, index: usize, peers: usize) -> Vec<(((Node, Node),(Time,Time)), Time, isize)> {
+/// Methods for reading LDBC input.
+mod input {
 
-    use std::io::{BufRead, BufReader};
-    use std::fs::File;
+    use super::{Node, Text, Edge, Forum, Time};
 
-    let mut query = Vec::new();
-    let file = BufReader::new(File::open(filename).unwrap());
-    let mut lines = file.lines();
-    lines.next();
-    for (count, readline) in lines.enumerate() {
-        if count % peers == index {
-            let line = readline.ok().expect("read error");
-            if !line.starts_with('#') {
-                let mut elts = line[..].split('|');
-                let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
-                let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
-                let date = elts.next().expect("line missing start date");
-                let start_date = date.parse::<usize>().expect("failed to parse milliseconds");
-                // let mut date = date.to_string();
-                // let len = date.len();
-                // date.insert(len - 2, ':');
-                // println!("Q1PARSING DATE: {:?}", date);
-                // let start_date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
-                let date = elts.next().expect("line missing end date");
-                // let mut date = date.to_string();
-                // let len = date.len();
-                // date.insert(len - 2, ':');
-                // println!("Q2PARSING DATE: {:?}", date);
-                // let end_date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
-                let end_date = date.parse::<usize>().expect("failed to parse milliseconds");
-                query.push((((src, dst), (start_date, end_date)), 1, 1));
-            }
-        }
-    }
-    println!("query: read {} lines", query.len());
-    query.sort_by(|x,y| x.1.cmp(&y.1));
-    query
-}
+    /// Reads lines of text into pairs of integers.
+    pub fn read_query(filename: &str, index: usize, peers: usize) -> Vec<(((Node, Node),(Time,Time)), Time, isize)> {
 
-/// Reads lines of text into pairs of integers.
-fn read_knows(filename: &str, index: usize, peers: usize) -> Vec<((Node, Node), Time, isize)> {
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
 
-    use std::io::{BufRead, BufReader};
-    use std::fs::File;
-
-    let mut knows = Vec::new();
-    let file = BufReader::new(File::open(filename).unwrap());
-    let mut lines = file.lines();
-    lines.next();
-    for (count, readline) in lines.enumerate() {
-        if count % peers == index {
-            let line = readline.ok().expect("read error");
-            if !line.starts_with('#') {
-                let mut elts = line[..].split('|');
-                let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
-                let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
-                let date = elts.next().expect("line missing creation date");
-                let mut date = date.to_string();
-                let len = date.len();
-                date.insert(len - 2, ':');
-                // println!("KPARSING DATE: {:?}", date);
-                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
-                knows.push(((src, dst), date, 1));
-            }
-        }
-    }
-    println!("knows: read {} lines", knows.len());
-    knows.sort_by(|x,y| x.1.cmp(&y.1));
-    knows
-}
-
-/// Reads lines of text into pairs of integers.
-fn read_comms(filename: &str, index: usize, peers: usize) -> Vec<((Text, (Node, Text)), Time, isize)> {
-
-    // Field zero is "id"
-    // Field six is "creator"
-    // Fields 8/9 reply_of_post and reply_of_comment 
-
-    // let mut mapping = std::collections::HashMap::new();
-
-    use std::io::{BufRead, BufReader};
-    use std::fs::File;
-
-    let mut comms = Vec::new();
-    let file = BufReader::new(File::open(filename).unwrap());
-    let mut lines = file.lines();
-    lines.next();
-    for (count, readline) in lines.enumerate() {
-        if count % peers == index {
-        let line = readline.ok().expect("read error");
-            if !line.starts_with('#') {
-                let mut elts = line[..].split('|');
-                let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
-                let date = elts.next().expect("line missing creation date");
-                let mut date = date.to_string();
-                let len = date.len();
-                date.insert(len - 2, ':');
-                // println!("CPARSING DATE: {:?}", date);
-                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
-                elts.next();
-                elts.next();
-                elts.next();
-                elts.next();
-                let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
-                elts.next();
-                let post = elts.next().expect("line missing post field");
-                let comment = elts.next().expect("line missing comment field");
-
-                let link =
-                if let Ok(post) = post.parse::<Text>() {
-                    post
-                } else if let Ok(comment) = comment.parse::<Text>() {
-                    comment
+        let mut query = Vec::new();
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut lines = file.lines();
+        lines.next();
+        for (count, readline) in lines.enumerate() {
+            if count % peers == index {
+                let line = readline.ok().expect("read error");
+                if !line.starts_with('#') {
+                    let mut elts = line[..].split('|');
+                    let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
+                    let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
+                    let date = elts.next().expect("line missing start date");
+                    let start_date = date.parse::<usize>().expect("failed to parse milliseconds");
+                    // let mut date = date.to_string();
+                    // let len = date.len();
+                    // date.insert(len - 2, ':');
+                    // println!("Q1PARSING DATE: {:?}", date);
+                    // let start_date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                    let date = elts.next().expect("line missing end date");
+                    // let mut date = date.to_string();
+                    // let len = date.len();
+                    // date.insert(len - 2, ':');
+                    // println!("Q2PARSING DATE: {:?}", date);
+                    // let end_date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                    let end_date = date.parse::<usize>().expect("failed to parse milliseconds");
+                    query.push((((src, dst), (start_date, end_date)), 1, 1));
                 }
-                else {
-                    panic!("Failed to parse either parent post or comment");
-                };
-
-                comms.push(((id, (creator, link)), date, 1));
             }
         }
+        println!("query: read {} lines", query.len());
+        query.sort_by(|x,y| x.1.cmp(&y.1));
+        query
     }
-    println!("comms: read {} lines", comms.len());
-    comms.sort_by(|x,y| x.1.cmp(&y.1));
-    comms
-}
 
-/// Reads lines of text into pairs of integers.
-fn read_posts(filename: &str, index: usize, peers: usize) -> Vec<((Text, (Node, Forum)), Time, isize)> {
+    /// Reads lines of text into pairs of integers.
+    pub fn read_knows(filename: &str, index: usize, peers: usize) -> Vec<(Edge, Time, isize)> {
 
-    // Field zero is "id"
-    // Field 8 is "creator"
-    // Field 9 is "forum" 
-    
-    use std::io::{BufRead, BufReader};
-    use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
 
-    let mut posts = Vec::new();
-    let file = BufReader::new(File::open(filename).unwrap());
-    let mut lines = file.lines();
-    lines.next();
-    for (count, readline) in lines.enumerate() {
-        if count % peers == index {
+        let mut knows = Vec::new();
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut lines = file.lines();
+        lines.next();
+        for (count, readline) in lines.enumerate() {
+            if count % peers == index {
+                let line = readline.ok().expect("read error");
+                if !line.starts_with('#') {
+                    let mut elts = line[..].split('|');
+                    let src: Node = elts.next().expect("line missing src field").parse().expect("malformed src");
+                    let dst: Node = elts.next().expect("line missing dst field").parse().expect("malformed dst");
+                    let date = elts.next().expect("line missing creation date");
+                    let mut date = date.to_string();
+                    let len = date.len();
+                    date.insert(len - 2, ':');
+                    // println!("KPARSING DATE: {:?}", date);
+                    let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                    knows.push(((src, dst), date, 1));
+                }
+            }
+        }
+        println!("knows: read {} lines", knows.len());
+        knows.sort_by(|x,y| x.1.cmp(&y.1));
+        knows
+    }
+
+    /// Reads lines of text into pairs of integers.
+    pub fn read_comms(filename: &str, index: usize, peers: usize) -> Vec<((Text, (Node, Text)), Time, isize)> {
+
+        // Field zero is "id"
+        // Field six is "creator"
+        // Fields 8/9 reply_of_post and reply_of_comment 
+
+        // let mut mapping = std::collections::HashMap::new();
+
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
+
+        let mut comms = Vec::new();
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut lines = file.lines();
+        lines.next();
+        for (count, readline) in lines.enumerate() {
+            if count % peers == index {
             let line = readline.ok().expect("read error");
-            if !line.starts_with('#') {
-                let mut elts = line[..].split('|');
-                let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
-                elts.next();
-                let date = elts.next().expect("line missing creation date");
-                let mut date = date.to_string();
-                let len = date.len();
-                date.insert(len - 2, ':');
-                // println!("PPARSING DATE: {:?}", date);
-                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
-                elts.next();
-                elts.next();
-                elts.next();
-                elts.next();
-                elts.next();
-                let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
-                let forum: Forum = elts.next().expect("line missing post field").parse().expect("malformed forum");
+                if !line.starts_with('#') {
+                    let mut elts = line[..].split('|');
+                    let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
+                    let date = elts.next().expect("line missing creation date");
+                    let mut date = date.to_string();
+                    let len = date.len();
+                    date.insert(len - 2, ':');
+                    // println!("CPARSING DATE: {:?}", date);
+                    let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                    elts.next();
+                    elts.next();
+                    elts.next();
+                    elts.next();
+                    let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
+                    elts.next();
+                    let post = elts.next().expect("line missing post field");
+                    let comment = elts.next().expect("line missing comment field");
 
-                posts.push(((id, (creator, forum)), date, 1));
+                    let link =
+                    if let Ok(post) = post.parse::<Text>() {
+                        post
+                    } else if let Ok(comment) = comment.parse::<Text>() {
+                        comment
+                    }
+                    else {
+                        panic!("Failed to parse either parent post or comment");
+                    };
+
+                    comms.push(((id, (creator, link)), date, 1));
+                }
             }
         }
+        println!("comms: read {} lines", comms.len());
+        comms.sort_by(|x,y| x.1.cmp(&y.1));
+        comms
     }
-    println!("posts: read {} lines", posts.len());
-    posts.sort_by(|x,y| x.1.cmp(&y.1));
-    posts
-}
 
+    /// Reads lines of text into pairs of integers.
+    pub fn read_posts(filename: &str, index: usize, peers: usize) -> Vec<((Text, (Node, Forum)), Time, isize)> {
 
-/// Reads lines of text into pairs of integers.
-fn read_forum(filename: &str, index: usize, peers: usize) -> Vec<((Forum, Time), Time, isize)> {
+        // Field zero is "id"
+        // Field 8 is "creator"
+        // Field 9 is "forum" 
+        
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
 
-    // Field zero is "id"
-    // Field two is creation date.
-    
-    use std::io::{BufRead, BufReader};
-    use std::fs::File;
+        let mut posts = Vec::new();
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut lines = file.lines();
+        lines.next();
+        for (count, readline) in lines.enumerate() {
+            if count % peers == index {
+                let line = readline.ok().expect("read error");
+                if !line.starts_with('#') {
+                    let mut elts = line[..].split('|');
+                    let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
+                    elts.next();
+                    let date = elts.next().expect("line missing creation date");
+                    let mut date = date.to_string();
+                    let len = date.len();
+                    date.insert(len - 2, ':');
+                    // println!("PPARSING DATE: {:?}", date);
+                    let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                    elts.next();
+                    elts.next();
+                    elts.next();
+                    elts.next();
+                    elts.next();
+                    let creator: Node = elts.next().expect("line missing author field").parse().expect("malformed author");
+                    let forum: Forum = elts.next().expect("line missing post field").parse().expect("malformed forum");
 
-    let mut forum = Vec::new();
-    let file = BufReader::new(File::open(filename).unwrap());
-    let mut lines = file.lines();
-    lines.next();
-    for (count, readline) in lines.enumerate() {
-        if count % peers == index {
-            let line = readline.ok().expect("read error");
-            if !line.starts_with('#') {
-                let mut elts = line[..].split('|');
-                let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
-                elts.next();
-                let date = elts.next().expect("line missing creation date");
-                let mut date = date.to_string();
-                let len = date.len();
-                date.insert(len - 2, ':');
-                // println!("FPARSING DATE: {:?}", date);
-                let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
-                forum.push(((id, date), date, 1));
+                    posts.push(((id, (creator, forum)), date, 1));
+                }
             }
         }
+        println!("posts: read {} lines", posts.len());
+        posts.sort_by(|x,y| x.1.cmp(&y.1));
+        posts
     }
-    println!("forum: read {} lines", forum.len());
-    forum.sort_by(|x,y| x.1.cmp(&y.1));
-    forum
+
+    /// Reads lines of text into pairs of integers.
+    pub fn read_forum(filename: &str, index: usize, peers: usize) -> Vec<((Forum, Time), Time, isize)> {
+
+        // Field zero is "id"
+        // Field two is creation date.
+        
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
+
+        let mut forum = Vec::new();
+        let file = BufReader::new(File::open(filename).unwrap());
+        let mut lines = file.lines();
+        lines.next();
+        for (count, readline) in lines.enumerate() {
+            if count % peers == index {
+                let line = readline.ok().expect("read error");
+                if !line.starts_with('#') {
+                    let mut elts = line[..].split('|');
+                    let id: Text = elts.next().expect("line missing id field").parse().expect("malformed id");
+                    elts.next();
+                    let date = elts.next().expect("line missing creation date");
+                    let mut date = date.to_string();
+                    let len = date.len();
+                    date.insert(len - 2, ':');
+                    // println!("FPARSING DATE: {:?}", date);
+                    let date = chrono::DateTime::parse_from_rfc3339(&date).expect("DateTime parse error").timestamp_millis() as usize;
+                    forum.push(((id, date), date, 1));
+                }
+            }
+        }
+        println!("forum: read {} lines", forum.len());
+        forum.sort_by(|x,y| x.1.cmp(&y.1));
+        forum
+    }
 }
