@@ -111,72 +111,47 @@ where
     G::Timestamp: differential_dataflow::lattice::Lattice,
 {
     use differential_dataflow::operators::iterate::Iterate;
+    // use differential_dataflow::operators::join::Join;
     use differential_dataflow::operators::reduce::Reduce;
-    use differential_dataflow::operators::reduce::Count;
-    use differential_dataflow::operators::join::Join;
-    use differential_dataflow::operators::reduce::Threshold;
+    // use differential_dataflow::operators::consolidate::Consolidate;
 
     // TODO: Optimize triangle computation.
-    let triangles = triangles(&edges);
-
-    // New algorithm starts from a set of triangles, and a candidate leveling of each edge.
-    // This candidate is initially zero, but gets progressively incremented each round an
-    // edge survives.
-    // This is not actually a collection (Edge, level), but rather a collection of Edge where
-    // the multiplicity indicates the level of the edge.
+    let triangles = triangles(&edges).map(|(a,b,c)| ((b,c),a));
 
     edges
-        .filter(|_| false)
-        .iterate(|levels| {
+        .map(|edge| (edge, Node::max_value()))
+        .iterate(|labels| {
 
-            use differential_dataflow::operators::consolidate::Consolidate;
 
-            let triangles = triangles.enter(&levels.scope());
+            use differential_dataflow::operators::join::JoinCore;
 
-            let to_advance =
-            edges
-                .enter(&levels.scope())
-                .iterate(|active| {
+            let labels_by_edge = labels.arrange_by_key();
 
-                    let levels = levels.enter(&active.scope());
-
-                    use timely::dataflow::operators::map::Map;
-                    use timely::order::Product;
-                    use differential_dataflow::collection::AsCollection;
-
-                    let spread = 
-                    levels
-                        .inner
-                        .map_in_place(|(edge,time,diff)| 
-                            {
-                                time.inner = 1024 * time.outer.inner;
-                            }
-                        )
-                        .as_collection();
-
-                    use differential_dataflow::operators::arrange::arrangement::ArrangeBySelf;
-                    let active_by_self = active.arrange_by_self();
-
-                    use differential_dataflow::operators::join::JoinCore;
-
-                    triangles
-                        .enter(&active.scope())
-                        .map(|(a,b,c)| ((a,b),c))
-                        .join_core(&active_by_self, |&k,&v,&()| Some((k,v)))
-                        .map(|((a,b),c)| ((a,c),b))
-                        .join_core(&active_by_self, |&k,&v,&()| Some((k,v)))
-                        .map(|((a,c),b)| ((b,c),a))
-                        .join_core(&active_by_self, |&k,&v,&()| Some((k,v)))
-                        .flat_map(|((b,c),a)| vec![(a,b), (a,c), (b,c)])
-                        .concat(&spread.negate())
-                        .threshold(|_edge,count| if count > &0 { 1 } else { 0 })
-                });
-
-            levels.concat(&to_advance).consolidate()
+            triangles
+                .enter(&labels.scope())
+                .join_core(&labels_by_edge, |&(b,c),&a,&lbl| Some(((a,b),(c,lbl))))
+                .join_core(&labels_by_edge, |&(a,b),&(c,lbl1),&lbl2| Some(((a,c),(b,std::cmp::min(lbl1,lbl2)))))
+                .join_core(&labels_by_edge, |&(a,c),&(b,lbl1),&lbl2| Some(((a,b,c),std::cmp::min(lbl1,lbl2))))
+                .flat_map(|((a,b,c),lbl)| {
+                    vec![((a,b),lbl), ((a,c),lbl), ((b,c),lbl)]
+                })
+                .reduce(|_edge, input, output| {
+                    let mut total = 0;
+                    for (label, count) in input.iter().rev() {
+                        // total not >= previous label.
+                        if total >= **label {
+                            output.push((total, 1));
+                            return;
+                        }
+                        total += *count as Node;
+                        if total >= **label {
+                            output.push((**label, 1));
+                            return;
+                        }
+                    }
+                    output.push((total, 1));
+                })
         })
-        .count()
-        // .inspect(|x| println!("output: {:?}", x))
-        .map(|(edge, count)| (edge, count as Node))
 }
 
 fn triangles<G>(edges: &Collection<G, Edge>) -> Collection<G, (Node, Node, Node)>
