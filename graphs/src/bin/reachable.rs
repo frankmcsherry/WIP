@@ -4,7 +4,6 @@ use timely::dataflow::operators::to_stream::ToStream;
 use timely::dataflow::operators::map::Map;
 use differential_dataflow::input::Input;
 use differential_dataflow::collection::AsCollection;
-use differential_dataflow::operators::consolidate::Consolidate;
 
 fn main() {
 

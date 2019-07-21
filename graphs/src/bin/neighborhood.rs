@@ -9,6 +9,7 @@ use differential_dataflow::operators::iterate::Iterate;
 use differential_dataflow::operators::join::Join;
 use differential_dataflow::operators::reduce::Threshold;
 use differential_dataflow::operators::consolidate::Consolidate;
+use differential_dataflow::operators::arrange::arrangement::ArrangeByKey;
 
 fn main() {
 
@@ -29,7 +30,6 @@ fn main() {
 
         let mut probe = timely::dataflow::ProbeHandle::new();
         
-
         let mut sources =
         worker.dataflow(|scope| {
 
@@ -38,12 +38,13 @@ fn main() {
             let edges =
             edges
                 .to_stream(scope)
-                .map(|edge| (edge, 0, 1))
-                .as_collection();
+                .map(|edge| (edge, (), 1))
+                .as_collection()
+                .arrange_by_key();
 
             let (handle, source) = scope.new_collection();
 
-            neighborhoods(edges, source)
+            graphs::computations::neighborhoods::neighborhoods(&edges, source)
                 .filter(move |_| inspect)
                 .map(|(node,_)| node)
                 .consolidate()
@@ -53,47 +54,13 @@ fn main() {
 
             handle
         });
-
-        sources.advance_to(1);
-        sources.flush();
-
-        while probe.less_than(sources.time()) {
-            worker.step();
-        }
-
-        println!("{:?}\tComputation stable", timer.elapsed());
-
+        
         sources.insert((source, steps));
-        sources.advance_to(2);
-        sources.flush();
 
-        while probe.less_than(sources.time()) {
-            worker.step();
-        }
+        while worker.step() {}
 
         println!("{:?}\tQuery complete", timer.elapsed());
 
     }).expect("Timely computation failed to start");
 
-}
-
-fn neighborhoods<G>(edges: Collection<G, Edge<Node>>, source: Collection<G, (Node, Iter)>) -> Collection<G, (Node, Node)> 
-where
-    G: timely::dataflow::scopes::Scope,
-    G::Timestamp: differential_dataflow::lattice::Lattice,
-{
-    let source = source.map(|(node,steps)| (node, (node, steps)));
-
-    source
-        .iterate(|inner| {
-            let edges = edges.enter(&inner.scope());
-            let source = source.enter(&inner.scope());
-            inner
-                .filter(|(_node,(_root, steps))| steps > &0)
-                .join_map(&edges, |_node, &(source,steps), &dest| (dest, (source, steps-1)))
-                .concat(&source)
-                .distinct()
-        })
-        .map(|(dest,(node,_))| (node, dest))
-        .distinct()
 }
