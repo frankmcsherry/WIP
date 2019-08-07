@@ -5,6 +5,7 @@ authors = ["Frank McSherry <fmcsherry@me.com>"]
 edition = "2018"
 
 [dependencies]
-timely = "0.10"
-differential-dataflow = "0.10"
+timely = { git = "https://github.com/TimelyDataflow/timely-dataflow" }
+differential-dataflow = { git = "https://github.com/TimelyDataflow/differential-dataflow" }
+dogsdogsdogs = { git = "https://github.com/TimelyDataflow/differential-dataflow" }
 graph_map = "0.1"
