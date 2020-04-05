@@ -31,36 +31,38 @@ fn main() {
 
         let text = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
 
-        // define BFS dataflow; return handles to roots and edges inputs
+        // define Sudoku dataflow, return a handle to the start state.
         let mut probe = Handle::new();
-        let mut start = worker.dataflow::<(),_,_>(|scope| {
+        let mut start = worker.dataflow::<usize,_,_>(|scope| {
 
             // Where the initial values come from.
             //   (val, row, col): means grid[row][col] = val.
             let (start_input, start) = scope.new_collection();
 
-            let initial = start.map(|(_val, row, col)| (row, col)).count();
+            let board = start.flat_map(|(val, row, col)| {
+                let mut result = Vec::new();
+                if val != ('.' as u8) {
+                    result.push((val - ('0' as u8), row, col));
+                }
+                else {
+                    for v in 1 .. 10 {
+                        result.push((v, row, col));
+                    }
+                }
+                result
+            });
 
             let result =
-            sudoku(&start)
-                .consolidate()
-                // .inspect(|x| println!("\t{:?}", x))
-                .probe_with(&mut probe);
+            sudoku(&board)
+                .consolidate();
 
-            let afterward =
             result
-                .map(|(val, row, col)| ((row, col), val))
-                .reduce(|_key, input, output| {
-                    let mut vector = Vec::new();
-                    for (val, _wgt) in input {
-                        vector.push(**val);
-                    }
-                    output.push((vector, 1));
-                });
-
-            initial
-                .join(&afterward)
-                .inspect(|(((row, col), (init, vals)), (), diff)| println!("({:?}, {:?}): {:?} -> {:?} (change: {:?})", row, col, init, vals, diff));
+                .map(|(_val, row, col)| (row, col))
+                .count()
+                .map(|(_row_col, count)| count)
+                .consolidate()
+                .inspect(|x| println!("Final counts: {:?}", x))
+                .probe_with(&mut probe);
 
             start_input
         });
@@ -68,14 +70,34 @@ fn main() {
         for (count, val) in text.bytes().enumerate() {
             let row = 1 + (count as u8 / 9);
             let col = 1 + (count as u8 % 9);
-            if val != ('.' as u8) {
-                start.insert((val - ('0' as u8), row, col));
+            start.insert((val, row, col));
+        }
+
+        start.advance_to(1);
+        start.flush();
+
+        while probe.less_than(start.time()) {
+            worker.step();
+        }
+
+        println!("{:?}\tRound 0 complete", _timer.elapsed());
+
+        for (count, val) in text.bytes().enumerate() {
+            let row = 1 + (count as u8 / 9);
+            let col = 1 + (count as u8 % 9);
+
+            start.remove((val, row, col));
+            start.insert(('.' as u8, row, col));
+
+            let round = *start.time();
+            start.advance_to(round + 1);
+            start.flush();
+
+            while probe.less_than(start.time()) {
+                worker.step();
             }
-            else {
-                for v in 1 .. 10 {
-                    start.insert((v, row, col));
-                }
-            }
+
+            println!("{:?}\tRound {:?} complete", _timer.elapsed(), round);
         }
 
     }).unwrap();
@@ -90,40 +112,34 @@ where G::Timestamp: Lattice+Ord {
     start
         .iterate(|inner| {
 
+            // Identify the row, col pairs with a single candidate value.
             let determined =
-            inner
-                // .consolidate()
-                // .inspect(|vrc| println!("ITERATION  {:?}", vrc))
-                .map(|(val, row, col)| ((row, col), val))
-                .reduce(|_key, input, output| {
-                    if input.len() == 1 {
-                        output.push((input[0].0.clone(), 1));
-                    }
-                });
+            inner.map(|(_val, row, col)| (row, col))
+                 .threshold(|_row_col, count| if count == &1 { 1 } else { 0 });
 
-                let exclusions_row = determined.flat_map(|((row, col), val)| (1 .. 10).filter(move |r| r != &row).map(move |r| ((r, col), val)));
-                let exclusions_col = determined.flat_map(|((row, col), val)| (1 .. 10).filter(move |c| c != &col).map(move |c| ((row, c), val)));
-                let exclusions_cell = determined.flat_map(|((row, col), val)| {
-                    let row_off = 1 + 3 * ((row - 1)/3);
-                    let col_off = 1 + 3 * ((col - 1)/3);
-                    (row_off .. row_off+3)
-                        .flat_map(move |r| (col_off .. col_off+3).map(move |c| (r,c)))
-                        .filter(move |r_c| r_c != &(row, col))
-                        .map(move |(r,c)| ((r,c),val))
-                });
+            let determined =
+            inner.map(|(val, row, col)| ((row, col), val))
+                 .semijoin(&determined);
 
-                let exclusions =
-                exclusions_row
-                    .concat(&exclusions_col)
-                    .concat(&exclusions_cell)
-                    .map(|((row, col), val)| (val, row, col))
-                    .distinct();
+            let exclusions_row = determined.flat_map(|((row, col), val)| (1 .. 10).filter(move |r| r != &row).map(move |r| ((r, col), val)));
+            let exclusions_col = determined.flat_map(|((row, col), val)| (1 .. 10).filter(move |c| c != &col).map(move |c| ((row, c), val)));
+            let exclusions_cell = determined.flat_map(|((row, col), val)| {
+                let row_off = 1 + 3 * ((row - 1)/3);
+                let col_off = 1 + 3 * ((col - 1)/3);
+                (row_off .. row_off+3)
+                    .flat_map(move |r| (col_off .. col_off+3).map(move |c| (r,c)))
+                    .filter(move |r_c| r_c != &(row, col))
+                    .map(move |(r,c)| ((r,c),val))
+            });
 
-            inner
-                .map(|vrc| (vrc,()))
-                .antijoin(&exclusions)
-                .map(|(vrc,())| vrc)
-                .consolidate()
+            exclusions_row
+                .concat(&exclusions_col)
+                .concat(&exclusions_cell)
+                .map(|((row, col), val)| (val, row, col))
+                .negate()
+                .concat(&start.enter(&inner.scope()))
+                .threshold(|_row_col, count| if count == &1 { 1 } else { 0 })
+
         })
 
 }
