@@ -1,0 +1,4 @@
+# Reduce: sum a u64 column.
+# Result: P64[15]
+
+u64[1 2 3 4 5] reduce.+.u64

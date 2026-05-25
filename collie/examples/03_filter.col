@@ -1,0 +1,7 @@
+# Filter: keep elements >= 4.
+# `where` consumes (column, mask) and keeps rows where the mask is non-zero.
+# Result: P64[5, 9, 7, 4]
+
+u64[1 5 3 9 2 7 4]
+dup 4u64 >=
+where gather

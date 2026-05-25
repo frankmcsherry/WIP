@@ -1,0 +1,24 @@
+# Polymorphic sort.
+#
+# `sort.perm` returns a P64 permutation; `sort` returns the sorted value.
+# Both dispatch by shape:
+#   - Prim: by value (unsigned at the storage width — for signed/float
+#           use the typed `sort.<interp>` form).
+#   - Prod: lexicographic (field 0, then field 1, ...).
+#   - List: length-first (shortest rows first, ties broken by element-
+#           at-each-position).
+#
+# Phase 1 of Task #52.
+
+10u64 iota                  >ix
+ix 7u64 mod.u64             >v
+
+# Plain sort of a Prim. Expected: [0,0,1,1,2,2,3,4,5,6].
+v sort
+
+# Permutation that sorts v. Apply via gather to recover the sorted column.
+v sort.perm
+v swap gather
+
+# Lexicographic sort of a (v, ix) pair: sort by v, ties broken by ix.
+v ix entuple.2  sort

@@ -1,0 +1,17 @@
+# cumsum — prefix sum / running total.
+#
+# Flat: [a0, a1, a2, …] → [a0, a0+a1, a0+a1+a2, …]
+# List<Prim>: per-row prefix sum; outer bounds unchanged.
+#
+# Arithmetic wraps at the interp's width. Widen first
+# (e.g. `as.u64`) for overflow-safe accumulation.
+
+# Flat running total.
+u64[5 3 8 2 1]                          cumsum.u64
+# → [5, 8, 16, 18, 19]
+
+# Per-row running totals (e.g. daily revenue per region).
+u64[100 200 50  30 40 50  500 100]      # flat values
+u64[0 3 6 8]  nest                       # canonical N+1 starts: 3 rows of lengths 3, 3, 2
+cumsum.u64
+# → List<[100, 300, 350] ; [30, 70, 120] ; [500, 600]>

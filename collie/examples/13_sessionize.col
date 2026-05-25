@@ -1,0 +1,21 @@
+# Sessionization: tag events that follow a gap > threshold.
+#
+# Given a timestamp column, compute deltas to the previous event and
+# emit a 1 where the gap exceeds the threshold. A cumulative sum of
+# those flags assigns a session ID to each row.
+#
+# `shift.u64` is the lag op: `col 1u64 shift.u64` returns each value's
+# predecessor (with 0 padding at the start).
+#
+# Idiom:
+#   `ts ts 1u64 shift.u64 -.u64    > gap` — each row's gap from prev.
+#   `gap THRESHOLD >            > flag`
+#   `flag cumsum.u64                > session_id`
+
+u64[100 110 130 200 210 500 510]                 >ts
+ts dup 1u64 shift.u64 -.u64                      >gap
+gap 50u64 > as.u64                           >flag
+flag cumsum.u64                                  >session_id
+
+# Display: (ts, gap, session_id).
+ts gap session_id entuple.3

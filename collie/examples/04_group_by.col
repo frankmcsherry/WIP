@@ -1,0 +1,11 @@
+# GROUP BY region, summed amounts.
+# Region 0 → 100+50+75=225, region 1 → 200+150=350, region 2 → 300.
+# Result: (P8[0, 1, 2], P64[225, 350, 300])
+
+u8[0 1 0 2 1 0]                # region
+u64[100 200 50 300 150 75]     # amount
+entuple.2
+
+dup .1 swap .0 group
+reduce.+.u64
+entuple.2

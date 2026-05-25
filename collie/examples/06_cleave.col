@@ -1,0 +1,11 @@
+# Tree navigation: `.{ p0 ; p1 ; … }` produces a Prod where each
+# field is a different program applied to a fresh copy of TOS.
+# Input:  (a, b, c) = ([1,2,3], [10,20,30], [100,200,300])
+# Output: (a, c, b+a)
+
+u64[1 2 3]
+u64[10 20 30]
+u64[100 200 300]
+entuple.3
+
+.{ .0 ; .2 ; dup .1 swap .0 +.u64 }

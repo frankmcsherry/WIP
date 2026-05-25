@@ -1,0 +1,14 @@
+# Sort-merge equijoin (K, A) ⋈ (K, B) -> (K, A, B).
+# Both relations are pre-sorted on K.
+# Common keys: 2, 4, 7. Expected output (K, A, B):
+#   (2, 20, 2.0) (4, 40, 4.0) (7, 70, 7.0)
+
+u64[1 2 4 7 9] u64[10 20 40 70 90] entuple.2          # left  = (K, A)
+u64[2 3 4 5 7] f64[2.0 3.0 4.0 5.0 7.0] entuple.2     # right = (K, B)
+
+over .0 over .0 intersect
+pick 3 .1 pick 2 gather
+pick 3 .1 pick 2 gather
+pick 4 .0 pick 3 gather
+rot rot entuple.3
+roll 4 drop roll 3 drop roll 2 drop swap drop

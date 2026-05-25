@@ -1,0 +1,17 @@
+# search — lookup queries in a sorted target (interp-free, byte order).
+# For each query, returns the lower_bound index in target (first position p
+# where target[p] >= query). Sentinel target.len() means "past the end".
+#
+# Example: dictionary lookup.
+#   target  = [10, 20, 30, 40, 50]
+#   queries = [5, 20, 25, 50, 100]
+#   search returns         [0, 1, 2, 4, 5]
+#     5   → 0 (would insert before 10)         MISS
+#     20  → 1 (hits target[1] = 20)            HIT
+#     25  → 2 (would insert before 30)         MISS
+#     50  → 4 (hits target[4] = 50)            HIT
+#     100 → 5 (past the end, sentinel)         MISS
+
+u64[10 20 30 40 50]              # target (must be sorted ascending)
+u64[5 20 25 50 100]              # queries
+search

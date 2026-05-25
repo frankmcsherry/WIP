@@ -1,0 +1,28 @@
+# view.range — lazy slice as a special case of view.
+#
+# `view.range` constructs a View whose selector is a contiguous `[lo, hi)`
+# half-open range. Equivalent to `iota` + `view` but doesn't materialize the
+# index column. Useful for windowing without copies (e.g., binary-searching
+# inside a sub-range of a large sorted column).
+#
+# Stack effect:
+#   col lo hi view.range  →  View(col, Range{lo, hi})
+#
+# Below: search inside a sub-range of a large target.
+
+# A target padded with sentinel values on both ends; the "real" sorted data
+# lives in positions [2, 7).
+u64[99 99 10 20 30 40 50 99 99]   # padded target
+1u64                               # lo = 2 (skipping the leading sentinels)
+1u64
++.u64                              # (compose 2 from 1+1 — just demonstrating)
+7u64                               # hi = 7
+view.range
+
+# Queries against the windowed view.
+u64[25 50]
+search
+
+# Expected:
+#   viewed target = [10, 20, 30, 40, 50]
+#   queries [25, 50] → lower_bounds in view = [2, 4]

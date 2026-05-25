@@ -1,0 +1,9 @@
+# Per-row sum of two u64 fields.
+# Build a Prod[P64, P64] inline, then project each field and add.
+# Result: P64[11, 22, 33, 44, 55]
+
+u64[1 2 3 4 5]
+u64[10 20 30 40 50]
+entuple.2
+
+dup .0 swap .1 +.u64

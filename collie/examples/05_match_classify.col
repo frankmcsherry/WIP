@@ -1,0 +1,14 @@
+# Build a Sum and immediately eliminate it with `match`, applying
+# different per-lane logic. Each arm runs on its lane's slice;
+# `match` reassembles a flat column in original row order.
+#
+# Heights: short rows are doubled, tall rows are tripled.
+# Result: P64[10, 21, 6, 27, 18, 8, 24]
+
+u64[5 7 3 9 6 4 8]
+dup 6u64 >=
+branch
+match {
+  -> 2u64 *.u64
+  -> 3u64 *.u64
+}

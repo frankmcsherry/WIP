@@ -1,0 +1,34 @@
+# Top-3 quantities per (returnflag, linestatus) group.
+#
+# Same dataset as 48, different ask: for each (rf, ls) group, return the
+# top 3 quantity values descending.
+#
+# Written in `>name` flat-binding form. The per-row sort is the genuine
+# use of `each` — sorting *within each row* is per-row work, exactly
+# what each is for.
+
+time
+
+10000u64                                           >N
+N iota                                             >seed
+seed 3u64 mod.u64                                  >returnflag
+seed 3u64 /.u64  2u64 mod.u64                      >linestatus
+seed 50u64 mod.u64  1u64 +.u64                     >quantity
+
+time
+
+# Pack (returnflag, linestatus) → key.
+returnflag as.u64 2u64 *.u64  linestatus as.u64 +.u64   >key
+
+# Group quantities by key.
+quantity key group                             >grouped >uniq_keys
+
+# Per-group: sort ascending, reverse, take top 3.
+grouped each { sort reverse 3u64 take }        >top_3_per_group
+
+# Unpack key back to (rf, ls).
+uniq_keys 2u64 /.u64  as.u8                        >rf_out
+uniq_keys 2u64 mod.u64  as.u8                      >ls_out
+
+rf_out ls_out top_3_per_group entuple.3
+time

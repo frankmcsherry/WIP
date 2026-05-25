@@ -1,0 +1,17 @@
+[package]
+name = "collie"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "collie"
+path = "src/lib.rs"
+
+[[bin]]
+name = "collie"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+
+[workspace]
