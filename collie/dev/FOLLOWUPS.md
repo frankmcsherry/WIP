@@ -460,7 +460,7 @@ Theory: Rust's `iter().zip().map().collect()` for two Vec inputs fits a known fa
 
 The classical WCO triangle (Generic Join / Leapfrog Triejoin) wants the inner step to be a *sort-merge intersect* between `N(a)` and `N(b)`, with cost `O(min(|N(a)|, |N(b)|))` per pair instead of `O(|N(a)| · |N(b)|)`. That's the WCO leap.
 
-**Update (implemented):** `search.<interp>` now exists — see `src/ops/join.rs` and `examples/09_search.col`. WCO triangle via composed intersect lives in `examples/17_wco_list_intersect.col` (sort-merge) and `examples/18_wco_lftj_idiomatic.col` (LFTJ).
+**Update (implemented):** `search.<interp>` now exists — see `src/ops/join.rs` and `examples/09_search.col`. WCO triangle via composed intersect lives in `examples/17_wco_list_intersect.col` (sort-merge) and `examples/18_wco_lftj_def.col` (LFTJ).
 
 **The original temptation:** add a single bespoke combinator like `intersect.per_row.<interp>` — takes `Prod[List<List<X>>, List<List<X>>]`, produces the per-row intersections. Solves the problem, ~40 lines. But this bundles "iterate rows" with "intersect inner lists" into one op, which is the *imperative* survey shape (à la datatoad's `extend`/`propose`). It's the right *algorithm*, but probably the wrong *factoring* for an array language.
 

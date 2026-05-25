@@ -10,7 +10,7 @@ kernels underneath.
 What you're looking at today is closer to a **human-writable columnar
 IR** than a finished array language: the inner-loop kernels are
 tight, but the surface for relational shapes is still mechanical
-(see the WCO triangle in `examples/19_wco_lftj_def.col` for the
+(see the WCO triangle in `examples/18_wco_lftj_def.col` for the
 honest "this could be terser" example). A surface lift is on the
 roadmap; see `dev/SURFACE.md`. Treat the array-language framing as
 where we're headed, not where we are.
@@ -55,7 +55,7 @@ A few things to notice:
 ## Design
 
 collie is a **concatenative, functional, interpreted columnar engine**.
-Six principles, each picking one side of a real design trade-off:
+Seven principles, each picking one side of a real design trade-off:
 
 1. **Flat data, positionally addressable** — `Value` is one of
    `Prim | Prod | Sum | List | View`. No pointer-graph types;
@@ -73,6 +73,9 @@ Six principles, each picking one side of a real design trade-off:
 6. **Values are immutable; ops are pure (modulo diagnostics)** —
    no mutation, no aliasing, equational reasoning. Same family as
    Joy / Cat / Factor.
+7. **Sequential access by default; sort to escape random access** —
+   kernels walk columns front-to-back; random probing is a sort
+   waiting to happen. Distribution/radix is the one movement kernel.
 
 See [`PRINCIPLES.md`](PRINCIPLES.md) for the full statement and the
 trade each makes.
@@ -86,7 +89,7 @@ cargo run --release -- examples/17_wco_list_intersect.col    # one example
 cargo run --release -- foo.col                               # any .col file
 cargo run --release -- repl                                  # interactive REPL
 cargo run --release -- bench                                 # microbenchmarks
-cargo test  --release                                        # 83 unit tests
+cargo test  --release                                        # 114 unit tests
 ```
 
 ## What's where
@@ -130,7 +133,7 @@ see `src/tools/ops_extra.rs` for an out-of-tree example.
   grouped by role (per-element compute, structural reshape, surveys,
   aggregations, sort family, escape hatches, …) with stack effects
   and one-line semantics.
-- **`examples/`** — `01_reduce_sum` through `19_wco_lftj_def`. Read
+- **`examples/`** — `01_reduce_sum` through `18_wco_lftj_def`. Read
   them in order; each one introduces one or two new ideas.
 - **[`BAKEOFF.md`](BAKEOFF.md)** — head-to-head with K / BQN / Uiua
   on representative tasks. Where collie wins, where it pays for the

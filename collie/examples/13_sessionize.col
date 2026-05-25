@@ -12,10 +12,10 @@
 #   `gap THRESHOLD >            > flag`
 #   `flag cumsum.u64                > session_id`
 
-u64[100 110 130 200 210 500 510]                 >ts
-ts dup 1u64 shift.u64 -.u64                      >gap
-gap 50u64 > as.u64                           >flag
-flag cumsum.u64                                  >session_id
+u64[100 110 130 200 210 500 510]                 :ts
+ts dup 1u64 shift.u64 -.u64                      :gap
+gap 50u64 > as.u64                           :flag
+flag cumsum.u64                                  :session_id
 
 # Display: (ts, gap, session_id).
 ts gap session_id entuple.3

@@ -1,15 +1,30 @@
 //! Stage A — lower a parsed op stream into the term-graph IR.
 //!
-//! Pure 1:1 lowering: every op becomes exactly one term. No CSE, no
-//! elision, no rewriting — those are `optimize`-stage passes. `Let`/`Ref`
-//! and the body-bearing ops stay as terms (their bodies run via legacy
-//! eval inside `op.run`); routing/binding resolution into edges is a
-//! planned later refinement.
+//! Mostly 1:1 lowering: each op becomes one term. Two classes resolve
+//! into edges instead, so the graph the optimizer sees is as flat as
+//! possible:
+//!
+//! - **Routing** (`dup`/`swap`/`pick`/…) — alias OutRefs, no term.
+//! - **Binding** (`Let`/`Ref`) — *boiled away* when the binding stays in
+//!   the graph world: a build-time `env: Vec<OutRef>` mirrors the runtime
+//!   env, `Let` pushes its inputs' OutRefs and recurses into its body,
+//!   and `Ref` resolves to the bound OutRef. No `Let`/`Ref` term, and the
+//!   graph's own take-on-last-use (see `execute.rs`) subsumes `Ref`'s
+//!   `take` flag.
+//!
+//! A `Let` can only be boiled if its body holds no opaque body-bearing op
+//! (`each`/`repeat`/`match`/`cleave`): those run via legacy eval and read
+//! the *runtime* env at parse-time indices, so any binding they might
+//! capture must stay materialized there. Such a `Let` is kept Foreign
+//! (today's behavior) and its whole body runs via legacy eval — we never
+//! recurse into it, so boiled and kept regions never share an env and no
+//! re-indexing is needed.
 
 use crate::pipeline::graph::{Graph, Term, OutRef};
 use crate::pipeline::sysop::promote;
 use crate::ir::typecheck::{Op, TypeStack, TypeEnv};
 use crate::ir::shape::Shape;
+use crate::ops::letbind::{Let, Ref};
 
 /// Lower a parsed op stream into a term graph. Returns the graph and
 /// per-term output shapes (side-table; valid for the freshly-built graph,
@@ -20,7 +35,10 @@ pub fn build(prog: Vec<Box<dyn Op>>) -> Result<(Graph, Vec<Vec<Shape>>), String>
     let mut tstack: TypeStack = Vec::new();
     let mut tenv: TypeEnv = Vec::new();
     let mut shapes: Vec<Vec<Shape>> = Vec::new();
-    build_in(prog, &mut g, &mut bstack, &mut tstack, &mut tenv, &mut shapes)?;
+    // Build-time env of bound producers, mirroring the runtime `Let` env.
+    // Empty at top level — `Ref`s only ever appear inside a `Let` body.
+    let mut env: Vec<OutRef> = Vec::new();
+    build_in(prog, &mut g, &mut bstack, &mut tstack, &mut tenv, &mut shapes, &mut env)?;
     g.roots = bstack;
     Ok((g, shapes))
 }
@@ -32,6 +50,7 @@ fn build_in(
     tstack: &mut TypeStack,
     tenv: &mut TypeEnv,
     shapes: &mut Vec<Vec<Shape>>,
+    env: &mut Vec<OutRef>,
 ) -> Result<(), String> {
     for op in prog {
         // Stack-routing ops (dup/drop/swap/over/rot/pick/roll) carry no
@@ -43,9 +62,87 @@ fn build_in(
             resolve_routing(&*op, &map, bstack, tstack, tenv)?;
             continue;
         }
-        emit_term(op, g, bstack, tstack, tenv, shapes)?;
+        // Binding: boil into edges where the body is graph-visible.
+        // Classify on a borrow, then consume `op` accordingly.
+        enum Kind { BoilLet, RefIdx(usize), Other }
+        let kind = {
+            let any: &dyn std::any::Any = op.as_ref();
+            if let Some(l) = any.downcast_ref::<Let>() {
+                if body_has_opaque(&l.body) { Kind::Other } else { Kind::BoilLet }
+            } else if let Some(r) = any.downcast_ref::<Ref>() {
+                Kind::RefIdx(r.idx)
+            } else {
+                Kind::Other
+            }
+        };
+        match kind {
+            Kind::BoilLet => {
+                let any_box: Box<dyn std::any::Any> = op;
+                let l = *any_box.downcast::<Let>().expect("classified as Let");
+                boil_let(l, g, bstack, tstack, tenv, shapes, env)?;
+            }
+            Kind::RefIdx(idx) => {
+                // Resolve to the bound producer's OutRef. The graph's
+                // take-on-last-use makes `Ref`'s `take` flag irrelevant.
+                let slot = *env.get(idx).ok_or_else(|| {
+                    format!("graph build: ref {} out of env (len {})", idx, env.len())
+                })?;
+                op.tc(tstack, tenv).map_err(|e| format!("graph build: ref: {}", e))?;
+                bstack.push(slot);
+            }
+            Kind::Other => emit_term(op, g, bstack, tstack, tenv, shapes)?,
+        }
     }
     Ok(())
+}
+
+/// Boil a `Let` into the graph: bind its inputs' OutRefs into `env`
+/// (mirroring `Let::run`/`tc`'s env push), lower its body, then unwind.
+/// Produces no term.
+fn boil_let(
+    l: Let,
+    g: &mut Graph,
+    bstack: &mut Vec<OutRef>,
+    tstack: &mut TypeStack,
+    tenv: &mut TypeEnv,
+    shapes: &mut Vec<Vec<Shape>>,
+    env: &mut Vec<OutRef>,
+) -> Result<(), String> {
+    let n = l.names.len();
+    if bstack.len() < n || tstack.len() < n {
+        return Err(format!("graph build: let needs {} inputs, has {}", n, bstack.len()));
+    }
+    // Move the bound values off both stacks into the envs, in stack order
+    // (deepest..top) — exactly what `Let::run`/`tc` do.
+    let bound_refs = bstack.split_off(bstack.len() - n);
+    let bound_shapes = tstack.split_off(tstack.len() - n);
+    let env0 = env.len();
+    let tenv0 = tenv.len();
+    env.extend(bound_refs);
+    tenv.extend(bound_shapes);
+    build_in(l.body, g, bstack, tstack, tenv, shapes, env)?;
+    env.truncate(env0);
+    tenv.truncate(tenv0);
+    Ok(())
+}
+
+/// Does this op stream contain an opaque body-bearing op
+/// (`each`/`repeat`/`match`/`cleave`) anywhere, including nested `Let`
+/// bodies? Such ops run via legacy eval and read the runtime env, so a
+/// `Let` whose body holds one cannot be boiled.
+fn body_has_opaque(ops: &[Box<dyn Op>]) -> bool {
+    use crate::ops::list::{Each, Repeat};
+    use crate::ops::combinators::{Match, Cleave};
+    for op in ops {
+        let any: &dyn std::any::Any = op.as_ref();
+        if any.is::<Each>() || any.is::<Repeat>() || any.is::<Match>() || any.is::<Cleave>() {
+            return true;
+        }
+        if let Some(l) = any.downcast_ref::<Let>() {
+            if body_has_opaque(&l.body) { return true; }
+        }
+    }
+    false
 }
 
 /// Apply a routing op's `map` to the build stack: pop its inputs, push the

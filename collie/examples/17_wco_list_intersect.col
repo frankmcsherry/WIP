@@ -13,43 +13,43 @@
 #   4. Gather c values from adj_plus.values; spread (a, b) by counts; entuple.3.
 
 time
-1000000u64                                       >N
-N iota 1u64 +.u64                                >ks
-ks 0u64 like                                     >zeros
-ks 1u64 +.u64                                    >ks_plus_1
-zeros ks    ks         cat.3                     >a_col
-ks    zeros ks_plus_1  cat.3                     >b_col
+1000000u64                                       :N
+N iota 1u64 +.u64                                :ks
+ks 0u64 like                                     :zeros
+ks 1u64 +.u64                                    :ks_plus_1
+zeros ks    ks         cat.3                     :a_col
+ks    zeros ks_plus_1  cat.3                     :b_col
 
-b_col a_col group                            >adj_plus  >src_uniq
-a_col b_col group                            >adj_minus >dst_uniq
+b_col a_col group                            :[src_uniq adj_plus]
+a_col b_col group                            :[dst_uniq adj_minus]
 
 # Need adj_plus.values flat for the final gather.
-adj_plus flatten drop                            >adjp_values
+adj_plus flatten drop                            :adjp_values
 
 time   # phase 1 done
 
-src_uniq b_col search                        >pos_b_in_src
-dst_uniq a_col search                        >pos_a_in_dst
+src_uniq b_col search                        :pos_b_in_src
+dst_uniq a_col search                        :pos_a_in_dst
 
-pos_b_in_src src_uniq length <
-pos_a_in_dst dst_uniq length <
-and                                              >both_in
+pos_b_in_src src_uniq enlist count <
+pos_a_in_dst dst_uniq enlist count <
+and                                              :both_in
 
-a_col        both_in where gather                >a_f
-b_col        both_in where gather                >b_f
-pos_b_in_src both_in where gather                >pos_b_f
-pos_a_in_dst both_in where gather                >pos_a_f
+a_col        both_in where gather                :a_f
+b_col        both_in where gather                :b_f
+pos_b_in_src both_in where gather                :pos_b_f
+pos_a_in_dst both_in where gather                :pos_a_f
 
 # Per-anchor sub-list views (zero alloc).
 adj_plus  pos_b_f view
 adj_minus pos_a_f view
 # Row-shaped intersect → two SEQ<LIST<u64>>: positions in each side.
-intersect                                    >pos_in_B >pos_in_A
+intersect                                    :pos_in_B :pos_in_A
 
 # c values live in adj_plus.values at the positions from side A.
-pos_in_A count                                   >per_anchor_counts
-pos_in_A flatten drop                            >flat_pos_A
-adjp_values flat_pos_A gather                    >c_flat
+pos_in_A count                                   :per_anchor_counts
+pos_in_A flatten drop                            :flat_pos_A
+adjp_values flat_pos_A gather                    :c_flat
 
 # Spread (a, b) by per-anchor counts; assemble (a, b, c).
 a_f per_anchor_counts spread

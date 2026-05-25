@@ -1,0 +1,119 @@
+# ════════════════════════════════════════════════════════════════════
+# DESIGN SKETCH — NOT EXECUTABLE.
+#
+# An aspirational rewrite of examples/19_wco_lftj_def.col in a proposed
+# front-end surface, to show how much of the IR's argument-marshalling
+# noise the surface could absorb. None of `schema`, named-field records,
+# named-argument `def` calls, record `filter`, or `fork` exist yet — this
+# is a target, annotated with the IR it would lower to. The lowering is
+# the point: every piece of sugar below compiles to *routing* (detuple /
+# permute / zip / proj), which the graph resolves into edges — so all of
+# this is runtime-free. The back end already "solves for" the order; the
+# surface just stops making the human spell it out.
+#
+# Compare side-by-side with examples/19_wco_lftj_def.col.
+# ════════════════════════════════════════════════════════════════════
+
+# ── Schemas: name the column bundles that travel together ────────────
+# Lowers to: nothing at runtime. A schema is a parse-time map from field
+# name → Prod index. `.a` becomes `.0`, `.pos_a` becomes `.3`, etc.
+schema Anchor = { a, b, pos_b, pos_a }          # one candidate (a,b) row
+schema Index  = { adj, degs, bnds, vals }       # one direction's index
+
+# ── The per-lane body, taking records + named positions ──────────────
+# `def name(params) { body }` with named params. The call site names
+# arguments; lowering computes the stack permutation to this order, so
+# the body is written once in its natural order and never re-juggled.
+# `target`/`proposer` are Index records; the body reads their fields by
+# name (target.idx → a `.0` proj on the bundle). `proposer` only uses
+# .adj/.degs — unused fields cost nothing (projection is free).
+def lftj_lane(ai, bi, pp_target, pp_proposer, target: Index, proposer: Index) {
+   target.idx   pp_target   view
+   proposer.idx pp_proposer view
+   search                                    >positions
+   ai bi
+   target.counts pp_target gather
+   target.bnds   pp_target gather
+   entuple.4
+   proposer.counts pp_proposer gather
+   spread
+   detuple.4                                  >flat_lo >flat_t_lens >flat_b >flat_a
+   positions flatten drop                     >flat_pos
+   flat_pos flat_t_lens <                     >in_range
+   flat_pos in_range as.u64 *.u64
+   flat_lo +.u64
+   target.vals swap gather
+   proposer.idx pp_proposer view flatten drop dup
+   {| flat_queries |
+      = in_range and                          >hit
+      flat_a flat_b flat_queries entuple.3
+      hit where gather
+   }
+}
+
+time
+1000000u64 iota 1u64 +.u64                       >ks
+ks 0u64 like                                     >zeros
+ks 1u64 +.u64                                    >ks_plus_1
+zeros ks    ks         cat.3                      >a_col
+ks    zeros ks_plus_1  cat.3                      >b_col
+
+# `def` returning a record: `graph` derives the three columns from `adj`
+# and hands back a whole Index. The "produce N columns, then bundle them"
+# step disappears — the producer bundles. (`adj` is read several times;
+# in the IR that's just fan-out edges from one producer.)
+def graph(adj) {
+   Index{ adj: adj, degs: adj count, bnds: adj list>bounds, vals: adj flatten drop }
+}
+
+# `group` leaves the grouped values on top, uniq keys below — so `graph`
+# consumes the grouped values straight off the pipeline and the keys ride
+# underneath until bound. No intermediate `*_adj` name needed.
+b_col a_col group graph                           >fwd >src_uniq
+a_col b_col group graph                           >bwd >dst_uniq
+
+time
+
+# ── Anchors as a record; positions found by search ───────────────────
+src_uniq b_col search                            >pos_b_raw
+dst_uniq a_col search                            >pos_a_raw
+
+Anchor{ a: a_col, b: b_col, pos_b: pos_b_raw, pos_a: pos_a_raw }   >anchors
+
+# ── Record filter: one mask, all fields, no entuple/detuple/rebind ───
+# Lowers to: the same entuple.4 · where gather · detuple.4 as the IR —
+# but the bundle stays a bundle, so there is no manual untuple-and-
+# rename (and no reversed >name order to get wrong).
+pos_b_raw src_uniq enlist count <
+pos_a_raw dst_uniq enlist count <
+and                                              >both_in
+anchors both_in filter                           >anchors
+
+# `view` reads the two index-views straight through `<=` (Cmp Indices
+# fast path); the degree columns never materialize.
+fwd.degs anchors.pos_b view
+bwd.degs anchors.pos_a view
+<=                                               >use_S_mask
+
+# ── fork: per-lane flatmap then union (the branch/split/cat pattern) ──
+# Proposed combinator for the "split by mask, map each lane, concatenate"
+# shape that `match` can't express (arms flatmap; output is an unordered
+# bag, here a set of triangles). Lowers to exactly today's
+# `branch split {| disc l0 l1 | … cat.2 }` — but hides the discriminant
+# (which the body never uses) and names the lanes positionally.
+# The role-swap between lanes is now just *which field feeds which named
+# param* — no `swap`, no detuple, no reversed binding.
+anchors use_S_mask fork {| lane_T lane_S |
+
+   # Lane T: target = N+(b), proposer = N-(a)
+   lftj_lane(ai: lane_T.a, bi: lane_T.b,
+             pp_target: lane_T.pos_b, pp_proposer: lane_T.pos_a,
+             target: fwd, proposer: bwd)
+
+   # Lane S: roles swapped — target = N-(a), proposer = N+(b).
+   # The whole swap is these two lines differing from lane T.
+   lftj_lane(ai: lane_S.a, bi: lane_S.b,
+             pp_target: lane_S.pos_a, pp_proposer: lane_S.pos_b,
+             target: bwd, proposer: fwd)
+}
+time

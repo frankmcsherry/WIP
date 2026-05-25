@@ -12,7 +12,7 @@ Consumer-facing (repo root):
 | File | Role |
 |---|---|
 | `README.md` | Top-level overview, layout, install/run. |
-| `PRINCIPLES.md` | The three design principles + the trades they make. |
+| `PRINCIPLES.md` | The seven design principles + the trades they make. |
 | `BAKEOFF.md` | Cross-language comparison + perf numbers. |
 
 Workshop notes (`dev/`):
@@ -30,13 +30,25 @@ Workshop notes (`dev/`):
 src/
   ir/         language definition (value, stack, op, shape, typecheck, profile)
   ops/        operators (each = PrimOp + Typed)
-  syntax/     parser + registry
+  pipeline/   graph IR + execution substrate (graph, lower, optimize,
+              execute, sysop) — the primary eval path
+  syntax/     parser + registry + last-use inference
   tools/      binary-only utilities (REPL, bench, pretty, serialize, demos)
   lib.rs      library entry
   main.rs    binary entry (CLI)
 examples/     19 .col files — curated tour from basics to WCO triangle
 dev/          workshop notes (BACKLOG, FOLLOWUPS, SURFACE, ONBOARDING)
 ```
+
+`pipeline/` is where parsed op streams become a `Graph` of `Term`s
+(`lower.rs`), get hash-consed / dead-output-pruned (`optimize.rs`),
+and run via `execute.rs`. `sysop.rs` holds the introspectable
+`SystemOp` enum the optimizer pattern-matches on. Binding (`let`/`ref`,
+i.e. `:name` / `:[names]`) is *boiled into edges* during lowering — no term — except
+when a binding is captured inside an opaque body-bearing op
+(`each`/`repeat`/`match`/`cleave`), where the `let` is kept Foreign and
+its body runs via legacy eval. Body-bearing ops still execute via legacy
+eval inside `op.run`.
 
 Library is published via `lib.rs` and importable as `use collie::...`.
 The `tools/` subdir is binary-only (not part of the public API).
@@ -67,7 +79,7 @@ PATH="$HOME/.cargo/bin:$PATH" cargo test --release
 PATH="$HOME/.cargo/bin:$PATH" ./target/release/collie examples
 ```
 
-83 unit tests + 19 examples should pass. If something breaks, that's
+114 unit tests + 19 examples should pass. If something breaks, that's
 a real regression — find and fix.
 
 **Bench when perf is the point.** `./target/release/collie bench` for
@@ -77,13 +89,15 @@ and the `time` ops inside each example bracket their phases.
 
 ## Quick references
 
-- **The three principles** (flat-data + positions, whole-collection
-  dispatch, layered typing) are in `PRINCIPLES.md`.
+- **The seven principles** (flat data + positions, whole-collection
+  dispatch, layered typing, sequences-with-restrictions, shape
+  polymorphism, immutability/purity, sequential-access-by-default)
+  are in `PRINCIPLES.md`.
 - **The four-layer architecture** (Layer 1: core IR, Layer 2: ops,
   Layer 3: types, Layer 4: syntax) is in `README.md` and visible in
   the `src/` directory structure.
-- **`>name` and `def` syntax** — see `dev/SURFACE.md` and the
-  later WCO examples (`18`, `19` use both heavily).
+- **`:name` / `:[names]` binding and `def` syntax** — see `dev/SURFACE.md` and the
+  later WCO example (`18` uses both heavily).
 - **Positions idiom** — surveying ops return positions; `gather`
   materializes. See `PRINCIPLES.md` (Idioms section) and
   `dev/FOLLOWUPS.md` §0a for the original audit.

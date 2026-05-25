@@ -1,0 +1,82 @@
+# WCO triangle, the match-based / order-preserving counterpart to
+# example 18. Same triangles; different (and often more useful) structure.
+#
+# 18 flat-emits (a,b,c) via branch/split/cat and carries (a,b) through each
+# lane as passengers — because `branch` reorders the anchors, so each emitted
+# triple must already know its (a,b). That's ideal for an unordered *bag* of
+# triples. But when the result feeds a downstream join or delta tracking (as
+# in datatoad), you want it back in ORIGINAL anchor order. So here:
+#   * branch only the *positions* — no (a,b) in the lane,
+#   * each lane returns List<c> per anchor (grouped, not flat),
+#   * `match` reassembles by discriminant into original anchor order,
+#   * attach (a,b) afterward from the original columns, now realigned.
+# The cost vs 18: a per-anchor re-nest of survivors and match's order-
+# restoring merge (a scatter). The lane is anchor-free; the output is ordered.
+
+# Per-lane: enumerate the proposer's neighbors, validate against the target,
+# return the surviving c's grouped per anchor (a List<c>). No a,b.
+def lftj_lane_g {
+   :[t_pos p_pos t_adj p_adj]
+   t_adj t_pos view  p_adj p_pos view  search    :positions
+   t_adj list>ranges t_pos gather                 :t_range
+
+   t_range .1 t_range .0 -.u64  t_range .0  entuple.2
+   p_adj count p_pos gather  spread  detuple.2    :[tlen base]
+
+   positions flatten drop                         :pos
+   pos tlen <                                      :ok
+   base  pos ok as.u64 *.u64  +.u64               :slot
+   t_adj flatten drop slot gather                 :cand
+   p_adj p_pos view flatten drop                  :queries
+   cand queries =  ok and                         :hit          # flat, per proposer neighbor
+
+   # Regroup survivors per anchor: counts = hits per anchor → bounds → nest.
+   queries hit where gather                       :surv         # flat surviving c's
+   p_adj p_pos view list>bounds                   :pbnds
+   hit as.u64 pbnds nest  reduce.+.u64            :cnts         # survivors per anchor
+   surv  u64[0] cnts cumsum.u64 cat.2  nest                     # List<c> per anchor
+}
+
+time
+1000000u64                                      :N
+N iota 1u64 +.u64                                :ks
+ks 0u64 like                                     :zeros
+ks 1u64 +.u64                                    :ks_plus_1
+zeros ks    ks         cat.3                     :a_col
+ks    zeros ks_plus_1  cat.3                     :b_col
+
+b_col a_col group :[src_uniq fwd_adj]  fwd_adj count :fwd_degs
+a_col b_col group :[dst_uniq bwd_adj]  bwd_adj count :bwd_degs
+
+time
+
+src_uniq b_col search                            :pos_b_raw
+dst_uniq a_col search                            :pos_a_raw
+
+pos_b_raw src_uniq enlist count <
+pos_a_raw dst_uniq enlist count <
+and                                              :both_in
+
+# Original-order anchor columns (a, b) and lookup positions, all filtered.
+a_col both_in where gather                       :a_f
+b_col both_in where gather                       :b_f
+pos_b_raw both_in where gather                   :pos_b_f
+pos_a_raw both_in where gather                   :pos_a_f
+
+fwd_degs pos_b_f view  bwd_degs pos_a_f view  <=  :use_S_mask
+
+# Branch only the positions; dispatch per lane; match reassembles in order.
+pos_b_f pos_a_f entuple.2 use_S_mask branch match {
+   -> detuple.2       fwd_adj bwd_adj  lftj_lane_g   # lane T: target N+(b)
+   -> detuple.2 swap  bwd_adj fwd_adj  lftj_lane_g   # lane S: target N-(a)
+}
+:grouped_c
+
+# Attach (a,b) from the original columns — match restored anchor order, so
+# a_f/b_f realign with grouped_c. Broadcast each anchor's (a,b) over its c's.
+grouped_c bounds>keys                            :keys
+a_f keys gather
+b_f keys gather
+grouped_c flatten drop
+entuple.3
+time

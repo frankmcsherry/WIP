@@ -12,26 +12,26 @@
 #   3. Pretty-printer renders List<P8> with valid UTF-8 as Str<…>.
 
 80u64 iota as.f64  79.0f64 /.f64  3.5f64 *.f64  2.5f64 -.f64
-{| cre_axis |
+{ :[ cre_axis ]
    40u64 iota as.f64  39.0f64 /.f64  2.0f64 *.f64  1.0f64 -.f64
-   {| cim_axis |
+   { :[ cim_axis ]
 
       cre_axis  u64[0 80]  nest
       cim_axis  u64[0 40]  nest
       entuple.2  xprod  flatten drop  detuple.2
 
-      {| cre cim |
+      { :[ cre cim ]
          cre 0.0f64 *.f64
          cim 0.0f64 *.f64
 
          repeat 30 {
-            {| zre zim |
+            { :[ zre zim ]
                zre zre *.f64  zim zim *.f64  -.f64  cre +.f64
                zre zim *.f64  2.0f64 *.f64  cim +.f64
             }
          }
 
-         {| zre zim |
+         { :[ zre zim ]
             zre zre *.f64  zim zim *.f64  +.f64
             # `<` is interp-free (unsigned-bits order). Correct here because
             # both sides are non-negative (a magnitude vs 4.0), where IEEE

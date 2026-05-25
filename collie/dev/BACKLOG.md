@@ -237,9 +237,33 @@ Prioritized order. Top is what to start with on a fresh session.
   `shift_runs`) to read `View<Prim>` inner values. Self-contained;
   enables the desugar without performance regression on the
   `filter → reduce` mask-streaming path.
-- **State this session:** Recipe articulated in PRINCIPLES.md; one
-  trivial application landed (`length` → `enlist count`); broader
-  sweep deferred pending the elaboration step.
+- **State this session:** Recipe articulated in PRINCIPLES.md;
+  `length` (the atom-form alias for `enlist count`) **retired** — the
+  SEQ-first `count` is the only token, flat total is `enlist count`.
+  Example 07's `each` dropped onto the segment-aware reduce/count path.
+  Broader sweep (reduce/any/all/cumsum/shift/intersect/search) still
+  deferred pending the elaboration step.
+
+### 0c. Segmented sort — expose the per-row form (SEQ-first)
+
+- **What:** The engine's `sort_blocks` already sorts *within* groups
+  (the recursive core refines per-block). But the only surface sort is
+  the flat `sort` (`SEQ<T> → SEQ<T>`); there is no `sort.segmented`
+  (`SEQ<LIST<T>> → SEQ<LIST<T>>`, sort within each row). So per-group
+  sorting is only reachable via `each { sort }` — per-row interpreter
+  dispatch over a kernel that is already segmented internally.
+- **Recipe form:** per the SEQ→SEQ recipe, the segmented form is the
+  primitive and the flat form is the lift: `sort ≡ enlist sort.segmented
+  delist`. (Mirror of `count` being segmented with `enlist count` the
+  flat lift — same shape, opposite default historically.) Need a
+  `delist`/`unlist` to match.
+- **Consumer:** example 15 (`grouped each { sort reverse 3u64 take }`),
+  the last `each` in the curated examples. Fully retiring its `each`
+  also needs per-group `take K` (segmented head) and per-group reverse
+  (or descending sort). Land segmented sort first; it's the one whose
+  kernel already exists.
+- **State this session:** Identified, not started. `sort_blocks` is in
+  `src/ops/sort.rs` (`mod perm`).
 
 ### 0b. Trie-walker kernel — shared substrate for polymorphic survey ops
 
@@ -362,7 +386,7 @@ Revisit only if a cluster of features wants logical/physical width decoupling.
   SQL-flavored layer, a datalog layer. Going long on a single
   unified surface risks a disorderly language; each front-end can
   pick its own idioms and elaborate independently.
-- **Why:** The WCO triangle example (`examples/19_wco_lftj_def.col`)
+- **Why:** The WCO triangle example (`examples/18_wco_lftj_def.col`)
   is the moment of truth. The kernels are tight but the surface
   reads like join-engine assembly — twenty-plus named bindings,
   `detuple.4` shuffling, parameter ordering by hand. The IR is
@@ -467,6 +491,23 @@ git log around 2026-05-23 for the design notes and barriers found.)*
 Discrete items that don't sequence dependently — pick up between bigger
 pieces.
 
+- **Segmented `filter` (per-row filter) — the laggard of the SEQ→SEQ
+  recipe.** `filter`/`where`/`gather` are flat-only; `reduce`/`count`/
+  `cumsum`/`shift` all got per-row (List) forms, `filter` never did. So
+  filtering grouped data means flatten → `where gather` → recount survivors
+  per group → `cumsum` → prepend 0 → `nest` (the re-nest dance in example
+  19's `lftj_lane_g`). A segmented `filter` (`List<T>` filtered by an aligned
+  `List<bool>` → `List<T>`, keeping rows) collapses all of that to one op.
+  This is BACKLOG #0 applied to `filter`, and #0b (trie-walker) is the
+  structural version — *carry the per-group bounds through compute* so the
+  flatten/re-nest never happens. Concrete witness: `19_wco_lftj_match.col`.
+  A cheaper interim win: `nest`-by-counts (build a List from values + per-row
+  counts, no manual `u64[0] … cumsum cat.2` to make bounds).
+  **Kickoff doc + step plan: `dev/SEGMENTED.md`** (step 1 = element-wise
+  cmp/arith preserve List; step 2 = segmented `filter`; step 3 = rewrite
+  `lftj_lane_g`; step 4 = trie-walker). Started: no; next action noted in
+  the doc (place the List branch in `cmp.rs`'s flat fall-through).
+
 - **LIST and TUPLE entries in BAKEOFF** — bench collie vs BQN on
   ragged-list and Prod-of-columns workloads where collie's design
   center actually lives. Discussed in conversation; no ticket. ~1
@@ -535,14 +576,19 @@ is a data point about whether the construct is load-bearing or just a
 shortcut.
 
 - **`each { body }`** — runs body per row. Violates principle 2
-  (whole-collection-only dispatch). Used by example 15 (top-K per
-  group). The body is columnar *within* one row, so the cost is
-  per-row interpreter dispatch, not per-element. Watch list: every
-  use is a signal we don't yet have the right columnar primitive.
-- **`reduce { body }`** — generic per-row reduction. Same as `each`
-  but accumulating. The typed variants (`reduce.+`, `reduce.*`,
-  `reduce.min`, `reduce.max`) cover almost all real use. Body-bearing
-  version is rarely needed.
+  (whole-collection-only dispatch). The body is columnar *within* one
+  row, so the cost is per-row interpreter dispatch, not per-element.
+  Watch list: every use is a signal we don't yet have the right
+  columnar primitive. **Down to one use (example 15).** Example 07's
+  `each { .{ length ; reduce.+ ; reduce.max } }` was removed: the
+  reduce-family and `count` are already segment-aware on a List, so
+  the cleave does the per-group work directly (the `each` only added
+  dispatch + a vestigial length-1 `List<Prod>` nesting). Required the
+  `length`→`count` swap — `length` was whole-collection (counted rows),
+  `count` is per-row. **Example 15 (`each { sort reverse 3u64 take }`)
+  is the honest remaining case** — it marks three missing segmented
+  ops (per-group sort, per-group `take K`, per-group reverse); see
+  "Segmented sort" in Next.
 - **`Cleave { paths }`** — runs each `path` against a copy of the
   input value. Dispatch is bounded by `paths.len()`, not by N, so
   it's principle-2-aligned in spirit. But its purpose is not
@@ -615,6 +661,142 @@ Real items, intentionally deferred. Each has a reason.
 ## Done recently
 
 (Last ~10 items. Older history lives in commit messages.)
+
+### AB. Example 19 tidied → renumbered 18; old 18 cut
+
+`lftj_lane` params renamed to role-based `:[a b t_pos p_pos t_adj p_adj]`
+(t_*/p_* = target searched / proposer enumerated); the `dup`/`swap`/stack-
+leftover in the validation step replaced with explicit binds so `:hit`
+reads as dataflow; lines compressed (one line = one complete thought, bind
+to untangle cross-line operands); dead `disc` bind → `:[_ …]` (a normal
+unused name the graph drops). Output byte-identical, still fully boils.
+Then `18_wco_lftj_idiomatic.col` (redundant with the clean def-factored
+version) was cut and `19_wco_lftj_def.col` renumbered to `18`; all refs +
+counts updated. 18 examples, 114 tests.
+
+Then a **match-based, order-preserving** counterpart was added as the new
+example 19 (`19_wco_lftj_match.col`): branch only the positions, each lane
+returns `List<c>` per anchor, `match` reassembles into original anchor
+order, `(a,b)` attached afterward. Same 2,999,997 triples as 18; pairs with
+it to teach flat-bag vs ordered-grouped (datatoad needs order for downstream
+joins / deltas). 19 examples. **Surfaced a primitive gap** — see the new
+"segmented filter" candidate. — 2026-05-25.
+
+### AA. Binding notation → `:` ; retired `>name`/`name>`/`{| |}`
+
+The binding sigil moved from `>` to `:`, freeing `>` to mean comparison
+only. New surface: `:name` (bind top of stack), `:[a b c]` (bind top N,
+deepest-to-top — reads forward, kills the reversed-peel order trap), and
+`{ … }` as a standalone **scope block** that delimits where a `:`-bind
+reaches (so `{| names | body }` became `{ :[names] body }`; `each {| n |}`
+→ `each { :[n] … }`; `def name {| … |}` → `def name { :[…] … }`). The
+explicit-take `name>` is gone — last-use is inferred and the graph derives
+it via use-counting, so it was doubly vestigial. Tokenizer also treats
+`,` as a separator (so `:[a, b]` ≡ `:[a b]`). All 19 examples migrated
+(outputs byte-identical to baseline); parser arms for `>name`/`name>`/`{|`
+removed; tests migrated (`pipeline::binding_clone_and_inferred_take`,
+repl `brace_depth`). 114 tests + 19 examples green.
+
+- **Design notes (this thread):** binding is purely front-end — `:`/`:[]`/
+  `{}` lower to the same `Let`/`Ref` (boiled to edges) + existing ops; the
+  core gained nothing. Two roughness axes identified: output-binding
+  (positional `>name` peel → `:[…]` destructure) and argument-marshalling
+  (positional op args / `detuple.N` → named args / records, future). `[]`
+  means "take apart the stack", `()` means "take apart a tuple". Patterns
+  destructure *static-arity* structure only (Prod + stack); List (dynamic
+  length) and Sum (`split`/`match`) are out by nature.
+- **Deferred — `:(…)` tuple-destructure pattern.** `:(a b c)` = destructure
+  the Prod on top into fields (folds `detuple.N` into the bind), nestable as
+  `:[(a b) c]`. Dropped for now on a symmetry argument (`detuple :[…]` and
+  `split :[…]` are parallel; we didn't sugar `split`, so don't sugar
+  `detuple` yet). Add when the `detuple.N` noise warrants it. (Supersedes
+  the old `{| (a,b,c) |}` "pattern destructure" item under #1.)
+- **Dead weight removed:** the `takens: Vec<bool>` use-after-take tracking
+  in `parse.rs` (write-only once `>`/`name>` went) is gone — dropped from
+  `parse()`, the `parse_block` signature, all call sites, and both bind arms;
+  last-use scoping reads `scope_depth(scopes)` directly. Secondary docs still
+  show old syntax
+  (BAKEOFF.md, dev/SURFACE.md, dev/ONBOARDING.md, dev/FOLLOWUPS.md) — sweep
+  when touched; the canonical refs (OPERATORS/PRINCIPLES/CLAUDE/README) are
+  updated. — 2026-05-25.
+
+### Z. `list>ranges` + example 19 cleanup (the Index is the List)
+
+A `List` is already `(bounds, values)`, so a CSR-style "index" doesn't
+need a heterogeneous record bundling degs/bnds/vals — those are all
+projections of the List. New op `list>ranges` (`List → Prod[View<Range>,
+View<Range>]`) exposes the per-row `(lower, upper)` offsets as two
+zero-copy windows over the single N+1 bounds buffer (`lower = bounds[0..N]`,
+`upper = bounds[1..N+1]`); degree = `upper - lower`, so `count` is
+derivable. This recovers the logical length-N relation the N+1 layout
+stores by sharing interior endpoints — the offset is the storage trick,
+views are the view of it (principle 1 + 4). First-class `SystemOp::
+ListRanges`; unit test `list_ranges_are_offset_views`.
+
+Example 19 rewritten: `lftj_lane` now takes the two adjacency **Lists**
+and derives bounds/degree/values inside via `list>ranges` + `flatten
+drop`, instead of `def graph` precomputing loose degs/bnds/vals columns
+threaded 6-at-a-time per lane. The two lanes collapse to
+`lane_X detuple.4 [swap] · two Lists · lftj_lane`. **Measured (6× each,
+steady state): performance-neutral** — prep ~128ms and total ~432–443ms
+for both; the value `flatten` moves from prep into the lanes rather than
+duplicating, and `list>ranges` is views + the same gathers (recursing the
+Prod) + one subtract, so nothing materializes in the hot path. Confirms
+`view.range`/`list>ranges` are genuinely zero-copy. (Earlier single-run
+"~3% regression" was a cold first-run artifact — retracted.) Graph fully
+boils (92 terms, 0 `let`/`ref`). 114 tests + 19 examples green.
+— 2026-05-25.
+
+### Y. `let`/`ref` boiled into graph edges (binding minimized, not removed)
+
+Binding was an opaque barrier: `>name` lowers to `Let { body: rest-of-
+block }`, which the graph treated as whole-stack-in/out and ran via
+legacy eval — so in flat `>name` programs (the WCO examples) almost the
+entire body was invisible to the optimizer. Now `lower.rs` boils `Let`
+into a build-time `env: Vec<OutRef>` (mirrors the runtime env push/pop)
+and resolves `Ref` to the bound producer's OutRef — no `let`/`ref` term.
+Name resolution was already static (`Ref.idx`), and the graph's own
+take-on-last-use (execute.rs) subsumes `Ref`'s `take` flag, so the boiled
+form needs neither. **Gated, not total:** a `Let` whose body holds an
+opaque body-bearing op (`each`/`repeat`/`match`/`cleave`) is kept Foreign
+— those bodies run via legacy eval and read the runtime env at parse
+indices, so boiled/kept regions never share an env (no re-indexing).
+Verified: 17/18/19 now have 0 `let`/`ref` terms (38/84/84 flat terms);
+15 (has `each`) keeps its 1 `let`. A/B vs `--legacy`: parity, and the
+~4% example-19 conservative-arity gap is closed. No optimizer pass runs
+on the flat graph yet — that's the unlocked follow-on (entuple/detuple
+round-trip elision, CSE through former binding boundaries). The full
+removal of binding is blocked by the same opaque body-bearing ops as
+everything else; minimizing is as far as it goes until those move to
+quotations/segmented primitives. 113 tests + 19 examples green. — 2026-05-25.
+
+### X. `reduce { body }` removed (unused body-bearing per-row op)
+
+The bare-body `reduce` (`list::Reduce`) mapped a row-collapsing body
+over each row of a List (body gets the whole sub-list, must return
+length-1) — `each`-shaped per-row dispatch with an output-arity assert,
+*not* a fold. Zero example/test uses; the typed `reduce.+/min/max/*`
+(separate `reduce_ops` kernels) cover real work. Removed: struct + both
+impls (list.rs), the `"reduce"` parser arm, `has_body`/inference
+downcasts, the now-orphaned `concat_rows` helper, and doc entries
+(OPERATORS, ONBOARDING). `each` is now the sole "remove if a columnar
+form appears" escape hatch. Add back if a workload reveals what it was
+for. 113 tests + 19 examples green. — 2026-05-25.
+
+### W. `length` retired + example 07's `each` removed (SEQ-first cleanup)
+
+`length` was atom-form sugar (`enlist count`) competing with the
+SEQ-first `count` (segmented; rejects a bare Prim). Retired: parser
+desugar deleted, 6 WCO sites (`X_uniq length` → `X_uniq enlist count`),
+catalogue entries, test repurposed (`enlist_count_is_flat_total`).
+Example 07's `each { .{ length ; reduce.+ ; reduce.max } }` → bare
+`.{ count ; reduce.+.u64 ; reduce.max.u64 }`: the reduce-family and
+`count` are segment-aware on a List, so the `each` was pure per-row
+dispatch and also produced a vestigial length-1 `List<Prod>` instead of
+flat `Prod[c,t,m]`. `each` now appears in exactly one curated example
+(15). Also fixed stale counts in CLAUDE.md/README (83→113 tests, "three"/
+"six"→seven principles) and documented the `pipeline/` layer in CLAUDE.md.
+113 tests + 19 examples green. — 2026-05-25.
 
 ### U. `search` / `intersect` → byte-gallop over order-form keys
 

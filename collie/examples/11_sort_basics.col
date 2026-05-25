@@ -10,8 +10,8 @@
 #
 # Phase 1 of Task #52.
 
-10u64 iota                  >ix
-ix 7u64 mod.u64             >v
+10u64 iota                  :ix
+ix 7u64 mod.u64             :v
 
 # Plain sort of a Prim. Expected: [0,0,1,1,2,2,3,4,5,6].
 v sort

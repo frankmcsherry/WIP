@@ -320,7 +320,7 @@ These shape how we write code against the principles, but they are
 not themselves design principles.
 
 - **Composability before sugar.** Prefer fewer ops that compose well.
-  Sugar (`>name`, `name>`, parser peepholes, `def`) is fine when it
+  Sugar (`:name`, `:[names]`, parser peepholes, `def`) is fine when it
   lowers to existing core ops without introducing new semantics.
 
 - **No new primitive without a real workload.** Every op should

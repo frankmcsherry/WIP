@@ -15,7 +15,7 @@
 //! For sequential ops (Let body, top-level program) this is just "find
 //! the rightmost reference."
 //!
-//! For loop-body ops (`Each`, `Reduce`, `Repeat` with N>1), references
+//! For loop-body ops (`Each`, `Repeat` with N>1), references
 //! inside the body are executed *multiple times* — once per iteration.
 //! Marking a Ref inside a loop body as take would consume the binding
 //! on the first iteration, leaving the second iteration with a drained
@@ -26,7 +26,7 @@
 //! arm, `Cleave` path, `Repeat` with N=1), references inside the body
 //! are safe to mark. The current implementation conservatively treats
 //! all body-bearing ops as "single-execution" — which is wrong for
-//! `Each`/`Reduce`/`Repeat`. The mitigation: the inference only marks
+//! `Each`/`Repeat`. The mitigation: the inference only marks
 //! Refs whose idx falls within the *current* Let's bound range, and the
 //! inference is run after each Let close. So Refs inside an outer
 //! loop's body that target the loop's own local bindings are marked
@@ -37,7 +37,7 @@ use std::any::Any;
 
 use crate::ir::typecheck::Op;
 use crate::ops::letbind::{Let, Ref};
-use crate::ops::list::{Each, Reduce, Repeat};
+use crate::ops::list::{Each, Repeat};
 use crate::ops::combinators::{Match, Cleave};
 
 /// Mark the last reference to each name bound by the just-closed `Let`
@@ -117,9 +117,6 @@ fn op_sub_bodies<'a>(op: &'a dyn Op) -> Vec<&'a [Box<dyn Op>]> {
     }
     if let Some(e) = any_ref.downcast_ref::<Each>() {
         return vec![&e.body];
-    }
-    if let Some(r) = any_ref.downcast_ref::<Reduce>() {
-        return vec![&r.body];
     }
     if let Some(r) = any_ref.downcast_ref::<Repeat>() {
         return vec![&r.body];

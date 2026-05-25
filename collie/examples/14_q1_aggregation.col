@@ -16,33 +16,33 @@
 
 time
 
-100000u64                                          >N
-N iota                                             >seed
-seed 3u64 mod.u64                                  >returnflag
-seed 3u64 /.u64  2u64 mod.u64                      >linestatus
-seed 50u64 mod.u64  1u64 +.u64                     >quantity
-seed 100u64 mod.u64                                >price_raw
-seed 1000u64 mod.u64                               >discount
-seed 365u64 mod.u64                                >shipdate
-quantity 100u64 *.u64  price_raw +.u64             >price
-price  10000u64 discount -.u64  *.u64  10000u64 /.u64   >price_adj
+100000u64                                          :N
+N iota                                             :seed
+seed 3u64 mod.u64                                  :returnflag
+seed 3u64 /.u64  2u64 mod.u64                      :linestatus
+seed 50u64 mod.u64  1u64 +.u64                     :quantity
+seed 100u64 mod.u64                                :price_raw
+seed 1000u64 mod.u64                               :discount
+seed 365u64 mod.u64                                :shipdate
+quantity 100u64 *.u64  price_raw +.u64             :price
+price  10000u64 discount -.u64  *.u64  10000u64 /.u64   :price_adj
 
 time   # data ready
 
 # Filter: shipdate <= 250
-shipdate 250u64 <=                             >ship_mask
+shipdate 250u64 <=                             :ship_mask
 
 # Pack (returnflag, linestatus) → key = rf*2 + ls
-returnflag as.u64 2u64 *.u64  linestatus as.u64 +.u64   >key
+returnflag as.u64 2u64 *.u64  linestatus as.u64 +.u64   :key
 
 # Gather kept rows by mask.
 key quantity price price_adj entuple.4
 ship_mask where gather
-detuple.4                                          >pr_adj >pr >qty >k
+detuple.4                                          :[k qty pr pr_adj]
 
 # Group payload by key. Note: this consumes (vals, keys) and produces
 # (uniq_keys, List<vals>).
-qty pr pr_adj entuple.3  k group                    >grouped >uniq_keys
+qty pr pr_adj entuple.3  k group                    :[uniq_keys grouped]
 
 # Per-group aggregates via cleave-on-list. `.i` now recurses through
 # List<Prod[A,B,C]> to give List<field_i>, so reduce.+ runs per-row in
@@ -52,11 +52,11 @@ grouped .{ count
          ; .1 reduce.+.u64
          ; .2 reduce.+.u64
          }
-detuple.4                                          >sum_pr_adj >sum_pr >sum_qty >counts
+detuple.4                                          :[counts sum_qty sum_pr sum_pr_adj]
 
 # Unpack key back to (rf, ls).
-uniq_keys 2u64 /.u64  as.u8                        >rf_out
-uniq_keys 2u64 mod.u64  as.u8                      >ls_out
+uniq_keys 2u64 /.u64  as.u8                        :rf_out
+uniq_keys 2u64 mod.u64  as.u8                      :ls_out
 
 rf_out ls_out counts sum_qty sum_pr sum_pr_adj entuple.6
 time

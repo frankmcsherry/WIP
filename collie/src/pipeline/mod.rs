@@ -88,13 +88,15 @@ mod tests {
 
     #[test]
     fn let_block_resolves_to_data_edges() {
-        agree("u64[1 2 3] {| a | a a +.u64 }");
+        agree("u64[1 2 3] :[a] a a +.u64");
     }
 
     #[test]
-    fn forth_style_take_and_clone() {
-        agree("u64[1 2 3] >x  x x +.u64");
-        agree("u64[1 2 3] >x  x> u64[10 20 30] +.u64");
+    fn binding_clone_and_inferred_take() {
+        agree("u64[1 2 3] :x  x x +.u64");
+        // last-use of `x` is auto-inferred as a take (and the graph derives
+        // it from use-counting); no explicit take syntax needed.
+        agree("u64[1 2 3] :x  x u64[10 20 30] +.u64");
     }
 
     #[test]
@@ -224,7 +226,7 @@ mod tests {
 
     #[test]
     fn wco_small_smoke() {
-        let src = std::fs::read_to_string("examples/19_wco_lftj_def.col").unwrap();
+        let src = std::fs::read_to_string("examples/18_wco_lftj_def.col").unwrap();
         let src = src.replace("1000000u64", "10u64");
         agree(&src);
     }

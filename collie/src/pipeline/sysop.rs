@@ -53,7 +53,7 @@ pub enum SystemOp {
     // Structural — Sum
     Inject { n: usize }, Split, Partition { n: usize }, Branch { k: usize },
     // Structural — List / View
-    Nest, NestStride, Flatten, Bounds, BoundsKeys, Head, Like, Enlist, Unlist, Iota,
+    Nest, NestStride, Flatten, Bounds, ListRanges, BoundsKeys, Head, Like, Enlist, Unlist, Iota,
     View, ViewRange, DecomposeView,
     // Slicing / concat
     Concat, Cat { n: usize }, Take, Skip, Reverse,
@@ -112,6 +112,7 @@ impl SystemOp {
             SystemOp::NestStride => Box::new(cmb::NestStride),
             SystemOp::Flatten => Box::new(cmb::Flatten),
             SystemOp::Bounds => Box::new(list::Bounds),
+            SystemOp::ListRanges => Box::new(list::ListRanges),
             SystemOp::BoundsKeys => Box::new(list::BoundsToKeys),
             SystemOp::Head => Box::new(list::Head),
             SystemOp::Like => Box::new(list::Like),
@@ -185,11 +186,11 @@ impl SystemOp {
     /// `match`/`cleave`). DCE keeps these live conservatively — the body
     /// may itself be side-effecting, which isn't visible from here.
     pub fn has_body(&self) -> bool {
-        use crate::ops::{list::{Each, Reduce, Repeat}, combinators::{Match, Cleave}};
+        use crate::ops::{list::{Each, Repeat}, combinators::{Match, Cleave}};
         match self {
             SystemOp::Foreign(o) => {
                 let any: &dyn std::any::Any = o.as_ref();
-                any.is::<Each>() || any.is::<Reduce>() || any.is::<Repeat>()
+                any.is::<Each>() || any.is::<Repeat>()
                     || any.is::<Match>() || any.is::<Cleave>()
             }
             _ => false,
@@ -250,6 +251,7 @@ pub fn promote(op: Box<dyn Op>) -> SystemOp {
     zst!(cmb::Nest, SystemOp::Nest); zst!(cmb::NestStride, SystemOp::NestStride);
     zst!(cmb::Flatten, SystemOp::Flatten);
     zst!(list::Bounds, SystemOp::Bounds); zst!(list::BoundsToKeys, SystemOp::BoundsKeys);
+    zst!(list::ListRanges, SystemOp::ListRanges);
     zst!(list::Head, SystemOp::Head); zst!(list::Like, SystemOp::Like);
     zst!(cmb::Enlist, SystemOp::Enlist); zst!(cmb::Unlist, SystemOp::Unlist);
     zst!(list::Iota, SystemOp::Iota);

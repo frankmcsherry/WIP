@@ -1,5 +1,7 @@
 # Per-region (count, total, max) — one pass producing three aggregates.
-# Combines group + each + cleave: factorized output Prod[region, List<Prod[c,t,m]>].
+# Combines group + cleave: factorized output Prod[region, Prod[c,t,m]].
+# No `each`: the reduce-family and `count` are already segment-aware on a
+# List, so the cleave's three branches each do per-group work in one kernel.
 # Result for region {0,1,2}:
 #   region 0: 4 transactions, total 250, max 100
 #   region 1: 3 transactions, total 600, max 250
@@ -9,6 +11,6 @@ u8[ 0   1   0   2   1   0   2   1   0   2]
 u64[100 200 50  300 150 75  400 250 25  100]
 entuple.2
 
-dup .1 swap .0 group
-each { .{ length ; reduce.+.u64 ; reduce.max.u64 } }
+detuple.2 swap group
+.{ count ; reduce.+.u64 ; reduce.max.u64 }
 entuple.2

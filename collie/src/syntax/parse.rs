@@ -1,7 +1,7 @@
 //! Layer 4: parser. Tokenizes whitespace-separated text. Op-name lookups are
 //! delegated to an `OpRegistry` (one of several possible front-ends). The
 //! parser only knows about structural forms — blocks, refs, array literals,
-//! `pick`/`roll` and N-arity ops, `match`/`reduce`/`each`/`let`. Everything
+//! `pick`/`roll` and N-arity ops, `match`/`each`/`repeat`/`let`. Everything
 //! else is a token the registry resolves.
 
 use std::collections::HashMap;
@@ -25,7 +25,8 @@ fn tokenize(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for ch in src.chars() {
-        if ch.is_whitespace() {
+        if ch.is_whitespace() || ch == ',' {
+            // `,` is a separator (whitespace-equivalent): `:[a, b]` ≡ `:[a b]`.
             if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
         } else if ch == '[' || ch == ']' {
             if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
@@ -43,13 +44,9 @@ pub fn parse(src: &str, reg: &OpRegistry) -> Result<Vec<Box<dyn Op>>, String> {
     let toks = tokenize(&stripped);
     let mut i = 0;
     let mut scopes: Vec<Vec<String>> = Vec::new();
-    // Mirror of env positions: `true` means a binding has been consumed
-    // via `name>` and subsequent references to it are an error. Grows
-    // with `scopes`, truncated when scopes pops.
-    let mut takens: Vec<bool> = Vec::new();
     let mut defs: Defs = HashMap::new();
     let mut expansions: Vec<String> = Vec::new();
-    parse_block(&toks, &mut i, None, &mut scopes, &mut takens, &mut defs, &mut expansions, reg)
+    parse_block(&toks, &mut i, None, &mut scopes, &mut defs, &mut expansions, reg)
 }
 
 /// Strip `#` line comments (from `#` to end-of-line). Required for source
@@ -74,9 +71,15 @@ pub fn parse_file(path: &std::path::Path, reg: &OpRegistry) -> Result<Vec<Box<dy
     parse(&src, reg)
 }
 
+/// Total bindings currently in scope — the env index the next binding lands
+/// at. Used to scope last-use inference to a `Let`'s own names.
+fn scope_depth(scopes: &[Vec<String>]) -> usize {
+    scopes.iter().map(|s| s.len()).sum()
+}
+
 /// Is `s` a valid collie identifier — alphanumeric or underscore, first
-/// char a letter or underscore? Used to distinguish `>name` (binding) from
-/// `>` / `>=` (comparison ops).
+/// char a letter or underscore? Used to distinguish `:name` (binding) from
+/// other tokens.
 fn is_ident_after_prefix(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
@@ -113,7 +116,6 @@ fn parse_block(
     i: &mut usize,
     end: Option<&str>,
     scopes: &mut Vec<Vec<String>>,
-    takens: &mut Vec<bool>,
     defs: &mut Defs,
     expansions: &mut Vec<String>,
     reg: &OpRegistry,
@@ -149,61 +151,17 @@ fn parse_block(
                 let n: usize = toks[*i].parse().map_err(|_| format!("repeat: bad count {}", toks[*i]))?;
                 *i += 1;
                 expect(toks, i, "{")?;
-                let body = parse_block(toks, i, Some("}"), scopes, takens, defs, expansions, reg)?;
+                let body = parse_block(toks, i, Some("}"), scopes, defs, expansions, reg)?;
                 expect(toks, i, "}")?;
                 out.push(Box::new(ls::Repeat { n, body }));
             }
-            // Body-bearing constructs
+            // Body-bearing constructs. A named per-row form is written
+            // `each { :[names] … }` — the `{ … }` block + a `:[…]` bind.
             "each" => {
-                let body = if *i < toks.len() && toks[*i] == "{|" {
-                    *i += 1;
-                    let mut names = Vec::new();
-                    while *i < toks.len() && toks[*i] != "|" { names.push(toks[*i].clone()); *i += 1; }
-                    expect(toks, i, "|")?;
-                    let n_names = names.len();
-                    let start = takens.len();
-                    scopes.push(names.clone());
-                    takens.resize(takens.len() + n_names, false);
-                    let mut inner = parse_block(toks, i, Some("}"), scopes, takens, defs, expansions, reg)?;
-                    expect(toks, i, "}")?;
-                    scopes.pop();
-                    takens.truncate(takens.len() - n_names);
-                    // Auto-infer last-use takes for the Let's own bindings.
-                    // Refs to outer bindings inside this body are not marked
-                    // (would be incorrect when body is iterated per row).
-                    mark_last_use_in_body(&mut inner, start, n_names);
-                    vec![Box::new(lb::Let { names, body: inner }) as Box<dyn Op>]
-                } else {
-                    expect(toks, i, "{")?;
-                    let body = parse_block(toks, i, Some("}"), scopes, takens, defs, expansions, reg)?;
-                    expect(toks, i, "}")?;
-                    body
-                };
+                expect(toks, i, "{")?;
+                let body = parse_block(toks, i, Some("}"), scopes, defs, expansions, reg)?;
+                expect(toks, i, "}")?;
                 out.push(Box::new(ls::Each { body }));
-            }
-            "reduce" => {
-                let body = if *i < toks.len() && toks[*i] == "{|" {
-                    *i += 1;
-                    let mut names = Vec::new();
-                    while *i < toks.len() && toks[*i] != "|" { names.push(toks[*i].clone()); *i += 1; }
-                    expect(toks, i, "|")?;
-                    let n_names = names.len();
-                    let start = takens.len();
-                    scopes.push(names.clone());
-                    takens.resize(takens.len() + n_names, false);
-                    let mut inner = parse_block(toks, i, Some("}"), scopes, takens, defs, expansions, reg)?;
-                    expect(toks, i, "}")?;
-                    scopes.pop();
-                    takens.truncate(takens.len() - n_names);
-                    mark_last_use_in_body(&mut inner, start, n_names);
-                    vec![Box::new(lb::Let { names, body: inner }) as Box<dyn Op>]
-                } else {
-                    expect(toks, i, "{")?;
-                    let body = parse_block(toks, i, Some("}"), scopes, takens, defs, expansions, reg)?;
-                    expect(toks, i, "}")?;
-                    body
-                };
-                out.push(Box::new(ls::Reduce { body }));
             }
             ".{" => {
                 // .{ p0 ; p1 ; ... ; pN } — cleave: each path runs on a fresh
@@ -228,7 +186,7 @@ fn parse_block(
                         continue;
                     }
                     // Parse a single subprogram step, then loop.
-                    let one = parse_block(toks, i, None, scopes, takens, defs, expansions, reg)?;
+                    let one = parse_block(toks, i, None, scopes, defs, expansions, reg)?;
                     current.extend(one);
                     // parse_block returns on `;` or `}` (re-pushed via `i -= 1`),
                     // or on end-of-input. Loop to dispatch.
@@ -240,26 +198,20 @@ fn parse_block(
                 let mut arms = Vec::new();
                 while *i < toks.len() && toks[*i] != "}" {
                     expect(toks, i, "->")?;
-                    let arm = parse_block(toks, i, None, scopes, takens, defs, expansions, reg)?;
+                    let arm = parse_block(toks, i, None, scopes, defs, expansions, reg)?;
                     arms.push(arm);
                 }
                 expect(toks, i, "}")?;
                 out.push(Box::new(cm::Match { arms }));
             }
-            "{|" => {
-                let mut names = Vec::new();
-                while *i < toks.len() && toks[*i] != "|" { names.push(toks[*i].clone()); *i += 1; }
-                expect(toks, i, "|")?;
-                let n_names = names.len();
-                let start = takens.len();
-                scopes.push(names.clone());
-                takens.resize(takens.len() + n_names, false);
-                let mut body = parse_block(toks, i, Some("}"), scopes, takens, defs, expansions, reg)?;
+            // Standalone `{ … }` scope block: parse the body and inline its
+            // ops. The braces only delimit binding scope (a `:[…]` inside
+            // scopes to this `}`); there is no runtime effect of their own.
+            // Lets `{| names |}` lower to `{ :[names] … }`.
+            "{" => {
+                let body = parse_block(toks, i, Some("}"), scopes, defs, expansions, reg)?;
                 expect(toks, i, "}")?;
-                scopes.pop();
-                takens.truncate(takens.len() - n_names);
-                mark_last_use_in_body(&mut body, start, n_names);
-                out.push(Box::new(lb::Let { names, body }));
+                out.extend(body);
             }
             "->" | "}" | ";" => {
                 *i -= 1;
@@ -267,32 +219,23 @@ fn parse_block(
                 return Ok(out);
             }
             "def" => {
-                // `def name { body }` or `def name {| params | body }` —
-                // capture body tokens for later inline expansion. Emits
-                // no op. Block-scoped: snapshot at parse_block entry is
-                // restored on exit.
-                //
-                // For the `{` form, the captured body is the inner tokens
-                // (without the braces). For the `{|` form, the entire
-                // `{| ... |}` is captured so the expansion re-parses as a
-                // closure — the natural way to declare def parameters.
+                // `def name { body }` — capture the inner body tokens for
+                // later inline expansion. Emits no op. Block-scoped: the defs
+                // snapshot at parse_block entry is restored on exit. Parameters
+                // are declared inside the body with `:[names]` / `:name`.
                 if *i >= toks.len() { return Err("def: missing name".into()); }
                 let name = toks[*i].clone();
                 *i += 1;
                 if *i >= toks.len() { return Err(format!("def {}: missing body", name)); }
-                let include_outer = match toks[*i].as_str() {
-                    "{"  => false,
-                    "{|" => true,
-                    other => return Err(format!(
-                        "def {}: expected `{{` or `{{|`, got `{}`", name, other)),
-                };
-                let outer_start = *i;
+                if toks[*i] != "{" {
+                    return Err(format!("def {}: expected `{{`, got `{}`", name, toks[*i]));
+                }
                 *i += 1; // consume opener
                 let inner_start = *i;
                 let mut depth: usize = 1;
                 while *i < toks.len() && depth > 0 {
                     match toks[*i].as_str() {
-                        "{" | "{|" | ".{" => depth += 1,
+                        "{" | ".{" => depth += 1,
                         "}" => { depth -= 1; if depth == 0 { break; } }
                         _ => {}
                     }
@@ -301,63 +244,54 @@ fn parse_block(
                 if *i >= toks.len() {
                     return Err(format!("def {}: unterminated body", name));
                 }
-                let body_tokens: Vec<String> = if include_outer {
-                    toks[outer_start..*i + 1].to_vec()
-                } else {
-                    toks[inner_start..*i].to_vec()
-                };
+                let body_tokens: Vec<String> = toks[inner_start..*i].to_vec();
                 *i += 1; // consume the closing `}`
                 defs.insert(name, body_tokens);
             }
-            // Forth-style flat binding: `>name` pops the top of the stack
-            // and binds it to `name` for the rest of the current block.
-            // Equivalent to `{| name | <rest of block> }` — same IR, sweeter
-            // syntax for sequential pipelines.
-            //
-            // Requires `name` to be a valid identifier (alphanumeric +
-            // underscore, not starting with a digit). This excludes the
-            // comparison ops `>` and `>=`, which start with `>` but
-            // aren't bindings.
-            s if s.starts_with('>') && is_ident_after_prefix(&s[1..]) => {
+            // Flat binding: `:name` pops the top of the stack and binds it to
+            // `name` for the rest of the current block. Equivalent to
+            // `{ :[name] <rest> }` — same IR, sweeter for sequential pipelines.
+            // Body is the remainder of the block, so it boils to edges like
+            // any `Let`. (`>` is reserved for comparison only.)
+            s if s.starts_with(':') && is_ident_after_prefix(&s[1..]) => {
                 let name = s[1..].to_string();
-                let start = takens.len();
+                let start = scope_depth(scopes);
                 scopes.push(vec![name.clone()]);
-                takens.push(false);
-                let mut body = parse_block(toks, i, end, scopes, takens, defs, expansions, reg)?;
+                let mut body = parse_block(toks, i, end, scopes, defs, expansions, reg)?;
                 scopes.pop();
-                takens.pop();
                 mark_last_use_in_body(&mut body, start, 1);
                 out.push(Box::new(lb::Let { names: vec![name], body }));
                 *defs = defs_snapshot;
                 return Ok(out);
             }
-            // `name>` (take form): only matches if prefix is a valid
-            // identifier. Strips the trailing `>`, looks up the binding,
-            // verifies it's the last reference (errors if already taken
-            // or referenced after), emits `Ref { take: true }`. Subsequent
-            // uses of `name` will see takens[idx] = true and error.
-            s if s.ends_with('>') && s.len() > 1 && is_ident_after_prefix(&s[..s.len()-1]) => {
-                let name = &s[..s.len()-1];
-                if let Some(idx) = lookup_binding(name, scopes) {
-                    if takens[idx] {
-                        return Err(format!(
-                            "{}>: already consumed (use-after-take)", name
-                        ));
-                    }
-                    takens[idx] = true;
-                    out.push(Box::new(lb::Ref { idx, take: true }));
-                    continue;
+            // `:[a b c]` — bind the top N stack values to names a..c in stack
+            // order (a = deepest, c = top), for the rest of the scope. Commas
+            // optional (the tokenizer treats `,` as a separator). `()` is
+            // reserved for a future tuple-destructure pattern.
+            ":" => {
+                expect(toks, i, "[")?;
+                let mut names = Vec::new();
+                while *i < toks.len() && toks[*i] != "]" {
+                    names.push(toks[*i].clone());
+                    *i += 1;
                 }
-                return Err(format!("{}>: unknown binding", name));
+                expect(toks, i, "]")?;
+                let n_names = names.len();
+                let start = scope_depth(scopes);
+                scopes.push(names.clone());
+                let mut body = parse_block(toks, i, end, scopes, defs, expansions, reg)?;
+                scopes.pop();
+                mark_last_use_in_body(&mut body, start, n_names);
+                out.push(Box::new(lb::Let { names, body }));
+                *defs = defs_snapshot;
+                return Ok(out);
             }
             _ => {
-                // Binding reference first (shadows registry and defs).
+                // Binding reference (shadows registry and defs). Take is
+                // inferred (last-use) and the graph derives it via use-counting,
+                // so refs are emitted as clones; `mark_last_use_in_body` flips
+                // the final one to a take.
                 if let Some(idx) = lookup_binding(t, scopes) {
-                    if takens[idx] {
-                        return Err(format!(
-                            "ref {}: use-after-take (already consumed via {0}>)", t
-                        ));
-                    }
                     out.push(Box::new(lb::Ref { idx, take: false }));
                     continue;
                 }
@@ -371,25 +305,11 @@ fn parse_block(
                     let mut j = 0;
                     let body_ops = parse_block(
                         &body_toks, &mut j, None,
-                        scopes, takens, defs, expansions, reg,
+                        scopes, defs, expansions, reg,
                     )?;
                     expansions.pop();
                     out.extend(body_ops);
                     continue;
-                }
-                // Surface→IR desugars: ops whose meaning is fully captured by
-                // a short sequence of kernel ops. Keeps the surface ergonomic
-                // while shrinking the kernel surface.
-                //
-                // `length` (SEQ<T> → SEQ<u64>(1 elem)) = `enlist count`: wrap
-                // the column as one row of a list-of-self, then read the row
-                // length from bounds.
-                if t == "length" {
-                    if let (Some(en), Some(co)) = (reg.make("enlist"), reg.make("count")) {
-                        out.push(en);
-                        out.push(co);
-                        continue;
-                    }
                 }
                 // Registry lookup for plain ops, with a peephole fusion:
                 // `where` followed by `gather` becomes a single `filter` op.

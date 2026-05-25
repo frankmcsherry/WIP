@@ -4,29 +4,28 @@
 //! - **Aggregations and scans**: `Group`, `Cumsum`, `Unique`,
 //!   `Shift`, `ReduceAdd` (the typed `reduce.+`/`*`/`min`/`max`
 //!   live elsewhere as `reduce_ops`).
-//! - **Body-bearing escape hatches**: `Reduce { body }`, `Each`,
-//!   `Repeat`. These are the principle-2 escape hatches —
-//!   per-row interpreter dispatch. See `PRINCIPLES.md` for the
-//!   trade.
-//! - **Shape inspection**: `Bounds`, `BoundsToKeys`, `Count`,
-//!   `Length`. Cheap, structural.
-//! - **Construction and slicing**: `Singleton`, `Like`, `Head`,
-//!   `Iota`, `Spread`, `Where_`, `Filter`. `Filter` is the
-//!   parser-peephole fusion of `where` + `gather`.
+//! - **Body-bearing escape hatches**: `Each`, `Repeat`. These are
+//!   the principle-2 escape hatches — per-row interpreter dispatch.
+//!   See `PRINCIPLES.md` for the trade.
+//! - **Shape inspection**: `Bounds`, `BoundsToKeys`, `Count`.
+//!   Cheap, structural.
+//! - **Construction and slicing**: `Like`, `Head`, `Iota`,
+//!   `Spread`, `Where_`, `Filter`. `Filter` is the parser-peephole
+//!   fusion of `where` + `gather`.
 //!
 //! On a first read, skim the four section markers and the typed
-//! variants. The body-bearing arms (`Reduce`, `Each`, `Repeat`)
-//! each do an explicit `eval(&self.body, …)` loop and can be
-//! understood independently of the rest.
+//! variants. The body-bearing arms (`Each`, `Repeat`) each do an
+//! explicit `eval(&self.body, …)` loop and can be understood
+//! independently of the rest.
 
 use std::sync::Arc;
 use crate::ir::op::{PrimOp, eval};
 use crate::ir::stack::{Stack, pop};
 use crate::ir::typecheck::{Op, Typed, TypeStack, TypeEnv, tc_pop, typecheck};
-use crate::ir::value::{Value, Prim, PrimWidth, from_vec, bounds_var_from_ends, prod};
+use crate::ir::value::{Value, Prim, PrimWidth, from_vec, bounds_var_from_ends, prod, view, Selector};
 use crate::ir::shape::{Interp, Shape, bounds_as_u64};
 use crate::ops::helpers::{
-    broadcast, concat_rows, concat_values, gather,
+    broadcast, concat_values, gather,
     slice_value, sum_runs, sum_whole,
 };
 use crate::ops::sort::{sort_blocks, run_layout};
@@ -68,52 +67,6 @@ impl Typed for Group {
         let vals = tc_pop(st, "group")?;
         st.push(keys.clone());
         st.push(Shape::List { bounds: PrimWidth::W64, inner: Box::new(vals) });
-        Ok(())
-    }
-}
-
-#[derive(Debug)] pub struct Reduce { pub body: Vec<Box<dyn Op>> }
-impl PrimOp for Reduce {
-    fn name(&self) -> &str { "reduce" }
-    fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        let (bounds, inner) = match v {
-            Value::List { bounds, values } => (bounds_as_u64(&bounds)?.to_vec(), (*values).clone()),
-            other => {
-                let mut sub = vec![other];
-                eval(&self.body, &mut sub, env)?;
-                if sub.len() != 1 { return Err(format!("reduce body left {} values", sub.len())); }
-                st.push(sub.pop().unwrap());
-                return Ok(());
-            }
-        };
-        let mut row_outs: Vec<Value> = Vec::with_capacity(bounds.len().saturating_sub(1));
-        for w in bounds.windows(2) {
-            let lo = w[0] as usize;
-            let hi = w[1] as usize;
-            let slice = slice_value(&inner, lo, hi)?;
-            let mut sub = vec![slice];
-            eval(&self.body, &mut sub, env)?;
-            if sub.len() != 1 { return Err(format!("reduce body left {} values", sub.len())); }
-            let out = sub.pop().unwrap();
-            if out.len() != 1 {
-                return Err(format!("reduce body produced len {}, expected 1", out.len()));
-            }
-            row_outs.push(out);
-        }
-        st.push(concat_rows(&row_outs)?);
-        Ok(())
-    }
-}
-impl Typed for Reduce {
-    fn tc(&self, st: &mut TypeStack, env: &mut TypeEnv) -> Result<(), String> {
-        let v = tc_pop(st, "reduce")?;
-        let inner = match v { Shape::List { inner, .. } => *inner, other => other };
-        let mut sub = vec![inner];
-        typecheck(&self.body, &mut sub, env).map_err(|e| format!("reduce body: {}", e))?;
-        if sub.len() != 1 { return Err(format!("reduce body leaves {} types", sub.len())); }
-        st.push(sub.pop().unwrap());
         Ok(())
     }
 }
@@ -586,6 +539,43 @@ impl Typed for Bounds {
     }
 }
 
+/// `list>ranges` — the per-row `(lower, upper)` offset ranges of a List,
+/// as a `Prod[View<Range>, View<Range>]` of length N (one pair per row).
+/// The two fields are zero-copy windows over the single N+1 bounds buffer,
+/// offset by one (`lower = bounds[0..N]`, `upper = bounds[1..N+1]`) — the
+/// logical `(lo, hi)` relation that the N+1 layout stores by sharing
+/// interior endpoints. Degree is `upper - lower`; no separate `count`.
+#[derive(Debug)] pub struct ListRanges;
+impl PrimOp for ListRanges {
+    fn name(&self) -> &str { "list>ranges" }
+    fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+        let v = pop(st)?;
+        match v {
+            Value::List { bounds, .. } => {
+                let n = bounds.len() as u64;   // row count (len() is N, not N+1)
+                let bp = Value::Prim(bounds.to_prim());   // the N+1 offset buffer
+                let lower = view(bp.clone(), Selector::range(0, n));
+                let upper = view(bp, Selector::range(1, n + 1));
+                st.push(prod(vec![lower, upper]));
+            }
+            other => return Err(format!("list>ranges: not a list, got {:?}", other)),
+        }
+        Ok(())
+    }
+}
+impl Typed for ListRanges {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+        let v = tc_pop(st, "list>ranges")?;
+        match v {
+            Shape::List { bounds, .. } =>
+                st.push(Shape::Prod(vec![Shape::Prim(bounds), Shape::Prim(bounds)])),
+            other => return Err(format!("list>ranges: not a list: {}", other)),
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)] pub struct BoundsToKeys;
 impl PrimOp for BoundsToKeys {
     fn name(&self) -> &str { "bounds>keys" }
@@ -1026,16 +1016,41 @@ mod tests {
     }
 
     #[test]
-    fn length_desugars_to_enlist_count() {
+    fn enlist_count_is_flat_total() {
+        // `length` was retired as atom-form sugar; the flat total is now
+        // spelled `enlist count` (the SEQ-first `count` rejects a bare Prim).
         use crate::syntax::registry::OpRegistry;
         use crate::syntax::parse::parse;
         let reg = OpRegistry::standard();
-        let prog = parse("u64[1 2 3 4 5 6 7 8] length", &reg).unwrap();
+        let prog = parse("u64[1 2 3 4 5 6 7 8] enlist count", &reg).unwrap();
         let mut st = vec![];
         let mut env = Vec::new();
         crate::ir::op::eval(&prog, &mut st, &mut env).unwrap();
         assert_eq!(st.len(), 1);
         assert_eq!(st[0], from_vec::<u64>(vec![8]));
+    }
+
+    #[test]
+    fn list_ranges_are_offset_views() {
+        // `list>ranges` exposes a List's per-row (lower, upper) offsets as two
+        // windows over the N+1 bounds buffer: lower = bounds[0..N], upper =
+        // bounds[1..N+1]. Degree = upper - lower must equal `count`.
+        use crate::syntax::registry::OpRegistry;
+        use crate::syntax::parse::parse;
+        let reg = OpRegistry::standard();
+        let run = |src: &str| {
+            let prog = parse(src, &reg).unwrap();
+            let mut st = vec![];
+            let mut env = Vec::new();
+            crate::ir::op::eval(&prog, &mut st, &mut env).unwrap();
+            st.pop().unwrap()
+        };
+        // [10 20] ; [30 40 50] — bounds [0, 2, 5].
+        let base = "u64[10 20 30 40 50] u64[0 2 5] nest list>ranges";
+        // Materialize each view via an identity gather to compare to a Prim.
+        assert_eq!(run(&format!("{base} .0 u64[0 1] gather")), from_vec::<u64>(vec![0, 2]));
+        assert_eq!(run(&format!("{base} .1 u64[0 1] gather")), from_vec::<u64>(vec![2, 5]));
+        assert_eq!(run(&format!("{base} dup .1 swap .0 -.u64")), from_vec::<u64>(vec![2, 3]));
     }
 
     #[test]
@@ -1164,6 +1179,7 @@ pub fn register(r: &mut crate::syntax::registry::OpRegistry) {
             "filter" => Some(Box::new(Filter)),
             "bounds>keys" => Some(Box::new(BoundsToKeys)),
             "list>bounds" => Some(Box::new(Bounds)),
+            "list>ranges" => Some(Box::new(ListRanges)),
             // group / unique sort by equality — interp-free (the engine
             // sorts unsigned; the partition is interp-independent).
             "group" => Some(Box::new(Group)),

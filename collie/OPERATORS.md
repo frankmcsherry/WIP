@@ -91,10 +91,10 @@ Result is always a P8 mask column. Scalar broadcast as in arith.
 | `rot` | `a b c → b c a` | rotate third-from-top to top |
 | `pick N` | `… → … x` | copy the N-th-from-top |
 | `roll N` | `… → …` | rotate the N-th-from-top to top |
-| `{\| name … \| body }` | (Factor-style binding) | pops the named values, pushes them as locals available by name within `body` |
-| `>name` | `a →` | bind top to `name` for the rest of the block |
-| `name>` | `→ a` | reference `name`, taking ownership (last-use) |
-| `name` | `→ a` | reference `name`, cloning |
+| `:name` | `a →` | bind top of stack to `name` for the rest of the block |
+| `:[a b …]` | `… →` | bind the top N stack values to `a b …` (deepest-to-top) |
+| `name` | `→ a` | reference `name` (clone; last-use is inferred as a take) |
+| `{ … }` | `… → …` | scope block — delimits where a `:`-bind reaches; inlines its body |
 | `def n { body }` | — | parse-time inline macro; `body` is spliced wherever `n` appears |
 
 ---
@@ -127,12 +127,12 @@ Result is always a P8 mask column. Scalar broadcast as in arith.
 | `nest` | `seq<T> seq<P64> → List[T]` | `(values, bounds)` → list (bounds are run-end offsets) |
 | `nest.stride` | `seq<T> seq<P64> (1 elem) → List[T]` | rectangular list (stride-based bounds) |
 | `flatten` | `List[T] → seq<T> seq<P64>` | inverse of `nest` |
-| `list>bounds` | `List[T] → seq<P64>` | extract the bounds column |
+| `list>bounds` | `List[T] → seq<P64>` | extract the bounds column (raw N+1 offsets) |
+| `list>ranges` | `List[T] → Prod[seq<P64>, seq<P64>]` | per-row `(lower, upper)` offsets as two zero-copy views over the bounds buffer; degree = `upper - lower` |
 | `bounds>keys` | `seq<P64> → seq<P64>` | bounds → repeating row-key column (i appears `len(row i)` times) |
 | `enlist` | `seq<T> → List[T]` (1 row containing the whole input) | promote to singleton list |
 | `unlist` | `List[T] (1 row) → seq<T>` | inverse of enlist |
-| `count` | `List[T] → seq<P64>` | per-row element count |
-| `length` | `seq<T> → seq<P64>` (1 elem) | total length; surface sugar for `enlist count` |
+| `count` | `List[T] → seq<P64>` | per-row element count (flat total: `enlist count`) |
 | `head` | `List[T] → seq<T>` | first element of each row |
 
 ### Views
@@ -188,7 +188,6 @@ Rust kernel.
 | `reduce.min.<i>` | same shape | min |
 | `reduce.max.<i>` | same shape | max |
 | `count` | `List[T] → seq<P64>` | per-row element count (also listed under Lists) |
-| `length` | `seq<T> → seq<P64>` (1 elem) | total length |
 | `cumsum.<i>` | `seq → seq` or `List → List` | prefix sum (flat or per-row) |
 | `shift.<i>` | `seq scalar_n → seq` or `List scalar_n → List` | positive shift; fill with 0 |
 
@@ -239,7 +238,6 @@ use is a signal that we may be missing a primitive.
 | Op | Stack | Notes |
 |---|---|---|
 | `each { body }` | `List[T] → List[U]` | run `body` per row; body's stack must produce one value per row |
-| `reduce { body }` | `List[T] → seq` | per-row reduction with an arbitrary body (generic version of `reduce.+` etc.) |
 | `repeat { body }` | `seq → seq` (N times) | run `body` N times; body must be shape-preserving |
 | `match { -> a0 -> a1 … }` | `Sum → merged` | (also under Sums) per-lane body dispatch; whole-lane, not per-row |
 | `.{ p0 ; p1 ; … }` | `value → Prod[p0(v), p1(v), …]` | (`cleave`) run each path against a copy of the input |
@@ -269,9 +267,8 @@ a position-producing twin in spirit if not in name (`filter` =
 `where` + `gather`; `sort` ≈ `sort.perm` + `gather`; `group` =
 `sort.perm` + `bounds` + `gather`). See `PRINCIPLES.md` Idioms.
 
-**The escape hatches.** `each` and `reduce { body }` are the two
-constructs we'd most like to remove if a better columnar form
-appeared. `repeat` is fine — iteration count is programmer-bounded,
+**The escape hatch.** `each` is the construct we'd most like to
+remove if a better columnar form appeared. `repeat` is fine — iteration count is programmer-bounded,
 not data-bounded. `match` and `cleave` dispatch a bounded number of
 times (per Sum lane, per cleave path) and are aligned in spirit.
 
@@ -314,11 +311,11 @@ interpretation. The "structural polymorphism handles contents" layer
 of principle 5.
 
 - Stack: `pick N`, `roll N`
-- Bindings: `let` (`{| names | body }`), `ref` (`name`, `name>`); the
-  parser-only `def` is surface
+- Bindings: `let` (`:name` / `:[names]`, scoped by `{ … }`), `ref` (`name`);
+  the parser-only `def` is surface
 - Prod: `zipN`, `detupleN`, `.i`
 - Sum: `injectN`, `split`, `partitionN`, `branch`/`branch.K`, `match`
-- List: `nest`, `nest.stride`, `flatten`, `list>bounds`,
+- List: `nest`, `nest.stride`, `flatten`, `list>bounds`, `list>ranges`,
   `bounds>keys`, `count`, `head`, `enlist`, `unlist`
 - View: `view`, `view.range`, `decompose-view`
 - Surveys (positions are structural): `where`, `sort.perm`
@@ -326,7 +323,7 @@ of principle 5.
 - Joins (structural shape): `xprod`
 - Slicing: `take`, `skip`, `concat`, `cat.N`, `reverse`
 - Constructors (structural): `iota`, `spread`, `like`
-- Body-bearing: `each`, `reduce { body }`, `repeat`
+- Body-bearing: `each`, `repeat`
 
 **Type (width + interpretation matters).** Fundamental kernels whose
 behavior depends on how the bytes are read.
@@ -348,9 +345,8 @@ a separate surface IR; today these are recognized at parse time.
 
 - Stack shortcuts: `dup`, `drop`, `swap`, `over`, `rot` (special
   cases of `pick`/`roll`)
-- Binding sugar: `>name`, `name>`, `name`, `def name { body }`
-- Compute sugar: `filter` (= `where gather`), `length`
-  (= `enlist count`)
+- Binding sugar: `:name`, `:[names]`, `name`, `def name { body }`
+- Compute sugar: `filter` (= `where gather`)
 - Tuple sugar: `entuple.K` (= top-K `zipK`)
 - Cleave: `.{ p0 ; p1 ; … }` (= `dup p0 swap dup p1 swap … zipN`)
 

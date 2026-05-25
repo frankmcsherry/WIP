@@ -1,0 +1,70 @@
+# LFTJ-style WCO triangle with the per-lane body factored into a single
+# `def lftj_lane` and called twice.
+#
+# The adjacency *index* for each direction is just its grouped `List`: a
+# List is already `(bounds, values)`, so degree, offsets, and the value
+# pool are all projections of it. `lftj_lane` takes the two Lists and
+# derives what it needs inside via `list>ranges` (the per-row `(lo, hi)`
+# offset pairs, as zero-copy views over the bounds buffer). Degree is
+# `upper - lower`.
+
+# Extend anchor edge (a,b) to triangles (a,b,c): enumerate candidates from
+# the proposer side, validate each by searching the target side.
+# t_*/p_* = target (searched into) / proposer (the pivot we iterate);
+# `_pos` = the row to look up in the `_adj` List.
+def lftj_lane {
+   :[a b  t_pos p_pos  t_adj p_adj]
+
+   t_adj t_pos view  p_adj p_pos view  search      :positions  # proposer slots within target
+   t_adj list>ranges t_pos gather                  :t_range    # (lo, hi) of the target list
+
+   # Spread the anchor row (a, b, target-degree, target-base) per candidate.
+   a b  t_range .1 t_range .0 -.u64  t_range .0  entuple.4
+   p_adj count p_pos gather  spread  detuple.4     :[fa fb tlen base]
+
+   positions flatten drop                          :pos
+   pos tlen <                                      :ok         # found within the target list
+   base  pos ok as.u64 *.u64  +.u64                :slot       # absolute index into target values
+   t_adj flatten drop slot gather                  :cand       # target value at the found slot
+   p_adj p_pos view flatten drop                   :queries    # the proposer's neighbors
+
+   cand queries =  ok and                          :hit        # present in target, and in range
+   fa fb queries entuple.3  hit where gather                   # surviving (a, b, c)
+}
+
+time
+1000000u64 iota 1u64 +.u64                         :ks
+ks 0u64 like                                       :zeros
+ks 1u64 +.u64                                      :ks_plus_1
+zeros ks    ks         cat.3                       :a_col
+ks    zeros ks_plus_1  cat.3                       :b_col
+
+# The grouped Lists are the indexes; only the degree is needed at the outer
+# level (for use_S_mask). Bounds and values stay inside the Lists.
+b_col a_col group :[src_uniq fwd_adj]  fwd_adj count :fwd_degs
+a_col b_col group :[dst_uniq bwd_adj]  bwd_adj count :bwd_degs
+
+time
+
+src_uniq b_col search                              :pos_b_raw
+dst_uniq a_col search                              :pos_a_raw
+
+pos_b_raw src_uniq enlist count <
+pos_a_raw dst_uniq enlist count <
+and                                                :both_in
+
+a_col b_col pos_b_raw pos_a_raw entuple.4
+both_in where gather                               :quad
+
+# `view` not `gather`: `<=` reads the two index-views straight through
+# (Cmp's Indices fast path), so the gathered degree columns never
+# materialize — only the resulting mask does. `.2`/`.3` = pos_b/pos_a.
+fwd_degs quad .2 view  bwd_degs quad .3 view  <=  :use_S_mask
+
+quad use_S_mask branch split                       :[_ lane_T lane_S]
+# Lane T: target = N+(b), proposer = N-(a).
+# Lane S: roles swapped — one `swap`, and the two Lists in the other order.
+lane_T detuple.4       fwd_adj bwd_adj  lftj_lane
+lane_S detuple.4 swap  bwd_adj fwd_adj  lftj_lane
+cat.2
+time

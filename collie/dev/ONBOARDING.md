@@ -181,8 +181,6 @@ is what lets `each { reduce.+.u64 }` work without per-row stack juggling.
 - `each { body }` — body runs once per row. Works on `List<X>` or
   `Prod[List<A>, List<B>, …]`. **As of recently**, the Prod variant only
   requires matching outer counts; per-row inner lengths can differ.
-- `reduce { body }` — body runs once per row, must produce a length-1
-  result; outputs concatenated.
 - `reduce.+.<i>`, `reduce.max.<i>`, `reduce.min.<i>`, `reduce.any`,
   `reduce.all` — specialized reducers.
 - `.{ p0 ; p1 ; … }` — cleave: each path runs against a fresh copy of TOS;

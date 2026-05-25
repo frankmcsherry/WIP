@@ -203,8 +203,8 @@ mod tests {
     fn brace_depth_basic() {
         assert_eq!(brace_depth(""), 0);
         assert_eq!(brace_depth("u64[1 2 3]"), 0);
-        assert_eq!(brace_depth("{| a b |"), 1);
-        assert_eq!(brace_depth("{| a b | a b +.u64 }"), 0);
+        assert_eq!(brace_depth("{ :[a b]"), 1);
+        assert_eq!(brace_depth("{ :[a b] a b +.u64 }"), 0);
         assert_eq!(brace_depth(".{ .0 ; .1"), 1);
         assert_eq!(brace_depth(".{ .0 ; .1 }"), 0);
     }

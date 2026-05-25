@@ -240,29 +240,6 @@ pub fn slice_value(v: &Value, lo: usize, hi: usize) -> Result<Value, String> {
     })
 }
 
-pub fn concat_rows(rows: &[Value]) -> Result<Value, String> {
-    if rows.is_empty() { return Err("concat_rows: empty".into()); }
-    let first_prim = match &rows[0] {
-        Value::Prim(p) => p,
-        _ => return Err("concat_rows: expected Prim".into()),
-    };
-    let width = first_prim.width();
-    macro_rules! c { ($ctor:ident, $t:ty) => {{
-        let mut out: Vec<$t> = Vec::with_capacity(rows.len());
-        for r in rows {
-            if let Value::Prim(Prim::$ctor(v)) = r { out.push(v[0]); }
-            else { return Err("concat_rows: heterogeneous types".into()); }
-        }
-        Ok(Value::Prim(Prim::$ctor(Arc::new(out))))
-    }};}
-    match width {
-        PrimWidth::W8  => c!(P8,  u8),
-        PrimWidth::W16 => c!(P16, u16),
-        PrimWidth::W32 => c!(P32, u32),
-        PrimWidth::W64 => c!(P64, u64),
-    }
-}
-
 /// Concat several Values of the same shape (used by Each).
 pub fn concat_values(parts: &[Value]) -> Result<Value, String> {
     if parts.is_empty() { return Err("concat_values: empty".into()); }
