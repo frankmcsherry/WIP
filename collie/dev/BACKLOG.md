@@ -216,6 +216,47 @@ unchanged. Tell at a glance: `Vec<u64>`/`labels` return ⇒ perm-based;
 
 Prioritized order. Top is what to start with on a fresh session.
 
+### L. Close the IR under the engine — LANDED (keystone fully closed)
+
+**`dev/LAYERING.md` is the plan of record; the layering is now closed** — all
+three deletion-test questions answer "yes" (see Done recently). `SystemOp`
+graph is THE IR; the optimizer runs on the default path (`--no-opt`, proven
+equal to `--reference`); `each`/`match`/`cleave`/`repeat` are all gone; the
+engine takes no `env` and never calls legacy eval. What *remains* (all
+optional / future):
+
+- **A loop, if/when wanted.** `repeat` was removed (not Turing-complete by
+  choice). A future loop returns as a *dataflow* construct (Option A — a loop
+  term + body sub-graph carrying loop-carried + captured inputs) or via
+  quotations (#2). Design it when control flow is actually needed; the
+  removal forecloses neither.
+- **Binding as a removable pass (parked).** Boiling lives in `lower.rs` *by
+  necessity* — `:name` binds rest-of-block, so un-boiled = a legacy-eval blob,
+  not a useful graph. So it's the concatenative front end's lowering, not a
+  removable optimization (deletion-test #3 is "yes" by reframing: a new front
+  end has its own lowering). Making binding genuinely removable/shareable
+  needs a representation redesign (globally-unique slots + fine-grained
+  `Bind`/`Ref` terms runnable via a slot-env). Only worth it if a second
+  front end wants shared binding. Recorded, not built.
+- **Split front-end AST from back-end kernels — core DONE (see AF below).**
+  `as_kernel` deleted; `SystemOp` dispatches directly to free-fn kernels.
+  Remaining polish (steps 1/4/5): make the front-end structs fully inert
+  (default-erroring `run`, no `tc`, rewire `lower`'s type threading off
+  `op.tc`). Optional — buys enforcement-by-types, no capability; the structs
+  currently keep thin delegating shims so per-op unit tests stay green.
+  **Full design + migration plan: `dev/SYSOP_KERNELS.md`.**
+- **Doc sweep:** OPERATORS / ONBOARDING still document `each`/`match`/
+  `cleave`/`repeat` as ops and reference the REPL (now removed); ONBOARDING
+  also predates the `pipeline/` layer and has stale counts. README + CLAUDE
+  are current. Sweep ONBOARDING/OPERATORS wholesale when next touched.
+- ~~**Op-stream interpreter (`ir::op::eval`)**~~ — **DELETED.** Single
+  evaluator achieved: REPL removed, `bench`+`demos` migrated to the engine
+  (via a new `SystemOp::Const` + `lower::build_seeded` for bench's open
+  programs), `--reference`/`agree()` retired (optimizer-correctness tests now
+  assert optimized==unoptimized), `Let::run` errors as unreachable. See
+  dev/LAYERING.md "single evaluator." (Bench now measures the real engine
+  path, not the interpreter.)
+
 ### 0. Apply the SEQ→SEQ operator recipe across the catalogue
 
 - **What:** The operator-shape recipe (PRINCIPLES, Engineering
@@ -258,12 +299,13 @@ Prioritized order. Top is what to start with on a fresh session.
   flat lift — same shape, opposite default historically.) Need a
   `delist`/`unlist` to match.
 - **Consumer:** example 15 (`grouped each { sort reverse 3u64 take }`),
-  the last `each` in the curated examples. Fully retiring its `each`
-  also needs per-group `take K` (segmented head) and per-group reverse
-  (or descending sort). Land segmented sort first; it's the one whose
-  kernel already exists.
-- **State this session:** Identified, not started. `sort_blocks` is in
-  `src/ops/sort.rs` (`mod perm`).
+  the last `each` in the curated examples.
+- **State: LANDED.** `sort.segmented` / `reverse.segmented` /
+  `take.segmented` shipped (LAYERING step 1); example 15 rewritten,
+  `each` retired entirely. `sort.segmented` reuses `sort_seq` with per-row
+  labels. The recipe-pure direction (flat `sort ≡ enlist sort.segmented
+  unlist`) is still open — flat `sort` also handles Prod/List-key sorting,
+  so it's not a trivial swap; revisit with the elaboration step (#0).
 
 ### 0b. Trie-walker kernel — shared substrate for polymorphic survey ops
 
@@ -491,23 +533,6 @@ git log around 2026-05-23 for the design notes and barriers found.)*
 Discrete items that don't sequence dependently — pick up between bigger
 pieces.
 
-- **Segmented `filter` (per-row filter) — the laggard of the SEQ→SEQ
-  recipe.** `filter`/`where`/`gather` are flat-only; `reduce`/`count`/
-  `cumsum`/`shift` all got per-row (List) forms, `filter` never did. So
-  filtering grouped data means flatten → `where gather` → recount survivors
-  per group → `cumsum` → prepend 0 → `nest` (the re-nest dance in example
-  19's `lftj_lane_g`). A segmented `filter` (`List<T>` filtered by an aligned
-  `List<bool>` → `List<T>`, keeping rows) collapses all of that to one op.
-  This is BACKLOG #0 applied to `filter`, and #0b (trie-walker) is the
-  structural version — *carry the per-group bounds through compute* so the
-  flatten/re-nest never happens. Concrete witness: `19_wco_lftj_match.col`.
-  A cheaper interim win: `nest`-by-counts (build a List from values + per-row
-  counts, no manual `u64[0] … cumsum cat.2` to make bounds).
-  **Kickoff doc + step plan: `dev/SEGMENTED.md`** (step 1 = element-wise
-  cmp/arith preserve List; step 2 = segmented `filter`; step 3 = rewrite
-  `lftj_lane_g`; step 4 = trie-walker). Started: no; next action noted in
-  the doc (place the List branch in `cmp.rs`'s flat fall-through).
-
 - **LIST and TUPLE entries in BAKEOFF** — bench collie vs BQN on
   ragged-list and Prod-of-columns workloads where collie's design
   center actually lives. Discussed in conversation; no ticket. ~1
@@ -575,26 +600,16 @@ retained for now. Not "to do," but on the watch list — every use site
 is a data point about whether the construct is load-bearing or just a
 shortcut.
 
-- **`each { body }`** — runs body per row. Violates principle 2
-  (whole-collection-only dispatch). The body is columnar *within* one
-  row, so the cost is per-row interpreter dispatch, not per-element.
-  Watch list: every use is a signal we don't yet have the right
-  columnar primitive. **Down to one use (example 15).** Example 07's
-  `each { .{ length ; reduce.+ ; reduce.max } }` was removed: the
-  reduce-family and `count` are already segment-aware on a List, so
-  the cleave does the per-group work directly (the `each` only added
-  dispatch + a vestigial length-1 `List<Prod>` nesting). Required the
-  `length`→`count` swap — `length` was whole-collection (counted rows),
-  `count` is per-row. **Example 15 (`each { sort reverse 3u64 take }`)
-  is the honest remaining case** — it marks three missing segmented
-  ops (per-group sort, per-group `take K`, per-group reverse); see
-  "Segmented sort" in Next.
-- **`Cleave { paths }`** — runs each `path` against a copy of the
-  input value. Dispatch is bounded by `paths.len()`, not by N, so
-  it's principle-2-aligned in spirit. But its purpose is not
-  self-evident — flagged as unexplained complexity rather than
-  unearned. Action: either explain what it's for in `PRINCIPLES.md`
-  or remove if it doesn't pay for itself in the curated examples.
+- ~~**`each { body }`**~~ — **RETIRED.** Per-row interpreter dispatch
+  (principle-2 violator). Last use (example 15) replaced by segmented
+  `sort.segmented`/`reverse.segmented`/`take.segmented`; struct, parser
+  arm, and all downcasts removed (LAYERING step 1). The watch-list
+  discipline paid off: every use was indeed a missing columnar primitive.
+- ~~**`Cleave { paths }`**~~ — **RETIRED as an op.** It was sugar:
+  `.{ p0 ; p1 }` now desugars in the parser to `:[g_v] g_v p0 g_v p1
+  entuple.K` (paths inline, optimizer-visible). The "explain-or-remove"
+  flag is resolved by dissolving it (LAYERING step 4). The remaining
+  body-bearing op is `repeat` (the one genuine loop scope; see item L).
 - **`Selector::SequenceRange`** — transitional per its own docstring.
   Retirement target is `List<View<Runs>>`. See item #4 (Task #53).
 - **`Branch` with `BranchMode::{Strict, Clamp, Filter}`** — one op,
@@ -661,6 +676,96 @@ Real items, intentionally deferred. Each has a reason.
 ## Done recently
 
 (Last ~10 items. Older history lives in commit messages.)
+
+### AF. Back-end IR self-contained — `as_kernel` deleted
+
+Completed the SYSOP_KERNELS grind (steps 0–3). Every modeled op's `run`/`tc`
+kernel relocated off its front-end struct into a per-op **free function** in
+`crate::ops::*` (`cmp::run`, `arith::run`/`unary_run`, `convert::run`,
+`reduce_ops::{not,and,or,any,all,reduce_min,…}`, `list::{group_run,
+cumsum_run,shift_run,where_run,filter_run,…}`, `sort::{sort_perm_run,…}`,
+`sort_concat::*`, `swizzle::{run_swizzle,tc_swizzle}`, `view::*`,
+`join::{gather,intersect,search,xprod}_run/tc`, `combinators::{zip,detuple,
+proj,inject,split,merge,partition,branch,nest,nest_stride,flatten,enlist,
+unlist}_run/tc`). `SystemOp::{run,tc,name,arity}` are now **exhaustive
+matches** dispatching straight to those fns; `Const`/`Foreign` handled
+explicitly. **`as_kernel` (the reconstruct-and-delegate "leak") is deleted** —
+the back-end IR no longer rebuilds front-end structs to execute, severing the
+`pipeline → ops::structs`-for-execution dependency. The front/back IR split is
+preserved and sharpened (NOT merged); `promote` stays the one-way seam,
+`Foreign` the lone kernel-carrying back-end node. Each front-end struct keeps a
+one-line shim (`fn run(&self,…){ op_run(…) }`) so per-op unit tests stay green;
+making structs fully inert (steps 1/4/5) is deferred polish. 117 tests + 18
+examples green.
+
+### AE. Single evaluator — op-stream interpreter (`ir::op::eval`) deleted
+
+Followed AD by collapsing to one evaluator. **REPL removed** (the one
+interactive consumer of the op-stream interpreter; it needed seeded/
+incremental eval the graph engine doesn't do). **`bench` + `demos` migrated**
+to the graph engine: added `SystemOp::Const(Value)` (a constant source term;
+also the promoted-literal home) + `lower::build_seeded` so the engine can run
+*open* programs (bench pushes a prebuilt input — the engine otherwise only
+runs closed programs). Bench now measures the real path (build+optimize once,
+`eval_graph` in the timed loop; bench 1 ~1.1× rust, bench 2 ~1.0×).
+**`--reference` + `agree()` retired** — the differential oracle is replaced by
+within-engine invariants: optimizer-correctness tests assert *optimized ==
+unoptimized* (`optimize_corpus_preserves_results` on every example). **`eval`
+deleted** from `ir/op.rs`; `Let::run` errors as unreachable (binding is boiled
+in lowering, never a term). `eval_graph` already takes no `env`. Traded: the
+second-evaluator cross-check (mitigated by optimized-vs-unoptimized + corpus +
+unit tests). 117 tests + 18 examples green. — 2026-05-25.
+
+### AD. Layering — retired `each`/`match`/`cleave`/`repeat`; engine self-contained
+
+Executed `dev/LAYERING.md` steps 1–7, closing the keystone fully. **Step 1:** segmented
+per-row ops `sort.segmented`/`reverse.segmented`/`take.segmented` (sort.rs,
+sort_concat.rs; `sort.segmented` reuses `sort_seq` with per-row labels) +
+`SystemOp` variants; example 15 rewritten byte-identical; **`Each` deleted**
+(struct, parser arm, `has_body`/`body_has_opaque`/inference downcasts).
+**Step 2:** surface `mergeN` (`combinators::MergeN`, dotless like
+inject/partition; bare `merge` reserved for sorted union) + `SystemOp::Merge`;
+`merge_reproduces_match` test. **Step 3:** `match` desugars in the parser to
+`split :[g…] g_disc g_l0 <arm0> … mergeK` (token synthesis + re-parse);
+**`Match` deleted**; examples 05/19 verified (19 still 2,999,997 triples).
+**Step 4:** `cleave` desugars to `:[g_v] g_v <p0> … entuple.K`; **`Cleave`
+deleted**; examples 06/07/14 verified. **Steps 5–7:** **`repeat` removed
+entirely** (not Turing-complete by choice; it was the last body-bearing op +
+the last binding island) — so binding now boils 100% uniformly, `eval_graph`
+drops its `env`, and **the engine never calls legacy eval**: fully
+self-contained, cleaner than Option A or B. Mandelbrot (repeat's only user)
+removed. `body_has_opaque`/`has_body`/Let-Repeat dynamic-arity all deleted.
+`--legacy`→`--reference` (differential oracle); added `optimize()`
+(`elide_routing → cse → eliminate_dead`) **wired onto the default path**,
+`--no-opt` to disable, locked by `optimize_corpus_preserves_results`;
+`graph <path> --elide` is the `--emit-ir` view. **All three deletion-test
+questions now pass** — binding-boiling stays in lowering by necessity
+(`:name` binds rest-of-block → un-boiled = a legacy blob), which is correctly
+the concatenative front end's lowering (#3 resolved by reframing). 120 tests
++ 18 examples green. — 2026-05-25.
+
+### AC. Segmented compute — element-wise List preservation + segmented `filter`
+
+The SEQ→SEQ recipe applied to compute/`filter` (`dev/SEGMENTED.md`, steps 1–3).
+**Step 1:** `cmp`, `arith`/`neg`/`abs`, `as`, and boolean `and`/`or`/`not` now
+preserve `List` grouping (equal-bounds Lists, or List op length-1 scalar) via
+shared `helpers::list_elementwise2`/`list_elementwise1` peel/rewrap helpers and
+`shape::prim_width`; flat/View paths unchanged (List branch returns early
+before them). Each grew a `List<Prim>` typecheck arm. **Step 2:** segmented
+`filter` as representation dispatch on the existing `Filter` op (keyed on the
+mask being `List<P8>`; materializes a row-shaped-View src into a List; per-row
+survivors → new bounds, folding the count→bounds step in — no `nest.counts`
+op needed). **Step 3:** `19_wco_lftj_match.col`'s `lftj_lane_g` survivor
+re-nest dance (`where gather` + `list>bounds`/`nest`/`reduce.+`/`cumsum`/`cat`/
+`nest`) collapsed to `queries  hit queries list>bounds nest  filter`; output
+byte-identical (2,999,997 triples; full-column fingerprint old==new).
+**Findings:** the witness's *compute* is gather-driven so it stays flat by
+nature (grouping only recoverable at the final filter) — Step 1's element-wise
+List ops are a catalogue-wide win, not this witness's dominant pattern; the
+predicted View-inner wrinkle surfaced in its mild form (runtime
+`materialize_top`, not the deeper `RowAccess` read-through). 121 tests (114 +
+7) + 19 examples green. Step 4 (trie-walker, #0b) remains out of scope.
+— 2026-05-25.
 
 ### AB. Example 19 tidied → renumbered 18; old 18 cut
 

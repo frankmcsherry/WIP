@@ -1,7 +1,9 @@
-//! Layer 1: the PrimOp trait and the eval loop.
+//! Layer 1: the PrimOp trait.
 //!
-//! The core knows nothing about specific operators. It just iterates over
-//! a slice of `Box<dyn PrimOp>`-ish things and calls `run` on each.
+//! The core knows nothing about specific operators. The op-stream
+//! interpreter that used to live here (`eval`) was removed — programs are
+//! lowered to a term graph (`pipeline::lower`) and run by the graph engine
+//! (`pipeline::execute::eval_graph`), the only evaluator.
 
 use crate::ir::stack::Stack;
 use crate::ir::value::Value;
@@ -13,7 +15,7 @@ use crate::ir::value::Value;
 ///
 /// `Any` is a supertrait so the parser's last-use inference pass can
 /// downcast `Box<dyn PrimOp>` to concrete types (specifically `Ref` and
-/// the body-bearing ops like `Let`, `Each`, etc.) for AST traversal.
+/// the body-bearing ops like `Let`, `Repeat`, etc.) for AST traversal.
 /// `Any` is auto-implemented for any `'static` type — implementations
 /// don't need to do anything.
 pub trait PrimOp: std::fmt::Debug + std::any::Any {
@@ -40,25 +42,4 @@ pub trait PrimOp: std::fmt::Debug + std::any::Any {
     /// Inputs and outputs are both stack order (index 0 = deepest /
     /// pushed first), matching `arity`.
     fn routing_map(&self) -> Option<Vec<usize>> { None }
-}
-
-/// Run a program: iterate ops, call run on each.
-/// Generic over the trait so layer 3 can pass `Box<dyn Op>` (which is
-/// `dyn PrimOp + Typed`) without re-deriving.
-pub fn eval<O: PrimOp + ?Sized>(
-    prog: &[Box<O>],
-    st: &mut Stack,
-    env: &mut Vec<Value>,
-) -> Result<(), String> {
-    if crate::ir::profile::is_enabled() {
-        for op in prog {
-            let name = op.name();
-            // time_op records self-time (elapsed minus children) — so wrapper
-            // ops like `let` don't double-count their bodies' time.
-            crate::ir::profile::time_op(name, || op.run(st, env))?;
-        }
-    } else {
-        for op in prog { op.run(st, env)?; }
-    }
-    Ok(())
 }

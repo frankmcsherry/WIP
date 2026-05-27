@@ -80,9 +80,15 @@ vectorized kernels per op — no JIT to maintain, no codegen to debug,
 and rule-based optimization works directly on op sequences. We pay
 *materialization between ops*: long pipelines spend memory bandwidth
 that a compiled pipeline would avoid (`View` and Arc-1 reuse are
-the main mitigations). And row-iteration algorithms can't be
-expressed columnarly — they need the `each` escape hatch, which
-itself violates the principle.
+the main mitigations). The principle-2 *escape hatches are now all gone*:
+the per-row `each` became segmented columnar ops (`sort.segmented`,
+`reduce`, `filter`, …); `match`/`cleave` desugar to columnar ops in the
+parser; and `repeat` was removed outright — collie is deliberately not
+Turing-complete yet, so genuinely iterative algorithms (fixed-point,
+escape-test loops) are simply out of scope rather than served by a
+dispatch-violating hatch. Every op now dispatches once per whole column. A
+loop can return later as a *dataflow* construct (see `dev/LAYERING.md`)
+without reintroducing per-iteration interpreter dispatch.
 
 ---
 
@@ -312,6 +318,30 @@ exceptions exist and are fine.
   `Indices` — the former gather sequentially (principle 7); the latter
   is the random-access escape hatch.
 
+- **Segmented compute preserves grouping.** A `List`'s per-row grouping is
+  a *transparent restriction* on a flat sequence (principle 4), so compute
+  ops dispatch on representation (flat vs `List`) to keep the grouping
+  rather than forcing a `flatten` → compute → re-nest round-trip. Two
+  cases, split by whether the op changes per-row counts:
+  - **Element-wise** — `cmp`, `arith` (incl. `neg`/`abs`), `as`, boolean
+    `and`/`or`/`not`. The op never crosses a row boundary, so the kernel
+    runs on the flat inner values and **reattaches the same bounds**
+    (`List<T> op List<T> → List<T'>`; equal bounds required, a length-1
+    scalar broadcasts across all rows). Per-row counts are unchanged — the
+    grouping rides through untouched.
+  - **Count-changing** — `filter`. Per-row output length differs, so it
+    needs a real segmented kernel: keep per-row the elements where an
+    aligned `List<bool>` mask is true, deriving new bounds from the per-row
+    survivor counts (the "nest by counts" step folded into the op).
+  This is *representation dispatch* per the operator-shape recipe, **not** a
+  parallel `*.seg` op family — same token, flat path unchanged, the `List`
+  branch returns before it. The reduce-like ops (`reduce`/`count`/`cumsum`/
+  `shift`) already work this way, though there the `List` is *semantic*
+  (per-row vs whole-column) rather than a transparent restriction. The
+  practical payoff: filtering grouped data no longer pays a manual
+  `where gather` + recount + `cumsum` + `nest` re-grouping dance (see the
+  `lftj_lane_g` lane in `examples/19_wco_lftj_match.col`).
+
 ---
 
 # Engineering policies
@@ -340,6 +370,14 @@ not themselves design principles.
 - **Verify before generalizing.** If two ops look similar, write the
   third before merging them. Many shape-similar ops have load-bearing
   semantic differences that only emerge under real use.
+
+- **Optimizer passes are `Graph → Graph` and never load-bearing for
+  execution.** The engine must run an un-optimized graph to the same
+  result; an optimizer pass only ever *improves* a program, never enables
+  it. (`--no-opt` runs the engine without the optimizer; the corpus
+  equality test guards it.) This keeps the optimizer a cleanly removable
+  layer rather than a fused part of execution — see `dev/LAYERING.md` and
+  its three-question "smear test."
 
 - **Operator shape recipe.** Every op has one signature
   `SEQ<T_in> → SEQ<T_out>`. Internal dispatch on *representation* —

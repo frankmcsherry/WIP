@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
-use crate::ir::op::eval;
+use crate::pipeline::{build_seeded, optimize, eval_graph};
 use crate::syntax::parse::parse;
 use crate::ir::value::{Value, Prim, from_vec, Storage, prod};
 use crate::ir::shape::Interp;
@@ -37,12 +37,10 @@ pub fn run_bench() -> Result<(), String> {
         let prog = parse("dup .0 swap .1 +.u64", &reg)?;
         println!("[bench 1] per-row sum, N = {}", n);
         let runs = 20;
-        let mut env: Vec<Value> = Vec::new();
         let pairs = prod(vec![from_vec::<u64>(a_src.clone()), from_vec::<u64>(b_src.clone())]);
+        let g = optimize(build_seeded(prog, vec![pairs]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![pairs.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let out: Vec<u64> = a_src.iter().zip(b_src.iter()).map(|(&x, &y)| x + y).collect();
@@ -57,12 +55,10 @@ pub fn run_bench() -> Result<(), String> {
         let prog = parse("dup 50u64 >= where", &reg)?;
         println!("[bench 2] filter (keep >= 50), N = {}", n);
         let runs = 20;
-        let mut env: Vec<Value> = Vec::new();
         let v_in = from_vec::<u64>(src.clone());
+        let g = optimize(build_seeded(prog, vec![v_in]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![v_in.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let out: Vec<u64> = src.iter().copied().filter(|&x| x >= 50).collect();
@@ -78,12 +74,10 @@ pub fn run_bench() -> Result<(), String> {
         let prog = parse("dup .1 swap .0 group reduce.+.u64 entuple.2", &reg)?;
         println!("[bench 3] GROUP BY (100 regions, sum), N = {}", n);
         let runs = 10;
-        let mut env: Vec<Value> = Vec::new();
         let pair = prod(vec![from_vec::<u8>(regions.clone()), from_vec::<u64>(sales.clone())]);
+        let g = optimize(build_seeded(prog, vec![pair]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![pair.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let mut perm: Vec<usize> = (0..n).collect();
@@ -120,13 +114,11 @@ pub fn run_bench() -> Result<(), String> {
         println!("[bench 4] sort-merge equijoin, L = {}, R = {}", n_left, n_right);
         let runs = 10;
         let n_total = n_left + n_right;
-        let mut env: Vec<Value> = Vec::new();
         let l = prod(vec![from_vec::<u64>(lk.clone()), from_vec::<u64>(la.clone())]);
         let r = prod(vec![from_vec::<u64>(rk.clone()), from_vec::<f64>(rb.clone())]);
+        let g = optimize(build_seeded(prog, vec![l, r]).unwrap().0);
         let colang_time = bench_run("collie", n_total, runs, || {
-            let mut st = vec![l.clone(), r.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n_total, runs, || {
             let mut out_k: Vec<u64> = Vec::new();
@@ -157,13 +149,11 @@ pub fn run_bench() -> Result<(), String> {
         let prog = parse("+.u64", &reg)?;
         println!("[bench 5] add at N = {} (L1-resident)", n);
         let runs = 100_000;
-        let mut env: Vec<Value> = Vec::new();
         let a = from_vec::<u64>(a_src.clone());
         let b = from_vec::<u64>(b_src.clone());
+        let g = optimize(build_seeded(prog, vec![a, b]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![a.clone(), b.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let out: Vec<u64> = a_src.iter().zip(b_src.iter()).map(|(&x, &y)| x + y).collect();
@@ -187,13 +177,11 @@ pub fn run_bench() -> Result<(), String> {
         let prog = parse("+.i32", &reg)?;
         println!("[bench 6] i32 add at N = {} (Frank's reference setup)", n);
         let runs = 100_000;
-        let mut env: Vec<Value> = Vec::new();
         let a = from_vec::<i32>(a_src.clone());
         let b = from_vec::<i32>(b_src.clone());
+        let g = optimize(build_seeded(prog, vec![a, b]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![a.clone(), b.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let out: Vec<i32> = a_src.iter().zip(b_src.iter()).map(|(&x, &y)| x + y).collect();
@@ -257,11 +245,9 @@ pub fn run_bench() -> Result<(), String> {
         let runs = 5;
         let prog = parse("sort", &reg)?;
         let v = from_vec::<u64>(xs.clone());
-        let mut env: Vec<Value> = Vec::new();
+        let g = optimize(build_seeded(prog, vec![v]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![v.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let mut perm: Vec<usize> = (0..n).collect();
@@ -281,11 +267,9 @@ pub fn run_bench() -> Result<(), String> {
         let runs = 5;
         let prog = parse("sort", &reg)?;
         let pair = prod(vec![from_vec::<u64>(k0.clone()), from_vec::<u64>(k1.clone())]);
-        let mut env: Vec<Value> = Vec::new();
+        let g = optimize(build_seeded(prog, vec![pair]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![pair.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n, runs, || {
             let mut perm: Vec<usize> = (0..n).collect();
@@ -316,11 +300,9 @@ pub fn run_bench() -> Result<(), String> {
             bounds: crate::ir::value::bounds_var_from_ends(bounds.clone()),
             values: Arc::new(from_vec::<u64>(flat.clone())),
         };
-        let mut env: Vec<Value> = Vec::new();
+        let g = optimize(build_seeded(prog, vec![list]).unwrap().0);
         let colang_time = bench_run("collie", n_lists, runs, || {
-            let mut st = vec![list.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         let rust_time = bench_run("rust  ", n_lists, runs, || {
             // Sort row indices by (length, lex of contents).
@@ -375,11 +357,9 @@ pub fn run_bench() -> Result<(), String> {
             bounds: crate::ir::value::bounds_var_from_ends(ob.clone()),
             values: Arc::new(inner.clone()),
         };
-        let mut env: Vec<Value> = Vec::new();
+        let g = optimize(build_seeded(prog, vec![deep]).unwrap().0);
         let colang_time = bench_run("collie", outer, runs, || {
-            let mut st = vec![deep.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
         // Rust baseline: materialize as Vec<Vec<Vec<u64>>>, sort lex.
         let materialized: Vec<Vec<Vec<u64>>> = {
@@ -443,11 +423,9 @@ pub fn run_bench() -> Result<(), String> {
             disc: disc_prim,
             lanes: Arc::new(vec![lane0_v, lane1_v, lane2_v]),
         };
-        let mut env: Vec<Value> = Vec::new();
+        let g = optimize(build_seeded(prog, vec![sum_v]).unwrap().0);
         let colang_time = bench_run("collie", n, runs, || {
-            let mut st = vec![sum_v.clone()];
-            env.clear();
-            eval(&prog, &mut st, &mut env).unwrap();
+            std::hint::black_box(eval_graph(&g).unwrap());
         });
 
         // Rust baseline: derive Ord on a 3-variant enum, materialize a

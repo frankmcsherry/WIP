@@ -240,7 +240,7 @@ pub fn slice_value(v: &Value, lo: usize, hi: usize) -> Result<Value, String> {
     })
 }
 
-/// Concat several Values of the same shape (used by Each).
+/// Concat several Values of the same shape (used by `cat.N`).
 pub fn concat_values(parts: &[Value]) -> Result<Value, String> {
     if parts.is_empty() { return Err("concat_values: empty".into()); }
     let first = &parts[0];
@@ -510,5 +510,51 @@ pub fn extract_prim(v: &Value, ctx: &str) -> Result<Prim, String> {
     match v {
         Value::Prim(p) => Ok(p.clone()),
         other => Err(format!("{}: expected Prim, got {:?}", ctx, other)),
+    }
+}
+
+/// Segmented element-wise binary op (principle 4: grouping is a transparent
+/// restriction). Dispatches the List representation so that compute ops keep
+/// per-row grouping instead of forcing a flatten:
+///
+///   - both sides `List` with **equal bounds**: run `f` on the inner values
+///     and rewrap under the shared bounds (`List<T> List<T> → List<T'>`),
+///   - `List` op length-1 scalar `Prim` (either side): broadcast the scalar
+///     across the inner values — the inner kernel already broadcasts length-1,
+///     so we just hand it the scalar Prim and reattach the List's bounds,
+///   - neither side a `List`: return `None` so the caller falls through to its
+///     flat / View fast paths.
+///
+/// Mismatched-bounds Lists are an error ("segmented op: bounds differ") — we
+/// never silently broadcast one grouping against another.
+pub fn list_elementwise2<F>(a: &Value, b: &Value, f: F) -> Option<Result<Value, String>>
+where F: Fn(&Value, &Value) -> Result<Value, String>
+{
+    match (a, b) {
+        (Value::List { bounds: ba, values: va }, Value::List { bounds: bb, values: vb }) => {
+            if ba != bb {
+                return Some(Err("segmented op: bounds differ".into()));
+            }
+            Some(f(va, vb).map(|inner| list(ba.clone(), inner)))
+        }
+        (Value::List { bounds, values }, Value::Prim(p)) if p.len() == 1 => {
+            Some(f(values, b).map(|inner| list(bounds.clone(), inner)))
+        }
+        (Value::Prim(p), Value::List { bounds, values }) if p.len() == 1 => {
+            Some(f(a, values).map(|inner| list(bounds.clone(), inner)))
+        }
+        _ => None,
+    }
+}
+
+/// Segmented element-wise unary op — the unary sibling of
+/// [`list_elementwise2`]. Runs `f` on a `List`'s inner values and reattaches
+/// the same bounds; `None` when the input isn't a `List`.
+pub fn list_elementwise1<F>(a: &Value, f: F) -> Option<Result<Value, String>>
+where F: Fn(&Value) -> Result<Value, String>
+{
+    match a {
+        Value::List { bounds, values } => Some(f(values).map(|inner| list(bounds.clone(), inner))),
+        _ => None,
     }
 }

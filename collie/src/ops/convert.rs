@@ -13,6 +13,7 @@ use crate::ir::stack::{Stack, pop};
 use crate::ir::typecheck::{Typed, TypeStack, TypeEnv, tc_pop};
 use crate::ir::value::{Value, Prim, PrimWidth, Storage, from_vec};
 use crate::ir::shape::{Interp, Shape, is_primitive};
+use crate::ops::helpers::{extract_prim, list_elementwise1};
 
 #[derive(Debug)]
 pub struct As { pub interp: Interp }
@@ -20,52 +21,77 @@ pub struct As { pub interp: Interp }
 impl PrimOp for As {
     fn name(&self) -> &str { "as" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { run(self.interp, st) }
+}
+
+/// The `as` cast kernel (back-end `SystemOp::As` calls this directly).
+pub fn run(interp: Interp, st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
+        // Segmented: cast a List's inner values element-wise; bounds unchanged.
+        if let Some(res) = list_elementwise1(&v, |va| {
+            let p = extract_prim(va, "as")?;
+            Ok(cast_prim(&p, interp))
+        }) {
+            st.push(res?);
+            return Ok(());
+        }
         let p = match v {
             Value::Prim(p) => p,
             other => return Err(format!("as: not a prim: {:?}", other)),
         };
-        macro_rules! cast_from { ($src_t:ty, $($dst_interp:pat => $dst_t:ty),+) => {{
-            let xs = <$src_t as Storage>::extract(&p)?;
-            match self.interp {
-                $( $dst_interp => from_vec::<$dst_t>(xs.iter().map(|&x| x as $dst_t).collect()), )+
-            }
-        }};}
-        let out = match p.width() {
-            PrimWidth::W8 => cast_from!(u8,
-                Interp::U8 => u8, Interp::I8 => i8,
-                Interp::U16 => u16, Interp::I16 => i16,
-                Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
-                Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
-            PrimWidth::W16 => cast_from!(u16,
-                Interp::U8 => u8, Interp::I8 => i8,
-                Interp::U16 => u16, Interp::I16 => i16,
-                Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
-                Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
-            PrimWidth::W32 => cast_from!(u32,
-                Interp::U8 => u8, Interp::I8 => i8,
-                Interp::U16 => u16, Interp::I16 => i16,
-                Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
-                Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
-            PrimWidth::W64 => cast_from!(u64,
-                Interp::U8 => u8, Interp::I8 => i8,
-                Interp::U16 => u16, Interp::I16 => i16,
-                Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
-                Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
-        };
-        st.push(out);
+        st.push(cast_prim(&p, interp));
         Ok(())
+}
+
+/// Width/interp cast of one flat `Prim`. Shared by the flat and segmented
+/// (`List`) paths of `as`.
+fn cast_prim(p: &Prim, interp: Interp) -> Value {
+    macro_rules! cast_from { ($src_t:ty, $($dst_interp:pat => $dst_t:ty),+) => {{
+        let xs = match <$src_t as Storage>::extract(p) { Ok(xs) => xs, Err(_) => return Value::Prim(p.clone()) };
+        match interp {
+            $( $dst_interp => from_vec::<$dst_t>(xs.iter().map(|&x| x as $dst_t).collect()), )+
+        }
+    }};}
+    match p.width() {
+        PrimWidth::W8 => cast_from!(u8,
+            Interp::U8 => u8, Interp::I8 => i8,
+            Interp::U16 => u16, Interp::I16 => i16,
+            Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
+            Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
+        PrimWidth::W16 => cast_from!(u16,
+            Interp::U8 => u8, Interp::I8 => i8,
+            Interp::U16 => u16, Interp::I16 => i16,
+            Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
+            Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
+        PrimWidth::W32 => cast_from!(u32,
+            Interp::U8 => u8, Interp::I8 => i8,
+            Interp::U16 => u16, Interp::I16 => i16,
+            Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
+            Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
+        PrimWidth::W64 => cast_from!(u64,
+            Interp::U8 => u8, Interp::I8 => i8,
+            Interp::U16 => u16, Interp::I16 => i16,
+            Interp::U32 => u32, Interp::I32 => i32, Interp::F32 => f32,
+            Interp::U64 => u64, Interp::I64 => i64, Interp::F64 => f64),
     }
 }
 
 impl Typed for As {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { tc(self.interp, st) }
+}
+
+/// The `as` typecheck (back-end `SystemOp::As` calls this directly).
+pub fn tc(interp: Interp, st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "as")?;
-        if !is_primitive(&v) { return Err(format!("as.{}: not primitive: {}", self.interp, v)); }
-        st.push(Shape::Prim(self.interp.width()));
-        Ok(())
-    }
+        match &v {
+            _ if is_primitive(&v) => { st.push(Shape::Prim(interp.width())); Ok(()) }
+            // Segmented: List<Prim> → List<Prim(interp)>; bounds unchanged.
+            Shape::List { bounds, inner } if is_primitive(inner) => {
+                st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(interp.width())) });
+                Ok(())
+            }
+            _ => Err(format!("as.{}: not primitive: {}", interp, v)),
+        }
 }
 
 /// Scalar literal. Carries both an integer and a float field so float
@@ -74,13 +100,14 @@ impl Typed for As {
 #[derive(Debug)]
 pub struct LitNum { pub n: i128, pub f: f64, pub interp: Interp }
 
-impl PrimOp for LitNum {
-    fn name(&self) -> &str { "lit" }
-    fn arity(&self) -> Option<(usize, usize)> { Some((0, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+impl LitNum {
+    /// The scalar `Value` this literal denotes. Used by `run` and by the
+    /// graph builder, which promotes `LitNum` into `SystemOp::Const(value)`
+    /// rather than carrying it as a `Foreign` op.
+    pub fn to_value(&self) -> Value {
         let n = self.n;
         let f = self.f;
-        let v = match self.interp {
+        match self.interp {
             Interp::U8  => from_vec::<u8>(vec![n as u8]),
             Interp::I8  => from_vec::<i8>(vec![n as i8]),
             Interp::U16 => from_vec::<u16>(vec![n as u16]),
@@ -91,8 +118,15 @@ impl PrimOp for LitNum {
             Interp::U64 => from_vec::<u64>(vec![n as u64]),
             Interp::I64 => from_vec::<i64>(vec![n as i64]),
             Interp::F64 => from_vec::<f64>(vec![f]),
-        };
-        st.push(v); Ok(())
+        }
+    }
+}
+
+impl PrimOp for LitNum {
+    fn name(&self) -> &str { "lit" }
+    fn arity(&self) -> Option<(usize, usize)> { Some((0, 1)) }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+        st.push(self.to_value()); Ok(())
     }
 }
 
@@ -108,11 +142,17 @@ impl Typed for LitNum {
 #[derive(Debug)]
 pub struct LitArr { pub tag: &'static str, pub prim: Prim }
 
+impl LitArr {
+    /// The column `Value` this literal denotes (cheap `Arc` clone). Used by
+    /// `run` and by the graph builder's promotion to `SystemOp::Const`.
+    pub fn to_value(&self) -> Value { Value::Prim(self.prim.clone()) }
+}
+
 impl PrimOp for LitArr {
     fn name(&self) -> &str { self.tag }
     fn arity(&self) -> Option<(usize, usize)> { Some((0, 1)) }
     fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        st.push(Value::Prim(self.prim.clone())); Ok(())
+        st.push(self.to_value()); Ok(())
     }
 }
 impl Typed for LitArr {

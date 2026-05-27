@@ -12,33 +12,18 @@
 //! more* — at this Ref. If a later op also uses the binding, taking
 //! here would leave the slot drained for the later use.
 //!
-//! For sequential ops (Let body, top-level program) this is just "find
-//! the rightmost reference."
-//!
-//! For loop-body ops (`Each`, `Repeat` with N>1), references
-//! inside the body are executed *multiple times* — once per iteration.
-//! Marking a Ref inside a loop body as take would consume the binding
-//! on the first iteration, leaving the second iteration with a drained
-//! slot. **The inference must not mark Refs to outer bindings as take
-//! when those Refs sit inside a loop body.**
-//!
-//! For body-bearing ops that run their body exactly once (`Let`, `Match`
-//! arm, `Cleave` path, `Repeat` with N=1), references inside the body
-//! are safe to mark. The current implementation conservatively treats
-//! all body-bearing ops as "single-execution" — which is wrong for
-//! `Each`/`Repeat`. The mitigation: the inference only marks
-//! Refs whose idx falls within the *current* Let's bound range, and the
-//! inference is run after each Let close. So Refs inside an outer
-//! loop's body that target the loop's own local bindings are marked
-//! (safe — local bindings are fresh per iteration), but Refs targeting
-//! outer bindings are not touched by inner-Let inference.
+//! Every body now runs exactly once: `Let` bodies are sequential, and the
+//! only other body-bearing ops (`each`/`match`/`cleave`/`repeat`) have all
+//! been retired. So last-use marking is always "find the rightmost
+//! reference" — no multi-execution loop body to worry about. (If a future
+//! loop construct returns, references inside its body run multiple times,
+//! and this pass must again avoid marking Refs to outer bindings as take
+//! inside such a body.)
 
 use std::any::Any;
 
 use crate::ir::typecheck::Op;
 use crate::ops::letbind::{Let, Ref};
-use crate::ops::list::{Each, Repeat};
-use crate::ops::combinators::{Match, Cleave};
 
 /// Mark the last reference to each name bound by the just-closed `Let`
 /// (whose bound positions are `start..start + n_names`) as `take: true`.
@@ -108,24 +93,12 @@ fn op_uses_idx(op: &dyn Op, target_idx: usize) -> bool {
 }
 
 /// For body-bearing ops, return a list of sub-program slices to walk.
-/// Single-body ops return a Vec with one slice; multi-body ops (Match
-/// arms, Cleave paths) return one per arm/path.
+/// After `each`/`match`/`cleave`/`repeat` were retired, `Let` is the only
+/// body-bearing op left (and it's boiled to edges during lowering).
 fn op_sub_bodies<'a>(op: &'a dyn Op) -> Vec<&'a [Box<dyn Op>]> {
     let any_ref: &dyn Any = op;
     if let Some(l) = any_ref.downcast_ref::<Let>() {
         return vec![&l.body];
-    }
-    if let Some(e) = any_ref.downcast_ref::<Each>() {
-        return vec![&e.body];
-    }
-    if let Some(r) = any_ref.downcast_ref::<Repeat>() {
-        return vec![&r.body];
-    }
-    if let Some(m) = any_ref.downcast_ref::<Match>() {
-        return m.arms.iter().map(|a| a.as_slice()).collect();
-    }
-    if let Some(c) = any_ref.downcast_ref::<Cleave>() {
-        return c.paths.iter().map(|p| p.as_slice()).collect();
     }
     Vec::new()
 }

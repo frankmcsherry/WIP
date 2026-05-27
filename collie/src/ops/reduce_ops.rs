@@ -10,7 +10,37 @@ use crate::ir::op::PrimOp;
 use crate::ir::stack::{Stack, pop};
 use crate::ir::typecheck::{Typed, TypeStack, TypeEnv, tc_pop};
 use crate::ir::value::{Value, Storage, from_vec, PrimWidth};
-use crate::ir::shape::{Interp, Shape, bounds_as_u64};
+use crate::ir::shape::{Interp, Shape, bounds_as_u64, prim_width};
+use crate::ops::helpers::{list_elementwise1, list_elementwise2};
+
+/// Element-wise boolean binary op over two P8 columns (non-zero = true).
+/// Shared by the flat and segmented (`List`) paths of `and`/`or`.
+fn bool_binop<F: Fn(bool, bool) -> bool>(a: &Value, b: &Value, f: F) -> Result<Value, String> {
+    let pa = match a { Value::Prim(p) => p, _ => return Err("bool op: expected Prim".into()) };
+    let pb = match b { Value::Prim(p) => p, _ => return Err("bool op: expected Prim".into()) };
+    let xa = <u8 as Storage>::extract(pa)?;
+    let xb = <u8 as Storage>::extract(pb)?;
+    if xa.len() != xb.len() { return Err(format!("bool op: length mismatch {} vs {}", xa.len(), xb.len())); }
+    let out: Vec<u8> = xa.iter().zip(xb.iter()).map(|(&x, &y)| f(x != 0, y != 0) as u8).collect();
+    Ok(from_vec::<u8>(out))
+}
+
+/// Typecheck arm shared by the boolean binary ops (`and`/`or`): both sides
+/// P8 (flat or equal-bounds List<P8>) → same shape.
+fn bool_binop_tc(tag: &str, a: &Shape, b: &Shape) -> Result<Shape, String> {
+    let p8 = Shape::Prim(PrimWidth::W8);
+    match (a, b) {
+        (Shape::Prim(PrimWidth::W8), Shape::Prim(PrimWidth::W8)) => Ok(p8),
+        (Shape::List { bounds: lba, inner: ia }, Shape::List { bounds: lbb, inner: ib })
+            if lba == lbb && prim_width(ia) == Some(PrimWidth::W8) && prim_width(ib) == Some(PrimWidth::W8) =>
+            Ok(Shape::List { bounds: *lba, inner: Box::new(p8) }),
+        (Shape::List { bounds, inner }, Shape::Prim(PrimWidth::W8)) if prim_width(inner) == Some(PrimWidth::W8) =>
+            Ok(Shape::List { bounds: *bounds, inner: Box::new(p8) }),
+        (Shape::Prim(PrimWidth::W8), Shape::List { bounds, inner }) if prim_width(inner) == Some(PrimWidth::W8) =>
+            Ok(Shape::List { bounds: *bounds, inner: Box::new(p8) }),
+        _ => Err(format!("{}: needs Prim(P8) or equal-bounds List<P8> on both sides, got {} and {}", tag, a, b)),
+    }
+}
 
 /// Per-run reducer. Seeds the accumulator with `xs[prev]` to dodge
 /// neutral-value pitfalls (e.g. min/max with `Default::default()` is wrong).
@@ -56,73 +86,83 @@ fn fold_whole<T: Storage, F: Fn(T, T) -> T>(
 }
 
 macro_rules! reducer_op {
-    ($name:ident, $tag:literal, $accum:expr) => {
+    ($name:ident, $run:ident, $tc:ident, $tag:literal, $accum:expr) => {
         #[derive(Debug)]
         pub struct $name { pub interp: Interp }
         impl PrimOp for $name {
             fn name(&self) -> &str { $tag }
             fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-            fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-                // pop_raw — `fold_whole` is View-aware and avoids the
-                // intermediate gather that `pop()` would force.
-                let v = crate::ir::stack::pop_raw(st)?;
-                let out = match v {
-                    Value::List { bounds, values } => {
-                        let bnds = bounds_as_u64(&bounds)?.to_vec();
-                        match self.interp {
-                            Interp::U8  => fold_runs::<u8, _>(&values, &bnds, $accum)?,
-                            Interp::I8  => fold_runs::<i8, _>(&values, &bnds, $accum)?,
-                            Interp::U16 => fold_runs::<u16, _>(&values, &bnds, $accum)?,
-                            Interp::I16 => fold_runs::<i16, _>(&values, &bnds, $accum)?,
-                            Interp::U32 => fold_runs::<u32, _>(&values, &bnds, $accum)?,
-                            Interp::I32 => fold_runs::<i32, _>(&values, &bnds, $accum)?,
-                            Interp::U64 => fold_runs::<u64, _>(&values, &bnds, $accum)?,
-                            Interp::I64 => fold_runs::<i64, _>(&values, &bnds, $accum)?,
-                            Interp::F32 => fold_runs::<f32, _>(&values, &bnds, $accum)?,
-                            Interp::F64 => fold_runs::<f64, _>(&values, &bnds, $accum)?,
-                        }
-                    }
-                    other => match self.interp {
-                        Interp::U8  => fold_whole::<u8, _>(&other, $accum)?,
-                        Interp::I8  => fold_whole::<i8, _>(&other, $accum)?,
-                        Interp::U16 => fold_whole::<u16, _>(&other, $accum)?,
-                        Interp::I16 => fold_whole::<i16, _>(&other, $accum)?,
-                        Interp::U32 => fold_whole::<u32, _>(&other, $accum)?,
-                        Interp::I32 => fold_whole::<i32, _>(&other, $accum)?,
-                        Interp::U64 => fold_whole::<u64, _>(&other, $accum)?,
-                        Interp::I64 => fold_whole::<i64, _>(&other, $accum)?,
-                        Interp::F32 => fold_whole::<f32, _>(&other, $accum)?,
-                        Interp::F64 => fold_whole::<f64, _>(&other, $accum)?,
-                    }
-                };
-                st.push(out);
-                Ok(())
-            }
+            fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { $run(self.interp, st) }
         }
         impl Typed for $name {
-            fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-                let v = tc_pop(st, $tag)?;
-                let inner = match v { Shape::List { inner, .. } => *inner, other => other };
-                match inner {
-                    Shape::Prim(w) if w == self.interp.width() => st.push(Shape::Prim(w)),
-                    other => return Err(format!("{}.{}: expected Prim({}), got {}", $tag, self.interp, self.interp.width(), other)),
+            fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { $tc(self.interp, st) }
+        }
+        /// Reduce kernel (back-end `SystemOp::Reduce` calls this directly).
+        pub fn $run(interp: Interp, st: &mut Stack) -> Result<(), String> {
+            // pop_raw — `fold_whole` is View-aware and avoids the
+            // intermediate gather that `pop()` would force.
+            let v = crate::ir::stack::pop_raw(st)?;
+            let out = match v {
+                Value::List { bounds, values } => {
+                    let bnds = bounds_as_u64(&bounds)?.to_vec();
+                    match interp {
+                        Interp::U8  => fold_runs::<u8, _>(&values, &bnds, $accum)?,
+                        Interp::I8  => fold_runs::<i8, _>(&values, &bnds, $accum)?,
+                        Interp::U16 => fold_runs::<u16, _>(&values, &bnds, $accum)?,
+                        Interp::I16 => fold_runs::<i16, _>(&values, &bnds, $accum)?,
+                        Interp::U32 => fold_runs::<u32, _>(&values, &bnds, $accum)?,
+                        Interp::I32 => fold_runs::<i32, _>(&values, &bnds, $accum)?,
+                        Interp::U64 => fold_runs::<u64, _>(&values, &bnds, $accum)?,
+                        Interp::I64 => fold_runs::<i64, _>(&values, &bnds, $accum)?,
+                        Interp::F32 => fold_runs::<f32, _>(&values, &bnds, $accum)?,
+                        Interp::F64 => fold_runs::<f64, _>(&values, &bnds, $accum)?,
+                    }
                 }
-                Ok(())
+                other => match interp {
+                    Interp::U8  => fold_whole::<u8, _>(&other, $accum)?,
+                    Interp::I8  => fold_whole::<i8, _>(&other, $accum)?,
+                    Interp::U16 => fold_whole::<u16, _>(&other, $accum)?,
+                    Interp::I16 => fold_whole::<i16, _>(&other, $accum)?,
+                    Interp::U32 => fold_whole::<u32, _>(&other, $accum)?,
+                    Interp::I32 => fold_whole::<i32, _>(&other, $accum)?,
+                    Interp::U64 => fold_whole::<u64, _>(&other, $accum)?,
+                    Interp::I64 => fold_whole::<i64, _>(&other, $accum)?,
+                    Interp::F32 => fold_whole::<f32, _>(&other, $accum)?,
+                    Interp::F64 => fold_whole::<f64, _>(&other, $accum)?,
+                }
+            };
+            st.push(out);
+            Ok(())
+        }
+        pub fn $tc(interp: Interp, st: &mut TypeStack) -> Result<(), String> {
+            let v = tc_pop(st, $tag)?;
+            let inner = match v { Shape::List { inner, .. } => *inner, other => other };
+            match inner {
+                Shape::Prim(w) if w == interp.width() => st.push(Shape::Prim(w)),
+                other => return Err(format!("{}.{}: expected Prim({}), got {}", $tag, interp, interp.width(), other)),
             }
+            Ok(())
         }
     };
 }
 
-reducer_op!(ReduceMin, "reduce.min", |a, b| if a < b { a } else { b });
-reducer_op!(ReduceMax, "reduce.max", |a, b| if a > b { a } else { b });
-reducer_op!(ReduceMul, "reduce.*",   |a, b| a * b);
+reducer_op!(ReduceMin, reduce_min_run, reduce_min_tc, "reduce.min", |a, b| if a < b { a } else { b });
+reducer_op!(ReduceMax, reduce_max_run, reduce_max_tc, "reduce.max", |a, b| if a > b { a } else { b });
+reducer_op!(ReduceMul, reduce_mul_run, reduce_mul_tc, "reduce.*",   |a, b| a * b);
 
 // any / all: input is P8 (boolean column or list of bools), output is P8 with one value per row.
 #[derive(Debug)] pub struct Any;
 impl PrimOp for Any {
     fn name(&self) -> &str { "any" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { any_run(st) }
+}
+impl Typed for Any {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { any_tc(st) }
+}
+
+/// `any` kernel (back-end `SystemOp::Any` calls this directly).
+pub fn any_run(st: &mut Stack) -> Result<(), String> {
         // pop_raw so we can dispatch on View ourselves.
         let v = crate::ir::stack::pop_raw(st)?;
         let out = match v {
@@ -147,23 +187,29 @@ impl PrimOp for Any {
         };
         st.push(out);
         Ok(())
-    }
 }
-impl Typed for Any {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+
+/// `any` typecheck.
+pub fn any_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "any")?;
         let inner = match v { Shape::List { inner, .. } => *inner, other => other };
         if inner != Shape::Prim(PrimWidth::W8) { return Err(format!("any: needs Prim(P8), got {}", inner)); }
         st.push(Shape::Prim(PrimWidth::W8));
         Ok(())
-    }
 }
 
 #[derive(Debug)] pub struct All;
 impl PrimOp for All {
     fn name(&self) -> &str { "all" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { all_run(st) }
+}
+impl Typed for All {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { all_tc(st) }
+}
+
+/// `all` kernel (back-end `SystemOp::All` calls this directly).
+pub fn all_run(st: &mut Stack) -> Result<(), String> {
         let v = crate::ir::stack::pop_raw(st)?;
         let out = match v {
             Value::List { bounds, values } => {
@@ -187,38 +233,51 @@ impl PrimOp for All {
         };
         st.push(out);
         Ok(())
-    }
 }
-impl Typed for All {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+
+/// `all` typecheck.
+pub fn all_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "all")?;
         let inner = match v { Shape::List { inner, .. } => *inner, other => other };
         if inner != Shape::Prim(PrimWidth::W8) { return Err(format!("all: needs Prim(P8), got {}", inner)); }
         st.push(Shape::Prim(PrimWidth::W8));
         Ok(())
-    }
 }
 
 #[derive(Debug)] pub struct Not;
 impl PrimOp for Not {
     fn name(&self) -> &str { "not" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        let p = match v { Value::Prim(p) => p, _ => return Err("not: expected Prim".into()) };
-        let xs = <u8 as Storage>::extract(&p)?;
-        let out: Vec<u8> = xs.iter().map(|&b| (b == 0) as u8).collect();
-        st.push(from_vec::<u8>(out));
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { not_run(st) }
 }
 impl Typed for Not {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let v = tc_pop(st, "not")?;
-        if v != Shape::Prim(PrimWidth::W8) { return Err(format!("not: needs Prim(P8), got {}", v)); }
-        st.push(Shape::Prim(PrimWidth::W8));
-        Ok(())
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { not_tc(st) }
+}
+
+/// `not` kernel (back-end `SystemOp::Not` calls this directly).
+pub fn not_run(st: &mut Stack) -> Result<(), String> {
+    let v = pop(st)?;
+    if let Some(res) = list_elementwise1(&v, not_prim) { st.push(res?); return Ok(()); }
+    st.push(not_prim(&v)?);
+    Ok(())
+}
+pub fn not_tc(st: &mut TypeStack) -> Result<(), String> {
+    let v = tc_pop(st, "not")?;
+    match &v {
+        Shape::Prim(PrimWidth::W8) => { st.push(Shape::Prim(PrimWidth::W8)); Ok(()) }
+        Shape::List { bounds, inner } if prim_width(inner) == Some(PrimWidth::W8) => {
+            st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(PrimWidth::W8)) });
+            Ok(())
+        }
+        _ => Err(format!("not: needs Prim(P8) or List<P8>, got {}", v)),
     }
+}
+
+fn not_prim(v: &Value) -> Result<Value, String> {
+    let p = match v { Value::Prim(p) => p, _ => return Err("not: expected Prim".into()) };
+    let xs = <u8 as Storage>::extract(p)?;
+    let out: Vec<u8> = xs.iter().map(|&b| (b == 0) as u8).collect();
+    Ok(from_vec::<u8>(out))
 }
 
 /// `and` — elementwise AND of two P8 masks. Treats non-zero as true, zero as
@@ -227,29 +286,27 @@ impl Typed for Not {
 impl PrimOp for And {
     fn name(&self) -> &str { "and" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let b = pop(st)?;
-        let a = pop(st)?;
-        let pa = match a { Value::Prim(p) => p, _ => return Err("and: expected Prim".into()) };
-        let pb = match b { Value::Prim(p) => p, _ => return Err("and: expected Prim".into()) };
-        let xa = <u8 as Storage>::extract(&pa)?;
-        let xb = <u8 as Storage>::extract(&pb)?;
-        if xa.len() != xb.len() { return Err(format!("and: length mismatch {} vs {}", xa.len(), xb.len())); }
-        let out: Vec<u8> = xa.iter().zip(xb.iter()).map(|(&x, &y)| ((x != 0) && (y != 0)) as u8).collect();
-        st.push(from_vec::<u8>(out));
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { and_run(st) }
 }
 impl Typed for And {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let b = tc_pop(st, "and")?;
-        let a = tc_pop(st, "and")?;
-        if a != Shape::Prim(PrimWidth::W8) || b != Shape::Prim(PrimWidth::W8) {
-            return Err(format!("and: needs Prim(P8) on both sides, got {} and {}", a, b));
-        }
-        st.push(Shape::Prim(PrimWidth::W8));
-        Ok(())
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { and_tc(st) }
+}
+
+/// `and` kernel (back-end `SystemOp::And` calls this directly).
+pub fn and_run(st: &mut Stack) -> Result<(), String> {
+    let b = pop(st)?;
+    let a = pop(st)?;
+    if let Some(res) = list_elementwise2(&a, &b, |x, y| bool_binop(x, y, |p, q| p && q)) {
+        st.push(res?); return Ok(());
     }
+    st.push(bool_binop(&a, &b, |p, q| p && q)?);
+    Ok(())
+}
+pub fn and_tc(st: &mut TypeStack) -> Result<(), String> {
+    let b = tc_pop(st, "and")?;
+    let a = tc_pop(st, "and")?;
+    st.push(bool_binop_tc("and", &a, &b)?);
+    Ok(())
 }
 
 /// `or` — elementwise OR of two P8 masks.
@@ -257,29 +314,27 @@ impl Typed for And {
 impl PrimOp for Or {
     fn name(&self) -> &str { "or" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let b = pop(st)?;
-        let a = pop(st)?;
-        let pa = match a { Value::Prim(p) => p, _ => return Err("or: expected Prim".into()) };
-        let pb = match b { Value::Prim(p) => p, _ => return Err("or: expected Prim".into()) };
-        let xa = <u8 as Storage>::extract(&pa)?;
-        let xb = <u8 as Storage>::extract(&pb)?;
-        if xa.len() != xb.len() { return Err(format!("or: length mismatch {} vs {}", xa.len(), xb.len())); }
-        let out: Vec<u8> = xa.iter().zip(xb.iter()).map(|(&x, &y)| ((x != 0) || (y != 0)) as u8).collect();
-        st.push(from_vec::<u8>(out));
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { or_run(st) }
 }
 impl Typed for Or {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let b = tc_pop(st, "or")?;
-        let a = tc_pop(st, "or")?;
-        if a != Shape::Prim(PrimWidth::W8) || b != Shape::Prim(PrimWidth::W8) {
-            return Err(format!("or: needs Prim(P8) on both sides, got {} and {}", a, b));
-        }
-        st.push(Shape::Prim(PrimWidth::W8));
-        Ok(())
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { or_tc(st) }
+}
+
+/// `or` kernel (back-end `SystemOp::Or` calls this directly).
+pub fn or_run(st: &mut Stack) -> Result<(), String> {
+    let b = pop(st)?;
+    let a = pop(st)?;
+    if let Some(res) = list_elementwise2(&a, &b, |x, y| bool_binop(x, y, |p, q| p || q)) {
+        st.push(res?); return Ok(());
     }
+    st.push(bool_binop(&a, &b, |p, q| p || q)?);
+    Ok(())
+}
+pub fn or_tc(st: &mut TypeStack) -> Result<(), String> {
+    let b = tc_pop(st, "or")?;
+    let a = tc_pop(st, "or")?;
+    st.push(bool_binop_tc("or", &a, &b)?);
+    Ok(())
 }
 
 pub fn register(r: &mut crate::syntax::registry::OpRegistry) {

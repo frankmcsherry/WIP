@@ -27,10 +27,12 @@ pub fn use_counts(g: &Graph) -> Vec<Vec<usize>> {
 }
 
 /// Evaluate a graph; return the materialized roots (the final stack,
-/// bottom-to-top). `env` is the bound-value environment used by any
-/// remaining `Let`/`Ref` terms via legacy eval — pass a fresh empty one
-/// for top-level evaluation.
-pub fn eval_graph(g: &Graph, env: &mut Vec<Value>) -> Result<Vec<Value>, String> {
+/// bottom-to-top). The engine is self-contained over the IR: no op reads
+/// the bound-value `env` during graph eval (binding is boiled to edges in
+/// lowering, and no body-bearing op survives), so a throwaway env is passed
+/// to satisfy the `PrimOp::run` signature and never populated.
+pub fn eval_graph(g: &Graph) -> Result<Vec<Value>, String> {
+    let mut env: Vec<Value> = Vec::new();
     let mut counts = use_counts(g);
     let mut outs: Vec<Vec<Value>> = Vec::with_capacity(g.terms.len());
     for term in &g.terms {
@@ -45,7 +47,7 @@ pub fn eval_graph(g: &Graph, env: &mut Vec<Value>) -> Result<Vec<Value>, String>
                 sub.push(slot.clone());
             }
         }
-        term.op.run(&mut sub, env)?;
+        term.op.run(&mut sub, &mut env)?;
         if sub.len() != term.n_outputs {
             return Err(format!(
                 "graph eval: op {} produced {} outputs, declared {}",

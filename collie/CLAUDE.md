@@ -33,7 +33,7 @@ src/
   pipeline/   graph IR + execution substrate (graph, lower, optimize,
               execute, sysop) — the primary eval path
   syntax/     parser + registry + last-use inference
-  tools/      binary-only utilities (REPL, bench, pretty, serialize, demos)
+  tools/      binary-only utilities (bench, pretty, serialize, demos)
   lib.rs      library entry
   main.rs    binary entry (CLI)
 examples/     19 .col files — curated tour from basics to WCO triangle
@@ -79,7 +79,7 @@ PATH="$HOME/.cargo/bin:$PATH" cargo test --release
 PATH="$HOME/.cargo/bin:$PATH" ./target/release/collie examples
 ```
 
-114 unit tests + 19 examples should pass. If something breaks, that's
+117 unit tests + 18 examples should pass. If something breaks, that's
 a real regression — find and fix.
 
 **Bench when perf is the point.** `./target/release/collie bench` for

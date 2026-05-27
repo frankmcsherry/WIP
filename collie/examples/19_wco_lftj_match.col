@@ -27,14 +27,13 @@ def lftj_lane_g {
    pos tlen <                                      :ok
    base  pos ok as.u64 *.u64  +.u64               :slot
    t_adj flatten drop slot gather                 :cand
-   p_adj p_pos view flatten drop                  :queries
-   cand queries =  ok and                         :hit          # flat, per proposer neighbor
+   p_adj p_pos view                               :queries      # List<c> per anchor
+   cand  queries flatten drop =  ok and           :hit          # flat mask, per proposer neighbor
 
-   # Regroup survivors per anchor: counts = hits per anchor → bounds → nest.
-   queries hit where gather                       :surv         # flat surviving c's
-   p_adj p_pos view list>bounds                   :pbnds
-   hit as.u64 pbnds nest  reduce.+.u64            :cnts         # survivors per anchor
-   surv  u64[0] cnts cumsum.u64 cat.2  nest                     # List<c> per anchor
+   # Survivors per anchor in ONE segmented filter: nest the flat hit mask
+   # back onto queries' bounds, then keep the c's where the mask is true.
+   # (Replaces the old where/gather + count/cumsum/cat re-nest dance.)
+   queries  hit queries list>bounds nest  filter                # List<c> per anchor
 }
 
 time

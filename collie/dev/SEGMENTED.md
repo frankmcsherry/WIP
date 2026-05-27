@@ -110,10 +110,55 @@ per-layer driver. Out of scope for this doc; see BACKLOG #0b.
 - Keep the boiling property: these are pure `SystemOp` variants (not
   body-bearing), so graphs stay boilable.
 
-## State at handoff
+## State — Steps 1–3 LANDED (2026-05-25)
 
-- Steps not started. Was about to read `cmp.rs`'s fall-through (the flat
-  typed path, after the `View<Mask>`/`View<Indices>` fast-paths) to place
-  the Step-1 List branch.
-- Witness `examples/19_wco_lftj_match.col` is in the suite (19 examples).
-- Suite baseline: 114 tests + 19 examples green.
+All three steps done; 121 tests (114 baseline + 7 new) + 19 examples green.
+
+**Step 1 — element-wise compute preserves `List`.** Shared helpers
+`list_elementwise2`/`list_elementwise1` in `helpers.rs` peel/rewrap a `List`
+(equal-bounds Lists, or List op length-1 scalar; mismatched bounds → error
+"segmented op: bounds differ"). Wired into the `run` of `cmp` (`Cmp`), `arith`
+(`Arith` + `UnaryArith`), `as` (`convert::As`, cast factored into
+`cast_prim`), and boolean `and`/`or`/`not` (`reduce_ops`). Each grew a
+`List<Prim>` typecheck arm (cmp → `List<P8>`, arith → `List<Prim>`, etc.);
+`shape::prim_width` is the shared peel helper. The flat/View paths are
+unchanged — the List branch sits *before* them and returns early.
+
+**Step 2 — segmented `filter`.** Representation dispatch on the existing
+`Filter` op (no new token; `SystemOp::Filter` already wired). Keyed on the
+**mask** being a `List<P8>`: materializes the (possibly row-shaped View) src
+into a real List, checks equal bounds, keeps per-row the elements where the
+mask is true, and computes new bounds from per-row survivor counts. Eager
+(unlike flat `filter`'s lazy `View<Mask>`), since per-row output length
+differs. No `nest.counts` op was needed — the count→bounds step is folded in.
+
+**Step 3 — `lftj_lane_g` rewritten.** The 4-line survivor re-nest dance
+(`where gather` + `list>bounds` + `nest` + `reduce.+` + `cumsum` + `cat` +
+`nest`) collapsed to one segmented filter:
+`queries  hit queries list>bounds nest  filter`. Output byte-identical
+(2,999,997 triples; old-vs-new full-column fingerprint equal; truncated
+displays identical at N=10 and N=1M).
+
+### Findings worth keeping
+
+- **The witness's *compute* stays flat, by nature.** `ok`/`slot`/`cand`/`hit`
+  are gather-driven (`cand = t_adj flatten drop slot gather`), and `gather`
+  is flat-indexed — so the grouping necessarily breaks at the gather and is
+  only recoverable at the *end*. So Step 1's element-wise List ops, while a
+  genuine catalogue-wide improvement (and unit-tested), are **not** the
+  dominant pattern in this particular witness; the real win here is the
+  segmented `filter` (Step 2) eliminating the count-changing re-nest. Forcing
+  the compute grouped would *add* spread+nest ops (per-anchor scalar
+  broadcast of `tlen`/`base`), not remove them — anti-simplification.
+- **The View-inner wrinkle surfaced exactly where the doc predicted**, but in
+  its mild form: `queries = p_adj p_pos view` is a `Value::View` with a
+  row-shaped `SequenceRange` selector — shape `List`, value `View`. The fix
+  was a runtime `materialize_top` in segmented `filter` (the old code also
+  materialized via `flatten drop`), **not** the deeper `RowAccess`
+  read-through (BACKLOG #0 prerequisite). That heavier work is still only
+  needed if we want the *compute* (cmp/arith on `List<View<Prim>>` inners) to
+  stay lazy — out of scope here.
+
+### Not done (Step 4)
+
+- Trie-walker (#0b) — out of scope per this doc; see BACKLOG #0b.

@@ -16,7 +16,8 @@ use crate::ir::stack::{Stack, pop_raw, materialize_top};
 use crate::ir::typecheck::{Typed, TypeStack, TypeEnv, tc_pop};
 use crate::ir::value::{Value, Prim, PrimWidth, Selector, Storage};
 use crate::ir::shape::Shape;
-use crate::ops::helpers::extract_prim;
+use crate::ir::shape::prim_width;
+use crate::ops::helpers::{extract_prim, list_elementwise2};
 
 #[derive(Copy, Clone, Debug)]
 pub enum CmpOp { Lt, Le, Eq, Ne, Ge, Gt }
@@ -25,21 +26,47 @@ pub enum CmpOp { Lt, Le, Eq, Ne, Ge, Gt }
 pub struct Cmp { pub op: CmpOp }
 
 impl Cmp {
-    pub fn op_name(&self) -> &'static str {
-        match self.op {
-            CmpOp::Lt => "<", CmpOp::Le => "<=",
-            CmpOp::Eq => "=", CmpOp::Ne => "!=",
-            CmpOp::Ge => ">=", CmpOp::Gt => ">",
-        }
+    pub fn op_name(&self) -> &'static str { op_name(self.op) }
+}
+
+/// Operator symbol — a free fn so the back-end `SystemOp::Cmp` can name the
+/// op without reconstructing a `Cmp` struct.
+pub fn op_name(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Lt => "<", CmpOp::Le => "<=",
+        CmpOp::Eq => "=", CmpOp::Ne => "!=",
+        CmpOp::Ge => ">=", CmpOp::Gt => ">",
     }
 }
 
 impl PrimOp for Cmp {
-    fn name(&self) -> &str { self.op_name() }
+    fn name(&self) -> &str { op_name(self.op) }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { run(self.op, st) }
+}
+
+impl Typed for Cmp {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { tc(st) }
+}
+
+/// The comparison kernel. The back-end `SystemOp::Cmp` calls this directly;
+/// the `Cmp` struct's `run` is a thin shim. Pops two operands; pushes a `P8`
+/// mask (or a `List<P8>` for the segmented equal-bounds-List path).
+pub fn run(op: CmpOp, st: &mut Stack) -> Result<(), String> {
         let b = pop_raw(st)?;
         let a = pop_raw(st)?;
+
+        // Segmented (List-preserving) path: equal-bounds Lists, or a List
+        // against a length-1 scalar. Comparing never crosses a row boundary,
+        // so we compute on the flat inner values and reattach the same bounds.
+        if let Some(res) = list_elementwise2(&a, &b, |va, vb| {
+            let pa = extract_prim(va, "cmp")?;
+            let pb = extract_prim(vb, "cmp")?;
+            Ok(Value::Prim(do_cmp(&pa, &pb, op)?))
+        }) {
+            st.push(res?);
+            return Ok(());
+        }
 
         // Mask-aware fast paths — chained-filter inner loop. `a` is
         // `View<Prim, Mask>`; depending on `b` we have three streaming
@@ -60,12 +87,12 @@ impl PrimOp for Cmp {
             if let Value::Prim(_) = src_a.as_ref() {
                 if let Value::Prim(pb) = &b {
                     if pb.len() == 1 {
-                        let out = do_cmp_masked_scalar(src_a.as_ref(), mask_a, pb, self.op)?;
+                        let out = do_cmp_masked_scalar(src_a.as_ref(), mask_a, pb, op)?;
                         st.push(Value::Prim(out));
                         return Ok(());
                     }
                     if pb.len() == a.len() {
-                        let out = do_cmp_masked_full(src_a.as_ref(), mask_a, pb, self.op)?;
+                        let out = do_cmp_masked_full(src_a.as_ref(), mask_a, pb, op)?;
                         st.push(Value::Prim(out));
                         return Ok(());
                     }
@@ -75,7 +102,7 @@ impl PrimOp for Cmp {
                         if a.len() == b.len() {
                             let out = do_cmp_both_masked(
                                 src_a.as_ref(), mask_a, src_b.as_ref(), mask_b,
-                                self.op)?;
+                                op)?;
                             st.push(Value::Prim(out));
                             return Ok(());
                         }
@@ -95,7 +122,7 @@ impl PrimOp for Cmp {
                     && matches!(src_b.as_ref(), Value::Prim(_))
                     && idx_a.len() == idx_b.len()
                 {
-                    let out = do_cmp_both_indices(src_a.as_ref(), idx_a, src_b.as_ref(), idx_b, self.op)?;
+                    let out = do_cmp_both_indices(src_a.as_ref(), idx_a, src_b.as_ref(), idx_b, op)?;
                     st.push(Value::Prim(out));
                     return Ok(());
                 }
@@ -108,14 +135,14 @@ impl PrimOp for Cmp {
         let b_mat = materialize_top(b)?;
         let pa = extract_prim(&a_mat, "cmp")?;
         let pb = extract_prim(&b_mat, "cmp")?;
-        let out = do_cmp(&pa, &pb, self.op)?;
+        let out = do_cmp(&pa, &pb, op)?;
         st.push(Value::Prim(out));
         Ok(())
-    }
 }
 
-impl Typed for Cmp {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+/// The comparison typecheck (op-independent: width-only). Back-end
+/// `SystemOp::Cmp` calls this directly.
+pub fn tc(st: &mut TypeStack) -> Result<(), String> {
         // Interp-free: ordering is by unsigned word, equality bitwise; the
         // two sides need only agree in width. (Signed/float ordering via
         // order-form inputs; `=`/`!=` are bit-equality.) Result is a P8 mask.
@@ -126,9 +153,24 @@ impl Typed for Cmp {
                 st.push(Shape::Prim(PrimWidth::W8));
                 Ok(())
             }
-            _ => Err(format!("cmp: needs same-width Prim on both sides, got {} and {}", a, b)),
+            // Segmented: List<Prim> on both sides (equal bounds width, equal
+            // inner width) → List<P8>; bounds propagate.
+            (Shape::List { bounds: lba, inner: ia }, Shape::List { bounds: lbb, inner: ib })
+                if lba == lbb && prim_width(ia).is_some() && prim_width(ia) == prim_width(ib) => {
+                st.push(Shape::List { bounds: *lba, inner: Box::new(Shape::Prim(PrimWidth::W8)) });
+                Ok(())
+            }
+            // List<Prim> against a length-1 scalar (broadcast) → List<P8>.
+            (Shape::List { bounds, inner }, Shape::Prim(wb)) if prim_width(inner) == Some(*wb) => {
+                st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(PrimWidth::W8)) });
+                Ok(())
+            }
+            (Shape::Prim(wa), Shape::List { bounds, inner }) if prim_width(inner) == Some(*wa) => {
+                st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(PrimWidth::W8)) });
+                Ok(())
+            }
+            _ => Err(format!("cmp: needs same-width Prim or equal-bounds List<Prim> on both sides, got {} and {}", a, b)),
         }
-    }
 }
 
 fn cmp_apply<T, F>(a: &[T], b: &[T], f: F) -> Result<Vec<u8>, String>
@@ -230,6 +272,38 @@ mod tests {
         let b = view(src_b, Selector::Indices(Arc::new(vec![0, 2, 1])));
         let r = run_cmp(CmpOp::Lt, a, b);
         assert_eq!(r, from_vec::<u8>(vec![0, 0, 1]));
+    }
+
+    #[test]
+    fn segmented_lt_preserves_list_bounds() {
+        // Two Lists with equal bounds [0,2,5]: rows [1,2] | [3,4,5] vs
+        // [9,1] | [9,9,9]. Per-row `<` → [1,0] | [1,1,1], same bounds.
+        use crate::ir::value::{bounds_var_from_ends, list};
+        let a = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u64>(vec![1, 2, 3, 4, 5]));
+        let b = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u64>(vec![9, 1, 9, 9, 9]));
+        let r = run_cmp(CmpOp::Lt, a, b);
+        let expected = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u8>(vec![1, 0, 1, 1, 1]));
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn segmented_cmp_against_scalar_broadcasts() {
+        // List<u64> rows [1,5] | [3] compared `>=` 3u64 → [0,1] | [1].
+        use crate::ir::value::{bounds_var_from_ends, list};
+        let a = list(bounds_var_from_ends(vec![2, 3]), from_vec::<u64>(vec![1, 5, 3]));
+        let r = run_cmp(CmpOp::Ge, a, from_vec::<u64>(vec![3]));
+        let expected = list(bounds_var_from_ends(vec![2, 3]), from_vec::<u8>(vec![0, 1, 1]));
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn segmented_cmp_mismatched_bounds_errors() {
+        use crate::ir::value::{bounds_var_from_ends, list};
+        let a = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u64>(vec![1, 2, 3, 4, 5]));
+        let b = list(bounds_var_from_ends(vec![3, 5]), from_vec::<u64>(vec![1, 2, 3, 4, 5]));
+        let mut st = vec![a, b];
+        let mut env = Vec::new();
+        assert!(Cmp { op: CmpOp::Lt }.run(&mut st, &mut env).is_err());
     }
 
     #[test]

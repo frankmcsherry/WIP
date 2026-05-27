@@ -44,17 +44,18 @@ use crate::ops::helpers::{gallop_to, gather, sort_merge_intersect, materialize};
 impl PrimOp for Intersect {
     fn name(&self) -> &str { "intersect" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 2)) }  // (a, b) → (positions_in_a, positions_in_b)
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { intersect_run(st) }
+}
+/// `intersect` kernel (back-end `SystemOp::Intersect` calls this directly).
+pub fn intersect_run(st: &mut Stack) -> Result<(), String> {
         // pop_raw so a View on either side flows through naturally; the
         // dispatcher materializes only when it needs to.
         let b = pop_raw(st)?;
         let a = pop_raw(st)?;
-        self.run_dispatch(st, a, b)
-    }
+        intersect_run_dispatch(st, a, b)
 }
 
-impl Intersect {
-    /// Dispatch on input shape (rank-polymorphic). Returns matched
+/// Dispatch on input shape (rank-polymorphic). Returns matched
     /// **positions** in each side, in source coordinates:
     ///
     ///   - Flat: `SEQ<T> × SEQ<T> -> SEQ<u64> × SEQ<u64>` — positions in a,
@@ -66,7 +67,7 @@ impl Intersect {
     /// The flat form is the rank-1 case of the list-shaped form. Matched
     /// values are derivable via `gather`; positions are strictly more
     /// informative (you can gather any column at those positions).
-    fn run_dispatch(&self, st: &mut Stack, a: Value, b: Value) -> Result<(), String> {
+fn intersect_run_dispatch(st: &mut Stack, a: Value, b: Value) -> Result<(), String> {
         // Peel a flat View (Indices/Range); leave SequenceRange views.
         let a = peel_flat_view(a)?;
         let b = peel_flat_view(b)?;
@@ -89,21 +90,20 @@ impl Intersect {
                         a_lists.n_lists(), b_lists.n_lists()
                     ));
                 }
-                self.run_per_list(st, &a_lists, &b_lists)
+                intersect_run_per_list(st, &a_lists, &b_lists)
             }
             (other_a, other_b) => Err(format!(
                 "intersect: expected (Prim, Prim) or two list-shaped inputs, got ({:?}, {:?})",
                 other_a, other_b
             )),
         }
-    }
+}
 
-    fn run_per_list(
-        &self,
-        st: &mut Stack,
-        a: &ListAccess,
-        b: &ListAccess,
-    ) -> Result<(), String> {
+fn intersect_run_per_list(
+    st: &mut Stack,
+    a: &ListAccess,
+    b: &ListAccess,
+) -> Result<(), String> {
         let n_lists = a.n_lists();
         // Per-row matched POSITIONS, in source coordinates: for each row,
         // emit the positions of matches in a's source AND in b's source.
@@ -176,7 +176,6 @@ impl Intersect {
         st.push(pos_a);
         st.push(pos_b);
         Ok(())
-    }
 }
 
 /// Peel a flat-selector View (Indices/Range) by materializing it. Leaves
@@ -300,7 +299,9 @@ impl<'a> ListAccess<'a> {
 }
 
 impl Typed for Intersect {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { intersect_tc(st) }
+}
+pub fn intersect_tc(st: &mut TypeStack) -> Result<(), String> {
         let b = tc_pop(st, "intersect")?;
         let a = tc_pop(st, "intersect")?;
         // Interp-free: the two sides need only agree in width.
@@ -335,7 +336,6 @@ impl Typed for Intersect {
                 a, b
             )),
         }
-    }
 }
 
 /// `search.<interp>` — for each value in `queries`, find its `lower_bound`
@@ -359,7 +359,10 @@ impl Typed for Intersect {
 impl PrimOp for Search {
     fn name(&self) -> &str { "search" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }  // (target, queries) → positions
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { search_run(st) }
+}
+/// `search` kernel (back-end `SystemOp::Search` calls this directly).
+pub fn search_run(st: &mut Stack) -> Result<(), String> {
         // Two input shapes:
         //   (Prim, Prim) — flat: gallop, output P64 of positions.
         //   (List/View<SequenceRange>, List/View<SequenceRange>) — list-shaped:
@@ -377,7 +380,7 @@ impl PrimOp for Search {
                     target_lists.n_lists(), queries_lists.n_lists()
                 ));
             }
-            return self.run_per_list(st, &target_lists, &queries_lists);
+            return search_run_per_list(st, &target_lists, &queries_lists);
         }
 
         // Otherwise, flat form. Materialize each side to a contiguous Prim
@@ -390,21 +393,18 @@ impl PrimOp for Search {
         let positions = search_sort_gallop(&target_p, &queries_p)?;
         st.push(Value::Prim(Prim::P64(Arc::new(positions))));
         Ok(())
-    }
 }
 
-impl Search {
-    /// Per-list search. For each inner list i, sorts `queries[i]` and
-    /// galloples a single forward cursor over `target[i]` (sort-then-gallop,
-    /// not a per-query random restart). Output: List<u64> of per-list
-    /// positions (row-local within the corresponding target sub-list).
-    /// Position == |target[i]| is the past-end sentinel.
-    fn run_per_list(
-        &self,
-        st: &mut Stack,
-        target: &ListAccess,
-        queries: &ListAccess,
-    ) -> Result<(), String> {
+/// Per-list search. For each inner list i, sorts `queries[i]` and
+/// galloples a single forward cursor over `target[i]` (sort-then-gallop,
+/// not a per-query random restart). Output: List<u64> of per-list
+/// positions (row-local within the corresponding target sub-list).
+/// Position == |target[i]| is the past-end sentinel.
+fn search_run_per_list(
+    st: &mut Stack,
+    target: &ListAccess,
+    queries: &ListAccess,
+) -> Result<(), String> {
         let n_lists = target.n_lists();
         macro_rules! per_row { ($t:ty) => {{
             let t_slice = <$t as Storage>::extract(target.source_prim())?;
@@ -435,7 +435,6 @@ impl Search {
         };
         st.push(out);
         Ok(())
-    }
 }
 
 /// Materialize a flat Value (Prim or flat-selector View) to a contiguous
@@ -454,7 +453,9 @@ fn flatten_to_prim(v: Value, op: &str) -> Result<Prim, String> {
     }
 }
 impl Typed for Search {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { search_tc(st) }
+}
+pub fn search_tc(st: &mut TypeStack) -> Result<(), String> {
         let queries = tc_pop(st, "search")?;
         let target = tc_pop(st, "search")?;
         // Interp-free: target and queries need only agree in width (search
@@ -484,39 +485,44 @@ impl Typed for Search {
                 target, queries
             )),
         }
-    }
 }
 
 #[derive(Debug)] pub struct Gather;
 impl PrimOp for Gather {
     fn name(&self) -> &str { "gather" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }  // (col, idxs) → gathered
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let idxs = match pop(st)? {
-            Value::Prim(Prim::P64(i)) => i,
-            other => return Err(format!("gather: idxs must be P64, got {:?}", other)),
-        };
-        let col = pop(st)?;
-        let idxs_usize: Vec<usize> = idxs.iter().map(|&i| i as usize).collect();
-        st.push(gather(&col, &idxs_usize)?);
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { gather_run(st) }
 }
 impl Typed for Gather {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let idxs = tc_pop(st, "gather")?;
-        if idxs != Shape::Prim(PrimWidth::W64) { return Err(format!("gather: idxs must be Prim(P64), got {}", idxs)); }
-        let col = tc_pop(st, "gather")?;
-        st.push(col);
-        Ok(())
-    }
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { gather_tc(st) }
+}
+/// `gather` kernel (back-end `SystemOp::Gather` calls this directly).
+pub fn gather_run(st: &mut Stack) -> Result<(), String> {
+    let idxs = match pop(st)? {
+        Value::Prim(Prim::P64(i)) => i,
+        other => return Err(format!("gather: idxs must be P64, got {:?}", other)),
+    };
+    let col = pop(st)?;
+    let idxs_usize: Vec<usize> = idxs.iter().map(|&i| i as usize).collect();
+    st.push(gather(&col, &idxs_usize)?);
+    Ok(())
+}
+pub fn gather_tc(st: &mut TypeStack) -> Result<(), String> {
+    let idxs = tc_pop(st, "gather")?;
+    if idxs != Shape::Prim(PrimWidth::W64) { return Err(format!("gather: idxs must be Prim(P64), got {}", idxs)); }
+    let col = tc_pop(st, "gather")?;
+    st.push(col);
+    Ok(())
 }
 
 #[derive(Debug)] pub struct XProd;
 impl PrimOp for XProd {
     fn name(&self) -> &str { "xprod" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }  // Prod[List, List] → List<Prod>
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { xprod_run(st) }
+}
+/// `xprod` kernel (back-end `SystemOp::XProd` calls this directly).
+pub fn xprod_run(st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         let (list_a, list_b) = match v {
             Value::Prod(fs) if fs.len() == 2 => (fs[0].clone(), fs[1].clone()),
@@ -562,7 +568,6 @@ impl PrimOp for XProd {
             values: Arc::new(prod(vec![a_g, b_g])),
         });
         Ok(())
-    }
 }
 /// Column-at-a-time `search`: instead of a per-query *random* gallop that
 /// restarts on the whole target, **sort the queries**, then sweep a single
@@ -632,7 +637,9 @@ pub fn register(r: &mut crate::syntax::registry::OpRegistry) {
 }
 
 impl Typed for XProd {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { xprod_tc(st) }
+}
+pub fn xprod_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "xprod")?;
         match v {
             Shape::Prod(fs) if fs.len() == 2 => {
@@ -643,7 +650,6 @@ impl Typed for XProd {
             }
             other => Err(format!("xprod: expected Prod[List, List], got {}", other)),
         }
-    }
 }
 
 #[cfg(test)]
@@ -917,9 +923,8 @@ mod tests {
              u64[1 2 3 5 7] swap gather",
             &reg,
         ).unwrap();
-        let mut st = vec![];
-        let mut env = Vec::new();
-        crate::ir::op::eval(&prog, &mut st, &mut env).unwrap();
+        let (g, _) = crate::pipeline::build(prog).unwrap();
+        let st = crate::pipeline::eval_graph(&g).unwrap();
         assert_eq!(st.len(), 1);
         assert_eq!(st[0], from_vec::<u64>(vec![2, 3, 5]));
     }

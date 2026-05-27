@@ -84,12 +84,11 @@ trade each makes.
 
 ```
 cargo run --release                                          # default demo
-cargo run --release -- examples                              # all 19 examples
+cargo run --release -- examples                              # all 18 examples
 cargo run --release -- examples/17_wco_list_intersect.col    # one example
 cargo run --release -- foo.col                               # any .col file
-cargo run --release -- repl                                  # interactive REPL
 cargo run --release -- bench                                 # microbenchmarks
-cargo test  --release                                        # 114 unit tests
+cargo test  --release                                        # 117 unit tests
 ```
 
 ## What's where
@@ -99,7 +98,7 @@ src/
   ir/         language definition (value, stack, op, shape, typecheck)
   ops/        operators — one file per family
   syntax/     parser + registry
-  tools/      binary-only (REPL, bench, pretty, serialize, demos)
+  tools/      binary-only (bench, pretty, serialize, demos)
 examples/     19 .col files — tour from basics through WCO triangle
 dev/          workshop notes (BACKLOG, FOLLOWUPS, SURFACE, ONBOARDING)
 ```

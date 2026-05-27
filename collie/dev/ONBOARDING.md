@@ -185,6 +185,17 @@ is what lets `each { reduce.+.u64 }` work without per-row stack juggling.
   `reduce.all` — specialized reducers.
 - `.{ p0 ; p1 ; … }` — cleave: each path runs against a fresh copy of TOS;
   results gathered into a Prod.
+- **Segmented compute** — element-wise ops (`cmp`, `arith` incl.
+  `neg`/`abs`, `as`, boolean `and`/`or`/`not`) and `filter` dispatch on
+  representation to *preserve* `List` grouping instead of forcing a
+  `flatten` → compute → re-nest round-trip. An element-wise op on
+  equal-bounds `List`s (or a `List` against a length-1 scalar) runs on the
+  flat inner values and reattaches the same bounds (`List<T> op List<T> →
+  List<T'>`); segmented `filter` keeps per-row the elements where an
+  aligned `List<bool>` mask is true, deriving new bounds from the per-row
+  survivor counts. Same tokens as the flat forms — representation dispatch,
+  not a `*.seg` op family. See the "Segmented compute preserves grouping"
+  idiom in `PRINCIPLES.md`; witness in `examples/19_wco_lftj_match.col`.
 
 **Joins / lookups** (in `ops/join.rs`):
 - `gather` — `(col, P64-idxs) → col`. Works on Prim/Prod/List (recursive).

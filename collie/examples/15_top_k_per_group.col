@@ -3,9 +3,9 @@
 # Same dataset as 48, different ask: for each (rf, ls) group, return the
 # top 3 quantity values descending.
 #
-# Written in `>name` flat-binding form. The per-row sort is the genuine
-# use of `each` — sorting *within each row* is per-row work, exactly
-# what each is for.
+# Per-group top-k via the segmented (per-row) ops — `sort.segmented`,
+# `reverse.segmented`, `take.segmented` — the collective form of the old
+# `each { sort reverse 3u64 take }`. No per-row interpreter dispatch.
 
 time
 
@@ -23,8 +23,8 @@ returnflag as.u64 2u64 *.u64  linestatus as.u64 +.u64   :key
 # Group quantities by key.
 quantity key group                             :[uniq_keys grouped]
 
-# Per-group: sort ascending, reverse, take top 3.
-grouped each { sort reverse 3u64 take }        :top_3_per_group
+# Per-group: sort ascending, reverse → descending, take top 3.
+grouped sort.segmented reverse.segmented 3u64 take.segmented   :top_3_per_group
 
 # Unpack key back to (rf, ls).
 uniq_keys 2u64 /.u64  as.u8                        :rf_out

@@ -56,14 +56,14 @@ pub fn swizzle(p: Prim, interp: Interp, encode: bool) -> Result<Prim, String> {
     })
 }
 
-fn run_swizzle(st: &mut Stack, interp: Interp, encode: bool, who: &str) -> Result<(), String> {
+pub fn run_swizzle(st: &mut Stack, interp: Interp, encode: bool, who: &str) -> Result<(), String> {
     match pop(st)? {
         Value::Prim(p) => { st.push(Value::Prim(swizzle(p, interp, encode)?)); Ok(()) }
         other => Err(format!("{}: expected Prim, got {}", who, other)),
     }
 }
 
-fn tc_swizzle(st: &mut TypeStack, interp: Interp, who: &str) -> Result<(), String> {
+pub fn tc_swizzle(st: &mut TypeStack, interp: Interp, who: &str) -> Result<(), String> {
     let s = tc_pop(st, who)?;
     let w = interp.width();
     match s {

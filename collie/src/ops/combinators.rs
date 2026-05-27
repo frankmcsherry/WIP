@@ -2,28 +2,34 @@
 //! eliminators for `Prod`, `Sum`, and `List`. Three families:
 //!
 //! - **Prod**: `zipN`, `detupleN`, `proj` (`.i`), `entupleN`.
-//! - **Sum**: `injectN`, `split`, `partitionN`, `branch`, `match`,
+//! - **Sum**: `injectN`, `split`, `mergeN`, `partitionN`, `branch`,
 //!   `cleave` (`.{ path0 ; path1 }`).
 //! - **List shape**: `nest`, `nest.stride`, `flatten`, `enlist`,
 //!   `unlist`.
 //!
-//! `match` and `cleave` are body-bearing but dispatch per-lane /
-//! per-path (bounded by the type structure, not by N rows), so
-//! they're principle-2-aligned in spirit — see `PRINCIPLES.md`.
+//! `cleave` is body-bearing but dispatches per-path (bounded by the type
+//! structure, not by N rows), so it's principle-2-aligned in spirit — see
+//! `PRINCIPLES.md`. (`match` was retired: it desugars in the parser to
+//! `split` / per-lane arms / `mergeN`, so no body-bearing op is built.)
 
-use crate::ir::op::{PrimOp, eval};
+use crate::ir::op::PrimOp;
 use crate::ir::stack::{Stack, pop};
-use crate::ir::typecheck::{Op, Typed, TypeStack, TypeEnv, tc_pop, typecheck};
+use crate::ir::typecheck::{Typed, TypeStack, TypeEnv, tc_pop};
 use crate::ir::value::{Value, PrimWidth, prod, sum, list};
 use crate::ir::shape::{Shape, disc_as_u8};
-use crate::ops::helpers::{broadcast, gather, merge_by_disc};
+use crate::ops::helpers::{gather, merge_by_disc};
 
 #[derive(Debug)] pub struct ZipN { pub n: usize }
 impl PrimOp for ZipN {
     fn name(&self) -> &str { "zip" }
     fn arity(&self) -> Option<(usize, usize)> { Some((self.n, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let n = self.n;
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { zip_run(self.n, st) }
+}
+impl Typed for ZipN {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { zip_tc(self.n, st) }
+}
+/// `zipN` kernel (back-end `SystemOp::Zip` calls this directly).
+pub fn zip_run(n: usize, st: &mut Stack) -> Result<(), String> {
         let mut fs = Vec::with_capacity(n);
         for _ in 0..n { fs.push(pop(st)?); }
         fs.reverse();
@@ -34,17 +40,14 @@ impl PrimOp for ZipN {
         }
         st.push(prod(fs));
         Ok(())
-    }
 }
-impl Typed for ZipN {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        if st.len() < self.n { return Err(format!("zip{}: stack {}", self.n, st.len())); }
-        let mut fs = Vec::with_capacity(self.n);
-        for _ in 0..self.n { fs.push(st.pop().unwrap()); }
+pub fn zip_tc(n: usize, st: &mut TypeStack) -> Result<(), String> {
+        if st.len() < n { return Err(format!("zip{}: stack {}", n, st.len())); }
+        let mut fs = Vec::with_capacity(n);
+        for _ in 0..n { fs.push(st.pop().unwrap()); }
         fs.reverse();
         st.push(Shape::Prod(fs));
         Ok(())
-    }
 }
 
 /// `detuple.K` (or `detuple` for K=2) — opposite of `zipK`/`entupleK`. Pops a
@@ -54,48 +57,57 @@ impl Typed for ZipN {
 impl PrimOp for DetupleN {
     fn name(&self) -> &str { "detuple" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, self.n)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { detuple_run(self.n, st) }
+}
+impl Typed for DetupleN {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { detuple_tc(self.n, st) }
+}
+/// `detupleN` kernel (back-end `SystemOp::Detuple` calls this directly).
+pub fn detuple_run(n: usize, st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         match v {
             Value::Prod(fs) => {
-                if fs.len() != self.n {
-                    return Err(format!("detuple{}: prod has {} fields", self.n, fs.len()));
+                if fs.len() != n {
+                    return Err(format!("detuple{}: prod has {} fields", n, fs.len()));
                 }
                 for f in fs.iter() { st.push(f.clone()); }
                 Ok(())
             }
-            other => Err(format!("detuple{}: not a prod: {:?}", self.n, other)),
+            other => Err(format!("detuple{}: not a prod: {:?}", n, other)),
         }
-    }
 }
-impl Typed for DetupleN {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn detuple_tc(n: usize, st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "detuple")?;
         match v {
             Shape::Prod(fs) => {
-                if fs.len() != self.n {
-                    return Err(format!("detuple{}: prod has {} fields", self.n, fs.len()));
+                if fs.len() != n {
+                    return Err(format!("detuple{}: prod has {} fields", n, fs.len()));
                 }
                 for f in fs { st.push(f); }
                 Ok(())
             }
-            other => Err(format!("detuple{}: not a prod: {}", self.n, other)),
+            other => Err(format!("detuple{}: not a prod: {}", n, other)),
         }
-    }
 }
 
 #[derive(Debug)] pub struct Proj { pub i: usize }
 impl PrimOp for Proj {
     fn name(&self) -> &str { "." }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }  // Prod (or List<Prod>) → field
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { proj_run(self.i, st) }
+}
+impl Typed for Proj {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { proj_tc(self.i, st) }
+}
+/// `.i` projection kernel (back-end `SystemOp::Proj` calls this directly).
+pub fn proj_run(i: usize, st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         match v {
             Value::Prod(fs) => {
-                if self.i >= fs.len() {
-                    return Err(format!(".{}: only {} fields", self.i, fs.len()));
+                if i >= fs.len() {
+                    return Err(format!(".{}: only {} fields", i, fs.len()));
                 }
-                st.push(fs[self.i].clone());
+                st.push(fs[i].clone());
                 Ok(())
             }
             // List<Prod[A, B, C]> projects to List<field_i>, preserving
@@ -104,51 +116,54 @@ impl PrimOp for Proj {
             // needing an `each` to descend through the list.
             Value::List { bounds, values } => match &*values {
                 Value::Prod(fs) => {
-                    if self.i >= fs.len() {
-                        return Err(format!(".{}: List<Prod> has {} fields", self.i, fs.len()));
+                    if i >= fs.len() {
+                        return Err(format!(".{}: List<Prod> has {} fields", i, fs.len()));
                     }
-                    let inner = fs[self.i].clone();
+                    let inner = fs[i].clone();
                     st.push(Value::List { bounds, values: std::sync::Arc::new(inner) });
                     Ok(())
                 }
-                other => Err(format!(".{}: List inner is not a product: {:?}", self.i, other)),
+                other => Err(format!(".{}: List inner is not a product: {:?}", i, other)),
             },
-            other => Err(format!(".{}: not a product: {:?}", self.i, other)),
+            other => Err(format!(".{}: not a product: {:?}", i, other)),
         }
-    }
 }
-impl Typed for Proj {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn proj_tc(i: usize, st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, ".i")?;
         match v {
             Shape::Prod(fs) => {
-                if self.i >= fs.len() { return Err(format!(".{}: prod has {} fields", self.i, fs.len())); }
-                st.push(fs.into_iter().nth(self.i).unwrap());
+                if i >= fs.len() { return Err(format!(".{}: prod has {} fields", i, fs.len())); }
+                st.push(fs.into_iter().nth(i).unwrap());
                 Ok(())
             }
             Shape::List { bounds, inner } => match *inner {
                 Shape::Prod(fs) => {
-                    if self.i >= fs.len() {
-                        return Err(format!(".{}: List<Prod> has {} fields", self.i, fs.len()));
+                    if i >= fs.len() {
+                        return Err(format!(".{}: List<Prod> has {} fields", i, fs.len()));
                     }
-                    let field = fs.into_iter().nth(self.i).unwrap();
+                    let field = fs.into_iter().nth(i).unwrap();
                     st.push(Shape::List { bounds, inner: Box::new(field) });
                     Ok(())
                 }
-                other => Err(format!(".{}: List inner is not a product: {}", self.i, other)),
+                other => Err(format!(".{}: List inner is not a product: {}", i, other)),
             },
-            other => Err(format!(".{}: not a product: {}", self.i, other)),
+            other => Err(format!(".{}: not a product: {}", i, other)),
         }
-    }
 }
 
 #[derive(Debug)] pub struct InjectN { pub n: usize }
 impl PrimOp for InjectN {
     fn name(&self) -> &str { "inject" }
     fn arity(&self) -> Option<(usize, usize)> { Some((self.n + 1, 1)) }  // disc + N lanes → Sum
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let mut lanes = Vec::with_capacity(self.n);
-        for _ in 0..self.n { lanes.push(pop(st)?); }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { inject_run(self.n, st) }
+}
+impl Typed for InjectN {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { inject_tc(self.n, st) }
+}
+/// `injectN` kernel (back-end `SystemOp::Inject` calls this directly).
+pub fn inject_run(n: usize, st: &mut Stack) -> Result<(), String> {
+        let mut lanes = Vec::with_capacity(n);
+        for _ in 0..n { lanes.push(pop(st)?); }
         lanes.reverse();
         let disc_v = pop(st)?;
         let disc = match disc_v {
@@ -160,33 +175,36 @@ impl PrimOp for InjectN {
             let want = disc_u8.iter().filter(|&&d| d as usize == k).count();
             if lane.len() != want {
                 return Err(format!("inject{}: lane {} has len {}, expected {}",
-                                   self.n, k, lane.len(), want));
+                                   n, k, lane.len(), want));
             }
         }
         st.push(sum(disc, lanes));
         Ok(())
-    }
 }
-impl Typed for InjectN {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        if st.len() < self.n + 1 { return Err(format!("inject{}: stack {}", self.n, st.len())); }
-        let mut lanes = Vec::with_capacity(self.n);
-        for _ in 0..self.n { lanes.push(st.pop().unwrap()); }
+pub fn inject_tc(n: usize, st: &mut TypeStack) -> Result<(), String> {
+        if st.len() < n + 1 { return Err(format!("inject{}: stack {}", n, st.len())); }
+        let mut lanes = Vec::with_capacity(n);
+        for _ in 0..n { lanes.push(st.pop().unwrap()); }
         lanes.reverse();
         let disc = st.pop().unwrap();
         let disc_w = match disc {
             Shape::Prim(w) => w,
-            other => return Err(format!("inject{}: disc must be Prim, got {}", self.n, other)),
+            other => return Err(format!("inject{}: disc must be Prim, got {}", n, other)),
         };
         st.push(Shape::Sum { disc: disc_w, lanes });
         Ok(())
-    }
 }
 
 #[derive(Debug)] pub struct Split;
 impl PrimOp for Split {
     fn name(&self) -> &str { "split" }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { split_run(st) }
+}
+impl Typed for Split {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { split_tc(st) }
+}
+/// `split` kernel (back-end `SystemOp::Split` calls this directly).
+pub fn split_run(st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         match v {
             Value::Sum { disc, lanes } => {
@@ -196,10 +214,8 @@ impl PrimOp for Split {
             }
             other => Err(format!("split: not a sum: {:?}", other)),
         }
-    }
 }
-impl Typed for Split {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn split_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "split")?;
         match v {
             Shape::Sum { disc, lanes } => {
@@ -209,14 +225,70 @@ impl Typed for Split {
             }
             other => Err(format!("split: not a sum: {}", other)),
         }
-    }
+}
+
+/// `mergeN` — reassemble N per-lane columns into one column, ordered by a
+/// discriminant. The inverse of `split`/`partition`: given
+/// `disc lane0 … lane_{N-1}` (disc deepest, as `split` produces), walk `disc`
+/// and emit one element per position from the matching lane's cursor. Each
+/// lane's length must equal the count of its disc value. Output shape is the
+/// (shared) lane shape.
+///
+/// This is the merge half of `match` — `match { -> a0 -> a1 }` desugars to
+/// `split :[disc l0 l1]  disc  l0 a0  l1 a1  merge2`. (Dotless + arity-suffixed
+/// like `injectN`/`partitionN`; bare `merge` is reserved for sorted-set union.)
+#[derive(Debug)] pub struct MergeN { pub n: usize }
+impl PrimOp for MergeN {
+    fn name(&self) -> &str { "merge" }
+    fn arity(&self) -> Option<(usize, usize)> { Some((self.n + 1, 1)) }  // disc + N lanes → merged
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { merge_run(self.n, st) }
+}
+impl Typed for MergeN {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { merge_tc(self.n, st) }
+}
+/// `mergeN` kernel (back-end `SystemOp::Merge` calls this directly).
+pub fn merge_run(n: usize, st: &mut Stack) -> Result<(), String> {
+        let mut lanes = Vec::with_capacity(n);
+        for _ in 0..n { lanes.push(pop(st)?); }
+        lanes.reverse();
+        let disc_v = pop(st)?;
+        let disc = match disc_v {
+            Value::Prim(p) => p,
+            other => return Err(format!("merge{}: disc must be Prim, got {:?}", n, other)),
+        };
+        let disc_u8 = disc_as_u8(&disc)?;
+        let merged = merge_by_disc(disc_u8, &lanes)?;
+        st.push(merged);
+        Ok(())
+}
+pub fn merge_tc(n: usize, st: &mut TypeStack) -> Result<(), String> {
+        if st.len() < n + 1 { return Err(format!("merge{}: stack {}", n, st.len())); }
+        let mut lanes = Vec::with_capacity(n);
+        for _ in 0..n { lanes.push(st.pop().unwrap()); }
+        lanes.reverse();
+        let _disc = st.pop().unwrap();  // P8 discriminant (width-checked at run)
+        // All lanes must agree in shape; the merged column has that shape.
+        let first = lanes[0].clone();
+        for (k, l) in lanes.iter().enumerate().skip(1) {
+            if *l != first {
+                return Err(format!("merge{}: lane {} shape {} != lane 0 shape {}", n, k, l, first));
+            }
+        }
+        st.push(first);
+        Ok(())
 }
 
 #[derive(Debug)] pub struct PartitionN { pub n: usize }
 impl PrimOp for PartitionN {
     fn name(&self) -> &str { "partition" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, self.n)) }  // (col, disc) → N lanes
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { partition_run(self.n, st) }
+}
+impl Typed for PartitionN {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { partition_tc(self.n, st) }
+}
+/// `partitionN` kernel (back-end `SystemOp::Partition` calls this directly).
+pub fn partition_run(n: usize, st: &mut Stack) -> Result<(), String> {
         let disc_v = pop(st)?;
         let disc = match disc_v {
             Value::Prim(p) => p,
@@ -225,31 +297,28 @@ impl PrimOp for PartitionN {
         let disc_u8 = disc_as_u8(&disc)?.to_vec();
         let col = pop(st)?;
         if col.len() != disc_u8.len() {
-            return Err(format!("partition{}: col len {} != disc len {}", self.n, col.len(), disc_u8.len()));
+            return Err(format!("partition{}: col len {} != disc len {}", n, col.len(), disc_u8.len()));
         }
-        let mut lanes: Vec<Vec<usize>> = vec![Vec::new(); self.n];
+        let mut lanes: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (i, &d) in disc_u8.iter().enumerate() {
             let k = d as usize;
-            if k >= self.n { return Err(format!("partition{}: disc {} out of range", self.n, k)); }
+            if k >= n { return Err(format!("partition{}: disc {} out of range", n, k)); }
             lanes[k].push(i);
         }
         for idxs in lanes {
             st.push(gather(&col, &idxs)?);
         }
         Ok(())
-    }
 }
-impl Typed for PartitionN {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn partition_tc(n: usize, st: &mut TypeStack) -> Result<(), String> {
         let disc = tc_pop(st, "partition")?;
         match disc {
             Shape::Prim(_) => {}
-            other => return Err(format!("partition{}: disc must be Prim, got {}", self.n, other)),
+            other => return Err(format!("partition{}: disc must be Prim, got {}", n, other)),
         }
         let col = tc_pop(st, "partition")?;
-        for _ in 0..self.n { st.push(col.clone()); }
+        for _ in 0..n { st.push(col.clone()); }
         Ok(())
-    }
 }
 
 /// `branch.K` — the *constructor* pair for `match`. Pops `(col, disc)` and
@@ -261,169 +330,65 @@ impl Typed for PartitionN {
 impl PrimOp for Branch {
     fn name(&self) -> &str { "branch" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }  // (col, disc) → sum
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { branch_run(self.k, st) }
+}
+impl Typed for Branch {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { branch_tc(self.k, st) }
+}
+/// `branch.K` kernel (back-end `SystemOp::Branch` calls this directly).
+pub fn branch_run(k_arity: usize, st: &mut Stack) -> Result<(), String> {
         let disc_v = pop(st)?;
         let disc_prim = match disc_v {
             Value::Prim(p) => p,
-            other => return Err(format!("branch.{}: disc must be Prim, got {:?}", self.k, other)),
+            other => return Err(format!("branch.{}: disc must be Prim, got {:?}", k_arity, other)),
         };
         let disc_u8: Vec<u8> = disc_as_u8(&disc_prim)?.to_vec();
         let col = pop(st)?;
         if col.len() != disc_u8.len() {
             return Err(format!(
-                "branch.{}: col len {} != disc len {}", self.k, col.len(), disc_u8.len()
+                "branch.{}: col len {} != disc len {}", k_arity, col.len(), disc_u8.len()
             ));
         }
         for &d in &disc_u8 {
-            if (d as usize) >= self.k {
-                return Err(format!("branch.{}: disc value {} >= K", self.k, d));
+            if (d as usize) >= k_arity {
+                return Err(format!("branch.{}: disc value {} >= K", k_arity, d));
             }
         }
 
         // Partition by disc, build lanes.
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); self.k];
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); k_arity];
         for (i, &d) in disc_u8.iter().enumerate() {
             buckets[d as usize].push(i);
         }
-        let mut lanes: Vec<Value> = Vec::with_capacity(self.k);
+        let mut lanes: Vec<Value> = Vec::with_capacity(k_arity);
         for idxs in &buckets {
             lanes.push(gather(&col, idxs)?);
         }
 
         st.push(sum(crate::ir::value::prim_p8(disc_u8), lanes));
         Ok(())
-    }
 }
-impl Typed for Branch {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn branch_tc(k_arity: usize, st: &mut TypeStack) -> Result<(), String> {
         let disc = tc_pop(st, "branch")?;
         match disc {
             Shape::Prim(_) => {}
-            other => return Err(format!("branch.{}: disc must be Prim, got {}", self.k, other)),
+            other => return Err(format!("branch.{}: disc must be Prim, got {}", k_arity, other)),
         }
         let col = tc_pop(st, "branch")?;
-        let mut lanes = Vec::with_capacity(self.k);
-        for _ in 0..self.k { lanes.push(col.clone()); }
+        let mut lanes = Vec::with_capacity(k_arity);
+        for _ in 0..k_arity { lanes.push(col.clone()); }
         st.push(Shape::Sum { disc: PrimWidth::W8, lanes });
         Ok(())
-    }
-}
-
-#[derive(Debug)] pub struct Match { pub arms: Vec<Vec<Box<dyn Op>>> }
-impl PrimOp for Match {
-    fn name(&self) -> &str { "match" }
-    fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }  // sum → merged value
-    fn run(&self, st: &mut Stack, env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        let (disc, lanes) = match v {
-            Value::Sum { disc, lanes } => (disc, lanes),
-            other => return Err(format!("match: not a sum: {:?}", other)),
-        };
-        if lanes.len() != self.arms.len() {
-            return Err(format!("match: {} arms, {} variants", self.arms.len(), lanes.len()));
-        }
-        let mut outputs = Vec::with_capacity(self.arms.len());
-        for (arm, lane) in self.arms.iter().zip(lanes.iter()) {
-            let lane = lane.clone();
-            let mut sub = vec![lane.clone()];
-            let target_len = lane.len();
-            eval(arm, &mut sub, env)?;
-            if sub.len() != 1 {
-                return Err(format!("match arm left {} values on stack", sub.len()));
-            }
-            let mut out = sub.pop().unwrap();
-            if out.len() == 1 && target_len != 1 {
-                out = broadcast(&out, target_len);
-            }
-            if out.len() != target_len {
-                return Err(format!("match arm produced len {}, expected {}", out.len(), target_len));
-            }
-            outputs.push(out);
-        }
-        let disc_u8 = disc_as_u8(&disc)?.to_vec();
-        let merged = merge_by_disc(&disc_u8, &outputs)?;
-        st.push(merged);
-        Ok(())
-    }
-}
-impl Typed for Match {
-    fn tc(&self, st: &mut TypeStack, env: &mut TypeEnv) -> Result<(), String> {
-        let v = tc_pop(st, "match")?;
-        let lanes = match v {
-            Shape::Sum { lanes, .. } => lanes,
-            other => return Err(format!("match: expected Sum, got {}", other)),
-        };
-        if self.arms.len() != lanes.len() {
-            return Err(format!("match: {} arms but {} variants", self.arms.len(), lanes.len()));
-        }
-        let mut common: Option<Shape> = None;
-        for (k, (arm, lane)) in self.arms.iter().zip(lanes.iter()).enumerate() {
-            let mut sub = vec![lane.clone()];
-            typecheck(arm, &mut sub, env).map_err(|e| format!("match arm {}: {}", k, e))?;
-            if sub.len() != 1 {
-                return Err(format!("match arm {}: leaves {} values on type-stack", k, sub.len()));
-            }
-            let out = sub.pop().unwrap();
-            match &common {
-                None => common = Some(out),
-                Some(o) if o == &out => {}
-                Some(o) => return Err(format!("match arms disagree: arm 0 -> {}, arm {} -> {}", o, k, out)),
-            }
-        }
-        st.push(common.unwrap());
-        Ok(())
-    }
-}
-
-/// `.{ p0 ; p1 ; ... ; pN }` — tree navigation / cleave combinator.
-///
-/// Pops one value `v`, runs each path `pi` against a fresh copy of `v`, and
-/// pushes a `Prod[p0(v), p1(v), ..., pN(v)]`. Each `pi` must consume exactly
-/// one value and leave exactly one. Generalizes chained projections —
-/// `.{ .0 ; .2 }` extracts fields 0 and 2; `.{ .0 ; .1 +.u64 }` lets each path
-/// be an arbitrary subprogram.
-#[derive(Debug)] pub struct Cleave { pub paths: Vec<Vec<Box<dyn Op>>> }
-impl PrimOp for Cleave {
-    fn name(&self) -> &str { ".{}" }
-    fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }  // value → Prod[path_i(value)]
-    fn run(&self, st: &mut Stack, env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        let mut results = Vec::with_capacity(self.paths.len());
-        for (i, path) in self.paths.iter().enumerate() {
-            let mut sub = vec![v.clone()];
-            crate::ir::op::eval(path, &mut sub, env)?;
-            if sub.len() != 1 {
-                return Err(format!(".{{}}: path {} left {} values, expected 1", i, sub.len()));
-            }
-            results.push(sub.pop().unwrap());
-        }
-        st.push(prod(results));
-        Ok(())
-    }
-}
-impl Typed for Cleave {
-    fn tc(&self, st: &mut TypeStack, env: &mut TypeEnv) -> Result<(), String> {
-        let v = tc_pop(st, ".{}")?;
-        let mut shapes = Vec::with_capacity(self.paths.len());
-        for (i, path) in self.paths.iter().enumerate() {
-            let mut sub = vec![v.clone()];
-            crate::ir::typecheck::typecheck(path, &mut sub, env)
-                .map_err(|e| format!(".{{}}: path {}: {}", i, e))?;
-            if sub.len() != 1 {
-                return Err(format!(".{{}}: path {} leaves {} types, expected 1", i, sub.len()));
-            }
-            shapes.push(sub.pop().unwrap());
-        }
-        st.push(Shape::Prod(shapes));
-        Ok(())
-    }
 }
 
 #[derive(Debug)] pub struct Nest;
 impl PrimOp for Nest {
     fn name(&self) -> &str { "nest" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }  // (values, bounds) → list
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { nest_run(st) }
+}
+/// `nest` kernel (back-end `SystemOp::Nest` calls this directly).
+pub fn nest_run(st: &mut Stack) -> Result<(), String> {
         let bounds_v = pop(st)?;
         let bounds = match bounds_v {
             Value::Prim(p) => crate::ir::value::BoundsRepr::Var(p),
@@ -455,10 +420,11 @@ impl PrimOp for Nest {
         }
         st.push(list(bounds, values));
         Ok(())
-    }
 }
 impl Typed for Nest {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { nest_tc(st) }
+}
+pub fn nest_tc(st: &mut TypeStack) -> Result<(), String> {
         let bounds = tc_pop(st, "nest")?;
         let bw = match bounds {
             Shape::Prim(w) => w,
@@ -467,7 +433,6 @@ impl Typed for Nest {
         let v = tc_pop(st, "nest")?;
         st.push(Shape::List { bounds: bw, inner: Box::new(v) });
         Ok(())
-    }
 }
 
 /// `nest.stride` — pop a `values` Value and wrap it as a List whose bounds are
@@ -483,7 +448,10 @@ impl Typed for Nest {
 impl PrimOp for NestStride {
     fn name(&self) -> &str { "nest.stride" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }  // (values, count) → list
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { nest_stride_run(st) }
+}
+/// `nest.stride` kernel (back-end `SystemOp::NestStride` calls this directly).
+pub fn nest_stride_run(st: &mut Stack) -> Result<(), String> {
         let count = match pop(st)? {
             Value::Prim(crate::ir::value::Prim::P64(v)) if v.len() == 1 => v[0],
             other => return Err(format!("nest.stride: need length-1 P64 count, got {:?}", other)),
@@ -500,10 +468,11 @@ impl PrimOp for NestStride {
         let bounds = crate::ir::value::bounds_stride(stride, count);
         st.push(list(bounds, values));
         Ok(())
-    }
 }
 impl Typed for NestStride {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { nest_stride_tc(st) }
+}
+pub fn nest_stride_tc(st: &mut TypeStack) -> Result<(), String> {
         let count = tc_pop(st, "nest.stride")?;
         if count != Shape::Prim(crate::ir::value::PrimWidth::W64) {
             return Err(format!("nest.stride: count must be Prim(P64), got {}", count));
@@ -511,7 +480,6 @@ impl Typed for NestStride {
         let v = tc_pop(st, "nest.stride")?;
         st.push(Shape::List { bounds: crate::ir::value::PrimWidth::W64, inner: Box::new(v) });
         Ok(())
-    }
 }
 
 /// `enlist` — wrap `SEQ<T>` as `SEQ<LIST<T>>` of length 1, where the single
@@ -531,23 +499,26 @@ impl Typed for NestStride {
 impl PrimOp for Enlist {
     fn name(&self) -> &str { "enlist" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { enlist_run(st) }
+}
+impl Typed for Enlist {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { enlist_tc(st) }
+}
+/// `enlist` kernel (back-end `SystemOp::Enlist` calls this directly).
+pub fn enlist_run(st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         let n = v.len() as u64;
         let bounds = crate::ir::value::bounds_var_from_ends(vec![n]);
         st.push(crate::ir::value::list(bounds, v));
         Ok(())
-    }
 }
-impl Typed for Enlist {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn enlist_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "enlist")?;
         st.push(Shape::List {
             bounds: PrimWidth::W64,
             inner: Box::new(v),
         });
         Ok(())
-    }
 }
 
 /// `unlist` — extract the sole row of a length-1 `List<T>` as a plain `T`.
@@ -561,7 +532,13 @@ impl Typed for Enlist {
 impl PrimOp for Unlist {
     fn name(&self) -> &str { "unlist" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { unlist_run(st) }
+}
+impl Typed for Unlist {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { unlist_tc(st) }
+}
+/// `unlist` kernel (back-end `SystemOp::Unlist` calls this directly).
+pub fn unlist_run(st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         match v {
             Value::List { bounds, values } => {
@@ -575,10 +552,8 @@ impl PrimOp for Unlist {
             }
             other => Err(format!("unlist: expected List, got {:?}", other)),
         }
-    }
 }
-impl Typed for Unlist {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn unlist_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "unlist")?;
         match v {
             Shape::List { inner, .. } => {
@@ -587,14 +562,19 @@ impl Typed for Unlist {
             }
             other => Err(format!("unlist: expected List, got {}", other)),
         }
-    }
 }
 
 #[derive(Debug)] pub struct Flatten;
 impl PrimOp for Flatten {
     fn name(&self) -> &str { "flatten" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 2)) }  // list → (values, bounds)
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { flatten_run(st) }
+}
+impl Typed for Flatten {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { flatten_tc(st) }
+}
+/// `flatten` kernel (back-end `SystemOp::Flatten` calls this directly).
+pub fn flatten_run(st: &mut Stack) -> Result<(), String> {
         let v = pop(st)?;
         match v {
             Value::List { bounds, values } => {
@@ -604,10 +584,8 @@ impl PrimOp for Flatten {
             }
             other => Err(format!("flatten: not a list: {:?}", other)),
         }
-    }
 }
-impl Typed for Flatten {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+pub fn flatten_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "flatten")?;
         match v {
             Shape::List { bounds, inner } => {
@@ -617,7 +595,6 @@ impl Typed for Flatten {
             }
             other => Err(format!("flatten: not a list: {}", other)),
         }
-    }
 }
 
 #[cfg(test)]
@@ -675,6 +652,24 @@ mod tests {
         // Flatten pushes (values, bounds)
         assert_eq!(st2[0], values);
         assert_eq!(st2[1], bounds);
+    }
+
+    #[test]
+    fn merge_reproduces_match() {
+        // The match desugaring `split / arms / mergeN` must equal `match`.
+        // Sum disc:[0,1,0,1], lane0=[10,30], lane1=[20,40]; arms double / triple.
+        use crate::syntax::registry::OpRegistry;
+        use crate::syntax::parse::parse;
+        let reg = OpRegistry::standard();
+        let run = |src: &str| {
+            let prog = parse(src, &reg).unwrap();
+            let (g, _) = crate::pipeline::build(prog).unwrap();
+            crate::pipeline::eval_graph(&g).unwrap().pop().unwrap()
+        };
+        let setup = "u8[0 1 0 1] u64[10 30] u64[20 40] inject2";
+        let via_match  = run(&format!("{setup} match {{ -> 2u64 *.u64 -> 3u64 *.u64 }}"));
+        let via_merge  = run(&format!("{setup} split :[disc l0 l1]  disc  l0 2u64 *.u64  l1 3u64 *.u64  merge2"));
+        assert_eq!(via_match, via_merge);
     }
 
     #[test]
@@ -746,6 +741,11 @@ pub fn register(r: &mut crate::syntax::registry::OpRegistry) {
         }
         if let Some(rest) = t.strip_prefix("partition") {
             if let Ok(n) = rest.parse::<usize>() { return Some(Box::new(PartitionN { n })); }
+        }
+        // `mergeN` (dotless, like inject/partition); bare `merge` left free
+        // for the future sorted-set union.
+        if let Some(rest) = t.strip_prefix("merge") {
+            if let Ok(n) = rest.parse::<usize>() { return Some(Box::new(MergeN { n })); }
         }
         None
     });

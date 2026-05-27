@@ -1,18 +1,16 @@
 //! Layer 4: parser. Tokenizes whitespace-separated text. Op-name lookups are
 //! delegated to an `OpRegistry` (one of several possible front-ends). The
 //! parser only knows about structural forms — blocks, refs, array literals,
-//! `pick`/`roll` and N-arity ops, `match`/`each`/`repeat`/`let`. Everything
-//! else is a token the registry resolves.
+//! `pick`/`roll` and N-arity ops, `:`-binding, and the `match`/`cleave`
+//! desugarings. Everything else is a token the registry resolves.
 
 use std::collections::HashMap;
 
 use crate::syntax::inference::mark_last_use_in_body;
 use crate::syntax::registry::OpRegistry;
 use crate::ir::typecheck::Op;
-use crate::ops::combinators as cm;
 use crate::ops::convert as cv;
 use crate::ops::letbind as lb;
-use crate::ops::list as ls;
 use crate::ops::stack as sk;
 
 /// Parse-time inline definitions: `def name { body }` saves the body
@@ -146,63 +144,88 @@ fn parse_block(
                 *i += 1;
                 out.push(Box::new(sk::Roll { n }));
             }
-            "repeat" => {
-                if *i >= toks.len() { return Err("repeat: needs count".into()); }
-                let n: usize = toks[*i].parse().map_err(|_| format!("repeat: bad count {}", toks[*i]))?;
-                *i += 1;
-                expect(toks, i, "{")?;
-                let body = parse_block(toks, i, Some("}"), scopes, defs, expansions, reg)?;
-                expect(toks, i, "}")?;
-                out.push(Box::new(ls::Repeat { n, body }));
-            }
-            // Body-bearing constructs. A named per-row form is written
-            // `each { :[names] … }` — the `{ … }` block + a `:[…]` bind.
-            "each" => {
-                expect(toks, i, "{")?;
-                let body = parse_block(toks, i, Some("}"), scopes, defs, expansions, reg)?;
-                expect(toks, i, "}")?;
-                out.push(Box::new(ls::Each { body }));
-            }
+            // `.{ p0 ; p1 ; … }` — cleave: each path runs on a fresh copy of
+            // TOS, results bundled into a Prod. Sugar, desugared here to
+            // `:[g_v]  g_v <p0>  g_v <p1> … entuple.K` (bind the input, run each
+            // path on a reference). No `Cleave` op is built — the paths become
+            // inline op-stream. Faithful because every path is net 1→1 (it
+            // consumes the one reference, produces one value); paths are
+            // captured as raw token spans and the synthesized stream re-parsed.
             ".{" => {
-                // .{ p0 ; p1 ; ... ; pN } — cleave: each path runs on a fresh
-                // copy of TOS, results are gathered into a Prod.
-                let mut paths: Vec<Vec<Box<dyn Op>>> = Vec::new();
-                let mut current: Vec<Box<dyn Op>> = Vec::new();
+                let tag = *i; // unique per cleave site → collision-free gensym
+                let mut paths_toks: Vec<Vec<String>> = Vec::new();
+                let mut start = *i;
+                let mut depth: usize = 0;
                 loop {
-                    if *i >= toks.len() {
-                        return Err(".{: unterminated, expected }".into());
-                    }
-                    let t = &toks[*i];
-                    if t == "}" {
-                        *i += 1;
-                        if !current.is_empty() || paths.is_empty() {
-                            paths.push(std::mem::take(&mut current));
+                    if *i >= toks.len() { return Err(".{: unterminated, expected }".into()); }
+                    match toks[*i].as_str() {
+                        "{" | ".{" | "[" => { depth += 1; *i += 1; }
+                        "}" | "]" if depth > 0 => { depth -= 1; *i += 1; }
+                        "}" => {
+                            if start < *i || paths_toks.is_empty() { paths_toks.push(toks[start..*i].to_vec()); }
+                            *i += 1;
+                            break;
                         }
-                        break;
+                        ";" if depth == 0 => { paths_toks.push(toks[start..*i].to_vec()); *i += 1; start = *i; }
+                        _ => { *i += 1; }
                     }
-                    if t == ";" {
-                        *i += 1;
-                        paths.push(std::mem::take(&mut current));
-                        continue;
-                    }
-                    // Parse a single subprogram step, then loop.
-                    let one = parse_block(toks, i, None, scopes, defs, expansions, reg)?;
-                    current.extend(one);
-                    // parse_block returns on `;` or `}` (re-pushed via `i -= 1`),
-                    // or on end-of-input. Loop to dispatch.
                 }
-                out.push(Box::new(cm::Cleave { paths }));
+                let k = paths_toks.len();
+                let g_v = format!("__c{}_v", tag);
+                let mut synth: Vec<String> = vec![":".into(), "[".into(), g_v.clone(), "]".into()];
+                for path in &paths_toks {
+                    synth.push(g_v.clone());
+                    synth.extend(path.iter().cloned());
+                }
+                synth.push(format!("entuple.{}", k));
+                let mut j = 0;
+                let body_ops = parse_block(&synth, &mut j, None, scopes, defs, expansions, reg)?;
+                out.extend(body_ops);
             }
+            // `match { -> arm0 -> arm1 … }` is sugar, desugared here to
+            // `split :[g_disc g_l0 …] g_disc g_l0 <arm0> g_l1 <arm1> … mergeK`
+            // (the merge half is `mergeK`; binding lets each arm apply to its
+            // lane while disc rides through). No `Match` op is built — the arms
+            // become inline op-stream visible to the optimizer. The arms are
+            // captured as raw token spans and the synthesized stream is
+            // re-parsed in place (so arms still see outer bindings/defs).
             "match" => {
+                let tag = *i; // unique per match site → collision-free gensyms
                 expect(toks, i, "{")?;
-                let mut arms = Vec::new();
+                let mut arms_toks: Vec<Vec<String>> = Vec::new();
                 while *i < toks.len() && toks[*i] != "}" {
                     expect(toks, i, "->")?;
-                    let arm = parse_block(toks, i, None, scopes, defs, expansions, reg)?;
-                    arms.push(arm);
+                    let start = *i;
+                    let mut depth: usize = 0;
+                    while *i < toks.len() {
+                        match toks[*i].as_str() {
+                            "{" | ".{" | "[" => depth += 1,
+                            "}" | "]" if depth == 0 => break,
+                            "}" | "]" => depth -= 1,
+                            "->" if depth == 0 => break,
+                            _ => {}
+                        }
+                        *i += 1;
+                    }
+                    arms_toks.push(toks[start..*i].to_vec());
                 }
                 expect(toks, i, "}")?;
-                out.push(Box::new(cm::Match { arms }));
+                let k = arms_toks.len();
+                if k == 0 { return Err("match: no arms".into()); }
+                let g_disc = format!("__m{}_disc", tag);
+                let g_lanes: Vec<String> = (0..k).map(|j| format!("__m{}_l{}", tag, j)).collect();
+                let mut synth: Vec<String> = vec!["split".into(), ":".into(), "[".into(), g_disc.clone()];
+                synth.extend(g_lanes.iter().cloned());
+                synth.push("]".into());
+                synth.push(g_disc.clone());
+                for (j, arm) in arms_toks.iter().enumerate() {
+                    synth.push(g_lanes[j].clone());
+                    synth.extend(arm.iter().cloned());
+                }
+                synth.push(format!("merge{}", k));
+                let mut j = 0;
+                let body_ops = parse_block(&synth, &mut j, None, scopes, defs, expansions, reg)?;
+                out.extend(body_ops);
             }
             // Standalone `{ … }` scope block: parse the body and inline its
             // ops. The braces only delimit binding scope (a `:[…]` inside

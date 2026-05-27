@@ -103,16 +103,30 @@ pub fn elide_routing(g: Graph) -> Graph {
     Graph { terms: new_terms, roots: new_roots }
 }
 
+/// The default optimize pipeline (`Graph → Graph`): routing elision →
+/// CSE → dead-term elimination. Routing elision is a no-op on graphs from
+/// `build` (routing-free by construction) but kept for graphs other
+/// front-ends might produce. Because the whole thing is `Graph → Graph`,
+/// it is *never load-bearing for execution* — `eval_graph` runs an
+/// un-optimized graph to the same result (the `--no-opt` escape and the
+/// `optimize_corpus_preserves_results` test rely on this). See
+/// `dev/LAYERING.md`.
+pub fn optimize(g: Graph) -> Graph {
+    let (g, _hits) = cse(elide_routing(g));
+    eliminate_dead(g)
+}
+
 /// Dead-term elimination. Keeps only terms reachable from `roots`, plus
-/// side-effecting and body-bearing ops (whose execution is observable
-/// beyond their data outputs). Reindexes survivors.
+/// side-effecting ops (whose execution is observable beyond their data
+/// outputs — `time`/`show`/`profile.*`). Reindexes survivors. (No
+/// body-bearing ops remain to keep conservatively.)
 pub fn eliminate_dead(g: Graph) -> Graph {
     let n = g.terms.len();
     let mut live: Vec<bool> = vec![false; n];
 
     for r in &g.roots { live[r.term] = true; }
     for (i, t) in g.terms.iter().enumerate() {
-        if t.op.is_side_effecting() || t.op.has_body() {
+        if t.op.is_side_effecting() {
             live[i] = true;
         }
     }

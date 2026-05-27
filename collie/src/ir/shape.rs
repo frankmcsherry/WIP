@@ -71,6 +71,13 @@ pub fn shape_of(v: &Value) -> Shape {
 
 pub fn is_primitive(s: &Shape) -> bool { matches!(s, Shape::Prim(_)) }
 
+/// Width of a `Prim` shape, `None` for any compound shape. Used by the
+/// segmented (List-preserving) compute typecheck arms to peel a
+/// `List<Prim>` inner.
+pub fn prim_width(s: &Shape) -> Option<PrimWidth> {
+    if let Shape::Prim(w) = s { Some(*w) } else { None }
+}
+
 /// Per-op interpretation tag: how to read the bytes of a Prim.
 /// Lives in layer 1 because both operators (layer 2) and the parser (layer 4)
 /// need to reference it, and it's a tiny enum that doesn't ascribe meaning to

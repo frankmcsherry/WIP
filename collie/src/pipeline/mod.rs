@@ -23,8 +23,8 @@ pub mod lower;
 pub mod optimize;
 pub mod execute;
 
-pub use lower::build;
-pub use optimize::{cse, elide_routing, eliminate_dead};
+pub use lower::{build, build_seeded};
+pub use optimize::{cse, elide_routing, eliminate_dead, optimize};
 pub use execute::{eval_graph, use_counts};
 
 #[cfg(test)]
@@ -33,32 +33,31 @@ mod tests {
     use crate::ir::value::Value;
     use crate::syntax::registry::OpRegistry;
     use crate::syntax::parse::parse;
-    use crate::ir::op::eval as legacy_eval;
 
-    /// Run via legacy eval; return the final stack.
-    fn legacy(src: &str) -> Result<Vec<Value>, String> {
-        let reg = OpRegistry::standard();
-        let prog = parse(src, &reg)?;
-        let mut st: Vec<Value> = Vec::new();
-        let mut env: Vec<Value> = Vec::new();
-        legacy_eval(&prog, &mut st, &mut env)?;
-        Ok(st)
-    }
-
-    /// Build a graph, evaluate, return the final stack.
+    /// Build a graph, evaluate (no optimizer), return the final stack.
     fn via_graph(src: &str) -> Result<Vec<Value>, String> {
         let reg = OpRegistry::standard();
         let prog = parse(src, &reg)?;
         let (g, _shapes) = build(prog)?;
-        let mut env: Vec<Value> = Vec::new();
-        eval_graph(&g, &mut env)
+        eval_graph(&g)
     }
 
-    /// Assert legacy and graph paths produce the same stack.
+    /// Build, optimize, evaluate, return the final stack.
+    fn via_graph_opt(src: &str) -> Result<Vec<Value>, String> {
+        let reg = OpRegistry::standard();
+        let prog = parse(src, &reg)?;
+        let (g, _shapes) = build(prog)?;
+        eval_graph(&optimize(g))
+    }
+
+    /// Assert the optimizer preserves results: the optimized graph evaluates
+    /// to the same stack as the unoptimized graph. (The op-stream interpreter
+    /// was deleted, so this within-engine invariant replaces the old
+    /// legacy-vs-graph differential check.)
     fn agree(src: &str) {
-        let a = legacy(src).expect("legacy eval failed");
-        let b = via_graph(src).expect("graph eval failed");
-        assert_eq!(a, b, "legacy vs graph diverged on:\n  {}", src);
+        let unopt = via_graph(src).expect("graph eval failed");
+        let opt = via_graph_opt(src).expect("optimized graph eval failed");
+        assert_eq!(unopt, opt, "optimized vs unoptimized diverged on:\n  {}", src);
     }
 
     #[test]
@@ -100,12 +99,9 @@ mod tests {
     }
 
     #[test]
-    fn each_body_stays_opaque() {
-        agree("u64[1 2 3 4 5] u64[0 2 5] nest each { reduce.+.u64 }");
-    }
-
-    #[test]
-    fn match_body_stays_opaque() {
+    fn match_desugars_and_optimizes_consistently() {
+        // `match` desugars (parser) to split / per-lane arms / merge; check the
+        // optimizer preserves the result of the desugared graph.
         agree("u8[0 1 0] u64[10 20] u64[100] inject2 match { -> 1u64 like -> 1u64 like }");
     }
 
@@ -121,8 +117,7 @@ mod tests {
         let (g2, hits) = cse(g);
         assert!(hits > 0, "cse should merge the duplicate sub-tree");
         assert!(g2.terms.len() <= 4, "after cse expected ≤4 terms, got {}", g2.terms.len());
-        let mut env: Vec<Value> = Vec::new();
-        assert_eq!(eval_graph(&g2, &mut env).unwrap(), legacy(src).unwrap());
+        assert_eq!(eval_graph(&g2).unwrap(), via_graph(src).unwrap());
     }
 
     #[test]
@@ -135,8 +130,7 @@ mod tests {
         let pre = g.terms.len();
         let g2 = eliminate_dead(g);
         assert!(g2.terms.len() < pre, "dead-term-elim should remove terms: {} → {}", pre, g2.terms.len());
-        let mut env: Vec<Value> = Vec::new();
-        assert_eq!(eval_graph(&g2, &mut env).unwrap(), legacy(src).unwrap());
+        assert_eq!(eval_graph(&g2).unwrap(), via_graph(src).unwrap());
     }
 
     #[test]
@@ -203,8 +197,26 @@ mod tests {
         let pre = g.terms.len();
         let g2 = elide_routing(g);
         assert_eq!(g2.terms.len(), pre, "elide_routing should be a no-op on a built graph");
-        let mut env: Vec<Value> = Vec::new();
-        assert_eq!(eval_graph(&g2, &mut env).unwrap(), legacy(&src).unwrap());
+        assert_eq!(eval_graph(&g2).unwrap(), via_graph(&src).unwrap());
+    }
+
+    #[test]
+    fn optimize_corpus_preserves_results() {
+        // The full default optimize pipeline (elide → cse → dce) must preserve
+        // results vs the *unoptimized* graph on every example — the guarantee
+        // that lets us run it on the default path (`--no-opt` is identical).
+        let reg = OpRegistry::standard();
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("examples")
+            .unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "col")).collect();
+        paths.sort();
+        for path in &paths {
+            let src = std::fs::read_to_string(path).unwrap();
+            let (g, _) = build(parse(&src, &reg).unwrap()).unwrap();
+            let g = optimize(g);
+            assert_eq!(eval_graph(&g).unwrap(), via_graph(&src).unwrap(),
+                       "optimized diverged from unoptimized on {}", path.display());
+        }
     }
 
     #[test]
@@ -218,9 +230,8 @@ mod tests {
             let src = std::fs::read_to_string(path).unwrap();
             let (g, _) = build(parse(&src, &reg).unwrap()).unwrap();
             let g2 = elide_routing(g);
-            let mut env: Vec<Value> = Vec::new();
-            assert_eq!(eval_graph(&g2, &mut env).unwrap(), legacy(&src).unwrap(),
-                       "elided diverged from legacy on {}", path.display());
+            assert_eq!(eval_graph(&g2).unwrap(), via_graph(&src).unwrap(),
+                       "elided diverged from unoptimized on {}", path.display());
         }
     }
 

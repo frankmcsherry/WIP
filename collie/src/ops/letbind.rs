@@ -8,7 +8,7 @@
 //! The take-on-last-use machinery enables Arc-1 buffer reuse for
 //! anonymous-intermediate chains; see `src/syntax/inference.rs`.
 
-use crate::ir::op::{PrimOp, eval};
+use crate::ir::op::PrimOp;
 use crate::ir::stack::Stack;
 use crate::ir::typecheck::{Op, Typed, TypeStack, TypeEnv, typecheck};
 use crate::ir::value::Value;
@@ -18,22 +18,15 @@ pub struct Let { pub names: Vec<String>, pub body: Vec<Box<dyn Op>> }
 
 impl PrimOp for Let {
     fn name(&self) -> &str { "let" }
-    // Net stack effect depends on the body. The e-graph driver
-    // special-cases Let — recurses on the body separately and
-    // ignores the outer effect — so we return None as a barrier.
+    // Net stack effect depends on the body. The graph builder special-cases
+    // `Let` — `lower::boil_let` resolves it into edges and recurses on the
+    // body — so it returns None as a barrier and never reaches `emit_term`.
     fn arity(&self) -> Option<(usize, usize)> { None }
-    fn run(&self, st: &mut Stack, env: &mut Vec<Value>) -> Result<(), String> {
-        if st.len() < self.names.len() {
-            return Err(format!("let: stack has {} but need {}", st.len(), self.names.len()));
-        }
-        let mut bound = Vec::with_capacity(self.names.len());
-        for _ in 0..self.names.len() { bound.push(st.pop().unwrap()); }
-        bound.reverse();
-        let old_len = env.len();
-        for v in bound { env.push(v); }
-        eval(&self.body, st, env)?;
-        env.truncate(old_len);
-        Ok(())
+    fn run(&self, _st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+        // `Let` is boiled into graph edges during lowering (pipeline::lower)
+        // and never executes as a term. The op-stream interpreter that used
+        // to run it directly was removed — the graph engine is the only one.
+        Err("let: boiled during lowering, not directly runnable".into())
     }
 }
 impl Typed for Let {

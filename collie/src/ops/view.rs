@@ -38,7 +38,14 @@ use crate::ir::shape::Shape;
 impl PrimOp for View {
     fn name(&self) -> &str { "view" }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }  // (source, positions) → view
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { view_run(st) }
+}
+impl Typed for View {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { view_tc(st) }
+}
+
+/// `view` kernel (back-end `SystemOp::View` calls this directly).
+pub fn view_run(st: &mut Stack) -> Result<(), String> {
         let pos_v = crate::ir::stack::pop(st)?;
         let pos = match pos_v {
             Value::Prim(Prim::P64(v)) => v,
@@ -113,11 +120,10 @@ impl PrimOp for View {
                 "view: source must be Prim or List, got {}", other
             )),
         }
-    }
 }
 
-impl Typed for View {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+/// `view` typecheck (back-end `SystemOp::View` calls this directly).
+pub fn view_tc(st: &mut TypeStack) -> Result<(), String> {
         let pos = tc_pop(st, "view")?;
         if pos != Shape::Prim(PrimWidth::W64) {
             return Err(format!("view: positions must be Prim(P64), got {}", pos));
@@ -142,7 +148,6 @@ impl Typed for View {
                 "view: source must be Prim or List, got {}", other
             )),
         }
-    }
 }
 
 /// `view.range` — view of a contiguous sub-range `[lo, hi)`. Reads two P64
@@ -158,41 +163,43 @@ impl Typed for View {
 impl PrimOp for ViewRange {
     fn name(&self) -> &str { "view.range" }
     fn arity(&self) -> Option<(usize, usize)> { Some((3, 1)) }  // (source, lo, hi) → view
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let hi_v = crate::ir::stack::pop(st)?;
-        let lo_v = crate::ir::stack::pop(st)?;
-        let hi = match hi_v {
-            Value::Prim(Prim::P64(v)) if v.len() == 1 => v[0],
-            other => return Err(format!("view.range: hi must be length-1 P64, got {:?}", other)),
-        };
-        let lo = match lo_v {
-            Value::Prim(Prim::P64(v)) if v.len() == 1 => v[0],
-            other => return Err(format!("view.range: lo must be length-1 P64, got {:?}", other)),
-        };
-        if hi < lo {
-            return Err(format!("view.range: hi {} < lo {}", hi, lo));
-        }
-        let source = pop_raw(st)?;
-        let sel = Selector::range(lo, hi);
-        st.push(view(source, sel));
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { view_range_run(st) }
 }
-
 impl Typed for ViewRange {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let hi = tc_pop(st, "view.range")?;
-        let lo = tc_pop(st, "view.range")?;
-        if hi != Shape::Prim(PrimWidth::W64) {
-            return Err(format!("view.range: hi must be Prim(P64), got {}", hi));
-        }
-        if lo != Shape::Prim(PrimWidth::W64) {
-            return Err(format!("view.range: lo must be Prim(P64), got {}", lo));
-        }
-        let source = tc_pop(st, "view.range")?;
-        st.push(source);
-        Ok(())
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { view_range_tc(st) }
+}
+/// `view.range` kernel (back-end `SystemOp::ViewRange` calls this directly).
+pub fn view_range_run(st: &mut Stack) -> Result<(), String> {
+    let hi_v = crate::ir::stack::pop(st)?;
+    let lo_v = crate::ir::stack::pop(st)?;
+    let hi = match hi_v {
+        Value::Prim(Prim::P64(v)) if v.len() == 1 => v[0],
+        other => return Err(format!("view.range: hi must be length-1 P64, got {:?}", other)),
+    };
+    let lo = match lo_v {
+        Value::Prim(Prim::P64(v)) if v.len() == 1 => v[0],
+        other => return Err(format!("view.range: lo must be length-1 P64, got {:?}", other)),
+    };
+    if hi < lo {
+        return Err(format!("view.range: hi {} < lo {}", hi, lo));
     }
+    let source = pop_raw(st)?;
+    let sel = Selector::range(lo, hi);
+    st.push(view(source, sel));
+    Ok(())
+}
+pub fn view_range_tc(st: &mut TypeStack) -> Result<(), String> {
+    let hi = tc_pop(st, "view.range")?;
+    let lo = tc_pop(st, "view.range")?;
+    if hi != Shape::Prim(PrimWidth::W64) {
+        return Err(format!("view.range: hi must be Prim(P64), got {}", hi));
+    }
+    if lo != Shape::Prim(PrimWidth::W64) {
+        return Err(format!("view.range: lo must be Prim(P64), got {}", lo));
+    }
+    let source = tc_pop(st, "view.range")?;
+    st.push(source);
+    Ok(())
 }
 
 /// `decompose-view` — zero-cost View elim. Symmetric counterpart to `view` /
@@ -221,7 +228,14 @@ impl Typed for ViewRange {
 impl PrimOp for DecomposeView {
     fn name(&self) -> &str { "decompose-view" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 2)) }  // view → (source, positions)
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { decompose_view_run(st) }
+}
+impl Typed for DecomposeView {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { decompose_view_tc(st) }
+}
+
+/// `decompose-view` kernel (back-end `SystemOp::DecomposeView` calls this directly).
+pub fn decompose_view_run(st: &mut Stack) -> Result<(), String> {
         let v = pop_raw(st)?;
         // The retired-SequenceRange form: `List<bounds, View<Prim, Runs>>`.
         // Decompose to (source, List<P64> of per-row position iotas) —
@@ -302,11 +316,10 @@ impl PrimOp for DecomposeView {
             }
             other => Err(format!("decompose-view: expected View, got {:?}", other)),
         }
-    }
 }
 
-impl Typed for DecomposeView {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+/// `decompose-view` typecheck (back-end `SystemOp::DecomposeView` calls this directly).
+pub fn decompose_view_tc(st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "decompose-view")?;
         match v {
             // Flat selector view: push source's shape + P64.
@@ -334,7 +347,6 @@ impl Typed for DecomposeView {
                 }
             }
         }
-    }
 }
 
 pub fn register(r: &mut crate::syntax::registry::OpRegistry) {
@@ -429,17 +441,10 @@ mod tests {
     fn run_program(src: &str) -> Vec<Value> {
         use crate::syntax::registry::OpRegistry;
         use crate::syntax::parse::parse;
-        use crate::ir::shape::Shape;
-        use crate::ir::typecheck::typecheck;
         let reg = OpRegistry::standard();
         let prog = parse(src, &reg).unwrap();
-        let mut ts: Vec<Shape> = Vec::new();
-        let mut tenv: Vec<Shape> = Vec::new();
-        typecheck(&prog, &mut ts, &mut tenv).unwrap();
-        let mut st: Vec<Value> = Vec::new();
-        let mut env: Vec<Value> = Vec::new();
-        crate::ir::op::eval(&prog, &mut st, &mut env).unwrap();
-        st
+        let (g, _) = crate::pipeline::build(prog).unwrap();
+        crate::pipeline::eval_graph(&g).unwrap()
     }
 
     #[test]
@@ -465,9 +470,8 @@ mod tests {
         fn materialize_top(prog: &str) -> Value {
             let reg = crate::syntax::registry::OpRegistry::standard();
             let parsed = crate::syntax::parse::parse(prog, &reg).unwrap();
-            let mut st = vec![];
-            let mut env = Vec::new();
-            crate::ir::op::eval(&parsed, &mut st, &mut env).unwrap();
+            let (g, _) = crate::pipeline::build(parsed).unwrap();
+            let mut st = crate::pipeline::eval_graph(&g).unwrap();
             crate::ir::stack::pop(&mut st).unwrap()
         }
         let eager = materialize_top(

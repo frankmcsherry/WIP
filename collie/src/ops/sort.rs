@@ -91,28 +91,30 @@ pub struct SortPerm;
 impl PrimOp for SortPerm {
     fn name(&self) -> &str { "sort.perm" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        // Fast path: top-level Prim.
-        if let Value::Prim(p) = &v {
-            let perm = sort_prim_perm_top(p);
-            st.push(Value::Prim(Prim::P64(Arc::new(perm))));
-            return Ok(());
-        }
-        let n = v.len();
-        let labels = vec![0u64; n];
-        let (perm, _) = sort_blocks(&labels, &v)?;
-        st.push(Value::Prim(Prim::P64(Arc::new(perm))));
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { sort_perm_run(st) }
 }
-
 impl Typed for SortPerm {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let _ = tc_pop(st, "sort.perm")?;
-        st.push(Shape::Prim(PrimWidth::W64));
-        Ok(())
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { sort_perm_tc(st) }
+}
+/// `sort.perm` kernel (back-end `SystemOp::SortPerm` calls this directly).
+pub fn sort_perm_run(st: &mut Stack) -> Result<(), String> {
+    let v = pop(st)?;
+    // Fast path: top-level Prim.
+    if let Value::Prim(p) = &v {
+        let perm = sort_prim_perm_top(p);
+        st.push(Value::Prim(Prim::P64(Arc::new(perm))));
+        return Ok(());
     }
+    let n = v.len();
+    let labels = vec![0u64; n];
+    let (perm, _) = sort_blocks(&labels, &v)?;
+    st.push(Value::Prim(Prim::P64(Arc::new(perm))));
+    Ok(())
+}
+pub fn sort_perm_tc(st: &mut TypeStack) -> Result<(), String> {
+    let _ = tc_pop(st, "sort.perm")?;
+    st.push(Shape::Prim(PrimWidth::W64));
+    Ok(())
 }
 
 /// `sort` — polymorphic. Returns the sorted value. The data-returning
@@ -124,20 +126,65 @@ pub struct SortPoly;
 impl PrimOp for SortPoly {
     fn name(&self) -> &str { "sort" }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        let order = vec![0u64; v.len()];
-        let (sorted, _labels) = sort_seq(&order, &v, false)?;
-        st.push(sorted);
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { sort_poly_run(st) }
+}
+impl Typed for SortPoly {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { sort_poly_tc(st) }
+}
+/// `sort` kernel (back-end `SystemOp::Sort` calls this directly).
+pub fn sort_poly_run(st: &mut Stack) -> Result<(), String> {
+    let v = pop(st)?;
+    let order = vec![0u64; v.len()];
+    let (sorted, _labels) = sort_seq(&order, &v, false)?;
+    st.push(sorted);
+    Ok(())
+}
+pub fn sort_poly_tc(st: &mut TypeStack) -> Result<(), String> {
+    let v = tc_pop(st, "sort")?;
+    st.push(v);
+    Ok(())
 }
 
-impl Typed for SortPoly {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
-        let v = tc_pop(st, "sort")?;
-        st.push(v);
-        Ok(())
+/// `sort.segmented` — per-row sort: `List<T> → List<T>`, each row sorted
+/// independently, outer row order and per-row counts unchanged. The
+/// segmented (per-row) sibling of flat `sort`; replaces `each { sort }`.
+///
+/// Mechanism: label each element by its row id and hand `sort_seq` the
+/// labels as the `order`. `sort_seq` orders by id first (rows already
+/// contiguous, so they stay put) then refines *within* each equal-id group
+/// by value — i.e. sorts inside each row. Bounds are reattached unchanged.
+#[derive(Debug)]
+pub struct SortSegmented;
+
+impl PrimOp for SortSegmented {
+    fn name(&self) -> &str { "sort.segmented" }
+    fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { sort_seg_run(st) }
+}
+impl Typed for SortSegmented {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { sort_seg_tc(st) }
+}
+/// `sort.segmented` kernel (back-end `SystemOp::SortSegmented` calls this directly).
+pub fn sort_seg_run(st: &mut Stack) -> Result<(), String> {
+    let v = pop(st)?;
+    match v {
+        Value::List { bounds, values } => {
+            let mut labels: Vec<u64> = Vec::with_capacity(values.len());
+            for (i, (lo, hi)) in bounds.iter_pairs().enumerate() {
+                for _ in lo..hi { labels.push(i as u64); }
+            }
+            let (sorted, _) = sort_seq(&labels, values.as_ref(), false)?;
+            st.push(Value::List { bounds, values: Arc::new(sorted) });
+            Ok(())
+        }
+        other => Err(format!("sort.segmented: expected List, got {:?}", other)),
+    }
+}
+pub fn sort_seg_tc(st: &mut TypeStack) -> Result<(), String> {
+    let v = tc_pop(st, "sort.segmented")?;
+    match v {
+        Shape::List { .. } => { st.push(v); Ok(()) }
+        other => Err(format!("sort.segmented: expected List, got {}", other)),
     }
 }
 
@@ -145,8 +192,9 @@ pub fn register(r: &mut crate::syntax::registry::OpRegistry) {
     use crate::ir::typecheck::Op;
     r.add(|t: &str| -> Option<Box<dyn Op>> {
         match t {
-            "sort.perm"  => Some(Box::new(SortPerm)),
-            "sort"       => Some(Box::new(SortPoly)),
+            "sort.perm"      => Some(Box::new(SortPerm)),
+            "sort"           => Some(Box::new(SortPoly)),
+            "sort.segmented" => Some(Box::new(SortSegmented)),
             _ => None,
         }
     });

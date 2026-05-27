@@ -7,12 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::pipeline::{build, eval_graph};
+use crate::pipeline::{build, eval_graph, optimize};
 use crate::syntax::parse::parse_file;
 use crate::tools::pretty::pretty;
 use crate::syntax::registry::OpRegistry;
 use crate::ir::shape::shape_of;
-use crate::ir::value::Value;
 
 const EXAMPLES_DIR: &str = "examples";
 
@@ -41,8 +40,11 @@ fn run_one(reg: &OpRegistry, path: &Path) -> Result<(), String> {
     // build does both shape-inference (used as typecheck) and graph
     // construction; errors here are the equivalent of typecheck errors.
     let (graph, _shapes) = build(prog).map_err(|e| format!("build: {}", e))?;
-    let mut env: Vec<Value> = Vec::new();
-    let stack = eval_graph(&graph, &mut env).map_err(|e| format!("eval: {}", e))?;
+    // Run the full default path, optimizer included (the corpus equality
+    // test `optimize_corpus_preserves_results` guarantees this matches the
+    // reference interpreter).
+    let graph = optimize(graph);
+    let stack = eval_graph(&graph).map_err(|e| format!("eval: {}", e))?;
     if stack.is_empty() {
         println!("  (stack empty)");
     } else {

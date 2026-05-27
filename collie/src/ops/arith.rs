@@ -11,8 +11,8 @@ use crate::ir::op::PrimOp;
 use crate::ir::stack::{Stack, pop, pop_raw, materialize_top};
 use crate::ir::typecheck::{Typed, TypeStack, TypeEnv, tc_pop};
 use crate::ir::value::{Value, Prim, Selector, Storage};
-use crate::ir::shape::{Interp, Shape};
-use crate::ops::helpers::extract_prim;
+use crate::ir::shape::{Interp, Shape, prim_width};
+use crate::ops::helpers::{extract_prim, list_elementwise1, list_elementwise2};
 
 #[derive(Copy, Clone, Debug)]
 pub enum ArithOp { Add, Sub, Mul, Div, Mod }
@@ -21,21 +21,45 @@ pub enum ArithOp { Add, Sub, Mul, Div, Mod }
 pub struct Arith { pub op: ArithOp, pub interp: Interp }
 
 impl Arith {
-    pub fn op_name(&self) -> &'static str {
-        match self.op {
-            ArithOp::Add => "+", ArithOp::Sub => "-",
-            ArithOp::Mul => "*", ArithOp::Div => "/",
-            ArithOp::Mod => "%",
-        }
+    pub fn op_name(&self) -> &'static str { op_name(self.op) }
+}
+
+/// Operator symbol — free fn so `SystemOp::Arith` names the op without a struct.
+pub fn op_name(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+", ArithOp::Sub => "-",
+        ArithOp::Mul => "*", ArithOp::Div => "/",
+        ArithOp::Mod => "%",
     }
 }
 
 impl PrimOp for Arith {
-    fn name(&self) -> &str { self.op_name() }
+    fn name(&self) -> &str { op_name(self.op) }
     fn arity(&self) -> Option<(usize, usize)> { Some((2, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { run(self.op, self.interp, st) }
+}
+
+impl Typed for Arith {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { tc(self.interp, st) }
+}
+
+/// The binary-arith kernel (back-end `SystemOp::Arith` calls this directly;
+/// the struct's `run` is a thin shim).
+pub fn run(op: ArithOp, interp: Interp, st: &mut Stack) -> Result<(), String> {
         let b = pop_raw(st)?;
         let a = pop_raw(st)?;
+
+        // Segmented (List-preserving) path: equal-bounds Lists, or a List
+        // against a length-1 scalar. Arithmetic never crosses a row boundary,
+        // so compute on the flat inner values and reattach the same bounds.
+        if let Some(res) = list_elementwise2(&a, &b, |va, vb| {
+            let pa = extract_prim(va, "arith")?;
+            let pb = extract_prim(vb, "arith")?;
+            Ok(Value::Prim(do_arith(&pa, &pb, op, interp)?))
+        }) {
+            st.push(res?);
+            return Ok(());
+        }
 
         // Mask-aware fast paths, parallel to cmp.rs:
         //   1. a=View<Mask>, b=scalar Prim         (broadcast)
@@ -47,12 +71,12 @@ impl PrimOp for Arith {
             if let Value::Prim(_) = src_a.as_ref() {
                 if let Value::Prim(pb) = &b {
                     if pb.len() == 1 {
-                        let out = do_arith_masked_scalar(src_a.as_ref(), mask_a, pb, self.op, self.interp)?;
+                        let out = do_arith_masked_scalar(src_a.as_ref(), mask_a, pb, op, interp)?;
                         st.push(Value::Prim(out));
                         return Ok(());
                     }
                     if pb.len() == a.len() {
-                        let out = do_arith_masked_full(src_a.as_ref(), mask_a, pb, self.op, self.interp)?;
+                        let out = do_arith_masked_full(src_a.as_ref(), mask_a, pb, op, interp)?;
                         st.push(Value::Prim(out));
                         return Ok(());
                     }
@@ -62,7 +86,7 @@ impl PrimOp for Arith {
                         if a.len() == b.len() {
                             let out = do_arith_both_masked(
                                 src_a.as_ref(), mask_a, src_b.as_ref(), mask_b,
-                                self.op, self.interp)?;
+                                op, interp)?;
                             st.push(Value::Prim(out));
                             return Ok(());
                         }
@@ -77,25 +101,38 @@ impl PrimOp for Arith {
         let b_mat = materialize_top(b)?;
         let pa = match a_mat { Value::Prim(p) => p, other => return Err(format!("arith: expected Prim, got {:?}", other)) };
         let pb = match b_mat { Value::Prim(p) => p, other => return Err(format!("arith: expected Prim, got {:?}", other)) };
-        let out = do_arith_owned(pa, pb, self.op, self.interp)?;
+        let out = do_arith_owned(pa, pb, op, interp)?;
         st.push(Value::Prim(out));
         Ok(())
-    }
 }
 
-impl Typed for Arith {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+/// The binary-arith typecheck (back-end `SystemOp::Arith` calls this directly).
+pub fn tc(interp: Interp, st: &mut TypeStack) -> Result<(), String> {
         let b = tc_pop(st, "arith")?;
         let a = tc_pop(st, "arith")?;
-        let w = self.interp.width();
+        let w = interp.width();
         match (&a, &b) {
             (Shape::Prim(wa), Shape::Prim(wb)) if *wa == w && *wb == w => {
                 st.push(Shape::Prim(w));
                 Ok(())
             }
-            _ => Err(format!("arith.{}: needs Prim({}) on both sides, got {} and {}", self.interp, w, a, b)),
+            // Segmented: List<Prim(w)> on both sides (equal bounds) → List<Prim(w)>.
+            (Shape::List { bounds: lba, inner: ia }, Shape::List { bounds: lbb, inner: ib })
+                if lba == lbb && prim_width(ia) == Some(w) && prim_width(ib) == Some(w) => {
+                st.push(Shape::List { bounds: *lba, inner: Box::new(Shape::Prim(w)) });
+                Ok(())
+            }
+            // List<Prim(w)> against a length-1 scalar (broadcast) → List<Prim(w)>.
+            (Shape::List { bounds, inner }, Shape::Prim(wb)) if prim_width(inner) == Some(w) && *wb == w => {
+                st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(w)) });
+                Ok(())
+            }
+            (Shape::Prim(wa), Shape::List { bounds, inner }) if *wa == w && prim_width(inner) == Some(w) => {
+                st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(w)) });
+                Ok(())
+            }
+            _ => Err(format!("arith.{}: needs Prim({}) or equal-bounds List<Prim({})> on both sides, got {} and {}", interp, w, w, a, b)),
         }
-    }
 }
 
 /// Generic kernel: vec/vec, scalar/vec, vec/scalar (no broadcast materialization).
@@ -165,6 +202,27 @@ mod tests {
             from_vec::<i64>(vec![10, -10, 7]),
             from_vec::<i64>(vec![3, 3, 2]));
         assert_eq!(r, from_vec::<i64>(vec![3, -3, 3]));
+    }
+
+    #[test]
+    fn segmented_add_preserves_list_bounds() {
+        // Rows [1,2] | [3,4,5] + [10,20] | [30,40,50] → [11,22] | [33,44,55].
+        use crate::ir::value::{bounds_var_from_ends, list};
+        let a = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u64>(vec![1, 2, 3, 4, 5]));
+        let b = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u64>(vec![10, 20, 30, 40, 50]));
+        let r = run_arith(ArithOp::Add, Interp::U64, a, b);
+        let expected = list(bounds_var_from_ends(vec![2, 5]), from_vec::<u64>(vec![11, 22, 33, 44, 55]));
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn segmented_mul_by_scalar_broadcasts() {
+        // List rows [1,2] | [3] * 10u64 → [10,20] | [30], bounds preserved.
+        use crate::ir::value::{bounds_var_from_ends, list};
+        let a = list(bounds_var_from_ends(vec![2, 3]), from_vec::<u64>(vec![1, 2, 3]));
+        let r = run_arith(ArithOp::Mul, Interp::U64, a, from_vec::<u64>(vec![10]));
+        let expected = list(bounds_var_from_ends(vec![2, 3]), from_vec::<u64>(vec![10, 20, 30]));
+        assert_eq!(r, expected);
     }
 
     #[test]
@@ -468,29 +526,50 @@ pub enum UnaryArithOp { Neg, Abs }
 #[derive(Debug)]
 pub struct UnaryArith { pub op: UnaryArithOp, pub interp: Interp }
 
+/// Operator name — free fn so `SystemOp::UnaryArith` names it without a struct.
+pub fn unary_name(op: UnaryArithOp) -> &'static str {
+    match op { UnaryArithOp::Neg => "neg", UnaryArithOp::Abs => "abs" }
+}
+
 impl PrimOp for UnaryArith {
-    fn name(&self) -> &str {
-        match self.op { UnaryArithOp::Neg => "neg", UnaryArithOp::Abs => "abs" }
-    }
+    fn name(&self) -> &str { unary_name(self.op) }
     fn arity(&self) -> Option<(usize, usize)> { Some((1, 1)) }
-    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> {
-        let v = pop(st)?;
-        let p = extract_prim(&v, "unary arith")?;
-        let out = do_unary(&p, self.op, self.interp)?;
-        st.push(Value::Prim(out));
-        Ok(())
-    }
+    fn run(&self, st: &mut Stack, _env: &mut Vec<Value>) -> Result<(), String> { unary_run(self.op, self.interp, st) }
 }
 impl Typed for UnaryArith {
-    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> {
+    fn tc(&self, st: &mut TypeStack, _env: &mut TypeEnv) -> Result<(), String> { unary_tc(self.op, self.interp, st) }
+}
+
+/// The unary-arith kernel (back-end `SystemOp::UnaryArith` calls this directly).
+pub fn unary_run(op: UnaryArithOp, interp: Interp, st: &mut Stack) -> Result<(), String> {
+        let v = pop(st)?;
+        // Segmented: a List maps per-element; bounds unchanged.
+        if let Some(res) = list_elementwise1(&v, |va| {
+            let p = extract_prim(va, "unary arith")?;
+            Ok(Value::Prim(do_unary(&p, op, interp)?))
+        }) {
+            st.push(res?);
+            return Ok(());
+        }
+        let p = extract_prim(&v, "unary arith")?;
+        let out = do_unary(&p, op, interp)?;
+        st.push(Value::Prim(out));
+        Ok(())
+}
+
+/// The unary-arith typecheck.
+pub fn unary_tc(op: UnaryArithOp, interp: Interp, st: &mut TypeStack) -> Result<(), String> {
         let v = tc_pop(st, "unary arith")?;
-        let w = self.interp.width();
+        let w = interp.width();
         match &v {
             Shape::Prim(vw) if *vw == w => { st.push(Shape::Prim(w)); Ok(()) }
-            _ => Err(format!("{}.{}: needs Prim({}), got {}",
-                self.name(), self.interp, w, v)),
+            Shape::List { bounds, inner } if prim_width(inner) == Some(w) => {
+                st.push(Shape::List { bounds: *bounds, inner: Box::new(Shape::Prim(w)) });
+                Ok(())
+            }
+            _ => Err(format!("{}.{}: needs Prim({}) or List<Prim({})>, got {}",
+                unary_name(op), interp, w, w, v)),
         }
-    }
 }
 
 fn unary_apply<T, F>(xs: &[T], f: F) -> Vec<T>

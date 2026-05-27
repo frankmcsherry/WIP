@@ -12,18 +12,23 @@
 //!   graph's own take-on-last-use (see `execute.rs`) subsumes `Ref`'s
 //!   `take` flag.
 //!
-//! A `Let` can only be boiled if its body holds no opaque body-bearing op
-//! (`each`/`repeat`/`match`/`cleave`): those run via legacy eval and read
-//! the *runtime* env at parse-time indices, so any binding they might
-//! capture must stay materialized there. Such a `Let` is kept Foreign
-//! (today's behavior) and its whole body runs via legacy eval — we never
-//! recurse into it, so boiled and kept regions never share an env and no
-//! re-indexing is needed.
+//! Every `Let` boils: there are no longer any opaque body-bearing ops that
+//! would force one to stay Foreign (`each`/`match`/`cleave` desugar, `repeat`
+//! was removed). So no `Let`/`Ref` term ever reaches the graph, and the
+//! engine never runs a sub-program via legacy eval.
+//!
+//! Note: binding-boiling lives here in lowering *by necessity*, not as an
+//! optimization — `:name` binds the rest of its block, so an un-boiled
+//! top-level `Let` would swallow the whole remaining program into one
+//! legacy-eval blob. Boiling is what turns the concatenative front end's
+//! scoped binding into a dataflow graph at all; it is the concatenative
+//! lowering, not a removable `Graph → Graph` pass. See dev/LAYERING.md.
 
 use crate::pipeline::graph::{Graph, Term, OutRef};
-use crate::pipeline::sysop::promote;
+use crate::pipeline::sysop::{promote, SystemOp};
 use crate::ir::typecheck::{Op, TypeStack, TypeEnv};
-use crate::ir::shape::Shape;
+use crate::ir::shape::{Shape, shape_of};
+use crate::ir::value::Value;
 use crate::ops::letbind::{Let, Ref};
 
 /// Lower a parsed op stream into a term graph. Returns the graph and
@@ -38,6 +43,31 @@ pub fn build(prog: Vec<Box<dyn Op>>) -> Result<(Graph, Vec<Vec<Shape>>), String>
     // Build-time env of bound producers, mirroring the runtime `Let` env.
     // Empty at top level — `Ref`s only ever appear inside a `Let` body.
     let mut env: Vec<OutRef> = Vec::new();
+    build_in(prog, &mut g, &mut bstack, &mut tstack, &mut tenv, &mut shapes, &mut env)?;
+    g.roots = bstack;
+    Ok((g, shapes))
+}
+
+/// Lower an *open* program — one that expects `seeds` already on the stack —
+/// by prepending a `Const` source term per seed. The result is a closed
+/// graph the engine runs directly (each `Const` re-produces its value per
+/// eval). Used where the op-stream interpreter's "push inputs, then run"
+/// shape is wanted on the graph engine (e.g. the bench harness).
+pub fn build_seeded(prog: Vec<Box<dyn Op>>, seeds: Vec<Value>) -> Result<(Graph, Vec<Vec<Shape>>), String> {
+    let mut g = Graph::default();
+    let mut bstack: Vec<OutRef> = Vec::new();
+    let mut tstack: TypeStack = Vec::new();
+    let mut tenv: TypeEnv = Vec::new();
+    let mut shapes: Vec<Vec<Shape>> = Vec::new();
+    let mut env: Vec<OutRef> = Vec::new();
+    for v in seeds {
+        let sh = shape_of(&v);
+        let id = g.terms.len();
+        g.terms.push(Term { op: SystemOp::Const(v), children: vec![], n_outputs: 1 });
+        shapes.push(vec![sh.clone()]);
+        bstack.push(OutRef { term: id, idx: 0 });
+        tstack.push(sh);
+    }
     build_in(prog, &mut g, &mut bstack, &mut tstack, &mut tenv, &mut shapes, &mut env)?;
     g.roots = bstack;
     Ok((g, shapes))
@@ -62,13 +92,15 @@ fn build_in(
             resolve_routing(&*op, &map, bstack, tstack, tenv)?;
             continue;
         }
-        // Binding: boil into edges where the body is graph-visible.
-        // Classify on a borrow, then consume `op` accordingly.
+        // Binding: always boiled into edges. (There are no longer any
+        // opaque body-bearing ops that would force a `Let` to stay Foreign
+        // — `each`/`match`/`cleave`/`repeat` are all gone — so every `Let`
+        // boils and no `Let`/`Ref` term ever reaches the graph.)
         enum Kind { BoilLet, RefIdx(usize), Other }
         let kind = {
             let any: &dyn std::any::Any = op.as_ref();
-            if let Some(l) = any.downcast_ref::<Let>() {
-                if body_has_opaque(&l.body) { Kind::Other } else { Kind::BoilLet }
+            if any.is::<Let>() {
+                Kind::BoilLet
             } else if let Some(r) = any.downcast_ref::<Ref>() {
                 Kind::RefIdx(r.idx)
             } else {
@@ -124,25 +156,6 @@ fn boil_let(
     env.truncate(env0);
     tenv.truncate(tenv0);
     Ok(())
-}
-
-/// Does this op stream contain an opaque body-bearing op
-/// (`each`/`repeat`/`match`/`cleave`) anywhere, including nested `Let`
-/// bodies? Such ops run via legacy eval and read the runtime env, so a
-/// `Let` whose body holds one cannot be boiled.
-fn body_has_opaque(ops: &[Box<dyn Op>]) -> bool {
-    use crate::ops::list::{Each, Repeat};
-    use crate::ops::combinators::{Match, Cleave};
-    for op in ops {
-        let any: &dyn std::any::Any = op.as_ref();
-        if any.is::<Each>() || any.is::<Repeat>() || any.is::<Match>() || any.is::<Cleave>() {
-            return true;
-        }
-        if let Some(l) = any.downcast_ref::<Let>() {
-            if body_has_opaque(&l.body) { return true; }
-        }
-    }
-    false
 }
 
 /// Apply a routing op's `map` to the build stack: pop its inputs, push the
@@ -210,10 +223,9 @@ fn emit_term(
     Ok(())
 }
 
-/// Derive (n_in, n_out) for ops whose `arity()` returned None. Today:
-/// `split` (output count = 1 + Sum lane count), and `let`/`repeat` (bodies
-/// run on the outer stack at depths not visible from tc; treated
-/// conservatively as consuming and re-emitting the whole current stack).
+/// Derive (n_in, n_out) for ops whose `arity()` returned None. Today only
+/// `split` (output count = 1 + Sum lane count); `let`/`ref` are boiled, not
+/// emitted as terms, and the body-bearing ops that needed this are gone.
 fn derive_dynamic_arity(
     op: &dyn Op,
     pre: usize,
@@ -224,13 +236,6 @@ fn derive_dynamic_arity(
         let post = tstack.len();
         let n_out = (post + 1).saturating_sub(pre);  // popped 1, pushed n_out
         return Ok((1, n_out));
-    }
-    if any_ref.downcast_ref::<crate::ops::list::Repeat>().is_some() {
-        return Ok((pre, pre));
-    }
-    if any_ref.downcast_ref::<crate::ops::letbind::Let>().is_some() {
-        let post = tstack.len();
-        return Ok((pre, post));
     }
     Err(format!(
         "graph build: op {} has unknown arity() and no dynamic-arity handler",

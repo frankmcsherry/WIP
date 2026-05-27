@@ -15,7 +15,7 @@
 //! │ Layer 2: ops/      operators (each = PrimOp + Typed)    │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ Layer 1: ir/{value, stack, op, shape, profile}          │
-//! │          value model + eval loop. Knows nothing of      │
+//! │          value model + PrimOp trait. Knows nothing of   │
 //! │          specific operators, types, or syntax.          │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
@@ -23,17 +23,14 @@
 //! ## Library use
 //!
 //! ```ignore
-//! use collie::ir::{op::eval, shape::Shape, typecheck::typecheck, value::Value};
+//! use collie::pipeline::{build, optimize, eval_graph};
 //! use collie::syntax::{parse::parse, registry::OpRegistry};
 //!
 //! let reg = OpRegistry::standard();
 //! let prog = parse("u64[1 2 3] reduce.+.u64", &reg)?;
-//! let mut ts: Vec<Shape> = Vec::new();
-//! let mut tenv: Vec<Shape> = Vec::new();
-//! typecheck(&prog, &mut ts, &mut tenv)?;
-//! let mut stack: Vec<Value> = Vec::new();
-//! let mut env: Vec<Value> = Vec::new();
-//! eval(&prog, &mut stack, &mut env)?;
+//! let (graph, _shapes) = build(prog)?;   // lower to the term graph (typechecks)
+//! let graph = optimize(graph);            // Graph → Graph (optional; --no-opt skips)
+//! let stack = eval_graph(&graph)?;        // the only evaluator
 //! // stack now holds the result.
 //! ```
 

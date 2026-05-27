@@ -4,8 +4,7 @@
 //! op set. The serialization round-trip moved to a unit test in
 //! `tools/serialize.rs`.
 
-use crate::ir::op::eval;
-use crate::ir::value::Value;
+use crate::pipeline::{build, eval_graph};
 use crate::syntax::parse::parse;
 use crate::syntax::registry::OpRegistry;
 
@@ -20,9 +19,8 @@ pub fn run_extra<F: Fn(&mut OpRegistry)>(register: F) -> Result<(), String> {
     let src = "i32[-3 -2 -1 0 1 2 3 4 5 6 7] square.i32 0i32 30i32 clamp.i32";
     println!("program:  {}", src);
     let prog = parse(src, &reg)?;
-    let mut st: Vec<Value> = Vec::new();
-    let mut env: Vec<Value> = Vec::new();
-    eval(&prog, &mut st, &mut env)?;
+    let (g, _shapes) = build(prog)?;
+    let st = eval_graph(&g)?;
     println!("stack out: [");
     for v in &st { println!("  {}", v); }
     println!("]");
