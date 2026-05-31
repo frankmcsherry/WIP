@@ -1,0 +1,3 @@
+# n = 4
+# = List ends=[4] <[100, 101, 102, 103]>
+input |> iota |> map (fun x -> x |> add_u64 100)

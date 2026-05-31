@@ -1,0 +1,10 @@
+[package]
+name = "corgi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[[bench]]
+name = "eval"
+harness = false   # plain `fn main()` timing — no framework, no dependency

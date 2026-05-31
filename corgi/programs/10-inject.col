@@ -1,0 +1,3 @@
+# n = 5
+# = Sum tags=[1] [[], [5], []]
+input |> inject 1 (u64, u64, u64)

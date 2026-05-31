@@ -1,0 +1,3 @@
+# n = 8
+# = List ends=[4] <[0, 1, 2, 3]>
+input |> iota |> map (fun x -> x |> and 3) |> dedup

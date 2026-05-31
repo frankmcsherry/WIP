@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target
+
+# Editor
+/.vscode
+
+# Claude Code local settings (per-user)
+.claude/settings.local.json
