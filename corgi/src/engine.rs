@@ -1,23 +1,23 @@
 //! The engine: the row-movement primitives every shape op reduces to — `gather` (move rows by index) and
-//! `concat` (append same-shape columns) — plus the bound helpers and `mod generators` (the `gather`-family
-//! index currency). The structural comparator lives in [`crate::cmp`].
+//! `gather_lanes` (its multi-source form) — plus the bound helpers and `mod generators` (the `gather`-family
+//! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
 use crate::value::{Prim, Value};
 
-pub use generators::*;
+pub(crate) use generators::*;
 
-pub fn count_at(b: &[usize], i: usize) -> usize {
+fn count_at(b: &[usize], i: usize) -> usize {
     b[i] - if i == 0 { 0 } else { b[i - 1] }
 }
 
-pub fn row_span(b: &[usize], i: usize) -> (usize, usize) {
+pub(crate) fn row_span(b: &[usize], i: usize) -> (usize, usize) {
     (if i == 0 { 0 } else { b[i - 1] }, b[i])
 }
 
 /// lift a single-row constant to a column of length `n` (its stratum): `n` copies of `row`'s row 0. Total
 /// over every shape — it is `gather` at the all-zero index, so `Op::Lit`'s `judge` (which accepts any value's
 /// shape) and `eval` agree.
-pub fn fill(row: &Value, n: usize) -> Value {
+pub(crate) fn fill(row: &Value, n: usize) -> Value {
     gather(row, &vec![0usize; n])
 }
 
@@ -32,7 +32,7 @@ mod generators {
     /// the mask family: split element positions by a 0/1 `mask` into `(mask==0 positions, mask!=0 positions)`,
     /// each ascending. The shared atom under `Filter` (gathers the nonzero set, re-segmented) and `Partition`
     /// (gathers both into a Sum). Filter ⊂ Partition: Filter's survivors are exactly Partition's nonzero lane.
-    pub fn split_by_mask(mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn split_by_mask(mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
         let mut falses = Vec::new();
         let mut trues = Vec::new();
         for (j, &b) in mask.iter().enumerate() {
@@ -45,7 +45,7 @@ mod generators {
     /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`. The
     /// seq-level sibling is `split_by_mask` (Partition's); Filter needs the segmentation, so it has its own —
     /// the two share only the "mask nonzero" predicate, not a generator.
-    pub fn filter_mask(bounds: &[usize], mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn filter_mask(bounds: &[usize], mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut nb = Vec::with_capacity(bounds.len());
         let mut start = 0;
@@ -64,7 +64,7 @@ mod generators {
     /// the broadcast family: expand a list's `bounds` to the owner row of each element — `[2,3,6]` →
     /// `[0,0,1,2,2,2]`. Pairs with `gather` to replicate the scalar side of `Broadcast`. (The inverse of
     /// `bounds`: position → segment.)
-    pub fn owner_ids(bounds: &[usize]) -> Vec<usize> {
+    pub(crate) fn owner_ids(bounds: &[usize]) -> Vec<usize> {
         let mut idx = Vec::with_capacity(bounds.last().copied().unwrap_or(0));
         for i in 0..bounds.len() {
             idx.extend(std::iter::repeat_n(i, count_at(bounds, i)));
@@ -75,7 +75,7 @@ mod generators {
     /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row
     /// (rows spanned by `hay`). Emits the absolute haystack positions each pair names and the per-pair inner
     /// bounds. Pairs with `gather` to realise `Slices` — the materialising inverse of `Flatten`.
-    pub fn expand_ranges(outer: &[usize], lo: &[u64], hi: &[u64], hay: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn expand_ranges(outer: &[usize], lo: &[u64], hi: &[u64], hay: &[usize]) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut inner = Vec::new();
         let mut acc = 0;
@@ -97,7 +97,7 @@ mod generators {
 }
 
 /// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape.
-pub fn gather(v: &Value, idx: &[usize]) -> Value {
+pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     match v {
         Value::Prim(p) => Value::Prim(p.gather(idx)),
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather(c, idx)).collect()),
@@ -132,7 +132,7 @@ pub fn gather(v: &Value, idx: &[usize]) -> Value {
 /// one shape. The multi-source generalisation of [`gather`] (the 1-source case) and the fused inverse of
 /// `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from its
 /// variant instead of materialising `concat(variants)` first. `off` is the carried within-variant offset.
-pub fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Value {
+pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Value {
     match srcs[0] {
         Value::Prim(_) => {
             let prims: Vec<&Prim> = srcs
@@ -214,8 +214,10 @@ pub fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Value {
     }
 }
 
-/// concatenate same-shape columns end to end, re-basing witnesses.
-pub fn concat(parts: &[Value]) -> Value {
+/// concatenate same-shape columns end to end, re-basing witnesses. The pre-`gather_lanes` realization,
+/// kept as the reference the `gather_lanes` test validates against — no production op reduces to it.
+#[cfg(test)]
+pub(crate) fn concat(parts: &[Value]) -> Value {
     match &parts[0] {
         Value::Prim(_) => {
             let prims: Vec<&Prim> = parts
@@ -286,7 +288,7 @@ mod tests {
         Value::u64(xs.to_vec())
     }
 
-    /// the old realisation `gather_lanes` replaces: index into `concat(variants)` by lane-start + offset.
+    /// reference for `gather_lanes`: index into `concat(variants)` by lane-start + offset.
     fn oracle(variants: &[Value], tags: &[usize], off: &[usize]) -> Value {
         let mut start = vec![0usize; variants.len()];
         let mut acc = 0;

@@ -1,15 +1,13 @@
 //! Structural comparison and discrimination — the order machinery `sort`/`dedup`/`group`/`find` reduce to.
 //! Two coherent pieces: `mod compare` (the bulk structural comparator `compare_idx`, which `Rel` and `find`
 //! reduce to) and `mod discriminate` (the discrimination sort `sort` uses); both re-exported at this level.
-//! Next: the comparison op-bucket (`Gt` and friends) joins once the `Cmp` layer splits out of `core`, at
-//! which point these tighten from `pub` to private.
 
 use crate::engine::{gather, row_span};
 use crate::value::{Prim, Value};
 use std::cmp::Ordering;
 
-pub use compare::*;
-pub use discriminate::*;
+pub(crate) use compare::*;
+pub(crate) use discriminate::*;
 
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
@@ -18,10 +16,9 @@ mod compare {
     //!
     //! `compare_idx` is the kernel: it compares an explicit list of `(i, j)` index pairs in one descent per
     //! type level, PUSHING the indices down rather than gathering. The Sum arm is the subtle one — comparing
-    //! two equal-tag rows needs each row's offset WITHIN its variant — but a `Value::Sum` now CARRIES that
-    //! offset (built once at construction), so the arm reads it O(1) and recurses. That keeps the Sum
-    //! comparison LINEAR; a naive scalar comparator re-deriving the rank by a prefix scan per pair is O(n²),
-    //! which is why the scalar `compare2` survives only as the test oracle.
+    //! two equal-tag rows needs each row's offset WITHIN its variant, and a `Value::Sum` carries that
+    //! offset (built once at construction), so the arm reads it O(1) and recurses; the Sum comparison
+    //! stays LINEAR rather than the O(n²) of a per-pair rank scan. `compare2` (below) is the scalar oracle.
     //!
     //! `compare_cols` is the diagonal case (`Rel`'s lane compare); arbitrary pairs give the probe comparator
     //! `find`'s batched binary search wants — and because the carried offset is read, not recomputed, sparse
@@ -29,16 +26,11 @@ mod compare {
 
     use super::*;
 
-    /// Bulk structural order over an explicit list of index pairs: `out[k]` = the order of row `ia[k]`
-    /// of `a` vs row `ib[k]` of `b`, one descent per type level. The pairs are PUSHED DOWN rather than gathered: Sum remaps
-    /// `(i,j)` to the within-variant `(wa[i], wb[j])`, List expands each equal-length pair to its
-    /// element pairs, and only the leaf actually reads (via `cmp_idx`) — nothing is materialised. Each
-    /// level computes its contribution for all pairs and folds lexicographically (keep the first nonzero
-    /// sign); no early exit. Linear:
-    /// the within-offset cursor passes are O(column), the leaf reads O(pairs·depth).
-    ///
-    /// The diagonal pairs give `Rel`'s lane compare ([`compare_cols`]); arbitrary pairs give the probe
-    /// comparator `find`'s batched binary search wants — one kernel, no gather, for both.
+    /// Bulk structural order over a list of index pairs: `out[k]` = the order of row `ia[k]` of `a` vs
+    /// row `ib[k]` of `b`, one descent per type level (see the module doc). Each level folds its
+    /// contribution lexicographically (first nonzero sign wins), only the leaf reads — nothing is
+    /// materialised. Linear: within-offset cursor passes O(column), leaf reads O(pairs·depth). Diagonal
+    /// pairs are `Rel`'s lane compare ([`compare_cols`]); arbitrary pairs are what `find`'s search wants.
     pub fn compare_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
         debug_assert_eq!(ia.len(), ib.len());
         let m = ia.len();
@@ -60,8 +52,8 @@ mod compare {
             }
 
             // sum = tag order first; equal-tag pairs recurse into the lane at their within-variant
-            // indices (`wa`/`wb`, one cursor pass per side — the un-quadratic-ing step). No gather:
-            // the remapped indices descend as the next level's pairs.
+            // offsets (`oa`/`ob`, carried by the value). No gather: the remapped indices descend as
+            // the next level's pairs.
             (Value::Sum(ta, oa, va), Value::Sum(tb, ob, vb)) => {
                 assert_eq!(va.len(), vb.len(), "compare_idx: sum arity");
                 let (ta_v, tb_v) = (ta.usize_vec(), tb.usize_vec());
@@ -420,8 +412,7 @@ mod tests {
             &Value::Prod(vec![u(&[2, 1, 2, 1]), u(&[10, 20, 5, 30])]),
             &Value::Prod(vec![u(&[2, 1, 1, 1]), u(&[10, 25, 5, 30])]),
         );
-        // sum: equal-tag lanes hit the payload compare, unequal-tag lanes the tag order — the arm
-        // that was quadratic through `compare2`.
+        // sum: equal-tag lanes hit the payload compare, unequal-tag lanes the tag order.
         agree_cmp(
             &Value::sum(vec![0, 1, 0, 1, 0], vec![u(&[5, 7, 9]), u(&[2, 4])]),
             &Value::sum(vec![0, 1, 1, 1, 0], vec![u(&[5, 8]), u(&[2, 3, 1])]),
@@ -531,7 +522,7 @@ mod tests {
 
     #[test]
     fn list_of_sum_fully_discriminated() {
-        // List<Sum> — now structural all the way down (was the residual quadratic).
+        // List<Sum> — structural all the way down.
         let inner = Value::sum(vec![1, 0, 0, 1], vec![u(&[5, 8]), u(&[2, 9])]);
         agree(&Value::List(vec![2, 4], Box::new(inner)));
     }

@@ -13,11 +13,10 @@ pub enum Value {
     List(Vec<usize>, Box<Value>),      // end-offset per row; flattened values
 }
 
-/// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an
-/// `Arc` (leaves are write-once read-many; the `eval` clones values freely for shared edges and
-/// `tuple` formation, so a leaf clone must be a refcount bump, not a buffer copy). The `prim!`
-/// macro lists the widths ONCE and generates the enum + every method, so adding a width is one
-/// line here and the core's leaf arms stay one delegating line each (`Value::Prim(p) => p.method()`).
+/// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
+/// (leaves are write-once read-many; `eval` clones freely for shared edges, so a leaf clone must be a
+/// refcount bump, not a buffer copy). The `prim!` macro lists the widths ONCE and generates the enum +
+/// every method, so adding a width is one line here.
 macro_rules! prim {
     ($($V:ident => $t:ty),+ $(,)?) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -122,14 +121,9 @@ macro_rules! prim {
                 }
             }
 
-            /// bulk structural order: `out[k]` = the SIGN of record `ia[k]` of `self` vs record `ib[k]`
-            /// of `other` (same width) — `-1`/`0`/`+1` for `<`/`=`/`>`, matching `Ordering as i8`. The
-            /// width match is HOISTED once-per-column and the sign is `(gt) - (lt)`, not an `Ordering`
-            /// enum. The reads go THROUGH `ia`/`ib`, so the loop stays gather-bound (scalar on NEON, which
-            /// has no gather) — this is not the vectorized compare; for that, the dense column-vs-column
-            /// path is [`Prim::rel`]. The `i8` payoff is downstream: `compare_idx` folds these signs
-            /// lexicographically and `Pred`/`find` test them, and those dense passes vectorize where the
-            /// old `Ordering` round-trip did not.
+            /// structural order of paired records: `out[k]` = sign of `self[ia[k]]` vs `other[ib[k]]`
+            /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and scalar
+            /// on NEON; the dense column-vs-column compare is [`Prim::rel`].
             pub(crate) fn cmp_idx(&self, ia: &[usize], ib: &[usize], other: &Prim) -> Vec<i8> {
                 match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) =>
@@ -138,13 +132,9 @@ macro_rules! prim {
                 }
             }
 
-            /// lane-wise relational compare of two same-width columns → a 0/1 mask (as `u64`s).
-            /// Kind-blind: it reads the stored bytes (unsigned at the native width), which is correct
-            /// for unsigned AND for order-preserving *swizzled* signed columns — the leaf analog of the
-            /// discrimination order. The predicate arrives PRE-RESOLVED as the three order-flags
-            /// (`lt`/`eq`/`gt`: which of `<`/`=`/`>` count as true), not an `Ordering`-typed closure,
-            /// so the body is a branchless masked compare — packed comparisons or'd together, no enum
-            /// built per lane — which vectorizes where the old `Ordering` round-trip did not.
+            /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
+            /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
+            /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
             pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
                 match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
@@ -154,7 +144,9 @@ macro_rules! prim {
                 }
             }
 
-            /// append same-width leaves end to end.
+            /// append same-width leaves end to end. Test-only: the leaf of `engine::concat`, the
+            /// `gather_lanes` reference oracle (no production path concatenates leaves).
+            #[cfg(test)]
             pub(crate) fn concat(parts: &[&Prim]) -> Prim {
                 match parts[0] {
                     $( Prim::$V(_) => {
@@ -185,8 +177,7 @@ prim! {
 }
 
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in
-/// one cursor pass. A `Sum` carries this (see [`Value::sum`]) so comparison/search read it instead of
-/// re-deriving the rank; the ops that build sums (`gather`/`concat`/`Value::sum`) maintain it.
+/// one cursor pass. A `Sum` carries this (see [`Value::sum`]).
 fn within_offsets(tags: &[usize], k: usize) -> Vec<usize> {
     let mut cursor = vec![0usize; k];
     tags.iter().map(|&t| { let p = cursor[t]; cursor[t] += 1; p }).collect()
@@ -202,12 +193,10 @@ impl Value {
     /// a Sum from its discriminant `tags` (stored as a u8 leaf column — ≤256 variants) and the
     /// per-variant columns. The one place tags cross from `usize` into the `Prim` fold. The
     /// within-variant offset is computed here and carried, so comparison/search read it instead of
-    /// re-deriving each row's rank (the cliff the bulk passes used to dodge by recomputing).
+    /// re-deriving each row's rank.
     pub fn sum(tags: Vec<usize>, variants: Vec<Value>) -> Value {
-        // tags index the variants and are stored as a u8 discriminant, so the variant count must
-        // fit a u8 — else `t as u8` would silently truncate a tag onto the wrong lane. A wider tag
-        // leaf is the generalization (the width is derivable from the variant count), deferred until
-        // a >256-variant shape actually appears.
+        // tags are stored as a u8 discriminant, so the variant count must fit a u8 — else `t as u8`
+        // would silently truncate a tag onto the wrong lane.
         assert!(variants.len() <= 256, "Value::sum: {} variants exceeds the u8 tag width", variants.len());
         let offset = within_offsets(&tags, variants.len());
         let tags = Prim::U8(Arc::new(tags.iter().map(|&t| t as u8).collect()));

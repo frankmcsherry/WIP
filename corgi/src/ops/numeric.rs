@@ -1,5 +1,5 @@
 //! The numeric layer over the core — the first stacked vocabulary on `OpLike`.
-//! `NumOp` embeds the whole core `Op` (now structure + comparison only) via `Core`
+//! `NumOp` embeds the whole core `Op` (structure and comparison) via `Core`
 //! and adds arithmetic via `Arith`. The same `Graph`/`eval_graph`/`shape_of`
 //! machinery runs it unchanged; the core never learns arithmetic.
 //!
@@ -41,7 +41,7 @@ pub enum Kind {
 pub enum ArithOp {
     Bin(BinOp, Kind, u32), // binary leaf arithmetic at a bit-width
     Neg(Kind, u32),        // unary negate
-    AddU64(u64),           // U64 -> U64   x + c   (kept sugar)
+    AddU64(u64),           // U64 -> U64   x + c   (sugar)
     Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
     And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
     ReduceSum,             // List<U64> -> U64      (unsigned reduce)
@@ -61,8 +61,7 @@ macro_rules! swiz {
 /// apply a binary lane op `f` in place, writing into whichever operand buffer we uniquely own.
 /// Both lanes are read before the store, so EITHER side is a valid destination (Sub included:
 /// `f` is `x - y` regardless of where it lands). `get_mut` (not `make_mut`) tests uniqueness
-/// without cloning, so a shared LHS falls through to a unique RHS; only when both are shared do
-/// we allocate. The leaf analogue of `AddU64`'s move-on-last-use — extended to the whole grid.
+/// without cloning, so a shared LHS falls through to a unique RHS; only when both are shared do we allocate.
 fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = f(*x, y); }
@@ -86,9 +85,9 @@ fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
 }
 
 // list the widths ONCE; generate the per-width binary/unary leaf arithmetic. Mirrors `prim!`.
-// The (kind × op) dispatch is HOISTED ABOVE the lane loop (the `cmp_at` lesson): each arm matches
-// once, picks ONE concrete closure, then makes a single tight pass — no per-element branch to keep
-// the vectorizer out. `Kind::U` is native wrapping; `Kind::I` deswizzles/reswizzles via `swiz!`.
+// The (kind × op) dispatch is HOISTED ABOVE the lane loop: each arm matches once, picks ONE concrete
+// closure, then makes a single tight pass — no per-element branch to keep the vectorizer out.
+// `Kind::U` is native wrapping; `Kind::I` deswizzles/reswizzles via `swiz!`.
 macro_rules! grid {
     ($($V:ident => $u:ty : $i:ty),+ $(,)?) => {
         fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
@@ -131,10 +130,7 @@ impl ArithOp {
             }
             ArithOp::Neg(kind, _) => Value::Prim(neg_eval(*kind, input.into_prim("Neg"))),
             ArithOp::AddU64(c) => {
-                // in place when the input is uniquely owned: move-on-last-use leaves the leaf at
-                // refcount 1, so `into_u64` MOVES the buffer out; we mutate it and re-wrap, with no
-                // fresh output column (no allocation, no write-allocate). Shared input falls back to
-                // a clone inside `into_u64`, so this stays correct either way.
+                // in place when uniquely owned: `into_u64` moves the buffer out at refcount 1, else clones.
                 let mut xs = input.into_u64("AddU64");
                 xs.iter_mut().for_each(|x| *x = x.wrapping_add(*c));
                 Value::u64(xs)
@@ -214,7 +210,7 @@ impl OpLike for NumOp {
     }
     fn children(&self) -> Vec<&Graph<NumOp>> {
         match self {
-            NumOp::Core(c) => c.children(), // core bodies ARE Graph<NumOp> now
+            NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
             NumOp::Cmp(_) | NumOp::Arith(_) => Vec::new(),
         }
     }

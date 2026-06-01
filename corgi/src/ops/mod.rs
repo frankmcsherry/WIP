@@ -2,9 +2,9 @@
 //! its body layer); `numeric` is the first layer above it (`NumOp`, embedding
 //! `core::Op` plus arithmetic). Future buckets/layers (cmp, swizzle, …) live here too.
 
-pub mod cmp;
-pub mod core;
-pub mod numeric;
+pub(crate) mod cmp;
+pub(crate) mod core;
+pub(crate) mod numeric;
 
 pub use self::cmp::{CmpOp, Pred};
 pub use self::core::Op;

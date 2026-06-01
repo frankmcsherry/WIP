@@ -3,8 +3,8 @@
 //! which aligns with the operator set — `|>` is op application, `let` is graph sharing, `fun` is a
 //! closed body. The op-name table below is the whole vocabulary it reaches.
 
-pub mod ml;
-pub mod program;
+pub(crate) mod ml;
+pub(crate) mod program;
 
 pub use ml::parse_ml;
 pub use program::Program;

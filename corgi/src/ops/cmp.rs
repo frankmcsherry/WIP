@@ -3,9 +3,12 @@
 //! (discrimination via `sort_blocks`/`run_layout`) and `Find` (batched binary search via `compare_idx`). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
+//! The structural-order engine these ops reduce to is the private [`order`] submodule.
 
-use crate::cmp::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
+mod order;
+
 use crate::engine::gather;
+use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
 use crate::shape::Shape;
 use crate::value::Value;
 
@@ -45,7 +48,7 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
-    pub fn eval(&self, input: Value) -> Value {
+    pub(crate) fn eval(&self, input: Value) -> Value {
         match self {
             CmpOp::Rel(pred) => {
                 let (a, b) = input.into_pair("Rel");
@@ -100,10 +103,8 @@ impl CmpOp {
                 Value::List(no, Box::new(Value::Prod(vec![keys, inner])))
             }
 
-            // for each needle element, equal_range it in the matching haystack row — as a BATCHED
-            // binary search: every needle element advances its window in lockstep, one `compare_idx`
-            // per round (needle[i] vs haystack[mid_i]) rather than a scalar search per needle. Output is
-            // shaped like `needle`, each (lo,hi) RELATIVE to its haystack row.
+            // for each needle element, equal_range it in the matching haystack row (batched binary
+            // search, see `batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find");
                 let (nb, nvals) = needle.into_list("Find needle");
@@ -137,7 +138,7 @@ impl CmpOp {
     }
 
     /// the type-level shadow of `eval` — kind-blind, structural, exactly like `core::Op::judge`.
-    pub fn judge(&self, input: &Shape) -> Result<Shape, String> {
+    pub(crate) fn judge(&self, input: &Shape) -> Result<Shape, String> {
         use Shape::*;
         let err = |what: &str| Err(format!("{what}, got {input}"));
         Ok(match self {

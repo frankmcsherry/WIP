@@ -17,18 +17,17 @@
 //! element filled to its input's length — anchored to a stratum) and the two
 //! closed-body ops `MapList` / `MapSum` (they recurse into [`graph::eval_graph`]).
 //!
-//! Layers: [`value`] (the data) → [`engine`] (`gather`/`concat` + index gen) /
-//! [`cmp`] (`compare_idx`/structural order + discrimination sort) → [`op`] (the
-//! vocabulary) → [`graph`] (the IR + evaluator).
+//! Layers: [`value`] (the data) → [`engine`] (`gather`/`concat` + index gen) →
+//! [`ops`] (the vocabulary; `ops::cmp` carries its own `compare_idx`/structural-order
+//! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
 
-pub mod cmp;
-pub mod engine;
-pub mod frontend;
-pub mod graph;
-pub mod ops;
-pub mod optimize;
-pub mod shape;
-pub mod value;
+pub(crate) mod engine;
+pub(crate) mod frontend;
+pub(crate) mod graph;
+pub(crate) mod ops;
+pub(crate) mod optimize;
+pub(crate) mod shape;
+pub(crate) mod value;
 
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};

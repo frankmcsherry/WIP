@@ -15,24 +15,24 @@ use crate::value::Value;
 /// `NumOp`), delegating to these inherent methods.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Op<L> {
-    Lit(Value),   // a constant element, filled to the input's length (anchored)
-    Cast(u32),    // leaf -> leaf     re-width to N bits (low bytes / zero-pad), kind-blind
+    Lit(Value),     // a constant element, filled to the input's length (anchored)
+    Cast(u32),      // leaf -> leaf     re-width to N bits (low bytes / zero-pad), kind-blind
     // Tuple ops
-    Field(usize), // (.., X_i, ..) -> X_i
-    Broadcast,    // (X, List<Y>)   -> List<(X,Y)>
-    Partition,    // (X, U64-mask) -> Sum{zero-rows, nonzero-rows}   (the boolean 2-way; = Branch(2))
-    Branch(usize), // (X, U64-tags) -> Sum{X × n}   data-driven N-way partition: row i -> variant tags[i]
+    Field(usize),   // (.., X_i, ..) -> X_i
+    Broadcast,      // (X, List<Y>)   -> List<(X,Y)>
+    Partition,      // (X, U64-mask) -> Sum{zero-rows, nonzero-rows}   (the boolean 2-way; = Branch(2))
+    Branch(usize),  // (X, U64-tags) -> Sum{X × n}   data-driven N-way partition: row i -> variant tags[i]
     // List ops
-    Transpose, // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
-    Filter,    // (List<X>, List<U64-mask>) -> List<X>
-    Slices,    // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>   materialize each range
-    Flatten,   // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
-    Enlist,    // X -> List<X>   each element its own length-1 list (list-monad unit)
-    Iota,      // U64 -> List<U64>   per row [0,1,…,n-1] — a List-introducer / in-language data generator
+    Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
+    Filter,         // (List<X>, List<U64-mask>) -> List<X>
+    Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>   materialize each range
+    Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
+    Enlist,         // X -> List<X>   each element its own length-1 list (list-monad unit)
+    Iota,           // U64 -> List<U64>   per row [0,1,…,n-1] — a List-introducer / in-language data generator
     // Sum ops
-    Unwrap,                       // homogeneous Sum -> payload
-    Inject(usize, Vec<Shape>),    // X -> Sum{..tag:X..}   put X in variant `tag`, others empty (sum intro)
-    MapList(Box<Graph<L>>),       // closed body on a list's values (in the *layer* L)
+    Unwrap,                         // homogeneous Sum -> payload
+    Inject(usize, Vec<Shape>),      // X -> Sum{..tag:X..}   put X in variant `tag`, others empty (sum intro)
+    MapList(Box<Graph<L>>),         // closed body on a list's values (in the *layer* L)
     MapSum(Vec<(usize, Graph<L>)>), // closed bodies on chosen sum variants; unlisted variants pass
                                     // through. The Vec breaks the type recursion, so no Box. A variadic
                                     // match — disjoint indices keep the arms independent (the optimizer
@@ -40,7 +40,7 @@ pub enum Op<L> {
 }
 
 impl<L: OpLike> Op<L> {
-    pub fn eval(&self, input: Value) -> Value {
+    pub(crate) fn eval(&self, input: Value) -> Value {
         match self {
             Op::Lit(v) => fill(v, input.len()),
 
@@ -92,7 +92,7 @@ impl<L: OpLike> Op<L> {
 
             // N-way partition: the discriminant `tags` routes each row of `data` to its variant. The
             // tags ARE the sum's tag column; each variant gathers its rows in order (so the implicit
-            // within-variant offset matches `Value::sum`). The general form of `Partition`.
+            // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch");
                 let tags = tags_v.into_u64("Branch tags");
@@ -213,7 +213,7 @@ impl<L: OpLike> Op<L> {
     /// shape (or a structural error). Pattern-matches the input exactly like `eval`,
     /// so adding an op means one rule here and one in `eval`. `Input`/`Tuple` are
     /// handled by `graph::shape_of`, the analogue of `eval_graph`.
-    pub fn judge(&self, input: &Shape) -> Result<Shape, String> {
+    pub(crate) fn judge(&self, input: &Shape) -> Result<Shape, String> {
         use Shape::*;
         let err = |what: &str| Err(format!("{what}, got {input}"));
         Ok(match self {
@@ -328,7 +328,7 @@ impl<L: OpLike> Op<L> {
         })
     }
 
-    pub fn children(&self) -> Vec<&Graph<L>> {
+    pub(crate) fn children(&self) -> Vec<&Graph<L>> {
         match self {
             Op::MapList(b) => vec![b],
             Op::MapSum(arms) => arms.iter().map(|(_, b)| b).collect(),
