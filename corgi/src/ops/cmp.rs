@@ -8,7 +8,6 @@ use crate::cmp::{compare_cols, compare_idx, run_layout, runs_per_row, segment_la
 use crate::engine::gather;
 use crate::shape::Shape;
 use crate::value::Value;
-use std::cmp::Ordering;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -22,16 +21,15 @@ pub enum Pred {
 }
 
 impl Pred {
-    /// does this predicate hold for a lane's `Ordering`?
-    fn test(self, o: Ordering) -> bool {
-        use Ordering::*;
+    /// does this predicate hold for a lane's comparison sign (`-1`/`0`/`+1` for `<`/`=`/`>`)?
+    fn test(self, o: i8) -> bool {
         match self {
-            Pred::Eq => o == Equal,
-            Pred::Ne => o != Equal,
-            Pred::Lt => o == Less,
-            Pred::Le => o != Greater,
-            Pred::Gt => o == Greater,
-            Pred::Ge => o != Less,
+            Pred::Eq => o == 0,
+            Pred::Ne => o != 0,
+            Pred::Lt => o < 0,
+            Pred::Le => o <= 0,
+            Pred::Gt => o > 0,
+            Pred::Ge => o >= 0,
         }
     }
 }
@@ -53,8 +51,10 @@ impl CmpOp {
                 let (a, b) = input.into_pair("Rel");
                 assert_eq!(a.len(), b.len(), "Rel: operands at different strata");
                 let mask = match (&a, &b) {
-                    // leaf pair: the vectorized lane compare (SIMD-friendly).
-                    (Value::Prim(pa), Value::Prim(pb)) => pa.rel(pb, |o| pred.test(o)),
+                    // leaf pair: the vectorized lane compare. Resolve the predicate to its three
+                    // order-flags ONCE here (sign `-1`/`0`/`+1`), so `rel`'s lane loop is branchless.
+                    (Value::Prim(pa), Value::Prim(pb)) =>
+                        pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
@@ -127,8 +127,8 @@ impl CmpOp {
                 // batched search, different tie rule on `haystack[mid] vs needle`.
                 let mut lower = (lo.clone(), hi.clone());
                 let mut upper = (lo, hi);
-                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o == Ordering::Less);
-                batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o != Ordering::Greater);
+                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
                 let lo_c: Vec<u64> = lower.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
                 let hi_c: Vec<u64> = upper.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
                 Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
@@ -176,15 +176,15 @@ impl CmpOp {
 
 /// one batched lower/upper-bound search: every needle element advances its window `[lo,hi)` in
 /// lockstep until it collapses, one `compare_idx` per round comparing `haystack[mid]` to its needle
-/// element. `go_right(ord)` is the tie rule (`ord` is haystack-vs-needle): lower bound steps right on
-/// `Less`, upper bound on `not Greater`. Rounds = ⌈log₂ max-span⌉; each is linear in the live needles.
-/// No gather and no whole-row compare — `compare_idx` pushes the (mid, needle) index pairs down.
+/// element. `go_right(sign)` is the tie rule (`sign` is haystack-vs-needle, `-1`/`0`/`+1`): lower bound
+/// steps right on `< 0`, upper bound on `<= 0`. Rounds = ⌈log₂ max-span⌉; each is linear in the live
+/// needles. No gather and no whole-row compare — `compare_idx` pushes the (mid, needle) index pairs down.
 fn batched_bound(
     hvals: &Value,
     nvals: &Value,
     lo: &mut [usize],
     hi: &mut [usize],
-    go_right: impl Fn(Ordering) -> bool,
+    go_right: impl Fn(i8) -> bool,
 ) {
     loop {
         // live needles and their probe midpoints; the active list doubles as the needle indices

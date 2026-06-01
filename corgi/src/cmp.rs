@@ -32,28 +32,28 @@ mod compare {
     /// Bulk structural order over an explicit list of index pairs: `out[k]` = the order of row `ia[k]`
     /// of `a` vs row `ib[k]` of `b`, one descent per type level. The pairs are PUSHED DOWN rather than gathered: Sum remaps
     /// `(i,j)` to the within-variant `(wa[i], wb[j])`, List expands each equal-length pair to its
-    /// element pairs, and only the leaf actually reads (via `cmp_at`) — nothing is materialised. Each
-    /// level computes its contribution for all pairs and folds `prev.then(this)`; no early exit. Linear:
+    /// element pairs, and only the leaf actually reads (via `cmp_idx`) — nothing is materialised. Each
+    /// level computes its contribution for all pairs and folds lexicographically (keep the first nonzero
+    /// sign); no early exit. Linear:
     /// the within-offset cursor passes are O(column), the leaf reads O(pairs·depth).
     ///
     /// The diagonal pairs give `Rel`'s lane compare ([`compare_cols`]); arbitrary pairs give the probe
     /// comparator `find`'s batched binary search wants — one kernel, no gather, for both.
-    pub fn compare_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<Ordering> {
+    pub fn compare_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
         debug_assert_eq!(ia.len(), ib.len());
         let m = ia.len();
         match (a, b) {
-            // leaf: read each pair at its two indices.
-            (Value::Prim(pa), Value::Prim(pb)) => {
-                ia.iter().zip(ib).map(|(&i, &j)| pa.cmp_at(i, pb, j)).collect()
-            }
+            // leaf: read all pairs at their two indices in one width-dispatched pass.
+            (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(ia, ib, pb),
 
-            // product = lexicographic: fold the fields (same pairs), each refining prior `Equal`s.
+            // product = lexicographic: fold the fields (same pairs), each refining prior ties — keep
+            // the first field that broke the tie (the first nonzero sign).
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
-                let mut ord = vec![Ordering::Equal; m];
+                let mut ord = vec![0i8; m];
                 for (x, y) in ca.iter().zip(cb) {
                     for (o, c) in ord.iter_mut().zip(compare_idx(x, y, ia, ib)) {
-                        *o = (*o).then(c);
+                        if *o == 0 { *o = c; }
                     }
                 }
                 ord
@@ -65,8 +65,8 @@ mod compare {
             (Value::Sum(ta, oa, va), Value::Sum(tb, ob, vb)) => {
                 assert_eq!(va.len(), vb.len(), "compare_idx: sum arity");
                 let (ta_v, tb_v) = (ta.usize_vec(), tb.usize_vec());
-                let mut ord: Vec<Ordering> =
-                    ia.iter().zip(ib).map(|(&i, &j)| ta_v[i].cmp(&tb_v[j])).collect();
+                let mut ord: Vec<i8> =
+                    ia.iter().zip(ib).map(|(&i, &j)| ta_v[i].cmp(&tb_v[j]) as i8).collect();
                 let mut by_tag: Vec<Vec<usize>> = vec![Vec::new(); va.len()];
                 for (k, (&i, &j)) in ia.iter().zip(ib).enumerate() {
                     if ta_v[i] == tb_v[j] { by_tag[ta_v[i]].push(k); }
@@ -87,7 +87,7 @@ mod compare {
             // to their element index pairs, recurse ONCE (no per-position loop — `sort` needs that
             // refinement, `cmp` doesn't), then read each pair's first difference off its segment.
             (Value::List(ba, va), Value::List(bb, vb)) => {
-                let mut ord = vec![Ordering::Equal; m];
+                let mut ord = vec![0i8; m];
                 let (mut sia, mut sib) = (Vec::new(), Vec::new());
                 let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)
                 for (k, (&i, &j)) in ia.iter().zip(ib).enumerate() {
@@ -98,13 +98,13 @@ mod compare {
                             seg.push((k, sia.len(), la));
                             for p in 0..la { sia.push(s_a + p); sib.push(s_b + p); }
                         }
-                        Ordering::Equal => {}       // equal length 0 — stays Equal
-                        ow => ord[k] = ow,          // length decides
+                        Ordering::Equal => {}       // equal length 0 — stays Equal (0)
+                        ow => ord[k] = ow as i8,    // length decides
                     }
                 }
                 let cmp = compare_idx(va, vb, &sia, &sib);
                 for (k, start, len) in seg {
-                    if let Some(o) = cmp[start..start + len].iter().copied().find(|&o| o != Ordering::Equal) {
+                    if let Some(o) = cmp[start..start + len].iter().copied().find(|&o| o != 0) {
                         ord[k] = o;
                     }
                 }
@@ -116,7 +116,7 @@ mod compare {
     }
 
     /// the diagonal case: `out[i]` = the order of row `i` of `a` vs row `i` of `b` — `Rel`'s lane compare.
-    pub fn compare_cols(a: &Value, b: &Value) -> Vec<Ordering> {
+    pub fn compare_cols(a: &Value, b: &Value) -> Vec<i8> {
         let id: Vec<usize> = (0..a.len()).collect();
         compare_idx(a, b, &id, &id)
     }
@@ -138,10 +138,10 @@ mod discriminate {
     //! (the old O(n²)); every stage is linear, so the kernel is O(total input size).
     //!
     //! The leaf (`sort_leaf_blocks`) is the terminal: sort a fixed-width column within each block via
-    //! `Prim::sort_block` (a stable LSD byte-radix) plus an O(n) `cmp_at` scan for the label boundaries. That
+    //! `Prim::sort_block` (a stable LSD byte-radix) plus an O(n) `cmp_idx` scan for the label boundaries. That
     //! scan is the one spot that isn't top-down — pure (Henglein) discrimination would MSB-byte-partition the
     //! leaf too and read labels straight off the partition, with early-out; both are linear, so an MSD leaf is a
-    //! constant-factor win that drops `cmp_at` from the sort path, not a linearity change.
+    //! constant-factor win that drops `cmp_idx` from the sort path, not a linearity change.
 
     use super::*;
 
@@ -237,11 +237,13 @@ mod discriminate {
         let mut new_labels = Vec::with_capacity(p.len());
         let mut next = 0u64;
         for (lo, hi) in find_blocks(labels) {
-            // stable byte-radix within the block (one comparator gone); `cmp_at` stays only for the O(n)
-            // run-label scan. Radix is stable, so the recursion stays stable — group keeps V-within-key order.
+            // stable byte-radix within the block (one comparator gone); a single `cmp_idx` over the
+            // adjacent pairs feeds the O(n) run-label scan — one width-dispatch, not one per element.
+            // Radix is stable, so the recursion stays stable — group keeps V-within-key order.
             let sorted = p.sort_block(&(lo..hi).collect::<Vec<usize>>());
+            let adj = p.cmp_idx(&sorted[1..], &sorted[..sorted.len() - 1], p);
             for (k, &i) in sorted.iter().enumerate() {
-                if k > 0 && p.cmp_at(i, p, sorted[k - 1]) != Ordering::Equal {
+                if k > 0 && adj[k - 1] != 0 {
                     next += 1;
                 }
                 new_labels.push(next);
@@ -357,7 +359,8 @@ mod tests {
     /// O(n²) standard the bulk `compare_idx` is checked against, and the order `sort` must materialise.
     fn compare2(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
         match (a, b) {
-            (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_at(i, pb, j),
+            // i8 sign back to the oracle's `Ordering` (the one i8→Ordering boundary, test-only).
+            (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(&[i], &[j], pb)[0].cmp(&0),
             (Value::Prod(ca), Value::Prod(cb)) => {
                 for (x, y) in ca.iter().zip(cb) {
                     match compare2(x, i, y, j) {
@@ -404,7 +407,7 @@ mod tests {
     /// `compare_cols` must match the scalar `compare2` lane for lane — same contract, bulk path.
     fn agree_cmp(a: &Value, b: &Value) {
         let got = compare_cols(a, b);
-        let want: Vec<Ordering> = (0..a.len()).map(|i| compare2(a, i, b, i)).collect();
+        let want: Vec<i8> = (0..a.len()).map(|i| compare2(a, i, b, i) as i8).collect();
         assert_eq!(got, want);
     }
 
@@ -447,14 +450,14 @@ mod tests {
         let b = Value::sum(vec![0, 0, 1, 1], vec![u(&[5, 8]), u(&[2, 9])]);
         let (ia, ib) = (&[0usize, 2, 4, 1, 3], &[3usize, 1, 0, 2, 0]);
         let got = compare_idx(&a, &b, ia, ib);
-        let want: Vec<Ordering> = ia.iter().zip(ib).map(|(&i, &j)| compare2(&a, i, &b, j)).collect();
+        let want: Vec<i8> = ia.iter().zip(ib).map(|(&i, &j)| compare2(&a, i, &b, j) as i8).collect();
         assert_eq!(got, want);
 
         let la = Value::List(vec![2, 2, 5, 6], Box::new(u(&[3, 1, 4, 5, 9, 0])));
         let lb = Value::List(vec![2, 3, 6, 7], Box::new(u(&[3, 2, 7, 4, 5, 1, 0])));
         let (ja, jb) = (&[3usize, 0, 2, 1], &[3usize, 0, 2, 1]);
         let got = compare_idx(&la, &lb, ja, jb);
-        let want: Vec<Ordering> = ja.iter().zip(jb).map(|(&i, &j)| compare2(&la, i, &lb, j)).collect();
+        let want: Vec<i8> = ja.iter().zip(jb).map(|(&i, &j)| compare2(&la, i, &lb, j) as i8).collect();
         assert_eq!(got, want);
     }
 

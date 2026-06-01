@@ -3,7 +3,6 @@
 //! cardinality change lives *inside* a `List`.
 
 use crate::shape::Shape;
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -123,23 +122,34 @@ macro_rules! prim {
                 }
             }
 
-            /// structural order: record `i` of `self` vs record `j` of `other` (same width).
-            pub(crate) fn cmp_at(&self, i: usize, other: &Prim, j: usize) -> Ordering {
+            /// bulk structural order: `out[k]` = the SIGN of record `ia[k]` of `self` vs record `ib[k]`
+            /// of `other` (same width) — `-1`/`0`/`+1` for `<`/`=`/`>`, matching `Ordering as i8`. The
+            /// width match is HOISTED once-per-column and the sign is `(gt) - (lt)`, not an `Ordering`
+            /// enum. The reads go THROUGH `ia`/`ib`, so the loop stays gather-bound (scalar on NEON, which
+            /// has no gather) — this is not the vectorized compare; for that, the dense column-vs-column
+            /// path is [`Prim::rel`]. The `i8` payoff is downstream: `compare_idx` folds these signs
+            /// lexicographically and `Pred`/`find` test them, and those dense passes vectorize where the
+            /// old `Ordering` round-trip did not.
+            pub(crate) fn cmp_idx(&self, ia: &[usize], ib: &[usize], other: &Prim) -> Vec<i8> {
                 match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) => a[i].cmp(&b[j]), )+
-                    _ => panic!("cmp_at: prim width mismatch"),
+                    $( (Prim::$V(a), Prim::$V(b)) =>
+                        ia.iter().zip(ib).map(|(&i, &j)| (a[i] > b[j]) as i8 - (a[i] < b[j]) as i8).collect(), )+
+                    _ => panic!("cmp_idx: prim width mismatch"),
                 }
             }
 
             /// lane-wise relational compare of two same-width columns → a 0/1 mask (as `u64`s).
             /// Kind-blind: it reads the stored bytes (unsigned at the native width), which is correct
             /// for unsigned AND for order-preserving *swizzled* signed columns — the leaf analog of the
-            /// discrimination order. The predicate arrives as `keep: Ordering -> bool` so this layer
-            /// stays free of op-level concepts.
-            pub(crate) fn rel(&self, other: &Prim, keep: impl Fn(Ordering) -> bool) -> Vec<u64> {
+            /// discrimination order. The predicate arrives PRE-RESOLVED as the three order-flags
+            /// (`lt`/`eq`/`gt`: which of `<`/`=`/`>` count as true), not an `Ordering`-typed closure,
+            /// so the body is a branchless masked compare — packed comparisons or'd together, no enum
+            /// built per lane — which vectorizes where the old `Ordering` round-trip did not.
+            pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
                 match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) =>
-                        a.iter().zip(b.iter()).map(|(x, y)| keep(x.cmp(y)) as u64).collect(), )+
+                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
+                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u64)
+                        .collect(), )+
                     _ => panic!("rel: prim width mismatch"),
                 }
             }

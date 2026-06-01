@@ -47,15 +47,15 @@ pub enum ArithOp {
     ReduceSum,             // List<U64> -> U64      (unsigned reduce)
 }
 
-// op-match without a `num_traits` dependency: `wrapping_*` are inherent on every uN/iN.
-macro_rules! wrap {
-    ($op:expr, $x:expr, $y:expr) => {
-        match $op {
-            BinOp::Add => $x.wrapping_add($y),
-            BinOp::Sub => $x.wrapping_sub($y),
-            BinOp::Mul => $x.wrapping_mul($y),
-        }
-    };
+// deswizzle the order-preserving signed encoding (XOR the top bit `m`), apply a native wrapping op,
+// reswizzle. `m` is a per-width constant. This is the `Kind::I` lane body, factored so the grid's
+// six (kind × op) arms each stay a one-line lane map. `wrapping_*` are inherent on every uN/iN, so
+// no `num_traits` dependency.
+macro_rules! swiz {
+    ($u:ty, $i:ty, $x:ident, $y:ident, $op:ident) => {{
+        let m = !(<$u>::MAX >> 1);
+        ((($x ^ m) as $i).$op(($y ^ m) as $i) as $u) ^ m
+    }};
 }
 
 /// apply a binary lane op `f` in place, writing into whichever operand buffer we uniquely own.
@@ -85,33 +85,35 @@ fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     }
 }
 
-// list the widths ONCE; generate the per-width binary/unary leaf arithmetic. `Kind::I`
-// deswizzles (XOR the top bit, `as iN`), operates natively, reswizzles. Mirrors `prim!`.
-// Each arm builds a per-width lane closure and hands it to `bin_into`/`neg_into` for the in-place write.
+// list the widths ONCE; generate the per-width binary/unary leaf arithmetic. Mirrors `prim!`.
+// The (kind × op) dispatch is HOISTED ABOVE the lane loop (the `cmp_at` lesson): each arm matches
+// once, picks ONE concrete closure, then makes a single tight pass — no per-element branch to keep
+// the vectorizer out. `Kind::U` is native wrapping; `Kind::I` deswizzles/reswizzles via `swiz!`.
 macro_rules! grid {
     ($($V:ident => $u:ty : $i:ty),+ $(,)?) => {
         fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
             match (a, b) {
-                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(bin_into(av, bv, |x: $u, y: $u| match kind {
-                    Kind::U => wrap!(op, x, y),
-                    Kind::I => {
-                        let m = !(<$u>::MAX >> 1); // the top bit = the swizzle
-                        (wrap!(op, (x ^ m) as $i, (y ^ m) as $i) as $u) ^ m
-                    }
-                })), )+
+                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(match (kind, op) {
+                    (Kind::U, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_add(y)),
+                    (Kind::U, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_sub(y)),
+                    (Kind::U, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_mul(y)),
+                    (Kind::I, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
+                    (Kind::I, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
+                    (Kind::I, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
+                }), )+
                 _ => panic!("arith: operand width mismatch"),
             }
         }
 
         fn neg_eval(kind: Kind, a: Prim) -> Prim {
             match a {
-                $( Prim::$V(av) => Prim::$V(neg_into(av, |x: $u| match kind {
-                    Kind::U => x.wrapping_neg(),
-                    Kind::I => {
+                $( Prim::$V(av) => Prim::$V(match kind {
+                    Kind::U => neg_into(av, |x: $u| x.wrapping_neg()),
+                    Kind::I => neg_into(av, |x: $u| {
                         let m = !(<$u>::MAX >> 1);
                         (((x ^ m) as $i).wrapping_neg() as $u) ^ m
-                    }
-                })), )+
+                    }),
+                }), )+
             }
         }
     };
