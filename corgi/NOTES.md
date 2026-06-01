@@ -10,11 +10,13 @@ language; `cargo bench --bench eval` measures throughput.
 ```
 src/
   value.rs     Value (columnar data) + show. Leaf = Prim, a width-tagged Arc<Vec<uN>>
-               (u8/u16/u32/u64) via the `prim!` macro. Sum tags are a Prim u8 column.
+               (u8/u16/u32/u64) via the `prim!` macro. Sum = (u8 tag column, carried within-variant
+               offset per row, variants); build via Value::sum / sum_from_prim to keep the offset valid.
   engine.rs    row-movement primitives: gather, concat, fill + index generators
                (split_by_mask / filter_mask / owner_ids / expand_ranges / tag_offsets).
-  cmp.rs       the order machinery: compare2 (structural order) + the linear discrimination
-               sort (sort_blocks / run_layout / segment_labels). Consumers are the cmp ops only.
+  cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
+               is the diagonal case) + the linear discrimination sort (sort_blocks / run_layout /
+               segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph, shape_of,
                check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
@@ -92,9 +94,13 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).
 - **Length / stratum checker** — the one judgment `shape_of` skips (Tuple/Add same length; map body
   one stratum deeper). A pass beside `check`.
-- **Sum random-access cost** — `compare2`'s Sum arm rank-scans (O(i)), so `find` over a sum-shaped
-  haystack is O(n·m). The fix is find-local (sorted haystack ⇒ contiguous tags ⇒ block-start
-  offset), not a representation change. See the COST NOTE in `cmp.rs`.
+- **Sum random-access cost — RESOLVED (via representation).** A `Value::Sum` now carries the
+  within-variant offset per row (`Sum(tags, offset, variants)`), built once at construction by
+  `Value::sum`/`sum_from_prim` and maintained by `gather`/`concat`. `compare_idx` reads it O(1), so
+  `Rel`/`find` over sum-shaped data are linear (no per-call rank scan). The earlier plan was find-local
+  block-starts *avoiding* a representation change; carrying the offset proved simpler and uniform. The
+  offset is a DERIVED field (droppable at serialization: content-address `(tags, variants)`, rebuild on
+  load). Future optimization: skip computing it for sums a pass proves are never `find`/`Rel` operands.
 
 ## Conventions
 

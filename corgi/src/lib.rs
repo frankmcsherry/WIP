@@ -18,12 +18,11 @@
 //! closed-body ops `MapList` / `MapSum` (they recurse into [`graph::eval_graph`]).
 //!
 //! Layers: [`value`] (the data) → [`engine`] (`gather`/`concat` + index gen) /
-//! [`cmp`] (`compare2`/structural order) → [`op`] (the vocabulary) → [`graph`]
-//! (the IR + evaluator).
+//! [`cmp`] (`compare_idx`/structural order + discrimination sort) → [`op`] (the
+//! vocabulary) → [`graph`] (the IR + evaluator).
 
 pub mod cmp;
 pub mod engine;
-pub mod find_search; // PROTOTYPE: structural-search find, to the side for examination (not wired into eval)
 pub mod frontend;
 pub mod graph;
 pub mod ops;

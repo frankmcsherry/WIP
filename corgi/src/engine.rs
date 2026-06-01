@@ -24,8 +24,8 @@ pub fn fill(row: &Value, n: usize) -> Value {
 mod generators {
     //! Index generators — the `gather`-family currency. Each composite op is "make an index (and sometimes
     //! re-segmented bounds), then `gather`": mask→survivors (`Filter`/`Partition`), bounds→owner-ids
-    //! (`Broadcast`), range-expand (`Slices`), tag→offset (`Unwrap`). The index math lives here; the op bodies
-    //! in `ops::core` just generate, gather, and re-wrap.
+    //! (`Broadcast`), range-expand (`Slices`). The index math lives here; the op bodies in `ops::core` just
+    //! generate, gather, and re-wrap. (`Unwrap` reads the Sum's carried offset via `gather_lanes` — no generator.)
 
     use super::*;
 
@@ -94,18 +94,6 @@ mod generators {
         (idx, inner)
     }
 
-    /// the sum family: for a tagged column whose lanes have lengths `lane_lens`, the position of each row
-    /// within `concat(lanes)` — lane start plus a running per-lane cursor. Pairs with `gather ∘ concat` to
-    /// realise `Unwrap`. The same per-lane-cursor pass `gather`/`compare2`'s Sum arms (re)compute by hand.
-    pub fn tag_offsets(tags: &[usize], lane_lens: &[usize]) -> Vec<usize> {
-        let mut cursor = Vec::with_capacity(lane_lens.len());
-        let mut acc = 0;
-        for &l in lane_lens {
-            cursor.push(acc);
-            acc += l;
-        }
-        tags.iter().map(|&t| { let p = cursor[t]; cursor[t] += 1; p }).collect()
-    }
 }
 
 /// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape.
@@ -125,21 +113,103 @@ pub fn gather(v: &Value, idx: &[usize]) -> Value {
             }
             Value::List(nb, Box::new(gather(vals, &elem)))
         }
-        Value::Sum(tags, variants) => {
+        Value::Sum(tags, within, variants) => {
+            // `within` is the carried within-variant offset — read, not recomputed. Each selected row
+            // lands in its variant's lane at that offset; `sum_from_prim` rebuilds the result's offset.
             let tag_vec = tags.usize_vec();
-            let mut within = vec![0usize; tag_vec.len()];
-            let mut counts = vec![0usize; variants.len()];
-            for (i, &t) in tag_vec.iter().enumerate() {
-                within[i] = counts[t];
-                counts[t] += 1;
-            }
             let new_tags = tags.gather(idx); // the discriminant moves like any leaf column
             let mut per = vec![Vec::new(); variants.len()];
             for &i in idx {
                 per[tag_vec[i]].push(within[i]);
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
-            Value::Sum(new_tags, nv)
+            Value::sum_from_prim(new_tags, nv)
+        }
+    }
+}
+
+/// multi-source gather: result row `i` is row `off[i]` of source `srcs[tags[i]]` — all sources sharing
+/// one shape. The multi-source generalisation of [`gather`] (the 1-source case) and the fused inverse of
+/// `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from its
+/// variant instead of materialising `concat(variants)` first. `off` is the carried within-variant offset.
+pub fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Value {
+    match srcs[0] {
+        Value::Prim(_) => {
+            let prims: Vec<&Prim> = srcs
+                .iter()
+                .map(|v| match v {
+                    Value::Prim(p) => p,
+                    _ => panic!("gather_lanes: shape mismatch"),
+                })
+                .collect();
+            Value::Prim(Prim::gather_lanes(&prims, tags, off))
+        }
+        Value::Prod(c0) => Value::Prod(
+            (0..c0.len())
+                .map(|f| {
+                    let fields: Vec<&Value> = srcs
+                        .iter()
+                        .map(|v| match v {
+                            Value::Prod(c) => &c[f],
+                            _ => panic!("gather_lanes: shape mismatch"),
+                        })
+                        .collect();
+                    gather_lanes(&fields, tags, off)
+                })
+                .collect(),
+        ),
+        Value::List(..) => {
+            // each output row is a source row's span; expand to element-level (source, pos) pairs.
+            let lists: Vec<(&[usize], &Value)> = srcs
+                .iter()
+                .map(|v| match v {
+                    Value::List(b, vv) => (b.as_slice(), &**vv),
+                    _ => panic!("gather_lanes: shape mismatch"),
+                })
+                .collect();
+            let mut nb = Vec::with_capacity(tags.len());
+            let (mut etags, mut eoff) = (Vec::new(), Vec::new());
+            let mut acc = 0;
+            for (&t, &o) in tags.iter().zip(off) {
+                let (s, e) = row_span(lists[t].0, o);
+                for p in s..e {
+                    etags.push(t);
+                    eoff.push(p);
+                }
+                acc += e - s;
+                nb.push(acc);
+            }
+            let vals: Vec<&Value> = lists.iter().map(|l| l.1).collect();
+            Value::List(nb, Box::new(gather_lanes(&vals, &etags, &eoff)))
+        }
+        Value::Sum(..) => {
+            // pick each output row's tagged payload: build the output tag column, then per output-tag
+            // gather that variant from the sources at the carried within-offset.
+            let sums: Vec<(&Prim, &[usize], &[Value])> = srcs
+                .iter()
+                .map(|v| match v {
+                    Value::Sum(t, o, vs) => (t, o.as_slice(), vs.as_slice()),
+                    _ => panic!("gather_lanes: shape mismatch"),
+                })
+                .collect();
+            let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
+            let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
+            let out_tag_vec = out_tags.usize_vec();
+            let out_vars: Vec<Value> = (0..sums[0].2.len())
+                .map(|s| {
+                    let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
+                    for (i, &os) in out_tag_vec.iter().enumerate() {
+                        if os == s {
+                            let (t, o) = (tags[i], off[i]);
+                            s_t.push(t);
+                            s_o.push(sums[t].1[o]); // carried offset = position in the source's variant s
+                        }
+                    }
+                    let vsrcs: Vec<&Value> = sums.iter().map(|sm| &sm.2[s]).collect();
+                    gather_lanes(&vsrcs, &s_t, &s_o)
+                })
+                .collect();
+            Value::sum_from_prim(out_tags, out_vars)
         }
     }
 }
@@ -187,12 +257,12 @@ pub fn concat(parts: &[Value]) -> Value {
             }
             Value::List(nb, Box::new(concat(&vp)))
         }
-        Value::Sum(_, v0) => {
+        Value::Sum(_, _, v0) => {
             let mut tag_parts: Vec<&Prim> = Vec::new();
             let mut per = vec![Vec::new(); v0.len()];
             for p in parts {
                 match p {
-                    Value::Sum(t, v) => {
+                    Value::Sum(t, _, v) => {
                         tag_parts.push(t);
                         for (i, c) in v.iter().enumerate() {
                             per[i].push(c.clone());
@@ -201,7 +271,71 @@ pub fn concat(parts: &[Value]) -> Value {
                     _ => panic!("concat: shape mismatch"),
                 }
             }
-            Value::Sum(Prim::concat(&tag_parts), per.iter().map(|ps| concat(ps)).collect())
+            // the concatenated tags fix the offset, so it's rebuilt rather than spliced.
+            Value::sum_from_prim(Prim::concat(&tag_parts), per.iter().map(|ps| concat(ps)).collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::Value;
+
+    fn u(xs: &[u64]) -> Value {
+        Value::u64(xs.to_vec())
+    }
+
+    /// the old realisation `gather_lanes` replaces: index into `concat(variants)` by lane-start + offset.
+    fn oracle(variants: &[Value], tags: &[usize], off: &[usize]) -> Value {
+        let mut start = vec![0usize; variants.len()];
+        let mut acc = 0;
+        for (t, v) in variants.iter().enumerate() {
+            start[t] = acc;
+            acc += v.len();
+        }
+        let idx: Vec<usize> = tags.iter().zip(off).map(|(&t, &o)| start[t] + o).collect();
+        gather(&concat(variants), &idx)
+    }
+
+    /// `gather_lanes` must match the concat+gather oracle; `off` is the within-variant rank.
+    fn check(tags: &[usize], variants: Vec<Value>) {
+        let mut cur = vec![0usize; variants.len()];
+        let off: Vec<usize> = tags.iter().map(|&t| { let p = cur[t]; cur[t] += 1; p }).collect();
+        let refs: Vec<&Value> = variants.iter().collect();
+        assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
+    }
+
+    #[test]
+    fn gather_lanes_matches_concat_gather() {
+        let tags = [0usize, 1, 0, 1, 0]; // t0 ×3, t1 ×2
+        // leaf
+        check(&tags, vec![u(&[10, 20, 30]), u(&[40, 50])]);
+        // product
+        check(
+            &tags,
+            vec![
+                Value::Prod(vec![u(&[1, 2, 3]), u(&[4, 5, 6])]),
+                Value::Prod(vec![u(&[7, 8]), u(&[9, 10])]),
+            ],
+        );
+        // list payload (ragged spans, the recursive value gather)
+        check(
+            &tags,
+            vec![
+                Value::List(vec![2, 3, 6], Box::new(u(&[1, 2, 3, 4, 5, 6]))),
+                Value::List(vec![1, 3], Box::new(u(&[7, 8, 9]))),
+            ],
+        );
+        // sum payload (nested tags + within-offset remap)
+        check(
+            &tags,
+            vec![
+                Value::sum(vec![0, 1, 0], vec![u(&[1, 2]), u(&[3])]),
+                Value::sum(vec![1, 0], vec![u(&[4]), u(&[5])]),
+            ],
+        );
+        // empty
+        check(&[], vec![u(&[]), u(&[])]);
     }
 }

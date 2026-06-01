@@ -1,10 +1,10 @@
 //! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `Gt` (a column
 //! vs a constant, the immediate-form sugar) — plus the list ops `SortList`/`DedupList`/`GroupKey`
-//! (discrimination via `sort_blocks`/`run_layout`) and `Find` (binary search via `compare2`). All are
+//! (discrimination via `sort_blocks`/`run_layout`) and `Find` (batched binary search via `compare_idx`). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
 
-use crate::cmp::{compare2, run_layout, segment_labels, sort_blocks};
+use crate::cmp::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
 use crate::engine::gather;
 use crate::shape::Shape;
 use crate::value::Value;
@@ -55,8 +55,9 @@ impl CmpOp {
                 let mask = match (&a, &b) {
                     // leaf pair: the vectorized lane compare (SIMD-friendly).
                     (Value::Prim(pa), Value::Prim(pb)) => pa.rel(pb, |o| pred.test(o)),
-                    // any other shape: the same STRUCTURAL comparator sort/find use, per row.
-                    _ => (0..a.len()).map(|i| pred.test(compare2(&a, i, &b, i)) as u64).collect(),
+                    // any other shape: the bulk structural comparator — one descent per type level,
+                    // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
+                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                 };
                 Value::u64(mask)
             }
@@ -79,14 +80,7 @@ impl CmpOp {
                 let (_ends, firsts) = run_layout(&labels);
                 let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
                 // outer bounds: cumulative distinct count per row (runs never cross rows).
-                let mut nb = Vec::with_capacity(bounds.len());
-                let mut g = 0;
-                for &row_end in &bounds {
-                    while g < firsts.len() && firsts[g] < row_end {
-                        g += 1;
-                    }
-                    nb.push(g);
-                }
+                let nb = runs_per_row(&bounds, &firsts);
                 Value::List(nb, Box::new(gather(&vals, &idx)))
             }
 
@@ -102,62 +96,41 @@ impl CmpOp {
                 let keys = gather(&k_sorted, &firsts);
                 let inner = Value::List(ends, Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
-                let mut no = Vec::with_capacity(bounds.len());
-                let mut g = 0;
-                for &row_end in &bounds {
-                    while g < firsts.len() && firsts[g] < row_end {
-                        g += 1;
-                    }
-                    no.push(g);
-                }
+                let no = runs_per_row(&bounds, &firsts);
                 Value::List(no, Box::new(Value::Prod(vec![keys, inner])))
             }
 
-            // for each needle element, equal_range it in the matching haystack row; output is shaped like
-            // `needle`, each (lo,hi) RELATIVE to its haystack row.
+            // for each needle element, equal_range it in the matching haystack row — as a BATCHED
+            // binary search: every needle element advances its window in lockstep, one `compare_idx`
+            // per round (needle[i] vs haystack[mid_i]) rather than a scalar search per needle. Output is
+            // shaped like `needle`, each (lo,hi) RELATIVE to its haystack row.
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find");
                 let (nb, nvals) = needle.into_list("Find needle");
                 let (hb, hvals) = haystack.into_list("Find haystack");
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
-                let mut lo_c = Vec::new();
-                let mut hi_c = Vec::new();
+                let n = nvals.len();
+                // each needle element's haystack-row window [lo,hi) and its row start (row-relative answer).
+                let (mut lo, mut hi, mut base) = (vec![0usize; n], vec![0usize; n], vec![0usize; n]);
                 let (mut ns, mut hs) = (0, 0);
                 for r in 0..nb.len() {
                     let (ne, he) = (nb[r], hb[r]);
-                    for i in ns..ne {
-                        // lower = first j in [hs,he) with haystack[j] >= needle[i]
-                        let lower = {
-                            let (mut a, mut b) = (hs, he);
-                            while a < b {
-                                let m = (a + b) / 2;
-                                if compare2(&hvals, m, &nvals, i) == Ordering::Less {
-                                    a = m + 1;
-                                } else {
-                                    b = m;
-                                }
-                            }
-                            a
-                        };
-                        // upper = first j with haystack[j] > needle[i]
-                        let upper = {
-                            let (mut a, mut b) = (hs, he);
-                            while a < b {
-                                let m = (a + b) / 2;
-                                if compare2(&hvals, m, &nvals, i) != Ordering::Greater {
-                                    a = m + 1;
-                                } else {
-                                    b = m;
-                                }
-                            }
-                            a
-                        };
-                        lo_c.push((lower - hs) as u64);
-                        hi_c.push((upper - hs) as u64);
+                    for k in ns..ne {
+                        lo[k] = hs;
+                        hi[k] = he;
+                        base[k] = hs;
                     }
                     ns = ne;
                     hs = he;
                 }
+                // lower = first haystack pos NOT less than the needle; upper = first GREATER. Same
+                // batched search, different tie rule on `haystack[mid] vs needle`.
+                let mut lower = (lo.clone(), hi.clone());
+                let mut upper = (lo, hi);
+                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o == Ordering::Less);
+                batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o != Ordering::Greater);
+                let lo_c: Vec<u64> = lower.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
+                let hi_c: Vec<u64> = upper.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
                 Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
             }
         }
@@ -198,5 +171,41 @@ impl CmpOp {
                 _ => return err("Find expects a pair"),
             },
         })
+    }
+}
+
+/// one batched lower/upper-bound search: every needle element advances its window `[lo,hi)` in
+/// lockstep until it collapses, one `compare_idx` per round comparing `haystack[mid]` to its needle
+/// element. `go_right(ord)` is the tie rule (`ord` is haystack-vs-needle): lower bound steps right on
+/// `Less`, upper bound on `not Greater`. Rounds = ⌈log₂ max-span⌉; each is linear in the live needles.
+/// No gather and no whole-row compare — `compare_idx` pushes the (mid, needle) index pairs down.
+fn batched_bound(
+    hvals: &Value,
+    nvals: &Value,
+    lo: &mut [usize],
+    hi: &mut [usize],
+    go_right: impl Fn(Ordering) -> bool,
+) {
+    loop {
+        // live needles and their probe midpoints; the active list doubles as the needle indices
+        // (needle element k lives at index k in `nvals`).
+        let (mut active, mut mids) = (Vec::new(), Vec::new());
+        for (k, (&l, &h)) in lo.iter().zip(hi.iter()).enumerate() {
+            if l < h {
+                active.push(k);
+                mids.push((l + h) / 2);
+            }
+        }
+        if active.is_empty() {
+            break;
+        }
+        let ord = compare_idx(hvals, nvals, &mids, &active);
+        for (t, &k) in active.iter().enumerate() {
+            if go_right(ord[t]) {
+                lo[k] = mids[t] + 1;
+            } else {
+                hi[k] = mids[t];
+            }
+        }
     }
 }

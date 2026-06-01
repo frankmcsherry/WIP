@@ -58,36 +58,60 @@ macro_rules! wrap {
     };
 }
 
+/// apply a binary lane op `f` in place, writing into whichever operand buffer we uniquely own.
+/// Both lanes are read before the store, so EITHER side is a valid destination (Sub included:
+/// `f` is `x - y` regardless of where it lands). `get_mut` (not `make_mut`) tests uniqueness
+/// without cloning, so a shared LHS falls through to a unique RHS; only when both are shared do
+/// we allocate. The leaf analogue of `AddU64`'s move-on-last-use — extended to the whole grid.
+fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+    if let Some(dst) = Arc::get_mut(&mut a) {
+        for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = f(*x, y); }
+        a
+    } else if let Some(dst) = Arc::get_mut(&mut b) {
+        for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = f(x, *y); }
+        b
+    } else {
+        Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect())
+    }
+}
+
+/// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh.
+fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
+    if let Some(dst) = Arc::get_mut(&mut a) {
+        for x in dst.iter_mut() { *x = f(*x); }
+        a
+    } else {
+        Arc::new(a.iter().map(|&x| f(x)).collect())
+    }
+}
+
 // list the widths ONCE; generate the per-width binary/unary leaf arithmetic. `Kind::I`
 // deswizzles (XOR the top bit, `as iN`), operates natively, reswizzles. Mirrors `prim!`.
+// Each arm builds a per-width lane closure and hands it to `bin_into`/`neg_into` for the in-place write.
 macro_rules! grid {
     ($($V:ident => $u:ty : $i:ty),+ $(,)?) => {
-        fn bin_eval(op: BinOp, kind: Kind, a: &Prim, b: &Prim) -> Prim {
+        fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
             match (a, b) {
-                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(Arc::new(
-                    av.iter().zip(bv.iter()).map(|(&x, &y)| match kind {
-                        Kind::U => wrap!(op, x, y),
-                        Kind::I => {
-                            let m = !(<$u>::MAX >> 1); // the top bit = the swizzle
-                            (wrap!(op, (x ^ m) as $i, (y ^ m) as $i) as $u) ^ m
-                        }
-                    }).collect(),
-                )), )+
+                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(bin_into(av, bv, |x: $u, y: $u| match kind {
+                    Kind::U => wrap!(op, x, y),
+                    Kind::I => {
+                        let m = !(<$u>::MAX >> 1); // the top bit = the swizzle
+                        (wrap!(op, (x ^ m) as $i, (y ^ m) as $i) as $u) ^ m
+                    }
+                })), )+
                 _ => panic!("arith: operand width mismatch"),
             }
         }
 
-        fn neg_eval(kind: Kind, a: &Prim) -> Prim {
+        fn neg_eval(kind: Kind, a: Prim) -> Prim {
             match a {
-                $( Prim::$V(av) => Prim::$V(Arc::new(
-                    av.iter().map(|&x| match kind {
-                        Kind::U => x.wrapping_neg(),
-                        Kind::I => {
-                            let m = !(<$u>::MAX >> 1);
-                            (((x ^ m) as $i).wrapping_neg() as $u) ^ m
-                        }
-                    }).collect(),
-                )), )+
+                $( Prim::$V(av) => Prim::$V(neg_into(av, |x: $u| match kind {
+                    Kind::U => x.wrapping_neg(),
+                    Kind::I => {
+                        let m = !(<$u>::MAX >> 1);
+                        (((x ^ m) as $i).wrapping_neg() as $u) ^ m
+                    }
+                })), )+
             }
         }
     };
@@ -101,9 +125,9 @@ impl ArithOp {
                 let (a, b) = input.into_pair("binary arith");
                 let (pa, pb) = (a.into_prim("binary arith lhs"), b.into_prim("binary arith rhs"));
                 assert_eq!(pa.len(), pb.len(), "binary arith: operands at different strata");
-                Value::Prim(bin_eval(*op, *kind, &pa, &pb))
+                Value::Prim(bin_eval(*op, *kind, pa, pb))
             }
-            ArithOp::Neg(kind, _) => Value::Prim(neg_eval(*kind, &input.into_prim("Neg"))),
+            ArithOp::Neg(kind, _) => Value::Prim(neg_eval(*kind, input.into_prim("Neg"))),
             ArithOp::AddU64(c) => {
                 // in place when the input is uniquely owned: move-on-last-use leaves the leaf at
                 // refcount 1, so `into_u64` MOVES the buffer out; we mutate it and re-wrap, with no

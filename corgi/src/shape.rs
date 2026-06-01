@@ -24,7 +24,7 @@ pub fn shape_of_value(v: &Value) -> Shape {
     match v {
         Value::Prim(p) => Shape::Prim(p.bits()),
         Value::Prod(cols) => Shape::Prod(cols.iter().map(shape_of_value).collect()),
-        Value::Sum(_, variants) => Shape::Sum(variants.iter().map(shape_of_value).collect()),
+        Value::Sum(_, _, variants) => Shape::Sum(variants.iter().map(shape_of_value).collect()),
         Value::List(_, vals) => Shape::List(Box::new(shape_of_value(vals))),
     }
 }
