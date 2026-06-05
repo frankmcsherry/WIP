@@ -2,6 +2,7 @@
 //! `gather_lanes` (its multi-source form) — plus the bound helpers and `mod generators` (the `gather`-family
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
+use crate::shape::shape_of_value;
 use crate::value::{Prim, Value};
 
 pub(crate) use generators::*;
@@ -122,20 +123,27 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             for &i in idx {
                 per[tag_vec[i]].push(within[i]);
             }
-            let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
+            // gather each committed lane (possibly to fewer rows); a ⊥ lane stays ⊥.
+            let nv = variants.iter().zip(&per).map(|(v, s)| v.as_ref().map(|vv| gather(vv, s))).collect();
             Value::sum_from_prim(new_tags, nv)
         }
     }
 }
 
 /// multi-source gather: result row `i` is row `off[i]` of source `srcs[tags[i]]` — all sources sharing
-/// one shape. The multi-source generalisation of [`gather`] (the 1-source case) and the fused inverse of
-/// `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from its
-/// variant instead of materialising `concat(variants)` first. `off` is the carried within-variant offset.
-pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Value {
-    match srcs[0] {
+/// one shape (up to `⊥`). The multi-source generalisation of [`gather`] (the 1-source case) and the fused
+/// inverse of `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from
+/// its variant instead of materialising `concat(variants)` first. `off` is the carried within-variant offset.
+pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize]) -> Value {
+    // `None` sources are ⊥ lanes — `tags` never names one (no row carries an uncommitted variant's tag),
+    // so they're never read. Fill each with a zero-row value of the witness (first committed) shape to hold
+    // its slot for tag-indexing. Every sum has ≥1 committed lane, so a witness exists.
+    let witness = srcs.iter().flatten().next().copied().expect("gather_lanes: no committed source");
+    let ws = shape_of_value(witness);
+    let filled: Vec<Value> = srcs.iter().map(|s| s.map_or_else(|| Value::empty(&ws), |v| v.clone())).collect();
+    match &filled[0] {
         Value::Prim(_) => {
-            let prims: Vec<&Prim> = srcs
+            let prims: Vec<&Prim> = filled
                 .iter()
                 .map(|v| match v {
                     Value::Prim(p) => p,
@@ -147,10 +155,10 @@ pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Va
         Value::Prod(c0) => Value::Prod(
             (0..c0.len())
                 .map(|f| {
-                    let fields: Vec<&Value> = srcs
+                    let fields: Vec<Option<&Value>> = filled
                         .iter()
                         .map(|v| match v {
-                            Value::Prod(c) => &c[f],
+                            Value::Prod(c) => Some(&c[f]),
                             _ => panic!("gather_lanes: shape mismatch"),
                         })
                         .collect();
@@ -160,7 +168,7 @@ pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Va
         ),
         Value::List(..) => {
             // each output row is a source row's span; expand to element-level (source, pos) pairs.
-            let lists: Vec<(&[usize], &Value)> = srcs
+            let lists: Vec<(&[usize], &Value)> = filled
                 .iter()
                 .map(|v| match v {
                     Value::List(b, vv) => (b.as_slice(), &**vv),
@@ -179,13 +187,15 @@ pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Va
                 acc += e - s;
                 nb.push(acc);
             }
-            let vals: Vec<&Value> = lists.iter().map(|l| l.1).collect();
+            let vals: Vec<Option<&Value>> = lists.iter().map(|l| Some(l.1)).collect();
             Value::List(nb, Box::new(gather_lanes(&vals, &etags, &eoff)))
         }
         Value::Sum(..) => {
             // pick each output row's tagged payload: build the output tag column, then per output-tag
             // gather that variant from the sources at the carried within-offset.
-            let sums: Vec<(&Prim, &[usize], &[Value])> = srcs
+            // (tags, within-offsets, lanes) borrowed from each source sum.
+            type SumView<'a> = (&'a Prim, &'a [usize], &'a [Option<Value>]);
+            let sums: Vec<SumView> = filled
                 .iter()
                 .map(|v| match v {
                     Value::Sum(t, o, vs) => (t, o.as_slice(), vs.as_slice()),
@@ -195,8 +205,13 @@ pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Va
             let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
             let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
             let out_tag_vec = out_tags.usize_vec();
-            let out_vars: Vec<Value> = (0..sums[0].2.len())
+            let arity = sums[0].2.len();
+            let out_vars: Vec<Option<Value>> = (0..arity)
                 .map(|s| {
+                    // out lane `s` is ⊥ only if no source committed it.
+                    if sums.iter().all(|sm| sm.2[s].is_none()) {
+                        return None;
+                    }
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
                     for (i, &os) in out_tag_vec.iter().enumerate() {
                         if os == s {
@@ -205,8 +220,8 @@ pub(crate) fn gather_lanes(srcs: &[&Value], tags: &[usize], off: &[usize]) -> Va
                             s_o.push(sums[t].1[o]); // carried offset = position in the source's variant s
                         }
                     }
-                    let vsrcs: Vec<&Value> = sums.iter().map(|sm| &sm.2[s]).collect();
-                    gather_lanes(&vsrcs, &s_t, &s_o)
+                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| sm.2[s].as_ref()).collect();
+                    Some(gather_lanes(&vsrcs, &s_t, &s_o))
                 })
                 .collect();
             Value::sum_from_prim(out_tags, out_vars)
@@ -261,20 +276,24 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
         }
         Value::Sum(_, _, v0) => {
             let mut tag_parts: Vec<&Prim> = Vec::new();
-            let mut per = vec![Vec::new(); v0.len()];
+            let mut per: Vec<Vec<Value>> = vec![Vec::new(); v0.len()]; // committed contributions per lane
             for p in parts {
                 match p {
                     Value::Sum(t, _, v) => {
                         tag_parts.push(t);
                         for (i, c) in v.iter().enumerate() {
-                            per[i].push(c.clone());
+                            if let Some(cv) = c {
+                                per[i].push(cv.clone());
+                            }
                         }
                     }
                     _ => panic!("concat: shape mismatch"),
                 }
             }
-            // the concatenated tags fix the offset, so it's rebuilt rather than spliced.
-            Value::sum_from_prim(Prim::concat(&tag_parts), per.iter().map(|ps| concat(ps)).collect())
+            // a lane committed by any part is committed in the result (the ⊥ parts add no rows); the
+            // concatenated tags fix the offset, so it's rebuilt rather than spliced.
+            let lanes = per.into_iter().map(|ps| (!ps.is_empty()).then(|| concat(&ps))).collect();
+            Value::sum_from_prim(Prim::concat(&tag_parts), lanes)
         }
     }
 }
@@ -304,7 +323,7 @@ mod tests {
     fn check(tags: &[usize], variants: Vec<Value>) {
         let mut cur = vec![0usize; variants.len()];
         let off: Vec<usize> = tags.iter().map(|&t| { let p = cur[t]; cur[t] += 1; p }).collect();
-        let refs: Vec<&Value> = variants.iter().collect();
+        let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
         assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
     }
 

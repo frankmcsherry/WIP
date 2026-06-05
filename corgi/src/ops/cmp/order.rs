@@ -68,7 +68,11 @@ mod compare {
                     // `oa`/`ob` are the carried within-variant offsets — read, not recomputed.
                     let sia: Vec<usize> = ks.iter().map(|&k| oa[ia[k]]).collect();
                     let sib: Vec<usize> = ks.iter().map(|&k| ob[ib[k]]).collect();
-                    let sub = compare_idx(&va[t], &vb[t], &sia, &sib);
+                    // a row carrying tag `t` implies lane `t` is committed in both sums.
+                    let (Some(la), Some(lb)) = (&va[t], &vb[t]) else {
+                        unreachable!("compare_idx: row tag names an uncommitted lane");
+                    };
+                    let sub = compare_idx(la, lb, &sia, &sib);
                     // tag was Equal on these pairs, so the payload order IS the order.
                     for (&k, o) in ks.iter().zip(sub) { ord[k] = o; }
                 }
@@ -263,7 +267,7 @@ mod discriminate {
         (perm, cur)
     }
 
-    fn sort_sum_blocks(labels: &[u64], tags: &Prim, within: &[usize], variants: &[Value]) -> (Vec<usize>, Vec<u64>) {
+    fn sort_sum_blocks(labels: &[u64], tags: &Prim, within: &[usize], variants: &[Option<Value>]) -> (Vec<usize>, Vec<u64>) {
         let n = labels.len();
         // 1. discriminate by the tag column directly — a u8 leaf, so a single-pass radix.
         let (perm_disc, labels_disc) = sort_leaf_blocks(labels, tags);
@@ -281,7 +285,8 @@ mod discriminate {
             }
             let t = tag_vec[perm_disc[lo]]; // the whole block shares a tag
             let lane_pos: Vec<usize> = (lo..hi).map(|i| within[perm_disc[i]]).collect();
-            let lane = gather(&variants[t], &lane_pos);
+            // a block with rows of tag `t` implies lane `t` is committed.
+            let lane = gather(variants[t].as_ref().expect("sort: row tag names an uncommitted lane"), &lane_pos);
             let seed = vec![0u64; hi - lo];
             let (sub_perm, sub_labels) = sort_blocks(&seed, &lane);
             let span = sub_labels.iter().copied().max().unwrap_or(0);
@@ -387,7 +392,9 @@ mod tests {
                     Ordering::Equal => {
                         let wi = tav[..i].iter().filter(|&&t| t == ti).count();
                         let wj = tbv[..j].iter().filter(|&&t| t == ti).count();
-                        compare2(&va[ti], wi, &vb[ti], wj)
+                        // a row carrying tag `ti` implies lane `ti` is committed in both.
+                        let (la, lb) = (va[ti].as_ref().unwrap(), vb[ti].as_ref().unwrap());
+                        compare2(la, wi, lb, wj)
                     }
                     o => o,
                 }

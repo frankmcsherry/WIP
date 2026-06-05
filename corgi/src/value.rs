@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
-    Prim(Prim),                        // a leaf column at one byte width
-    Prod(Vec<Value>),                  // parallel columns, equal length
-    Sum(Prim, Vec<usize>, Vec<Value>), // discriminant (u8 leaf) + within-variant offset per row + variants
-    List(Vec<usize>, Box<Value>),      // end-offset per row; flattened values
+    Prim(Prim),                   // a leaf column at one byte width
+    Prod(Vec<Value>),             // parallel columns, equal length
+    Sum(Prim, Vec<usize>, Vec<Option<Value>>), // discriminant (u8 leaf) + within-variant offset per row +
+                                  // one lane per variant; a `None` lane is `⊥` — uncommitted, holds no rows
+                                  // (no row carries its tag) and adopts a sibling's shape at a merge.
+    List(Vec<usize>, Box<Value>), // end-offset per row; flattened values
 }
 
 /// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
@@ -195,30 +197,37 @@ impl Value {
     /// within-variant offset is computed here and carried, so comparison/search read it instead of
     /// re-deriving each row's rank.
     pub fn sum(tags: Vec<usize>, variants: Vec<Value>) -> Value {
+        // every lane committed — the common case (branch, tests). `⊥` lanes go through `sum_opt`.
+        Self::sum_opt(tags, variants.into_iter().map(Some).collect())
+    }
+
+    /// a Sum whose lanes may be `⊥` (`None`) — the `Inject` form, and the result shape of any merge.
+    pub fn sum_opt(tags: Vec<usize>, lanes: Vec<Option<Value>>) -> Value {
         // tags are stored as a u8 discriminant, so the variant count must fit a u8 — else `t as u8`
         // would silently truncate a tag onto the wrong lane.
-        assert!(variants.len() <= 256, "Value::sum: {} variants exceeds the u8 tag width", variants.len());
-        let offset = within_offsets(&tags, variants.len());
+        assert!(lanes.len() <= 256, "Value::sum: {} variants exceeds the u8 tag width", lanes.len());
+        let offset = within_offsets(&tags, lanes.len());
         let tags = Prim::U8(Arc::new(tags.iter().map(|&t| t as u8).collect()));
-        Value::Sum(tags, offset, variants)
+        Value::Sum(tags, offset, lanes)
     }
 
-    /// a Sum from an existing tag column; the within-variant offset is derived from it. For ops that
-    /// already hold the tags as a `Prim` and the variant columns (`gather`/`concat`).
-    pub(crate) fn sum_from_prim(tags: Prim, variants: Vec<Value>) -> Value {
-        let offset = within_offsets(&tags.usize_vec(), variants.len());
-        Value::Sum(tags, offset, variants)
+    /// a Sum from an existing tag column and its (possibly-`⊥`) lanes; the within-variant offset is
+    /// derived from the tags. For ops that already hold the tags as a `Prim` (`gather`/`concat`).
+    pub(crate) fn sum_from_prim(tags: Prim, lanes: Vec<Option<Value>>) -> Value {
+        let offset = within_offsets(&tags.usize_vec(), lanes.len());
+        Value::Sum(tags, offset, lanes)
     }
 
-    /// a zero-row value of the given shape — the all-empty witness of each constructor. `Inject`
-    /// builds its unselected variants with this; the recursion mirrors `shape_of_value` inverted.
+    /// a zero-row value of the given shape — the all-empty witness of each constructor. `gather_lanes`
+    /// fills its `⊥` source slots with this; the recursion mirrors `shape_of_value` inverted.
     pub fn empty(shape: &Shape) -> Value {
         match shape {
             Shape::Prim(w) => Value::Prim(Prim::empty(*w)),
             Shape::Prod(ss) => Value::Prod(ss.iter().map(Value::empty).collect()),
-            Shape::Sum(ss) => {
-                Value::sum_from_prim(Prim::U8(Arc::new(Vec::new())), ss.iter().map(Value::empty).collect())
-            }
+            Shape::Sum(ss) => Value::sum_from_prim(
+                Prim::U8(Arc::new(Vec::new())),
+                ss.iter().map(|o| o.as_ref().map(Value::empty)).collect(),
+            ),
             Shape::List(s) => Value::List(Vec::new(), Box::new(Value::empty(s))),
         }
     }
@@ -264,7 +273,7 @@ impl Value {
         }
     }
 
-    pub fn into_sum(self, who: &str) -> (Vec<usize>, Vec<usize>, Vec<Value>) {
+    pub fn into_sum(self, who: &str) -> (Vec<usize>, Vec<usize>, Vec<Option<Value>>) {
         match self {
             Value::Sum(tags, offset, variants) => (tags.usize_vec(), offset, variants),
             _ => panic!("{who}: expected a sum"),
@@ -293,7 +302,8 @@ pub fn show(v: &Value) -> String {
         Value::Prim(p) => p.show(),
         Value::Prod(c) => format!("({})", c.iter().map(show).collect::<Vec<_>>().join(", ")),
         Value::Sum(t, _, vs) => {
-            format!("Sum tags={:?} [{}]", t.usize_vec(), vs.iter().map(show).collect::<Vec<_>>().join(", "))
+            let lanes: Vec<String> = vs.iter().map(|o| o.as_ref().map_or("⊥".to_string(), show)).collect();
+            format!("Sum tags={:?} [{}]", t.usize_vec(), lanes.join(", "))
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b, show(vals)),
     }
