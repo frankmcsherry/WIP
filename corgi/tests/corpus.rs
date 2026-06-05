@@ -47,7 +47,7 @@ fn corpus_matches_goldens() {
         let p = Program::compile_ml(&prog).unwrap_or_else(|e| panic!("{who}: parse: {e}"));
         p.check();
         let seed = Value::u64(vec![n]);
-        let out = p.run(seed.clone());
+        let out = p.run(seed.clone()).unwrap_or_else(|e| panic!("{who}: shape: {e}"));
         let inferred = p.shape(&shape_of_value(&seed)).unwrap_or_else(|e| panic!("{who}: type: {e}"));
         assert_eq!(inferred, shape_of_value(&out), "{who}: typer disagrees with evaluator");
         assert_eq!(show(&out), expected, "{who}: output mismatch");

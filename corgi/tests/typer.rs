@@ -23,7 +23,7 @@ fn list(t: Shape) -> Shape {
 fn enlist_is_polymorphic() {
     // X -> List<X> for any X (here a sum)
     let g = one(Enlist);
-    let sum = Shape::Sum(vec![Shape::Prim(64), list(Shape::Prim(64))]);
+    let sum = Shape::Sum(vec![Some(Shape::Prim(64)), Some(list(Shape::Prim(64)))]);
     assert_eq!(shape_of(&g, &sum).unwrap(), list(sum));
 }
 
@@ -41,8 +41,8 @@ fn transpose_reads_arity_off_input() {
 #[test]
 fn unwrap_homogeneous_ok_heterogeneous_errs() {
     let g = one(Unwrap);
-    assert_eq!(shape_of(&g, &Shape::Sum(vec![Shape::Prim(64), Shape::Prim(64)])).unwrap(), Shape::Prim(64));
-    assert!(shape_of(&g, &Shape::Sum(vec![Shape::Prim(64), list(Shape::Prim(64))])).is_err());
+    assert_eq!(shape_of(&g, &Shape::Sum(vec![Some(Shape::Prim(64)), Some(Shape::Prim(64))])).unwrap(), Shape::Prim(64));
+    assert!(shape_of(&g, &Shape::Sum(vec![Some(Shape::Prim(64)), Some(list(Shape::Prim(64)))])).is_err());
 }
 
 #[test]
@@ -80,5 +80,5 @@ fn mapsum_rejects_duplicate_variant() {
     let inp = b.input();
     let out = b.add(MapSum(vec![(0, id()), (0, id())]), vec![inp]);
     let g = b.finish(out);
-    assert!(shape_of(&g, &Shape::Sum(vec![Shape::Prim(64), Shape::Prim(64)])).is_err());
+    assert!(shape_of(&g, &Shape::Sum(vec![Some(Shape::Prim(64)), Some(Shape::Prim(64))])).is_err());
 }

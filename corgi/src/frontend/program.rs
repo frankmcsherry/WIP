@@ -9,7 +9,7 @@
 use super::parse_ml;
 use crate::graph::{eval_graph, shape_of, Graph};
 use crate::ops::NumOp;
-use crate::shape::Shape;
+use crate::shape::{shape_of_value, Shape};
 use crate::value::Value;
 
 pub struct Program {
@@ -43,8 +43,11 @@ impl Program {
         shape_of(&self.graph, input)
     }
 
-    /// run the program on an input, consuming it.
-    pub fn run(&self, input: Value) -> Value {
-        eval_graph(&self.graph, input)
+    /// run the program on an input, consuming it — after shape-checking the graph against the input's
+    /// shape, so an ill-typed program is a located `Err` here rather than a panic deep inside an op.
+    /// This is the enforced surface boundary: nothing reaches `eval_graph` without passing the typer.
+    pub fn run(&self, input: Value) -> Result<Value, String> {
+        shape_of(&self.graph, &shape_of_value(&input))?;
+        Ok(eval_graph(&self.graph, input))
     }
 }

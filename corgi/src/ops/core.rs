@@ -6,7 +6,7 @@ use crate::engine::{
     expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, split_by_mask,
 };
 use crate::graph::{eval_graph, shape_of, Graph, OpLike};
-use crate::shape::{shape_of_value, Shape};
+use crate::shape::{join, shape_of_value, Shape};
 use crate::value::Value;
 
 /// the core op vocabulary: structure only — comparison/order is the `cmp` bucket (`ops::cmp`) and
@@ -31,7 +31,8 @@ pub enum Op<L> {
     Iota,           // U64 -> List<U64>   per row [0,1,…,n-1] — a List-introducer / in-language data generator
     // Sum ops
     Unwrap,                         // homogeneous Sum -> payload
-    Inject(usize, Vec<Shape>),      // X -> Sum{..tag:X..}   put X in variant `tag`, others empty (sum intro)
+    Inject(usize, usize),           // X -> Sum{tag:X, ⊥..}  put X in variant `tag` of `arity` lanes; the
+                                    // others are ⊥ (empty, shape uncommitted, pinned later by `join`).
     MapList(Box<Graph<L>>),         // closed body on a list's values (in the *layer* L)
     MapSum(Vec<(usize, Graph<L>)>), // closed bodies on chosen sum variants; unlisted variants pass
                                     // through. The Vec breaks the type recursion, so no Box. A variadic
@@ -110,17 +111,17 @@ impl<L: OpLike> Op<L> {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
                 let (tags, offset, variants) = input.into_sum("Unwrap");
-                let refs: Vec<&Value> = variants.iter().collect();
+                let refs: Vec<Option<&Value>> = variants.iter().map(|o| o.as_ref()).collect();
                 gather_lanes(&refs, &tags, &offset)
             }
 
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
             // payload column fills that lane, the others are zero-row. The unary dual of `tuple`.
-            Op::Inject(tag, shapes) => {
+            Op::Inject(tag, arity) => {
                 let n = input.len();
-                let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
-                variants[*tag] = input;
-                Value::sum(vec![*tag; n], variants)
+                let mut variants = vec![None; *arity];
+                variants[*tag] = Some(input);
+                Value::sum_opt(vec![*tag; n], variants)
             }
 
             Op::MapList(body) => {
@@ -131,15 +132,16 @@ impl<L: OpLike> Op<L> {
             Op::MapSum(arms) => {
                 let (tags, _offset, mut variants) = input.into_sum("MapSum");
                 for (k, body) in arms {
-                    // move the lane out so the body's `Input` owns it (refcount 1 ⇒ in-place);
-                    // a cheap empty product holds its slot until we write the result back.
-                    let lane = std::mem::replace(&mut variants[*k], Value::Prod(Vec::new()));
+                    // take the lane so the body's `Input` owns it (refcount 1 ⇒ in-place). A ⊥ lane
+                    // (`None`) has no rows and a deferred shape, so the body can't run on it — leave it
+                    // ⊥ (the judge defers its type the same way).
+                    let Some(lane) = variants[*k].take() else { continue };
                     let lane_len = lane.len();
                     let res = eval_graph(body, lane);
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
-                    variants[*k] = res;
+                    variants[*k] = Some(res);
                 }
-                Value::sum(tags, variants)
+                Value::sum_opt(tags, variants)
             }
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it
@@ -242,13 +244,13 @@ impl<L: OpLike> Op<L> {
 
             Op::Partition => match input {
                 Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
-                    Sum(vec![ts[0].clone(), ts[0].clone()])
+                    Sum(vec![Some(ts[0].clone()), Some(ts[0].clone())])
                 }
                 _ => return err("Partition expects (X, U64-mask)"),
             },
 
             Op::Branch(n) => match input {
-                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => Sum(vec![ts[0].clone(); *n]),
+                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => Sum(vec![Some(ts[0].clone()); *n]),
                 _ => return err("Branch expects (X, U64-tags)"),
             },
 
@@ -290,17 +292,30 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Iota expects U64"),
             },
 
+            // homogeneous up to `⊥`: fold the committed (`Some`) lanes by `join`, so `⊥` lanes adopt the
+            // concrete payload and a genuine clash of two concrete payloads is the type error.
             Op::Unwrap => match input {
-                Sum(ts) if !ts.is_empty() && ts.iter().all(|t| *t == ts[0]) => ts[0].clone(),
-                Sum(_) => return err("Unwrap variants are not homogeneous"),
+                Sum(ts) => {
+                    let mut present = ts.iter().flatten();
+                    let first = present
+                        .next()
+                        .ok_or_else(|| format!("Unwrap: sum has no committed variant, got {input}"))?
+                        .clone();
+                    present.try_fold(first, |a, t| join(&a, t))?
+                }
                 _ => return err("Unwrap expects a sum"),
             },
 
-            Op::Inject(tag, shapes) => match shapes.get(*tag) {
-                Some(want) if want == input => Sum(shapes.clone()),
-                Some(_) => return err(&format!("Inject({tag}) input doesn't match variant {tag}")),
-                None => return err(&format!("Inject({tag}) has no variant {tag}")),
-            },
+            // sum intro: the input lands in variant `tag`; the other `arity - 1` lanes are `⊥` (`None`,
+            // shape uncommitted) and adopt their type wherever the sum is later merged.
+            Op::Inject(tag, arity) => {
+                if *tag >= *arity {
+                    return err(&format!("Inject: tag {tag} out of range for arity {arity}"));
+                }
+                let mut variants = vec![None; *arity];
+                variants[*tag] = Some(input.clone());
+                Sum(variants)
+            }
 
             Op::MapList(body) => match input {
                 List(x) => List(Box::new(shape_of(body, x)?)),
@@ -318,7 +333,11 @@ impl<L: OpLike> Op<L> {
                         if arms[..i].iter().any(|(j, _)| j == k) {
                             return err(&format!("MapSum: duplicate variant {k}"));
                         }
-                        out[*k] = shape_of(body, &ts[*k])?;
+                        // a ⊥ (`None`) lane can't be shaped through the body — defer it (stays ⊥).
+                        out[*k] = match &ts[*k] {
+                            Some(s) => Some(shape_of(body, s)?),
+                            None => None,
+                        };
                     }
                     Sum(out)
                 }

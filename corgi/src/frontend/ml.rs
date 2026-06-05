@@ -8,20 +8,18 @@
 //!   apply = 'map' '(' 'fun' IDENT '->' expr ')'
 //!         | 'map_variant' NUM '(' 'fun' IDENT '->' expr ')'
 //!         | 'match' '(' (NUM '(' 'fun' IDENT '->' expr ')')(',' …)* ')'   -- MapSum + Unwrap
-//!         | 'inject' NUM '(' shape (',' shape)* ')'                       -- sum construction
+//!         | 'inject' NUM NUM                                             -- sum construction (tag arity)
 //!         | IDENT NUM?
-//!   shape = 'u64' | '(' shape (',' shape)* ')' | '[' shape ']'           -- leaf / product / list
 //!   proj  = atom ('.' NUM)*
 //!   atom  = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
 //!
 //! e.g.  let (subj, vals) = input.1 |> transpose in vals |> reduce_sum
 //!       e |> match (0 (fun lo -> lo), 1 (fun hi -> hi |> add_u64 100))   -- exhaustive ⇒ Unwrap types it
-//!       xs |> inject 0 (u64, u64)                                        -- tag xs into variant 0
+//!       xs |> inject 0 2                                                 -- tag xs into variant 0 of 2
 
 use super::{resolve, str_value, takes_num};
 use crate::graph::{Builder, Graph};
 use crate::ops::{NumOp, Op};
-use crate::shape::Shape;
 use std::collections::HashMap;
 
 // ----- tokens ------------------------------------------------------------
@@ -139,7 +137,7 @@ enum Apply {
     Map(String, Box<E>),
     MapVariant(usize, String, Box<E>),
     Match(Vec<(usize, String, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
-    Inject(usize, Vec<Shape>),       // tag + the variant shapes -> Op::Inject (sum construction)
+    Inject(usize, usize),            // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
 }
 
 enum E {
@@ -270,51 +268,15 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(Apply::Match(arms))
             }
-            // inject: construct a sum — `inject k (T0, T1, …)`, the payload going to variant k.
+            // inject: construct a sum — `inject tag arity`, the payload going to variant `tag` of
+            // `arity` lanes; the other lanes are ⊥ and adopt their type at a later merge.
             "inject" => {
                 let tag = self.num()? as usize;
-                self.eat(&Tok::LParen)?;
-                let mut shapes = vec![self.shape()?];
-                while self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    shapes.push(self.shape()?);
-                }
-                self.eat(&Tok::RParen)?;
-                Ok(Apply::Inject(tag, shapes))
+                let arity = self.num()? as usize;
+                Ok(Apply::Inject(tag, arity))
             }
             _ if takes_num(&name) => Ok(Apply::Op(name, Some(self.num()?))),
             _ => Ok(Apply::Op(name, None)),
-        }
-    }
-
-    /// a shape literal for `inject`: `u64`, a tuple `(T, …)`, or a list `[T]`. (Sum shapes would
-    /// want a `{T | …}` spelling we don't lex yet — they're the remaining boundary.)
-    fn shape(&mut self) -> Result<Shape, String> {
-        match self.peek() {
-            Some(Tok::LParen) => {
-                self.bump();
-                let mut ss = vec![self.shape()?];
-                while self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    ss.push(self.shape()?);
-                }
-                self.eat(&Tok::RParen)?;
-                Ok(Shape::Prod(ss))
-            }
-            Some(Tok::LBrack) => {
-                self.bump();
-                let inner = self.shape()?;
-                self.eat(&Tok::RBrack)?;
-                Ok(Shape::List(Box::new(inner)))
-            }
-            _ => {
-                let name = self.ident()?;
-                if name == "u64" {
-                    Ok(Shape::Prim(64))
-                } else {
-                    Err(format!("unknown shape '{name}' (expected `u64`, a tuple, or `[T]`)"))
-                }
-            }
         }
     }
 
@@ -414,7 +376,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     let ms = b.add(Op::MapSum(lowered), vec![id]);
                     Ok(b.add(Op::Unwrap, vec![ms]))
                 }
-                Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
+                Apply::Inject(tag, arity) => Ok(b.add(Op::Inject(*tag, *arity), vec![id])),
             }
         }
     }
