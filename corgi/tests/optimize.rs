@@ -37,9 +37,9 @@ fn join_input() -> Value {
 
 // the join with the shared transpose INLINED (fanned out) vs. hand-shared with `let`.
 const INLINED_JOIN: &str =
-    "((input.1, input.0 |> transpose |> field 0) |> find, input.0 |> transpose |> field 1) |> slices";
+    "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
 const ML_JOIN: &str =
-    "let t = input.0 |> transpose in let r = (input.1, t.0) |> find in (r, t.1) |> slices";
+    "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
 
 #[test]
 fn cse_collapses_the_fanout_join() {
@@ -55,7 +55,7 @@ fn cse_collapses_the_fanout_join() {
 #[test]
 fn dce_drops_a_dead_let() {
     // `x` (a transpose) is computed but the body ignores it.
-    let g = parse_ml("let x = input.0 |> transpose in input.1").unwrap();
+    let g = parse_ml("let x = input.0 transpose in input.1").unwrap();
     let lean = dce(&g);
     assert!(lean.node_count() < g.node_count());
     assert_eq!(eval_str(&lean, &join_input()), eval_str(&g, &join_input()));
@@ -74,9 +74,9 @@ type Case = (&'static str, fn() -> Value);
 #[test]
 fn optimize_preserves_eval_everywhere() {
     let cases: &[Case] = &[
-        ("input.1 |> transpose |> field 1 |> reduce_sum", sample),
-        ("(input.0, input.1 |> transpose |> field 1) |> broadcast |> map (fun p -> p |> add)", sample),
-        ("input.2 |> map_variant 1 (fun h -> h |> add_u64 1000000) |> unwrap", sample),
+        ("input.1 transpose field 1 reduce_sum", sample),
+        ("(input.0, input.1 transpose field 1) broadcast map (p -> p add)", sample),
+        ("input.2 map_variant 1 (h -> h add_u64 1000000) unwrap", sample),
         (INLINED_JOIN, join_input),
     ];
     for (src, mk) in cases {
@@ -89,7 +89,7 @@ fn optimize_preserves_eval_everywhere() {
 #[test]
 fn peephole_also_runs_under_bodies() {
     // a Field-of-Tuple inside a map body should fold too.
-    let g = parse_ml("input.1 |> map (fun p -> (p, p).0)").unwrap();
+    let g = parse_ml("input.1 map (p -> (p, p).0)").unwrap();
     let opt = peephole(&g);
     assert_eq!(eval_str(&opt, &sample()), eval_str(&g, &sample()));
 }

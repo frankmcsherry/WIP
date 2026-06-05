@@ -1,21 +1,24 @@
-//! A small ML-flavoured expression surface. `let` boils binding into shared edges (no
-//! re-derivation), product destructuring, `fun` lambdas for map/match bodies, and sum
-//! construction/elimination via `inject`/`match`.
+//! A small ML-flavoured expression surface, concatenative-by-juxtaposition: a value is followed by
+//! its operator stages with no separator (`input iota reduce_sum`). `let` boils binding into shared
+//! edges (no re-derivation), with product destructuring; lambdas (`x -> …`) are the map/match bodies;
+//! sums are built/eliminated via `inject`/`match`. A stage-chain runs until a token that can't begin a
+//! stage — notably the `let` body's `in`, the one identifier allowed to follow a complete chain.
 //!
-//!   expr  = 'let' pat '=' expr 'in' expr | pipe
-//!   pat   = IDENT | '(' IDENT (',' IDENT)* ')'
-//!   pipe  = proj ('|>' apply)*
-//!   apply = 'map' '(' 'fun' IDENT '->' expr ')'
-//!         | 'map_variant' NUM '(' 'fun' IDENT '->' expr ')'
-//!         | 'match' '(' (NUM '(' 'fun' IDENT '->' expr ')')(',' …)* ')'   -- MapSum + Unwrap
-//!         | 'inject' NUM NUM                                             -- sum construction (tag arity)
-//!         | IDENT NUM?
-//!   proj  = atom ('.' NUM)*
-//!   atom  = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
+//!   expr   = 'let' pat '=' expr 'in' expr | pipe
+//!   pat    = IDENT | '(' IDENT (',' IDENT)* ')'
+//!   pipe   = proj apply*                               -- juxtaposition; chain ends before `in`
+//!   apply  = 'map' '(' lambda ')'
+//!          | 'map_variant' NUM '(' lambda ')'
+//!          | 'match' '(' (NUM '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
+//!          | 'inject' NUM NUM                               -- sum construction (tag arity)
+//!          | IDENT NUM?
+//!   lambda = IDENT '->' expr
+//!   proj   = atom ('.' NUM)*
+//!   atom   = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
 //!
-//! e.g.  let (subj, vals) = input.1 |> transpose in vals |> reduce_sum
-//!       e |> match (0 (fun lo -> lo), 1 (fun hi -> hi |> add_u64 100))   -- exhaustive ⇒ Unwrap types it
-//!       xs |> inject 0 2                                                 -- tag xs into variant 0 of 2
+//! e.g.  let (subj, vals) = input.1 transpose in vals reduce_sum
+//!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
+//!       xs inject 0 2                                      -- tag xs into variant 0 of 2
 
 use super::{resolve, str_value, takes_num};
 use crate::graph::{Builder, Graph};
@@ -26,13 +29,10 @@ use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
-    PipeArrow, // |>
-    Arrow,     // ->
+    Arrow, // ->
     Dot,
     LParen,
     RParen,
-    LBrack,
-    RBrack,
     Comma,
     Eq,
     Ident(String),
@@ -48,10 +48,6 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
         let c = cs[i];
         match c {
             c if c.is_whitespace() => i += 1,
-            '|' if cs.get(i + 1) == Some(&'>') => {
-                toks.push(Tok::PipeArrow);
-                i += 2;
-            }
             '-' if cs.get(i + 1) == Some(&'>') => {
                 toks.push(Tok::Arrow);
                 i += 2;
@@ -66,14 +62,6 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             }
             ')' => {
                 toks.push(Tok::RParen);
-                i += 1;
-            }
-            '[' => {
-                toks.push(Tok::LBrack);
-                i += 1;
-            }
-            ']' => {
-                toks.push(Tok::RBrack);
                 i += 1;
             }
             ',' => {
@@ -220,16 +208,28 @@ impl P {
 
     fn pipe(&mut self) -> Result<E, String> {
         let mut e = self.proj()?;
-        while self.peek() == Some(&Tok::PipeArrow) {
-            self.bump();
+        // a value is followed by its stages by juxtaposition; the chain runs until a token that
+        // cannot begin a stage — in particular the `let` body's `in`, the one identifier that can
+        // legally follow a complete pipe without being an op.
+        while self.starts_apply() {
             let ap = self.apply()?;
             e = E::Pipe(Box::new(e), ap);
         }
         Ok(e)
     }
 
+    /// whether the next token can begin a pipe stage — a string constant, or any identifier other
+    /// than the chain-terminating `in`.
+    fn starts_apply(&self) -> bool {
+        match self.peek() {
+            Some(Tok::Str(_)) => true,
+            Some(Tok::Ident(k)) => k != "in",
+            _ => false,
+        }
+    }
+
     fn apply(&mut self) -> Result<Apply, String> {
-        // a string literal applied via `|>` is a constant, like `lit`: broadcast to the value.
+        // a string literal as a stage is a constant, like `lit`: broadcast to the value.
         if let Some(Tok::Str(_)) = self.peek() {
             let Some(Tok::Str(bytes)) = self.bump() else { unreachable!() };
             return Ok(Apply::Str(bytes));
@@ -249,7 +249,7 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(Apply::MapVariant(k, x, Box::new(body)))
             }
-            // match: one arm per variant — `match (k0 (fun x -> b0), k1 (fun y -> b1), …)`.
+            // match: one arm per variant — `match (k0 (x -> b0), k1 (y -> b1), …)`.
             "match" => {
                 self.eat(&Tok::LParen)?;
                 let mut arms = Vec::new();
@@ -281,10 +281,7 @@ impl P {
     }
 
     fn lambda(&mut self) -> Result<(String, E), String> {
-        if !self.is_kw("fun") {
-            return Err(format!("expected 'fun', found {:?}", self.peek()));
-        }
-        self.bump();
+        // a lambda is `IDENT -> body`; the `->` is the marker (no `fun` keyword).
         let x = self.ident()?;
         self.eat(&Tok::Arrow)?;
         let body = self.expr()?;

@@ -1,3 +1,3 @@
 # n = 8
 # = List ends=[4] <List ends=[2, 4, 6, 8] <[0, 1, 2, 3, 4, 5, 6, 7]>>
-let bn = input |> iota in let build = bn |> map (fun x -> (x |> shr 1, x)) in let probes = bn |> map (fun x -> x |> shr 1) |> dedup in let t = build |> transpose in let r = (probes, t.0) |> find in (r, t.1) |> slices
+let bn = input iota in let build = bn map (x -> (x shr 1, x)) in let probes = bn map (x -> x shr 1) dedup in let t = build transpose in let r = (probes, t.0) find in (r, t.1) slices

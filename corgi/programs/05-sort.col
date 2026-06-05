@@ -1,3 +1,3 @@
 # n = 5
 # = List ends=[5] <[5, 6, 7, 8, 9]>
-input |> iota |> map (fun x -> (x |> lit 9, x) |> sub) |> sort
+input iota map (x -> (x lit 9, x) sub) sort

@@ -1,7 +1,8 @@
 //! Front-end: the surface syntax that lowers to the core `Graph`. The core stays agnostic and many
-//! surfaces could target it; the one kept is the ML-flavoured `ml` expression language (`let`/`|>`/`fun`),
-//! which aligns with the operator set — `|>` is op application, `let` is graph sharing, `fun` is a
-//! closed body. The op-name table below is the whole vocabulary it reaches.
+//! surfaces could target it; the one kept is the ML-flavoured `ml` expression language, concatenative
+//! by juxtaposition — a value followed by its operator stages with no separator (`input iota`), `let`
+//! is graph sharing, and `x -> body` is a closed body. The op-name table below is the whole vocabulary
+//! it reaches.
 
 pub(crate) mod ml;
 pub(crate) mod program;

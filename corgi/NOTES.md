@@ -31,11 +31,11 @@ src/
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
-    ml.rs      the one surface: ML-flavoured (let / |> / fun / match / inject), lowering to Graph<NumOp>.
+    ml.rs      the one surface: ML-flavoured (let / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
 tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
-           an equivalence via `(A, B) |> eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
+           an equivalence via `(A, B) eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
 examples/tour.rs   benches/eval.rs   dev/*-kickoff.md
 ```
 
