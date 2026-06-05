@@ -42,6 +42,6 @@ fn main() {
         println!("• {desc}  (n = {n})");
         println!("    {prog}");
         println!("    : {ty}");
-        println!("    = {}\n", show(&p.run(seed)));
+        println!("    = {}\n", show(&p.run(seed).expect("shape error")));
     }
 }
