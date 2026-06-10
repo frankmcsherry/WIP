@@ -1,0 +1,11 @@
+# the embellishment law for filter: fused (List<X>, mask) filtering equals its kernel
+# expansion — zip the data with its mask, branch each element on the mask bit, unweave the
+# sum column, and keep lane 1. The fused op earns its keep as one mask-driven pass; this law
+# says it adds no expressive power (it was the last reduction awaiting zip).
+# n = 8
+# = [1]
+let data = input iota in
+let mask = data map (x -> x and 1) in
+let fused = (data, mask) filter in
+let kernel = (data, mask) zip map (p -> (p.0, p.1) branch 2) unweave field 2 in
+(fused, kernel) eq

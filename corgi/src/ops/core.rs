@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, split_by_mask,
+    expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
 };
 use crate::graph::{eval_graph, shape_of, Graph, OpLike};
 use crate::shape::{join, shape_of_value, Shape};
@@ -13,31 +13,65 @@ use crate::value::Value;
 /// arithmetic the `numeric` layer. Generic over `L`, the layer used for body sub-graphs, so a higher layer's
 /// `map` bodies can use the higher vocabulary. `Op<L>` is not itself `OpLike` — the layer enum is (e.g.
 /// `NumOp`), delegating to these inherent methods.
+///
+/// Organized as the KERNEL MATRIX — (intro / elim / map / capture) × (Prod / Sum / List) — plus
+/// two further tiers: the structural isos (re-slicings the columnar layout stores for free) and
+/// the fused forms / producers (each reducible to the kernel where the isos allow — the `law`
+/// corpus programs witness it — but kept for the execution strategy the expansion would lose).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Op<L> {
-    Lit(Value),     // a constant element, filled to the input's length (anchored)
-    Cast(u32),      // leaf -> leaf     re-width to N bits (low bytes / zero-pad), kind-blind
-    // Tuple ops
-    Field(usize),   // (.., X_i, ..) -> X_i
-    Broadcast,      // (X, List<Y>)   -> List<(X,Y)>
-    Partition,      // (X, U64-mask) -> Sum{zero-rows, nonzero-rows}   (the boolean 2-way; = Branch(2))
-    Branch(usize),  // (X, U64-tags) -> Sum{X × n}   data-driven N-way partition: row i -> variant tags[i]
-    // List ops
+    // ---- the kernel matrix ------------------------------------------------------------------
+    // PROD — intro is the graph-structural `Tuple`. Products are transparent (fixed arity, no
+    // witness column), so map is projection+rebuild and capture is `tuple` itself: no ops needed.
+    Field(usize),   // elim:  (.., X_i, ..) -> X_i
+    // SUM — witness: the tag column.
+    Branch(usize),  // intro: (X, U64-tags) -> Sum{X × n}  data-driven demux: row i -> variant
+                    //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
+    Inject(usize, usize), // intro: X -> Sum{tag: X, ⊥..} — the constant-tag Branch; the other
+                    //        lanes are ⊥ (empty, shape uncommitted, pinned later by `join`).
+    Unwrap,         // elim:  homogeneous (up to ⊥) Sum -> payload
+    MapSum(Vec<(usize, Graph<L>)>), // map: closed bodies on chosen variants; unlisted variants
+                    // pass through. The Vec breaks the type recursion, so no Box. A variadic
+                    // match — disjoint indices keep the arms independent (the optimizer relies
+                    // on this; `judge` rejects duplicates).
+    CapSum,         // capture: (X, Sum{A | B | ..}) -> Sum{(X,A) | (X,B) | ..} — distribute a
+                    // context into each lane (⊥ lanes stay ⊥); lets a `match` arm see an outer
+                    // value (closure capture, made explicit).
+    // LIST — witness: the bounds column.
+    Enlist,         // intro: X -> List<X>  each element its own length-1 list (list-monad unit)
+    Head,           // elim:  List<X> -> X  each row's first element (an empty row panics) —
+                    // Enlist's retraction and the one general stratum-dropping judgment;
+                    // `sort head` is structural min for any shape.
+    MapList(Box<Graph<L>>), // map: closed body on a list's values (in the *layer* L)
+    CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
+                    // (né Broadcast); the list-side closure capture.
+
+    // ---- structural isos: de-/re-structure between nestings the layout already stores; linear
+    // bounds work at most, no per-element compute. Three pairs: List⊗Prod (Transpose/Zip),
+    // List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave).
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
-    Filter,         // (List<X>, List<U64-mask>) -> List<X>
-    Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>   materialize each range
+    Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse; bounds must
+                    // agree (asserted). A pure rewrap — no data moves.
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
-    Enlist,         // X -> List<X>   each element its own length-1 list (list-monad unit)
-    Iota,           // U64 -> List<U64>   per row [0,1,…,n-1] — a List-introducer / in-language data generator
-    // Sum ops
-    Unwrap,                         // homogeneous Sum -> payload
-    Inject(usize, usize),           // X -> Sum{tag:X, ⊥..}  put X in variant `tag` of `arity` lanes; the
-                                    // others are ⊥ (empty, shape uncommitted, pinned later by `join`).
-    MapList(Box<Graph<L>>),         // closed body on a list's values (in the *layer* L)
-    MapSum(Vec<(usize, Graph<L>)>), // closed bodies on chosen sum variants; unlisted variants pass
-                                    // through. The Vec breaks the type recursion, so no Box. A variadic
-                                    // match — disjoint indices keep the arms independent (the optimizer
-                                    // relies on this; `judge` rejects duplicates).
+    Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>  materialize each range —
+                    // Flatten's inverse and the range form of Gather.
+    Unweave,        // List<Sum{A|B|..}> -> (tags:List<U64>, List<A>, List<B>, ..)  destructure a
+                    // sum column: the tag list plus each lane re-sliced per outer row. Lanes are
+                    // already stored packed in row order, so only bounds are computed; ⊥ lanes
+                    // are rejected (a standalone List<⊥> has no shape).
+    Weave,          // (tags:List<U64>, List<A>, List<B>, ..) -> List<Sum{A|B|..}>  Unweave's
+                    // inverse: interleave the lanes per the tags. Per-row tag counts must match
+                    // each lane's row length (asserted); the lanes' flat storage is the Sum's.
+
+    // ---- fused forms & producers -------------------------------------------------------------
+    Lit(Value),     // a constant element, filled to the input's length (anchored)
+    Cast(u32),      // leaf -> leaf  re-width to N bits (low bytes / zero-pad), kind-blind
+    Filter,         // (List<X>, List<U64-mask>) -> List<X>  keep mask-nonzero elements in one
+                    // pass (the kernel expansion is zip; map(branch); unweave; field — see the law)
+    Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  row-relative point gather —
+                    // the engine primitive surfaced. Chains compose in-language:
+                    // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
+    Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
 }
 
 impl<L: OpLike> Op<L> {
@@ -60,11 +94,107 @@ impl<L: OpLike> Op<L> {
                 )
             }
 
-            Op::Broadcast => {
-                let (x, list) = input.into_pair("Broadcast");
-                let (bounds, y) = list.into_list("Broadcast list");
+            // Transpose's inverse: parallel lists with identical bounds rewrap as one list of
+            // products. No data moves — the columns simply become the product's fields.
+            Op::Zip => {
+                let cols = input.into_prod("Zip");
+                let mut bounds: Option<Vec<usize>> = None;
+                let mut inner = Vec::with_capacity(cols.len());
+                for c in cols {
+                    let (b, v) = c.into_list("Zip column");
+                    match &bounds {
+                        None => bounds = Some(b),
+                        Some(prev) => assert_eq!(prev, &b, "Zip: column bounds differ"),
+                    }
+                    inner.push(v);
+                }
+                Value::List(bounds.expect("Zip: empty product"), Box::new(Value::Prod(inner)))
+            }
+
+            // destructure a sum column: the tag list plus each lane re-sliced per outer row. A
+            // lane's elements are stored packed in row order, so each lane keeps its values and
+            // only gains bounds (per-row cumulative tag counts) — no data moves but the tag widen.
+            Op::Unweave => {
+                let (bounds, vals) = input.into_list("Unweave");
+                let (tags, _offset, lanes) = vals.into_sum("Unweave");
+                let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
+                let mut counts = vec![0usize; lanes.len()];
+                let mut start = 0;
+                for &end in &bounds {
+                    for &t in &tags[start..end] {
+                        counts[t] += 1;
+                    }
+                    for (lb, &c) in lane_bounds.iter_mut().zip(&counts) {
+                        lb.push(c);
+                    }
+                    start = end;
+                }
+                let tag_list =
+                    Value::List(bounds, Box::new(Value::u64(tags.iter().map(|&t| t as u64).collect())));
+                let mut out = vec![tag_list];
+                for (o, lb) in lanes.into_iter().zip(lane_bounds) {
+                    let lane = o.expect("Unweave: ⊥ lane (judge rejects these)");
+                    out.push(Value::List(lb, Box::new(lane)));
+                }
+                Value::Prod(out)
+            }
+
+            // Unweave's inverse: interleave the lanes per the tag list. The lanes' flat row-major
+            // storage IS the Sum's lane storage, so after validating per-row tag counts against
+            // each lane's row lengths, the Sum is built without moving lane data.
+            Op::Weave => {
+                let mut cols = input.into_prod("Weave");
+                let rest = cols.split_off(1);
+                let (tb, tv) = cols.pop().expect("Weave: empty product").into_list("Weave tags");
+                let tags = tv.into_u64("Weave tags");
+                let mut lanes = Vec::with_capacity(rest.len());
+                let mut lane_bounds = Vec::with_capacity(rest.len());
+                for l in rest {
+                    let (b, v) = l.into_list("Weave lane");
+                    assert_eq!(b.len(), tb.len(), "Weave: lane/tags row count");
+                    lane_bounds.push(b);
+                    lanes.push(v);
+                }
+                let mut counts = vec![0usize; lanes.len()];
+                let mut start = 0;
+                for (r, &end) in tb.iter().enumerate() {
+                    for &t in &tags[start..end] {
+                        assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
+                        counts[t as usize] += 1;
+                    }
+                    for (t, (lb, &c)) in lane_bounds.iter().zip(&counts).enumerate() {
+                        assert_eq!(lb[r], c, "Weave: row {r} lane {t} length/tag-count mismatch");
+                    }
+                    start = end;
+                }
+                let sum = Value::sum(tags.iter().map(|&t| t as usize).collect(), lanes);
+                Value::List(tb, Box::new(sum))
+            }
+
+            Op::CapList => {
+                let (x, list) = input.into_pair("CapList");
+                let (bounds, y) = list.into_list("CapList list");
                 let idx = owner_ids(&bounds);
                 Value::List(bounds, Box::new(Value::Prod(vec![gather(&x, &idx), y])))
+            }
+
+            // capture into a sum: row i's context pairs with its payload inside variant tags[i].
+            // Lane t's rows are the tag-t rows in tag order, so gathering the context at those
+            // positions aligns with the carried within-variant offsets.
+            Op::CapSum => {
+                let (x, s) = input.into_pair("CapSum");
+                let (tags, _offset, lanes) = s.into_sum("CapSum sum");
+                assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
+                let mut per = vec![Vec::new(); lanes.len()];
+                for (i, &t) in tags.iter().enumerate() {
+                    per[t].push(i);
+                }
+                let new = lanes
+                    .into_iter()
+                    .zip(&per)
+                    .map(|(o, rows)| o.map(|lane| Value::Prod(vec![gather(&x, rows), lane])))
+                    .collect();
+                Value::sum_opt(tags, new)
             }
 
             Op::Cast(bits) => match input {
@@ -80,15 +210,6 @@ impl<L: OpLike> Op<L> {
                 let m = mv.into_u64("Filter mask");
                 let (idx, nb) = filter_mask(&bounds, &m);
                 Value::List(nb, Box::new(gather(&vals, &idx)))
-            }
-
-            Op::Partition => {
-                let (data, mask) = input.into_pair("Partition");
-                let m = mask.into_u64("Partition mask");
-                assert_eq!(data.len(), m.len());
-                let tags = m.iter().map(|&b| (b != 0) as usize).collect();
-                let (idx_f, idx_t) = split_by_mask(&m);
-                Value::sum(tags, vec![gather(&data, &idx_f), gather(&data, &idx_t)])
             }
 
             // N-way partition: the discriminant `tags` routes each row of `data` to its variant. The
@@ -158,6 +279,17 @@ impl<L: OpLike> Op<L> {
                 Value::List(lb, Box::new(inner))
             }
 
+            // point gather: each row-relative index becomes the haystack element it names.
+            // Output bounds are the index list's bounds (the indices decide the cardinality).
+            Op::Gather => {
+                let (idx, haystack) = input.into_pair("Gather");
+                let (ib, ivals) = idx.into_list("Gather indices");
+                let (hb, hvals) = haystack.into_list("Gather haystack");
+                assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
+                let abs = resolve_indices(&ib, &ivals.into_u64("Gather indices"), &hb);
+                Value::List(ib, Box::new(gather(&hvals, &abs)))
+            }
+
             // DESTRUCTURE one list layer: return the per-inner-list ranges (relative to
             // each top row's flattened span) AND the one-level-flattened values. Both
             // outputs are lists at the SAME top stratum, so they bundle as a Prod, and
@@ -192,6 +324,20 @@ impl<L: OpLike> Op<L> {
             Op::Enlist => {
                 let n = input.len();
                 Value::List((1..=n).collect(), Box::new(input))
+            }
+
+            // each row's first element — the stratum drop back out of a List. Partial: an empty
+            // row has no head, a data-dependent panic like Gather's bounds check.
+            Op::Head => {
+                let (bounds, vals) = input.into_list("Head");
+                let mut idx = Vec::with_capacity(bounds.len());
+                let mut start = 0;
+                for (r, &end) in bounds.iter().enumerate() {
+                    assert!(start < end, "Head: row {r} is empty");
+                    idx.push(start);
+                    start = end;
+                }
+                gather(&vals, &idx)
             }
 
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
@@ -234,28 +380,98 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Transpose expects a list"),
             },
 
-            Op::Broadcast => match input {
-                Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    List(y) => List(Box::new(Prod(vec![ts[0].clone(), (**y).clone()]))),
-                    _ => return err("Broadcast expects (X, List<Y>)"),
-                },
-                _ => return err("Broadcast expects a pair"),
+            Op::Zip => match input {
+                Prod(ts) if !ts.is_empty() => {
+                    let inners = ts
+                        .iter()
+                        .map(|t| match t {
+                            List(x) => Ok((**x).clone()),
+                            _ => Err(format!("Zip expects a product of lists, got {input}")),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    List(Box::new(Prod(inners)))
+                }
+                _ => return err("Zip expects a nonempty product of lists"),
             },
 
-            Op::Partition => match input {
-                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
-                    Sum(vec![Some(ts[0].clone()), Some(ts[0].clone())])
+            // every lane must be committed: a ⊥ lane would need a standalone List<⊥>, and ⊥ lives
+            // only inside Sum shapes. (Merge the sum first if a lane is uncommitted.)
+            Op::Unweave => match input {
+                List(inner) => match inner.as_ref() {
+                    Sum(ls) => {
+                        let mut out = vec![List(Box::new(Prim(64)))];
+                        for (k, o) in ls.iter().enumerate() {
+                            match o {
+                                Some(s) => out.push(List(Box::new(s.clone()))),
+                                None => return err(&format!("Unweave: lane {k} is ⊥ (uncommitted)")),
+                            }
+                        }
+                        Prod(out)
+                    }
+                    _ => return err("Unweave expects List<Sum>"),
+                },
+                _ => return err("Unweave expects a list"),
+            },
+
+            Op::Weave => match input {
+                Prod(ts) if ts.len() >= 2 => {
+                    if !matches!(&ts[0], List(t) if **t == Prim(64)) {
+                        return err("Weave expects (List<U64> tags, List<A>, ..)");
+                    }
+                    // the tag column is u8-backed, so the lane count must fit (eval's
+                    // `Value::sum` asserts the same bound — keep judge and eval in agreement).
+                    if ts.len() - 1 > 256 {
+                        return err("Weave: arity exceeds the u8 tag width");
+                    }
+                    let lanes = ts[1..]
+                        .iter()
+                        .map(|t| match t {
+                            List(x) => Ok(Some((**x).clone())),
+                            _ => Err(format!("Weave expects lane lists, got {input}")),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    List(Box::new(Sum(lanes)))
                 }
-                _ => return err("Partition expects (X, U64-mask)"),
+                _ => return err("Weave expects (List<U64> tags, List<A>, ..)"),
+            },
+
+            Op::CapList => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    List(y) => List(Box::new(Prod(vec![ts[0].clone(), (**y).clone()]))),
+                    _ => return err("CapList expects (X, List<Y>)"),
+                },
+                _ => return err("CapList expects a pair"),
+            },
+
+            // the context shape distributes into each committed lane; a ⊥ lane stays ⊥ (no rows,
+            // nothing to pair — the same deferral as MapSum's).
+            Op::CapSum => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    Sum(ls) => Sum(ls
+                        .iter()
+                        .map(|o| o.as_ref().map(|l| Prod(vec![ts[0].clone(), l.clone()])))
+                        .collect()),
+                    _ => return err("CapSum expects (X, Sum)"),
+                },
+                _ => return err("CapSum expects a pair"),
             },
 
             Op::Branch(n) => match input {
-                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => Sum(vec![Some(ts[0].clone()); *n]),
+                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
+                    // the tag column is u8-backed (same bound as Weave's; eval's `Value::sum` asserts it).
+                    if *n > 256 {
+                        return err(&format!("Branch: arity {n} exceeds the u8 tag width"));
+                    }
+                    Sum(vec![Some(ts[0].clone()); *n])
+                }
                 _ => return err("Branch expects (X, U64-tags)"),
             },
 
+            // only the widths the `prim!` macro generates exist; any other would judge fine and
+            // panic at eval — the typer owns the rejection.
             Op::Cast(bits) => match input {
-                Prim(_) => Prim(*bits),
+                Prim(_) if matches!(*bits, 8 | 16 | 32 | 64) => Prim(*bits),
+                Prim(_) => return err(&format!("Cast: unsupported width {bits}")),
                 _ => return err("Cast expects a leaf"),
             },
 
@@ -277,6 +493,14 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Slices expects a pair"),
             },
 
+            Op::Gather => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (List(i), List(t)) if **i == Prim(64) => List(t.clone()),
+                    _ => return err("Gather expects (List<U64>, List<T>)"),
+                },
+                _ => return err("Gather expects a pair"),
+            },
+
             Op::Flatten => match input {
                 List(inner) => match inner.as_ref() {
                     List(x) => Prod(vec![List(Box::new(Prod(vec![Prim(64), Prim(64)]))), List(x.clone())]),
@@ -286,6 +510,11 @@ impl<L: OpLike> Op<L> {
             },
 
             Op::Enlist => List(Box::new(input.clone())),
+
+            Op::Head => match input {
+                List(x) => (**x).clone(),
+                _ => return err("Head expects a list"),
+            },
 
             Op::Iota => match input {
                 Prim(64) => List(Box::new(Prim(64))),
@@ -311,6 +540,10 @@ impl<L: OpLike> Op<L> {
             Op::Inject(tag, arity) => {
                 if *tag >= *arity {
                     return err(&format!("Inject: tag {tag} out of range for arity {arity}"));
+                }
+                // u8 tag width, as in Branch/Weave — eval's `Value::sum_opt` asserts the same bound.
+                if *arity > 256 {
+                    return err(&format!("Inject: arity {arity} exceeds the u8 tag width"));
                 }
                 let mut variants = vec![None; *arity];
                 variants[*tag] = Some(input.clone());

@@ -13,7 +13,7 @@ src/
                (u8/u16/u32/u64) via the `prim!` macro. Sum = (u8 tag column, carried within-variant
                offset per row, variants); build via Value::sum / sum_from_prim to keep the offset valid.
   engine.rs    row-movement primitives: gather, concat, fill + index generators
-               (split_by_mask / filter_mask / owner_ids / expand_ranges / tag_offsets).
+               (filter_mask / owner_ids / resolve_indices / expand_ranges).
   cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
                is the diagonal case) + the linear discrimination sort (sort_blocks / run_layout /
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
@@ -22,8 +22,16 @@ src/
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / optimize over Graph<NumOp>.
   ops/
-    core.rs    Op<L>: structure only (Lit/Cast/Field/Broadcast/Partition/Branch/Transpose/Filter/Slices/
-               Flatten/Enlist/Iota/Unwrap/Inject/MapList/MapSum). Body-generic over L; inherent
+    core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
+                          intro          elim     map       capture
+                   PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
+                   SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
+                   LIST   Enlist         Head     MapList   CapList  (witness: bounds column)
+               plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
+               List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave) — and the fused forms/producers
+               (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
+               programs witness it), kept for the execution strategy the expansion loses. The
+               boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
                eval/judge/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
@@ -63,6 +71,14 @@ the `CmpOp` bucket including the `Rel(Pred)` compare-to-mask family, and consoli
 `ml` surface — all landed. The bench shows the streaming ops memory-bound and already
 NEON-vectorized; `sort_list` is the lone compute-bound op.
 
+Then the kernel-matrix session: `Op<L>` reorganized as (intro/elim/map/capture) × (Prod/Sum/List)
+with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (index-as-value) and
+`Head` (the stratum drop) added; the three iso pairs completed (`Zip`, `Unweave`/`Weave`);
+`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` now judge by `join` (⊥-laned probes
+unify with committed operands); the judge rejects what eval can't represent (`Cast` widths, sum
+arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
+kernel+isos, so the kernel's sufficiency is suite-checked.
+
 ## Live work — the DDIR consumer
 
 The real consumer is **DDIR** (`../../differential-dataflow/interactive/`): DD hosts opaque `Value`
@@ -81,15 +97,39 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **Fusion / vector-at-a-time (the perf multiplier).** Single ops are memory-bound, so the lever is
   fewer passes, not SIMD. Tile execution ~1024 rows to L1 (the Polars/X100 model), composing the
   existing SIMD kernels — no per-row interpreter. Needs a slice-capable op path + a fusable-run pass.
-- **Index-as-value / VIEW multiplicity.** Composite ops are "generate index, then gather"; lift the
-  index to a `Value` so the optimizer composes gathers (`gather(gather(v,i),j) = gather(v,gather(i,j))`)
-  and fuses. The lazy form is a multiplicity View (0 = filter, ≥1 = repeat, range = slice).
+- **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
+  is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
+  `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying
+  that law, so gather chains become index math + one final gather. The lazy form (multiplicity View:
+  0 = filter, ≥1 = repeat, range = slice) stays OUT of the representation — collie's `Selector`
+  (4 variants × a composition matrix × per-op awareness) is the cautionary tale; laziness lives in
+  the pass, where corgi can see the whole chain.
+- **Vectorized abstract machine — the CPS connection (to discuss).** The term graph with let-sharing
+  is already ANF (the "essence of CPS", Flanagan et al.), so CPS's bookkeeping benefits — named
+  intermediates, explicit order, local rewrites — are built in. The deeper half, control flow
+  becoming DATA, lands on the ADT machinery via Reynolds: with no function values, continuations
+  defunctionalize to a Sum of "what remains to do" plus an apply dispatching on tags — and that pair
+  IS Sum + MapSum. A sum column is a batch of suspended control decisions, the tag column a column
+  of program counters; `match` runs each continuation once over the rows that chose it. Conclusion
+  to pursue: a column of CEK-machine states stepped by MapSum is a vectorized interpreter — the same
+  destination as the term-column/CSE thread (programs/28), reached from the control side. Arguably
+  the shape of "interpreted columnar evaluation of programs".
+
 - **Serialization / durability.** Leaves are flat typed buffers → write columns out/down,
   content-address. Latent strength (vs roto's statelessness); unbuilt. Option-as-`Sum` vs
   Arrow-validity-bitmap is the representation reconcile point.
 - **Recursion / μ-types** — arbitrary-depth JSON; needs a recursive-column construct, and a
   length-carrying `Unit` for `null` / `Option` None.
 - **JSONL / Extern** — `split(delim)`, `parse_int` / `parse_json` as `Op::Extern` (opaque bucket).
+- **Named declarations (the naming layer).** Salvaged from the retired rust-surface kickoff; the
+  target is the existing `ml` surface, not a new one. Declarations are a compile-time table —
+  field-name↔index, variant-name↔tag, variant shapes — and names ERASE at lowering; the core stays
+  positional. Lowerings: record literal → `tuple` in declared field order; `s.a` → `Field(i)`;
+  named-arm `match` → `MapSum`+`Unwrap` (exhaustiveness still free via the join); constructor
+  `Foo x` → `Inject(tag, arity)` with both read off the declaration, so the surface's numeric
+  annotations disappear. Mechanical closure capture (free vars threaded via `CapList`/`CapSum`)
+  is the natural companion pass.
+
 - **Kind-checking numeric front-end** — where `i32` / `f32` live; type-checks kinds, inserts
   swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).
 - **Length / stratum checker** — the one judgment `shape_of` skips (Tuple/Add same length; map body

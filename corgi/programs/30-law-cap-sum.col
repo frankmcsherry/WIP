@@ -1,0 +1,18 @@
+# the capture laws for sums. cap_sum distributes a context into each lane —
+# (X, {A | B}) -> {(X, A) | (X, B)} — closure capture for `match`, made explicit.
+# Conjunct 1: capturing then stripping the context is the identity on the sum.
+# Conjunct 2: an arm can now SEE the context — adding a captured x+100 in the even lane agrees
+# with the direct arithmetic x + (1 - parity) * (x + 100).
+# n = 8
+# = [1]
+let xs = input iota in
+let sums = xs map (x -> (x, x and 1) branch 2) in
+let strip = xs map (x ->
+    (x add_u64 100, (x, x and 1) branch 2) cap_sum
+    map_variant 0 (p -> p.1) map_variant 1 (p -> p.1)) in
+let used = xs map (x ->
+    (x add_u64 100, (x, x and 1) branch 2) cap_sum
+    match (0 (p -> (p.0, p.1) add), 1 (p -> p.1))) in
+let direct = xs map (x ->
+    (x, ((x lit 1, x and 1) sub, x add_u64 100) mul) add) in
+((strip, sums) eq, (used, direct) eq) mul

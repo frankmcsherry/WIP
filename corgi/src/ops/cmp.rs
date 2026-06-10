@@ -9,7 +9,7 @@ mod order;
 
 use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
-use crate::shape::Shape;
+use crate::shape::{join, Shape};
 use crate::value::Value;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
@@ -142,9 +142,15 @@ impl CmpOp {
         use Shape::*;
         let err = |what: &str| Err(format!("{what}, got {input}"));
         Ok(match self {
+            // operands must JOIN (not equal), mirroring Find: a ⊥-laned operand (e.g. an
+            // inject'd probe) compares against a committed one; eval never reads a ⊥ lane
+            // (a row's tag only names a committed lane), so the comparator is total here.
             CmpOp::Rel(_) => match input {
-                Prod(ts) if ts.len() == 2 && ts[0] == ts[1] => Prim(64),
-                _ => return err("Rel expects (X, X) of equal shape"),
+                Prod(ts) if ts.len() == 2 => {
+                    join(&ts[0], &ts[1]).map_err(|e| format!("Rel: {e}"))?;
+                    Prim(64)
+                }
+                _ => return err("Rel expects a pair of unifiable shapes"),
             },
             CmpOp::Gt(_) => match input {
                 Prim(64) => Prim(64),
@@ -165,8 +171,14 @@ impl CmpOp {
             },
             CmpOp::Find => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(a), List(b)) if a == b => List(Box::new(Prod(vec![Prim(64), Prim(64)]))),
-                    (List(_), List(_)) => return err("Find needle/haystack element types differ"),
+                    // needle/haystack elements must JOIN, not equal: a ⊥ lane (e.g. an inject'd
+                    // probe) adopts the committed sibling's shape, as in `Unwrap`. Eval is total
+                    // over joined operands — a row's tag only ever names a committed lane, so
+                    // `compare_idx` never reads a ⊥ lane.
+                    (List(a), List(b)) => {
+                        join(a, b).map_err(|e| format!("Find: {e}"))?;
+                        List(Box::new(Prod(vec![Prim(64), Prim(64)])))
+                    }
                     _ => return err("Find expects (List<X>, List<X>)"),
                 },
                 _ => return err("Find expects a pair"),

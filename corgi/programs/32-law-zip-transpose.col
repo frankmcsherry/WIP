@@ -1,0 +1,9 @@
+# the List⊗Prod iso, both directions: zip undoes transpose on a list of pairs, and
+# transpose undoes zip on parallel lists. Both are pure rewraps of the columnar layout —
+# the law is that the wrapping is lossless.
+# n = 8
+# = [1]
+let xs = input iota in
+let pairs = xs map (x -> (x, (x, x) mul)) in
+let cols = pairs transpose in
+((pairs transpose zip, pairs) eq, (cols zip transpose, cols) eq) mul

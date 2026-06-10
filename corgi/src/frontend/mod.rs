@@ -34,17 +34,23 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cast" => Op::Cast(n()? as u32).into(),
         "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
-        "broadcast" => Op::Broadcast.into(),
-        "partition" => Op::Partition.into(),
-        "branch" => Op::Branch(n()? as usize).into(), // N-way partition by a discriminant column
+        "zip" => Op::Zip.into(),         // Transpose's inverse: parallel lists -> list of products
+        "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
+        "weave" => Op::Weave.into(),     // (tags, lane lists) -> sum column
+        "cap_list" => Op::CapList.into(), // capture: pair a context with every list element
+        "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
+        "branch" => Op::Branch(n()? as usize).into(), // N-way partition by a discriminant column;
+                                                      // `branch 2` on a 0/1 mask is the boolean split
         "filter" => Op::Filter.into(),
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
         "slices" => Op::Slices.into(),
+        "gather" => Op::Gather.into(), // row-relative point gather (indices, haystack)
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
+        "head" => Op::Head.into(), // each row's first element (the stratum drop; empty row panics)
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
         // relational compares: two equal-width leaf columns -> 0/1 mask. `gt`/`ge` are these with

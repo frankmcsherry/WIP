@@ -1,0 +1,11 @@
+# a Co-dfns-style flat tree: one row of nodes with a parent-by-index column (node k's parent
+# is k shr 1; root 0 is its own parent). `gather` composes the parent vector with itself —
+# pointer jumping: p∘p is every node's grandparent, (p∘p)∘(p∘p) its 4-ancestor, so all
+# eight nodes reach the root in two compositions. The algorithm IS index manipulation;
+# no node payloads ever move.
+# n = 8
+# = (List ends=[8] <[0, 0, 0, 0, 1, 1, 1, 1]>, List ends=[8] <[0, 0, 0, 0, 0, 0, 0, 0]>)
+let p = input iota map (x -> x shr 1) in
+let pp = (p, p) gather in
+let p4 = (pp, pp) gather in
+(pp, p4)

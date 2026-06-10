@@ -1,0 +1,15 @@
+# uniq -c over a heterogeneous ADT column: classify each number into Sum{U64 | List<U64>}
+# (evens carry `x and 3`, odds carry the list [0 .. x and 3)), discrimination-sort the sums
+# (tag first, then payload — lists length-first), dedup to the distinct values, then `find`
+# each distinct value's run in the sorted column: hi - lo is its multiplicity.
+# n = 10
+# = (List ends=[4] <Sum tags=[0, 0, 1, 1] [[0, 2], List ends=[1, 4] <[0, 0, 1, 2]>]>, List ends=[4] <[3, 2, 3, 2]>)
+let sums = input iota map (x ->
+    (x, x and 1) branch 2
+    map_variant 0 (e -> e and 3)
+    map_variant 1 (o -> o and 3 iota))
+in
+let sorted = sums sort in
+let keys = sorted dedup in
+let spans = (keys, sorted) find in
+(keys, spans map (p -> (p.1, p.0) sub))

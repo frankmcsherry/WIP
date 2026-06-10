@@ -54,7 +54,7 @@ fn juxtaposition_stops_at_let_in() {
     assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[2, 3, 4, 5, 6, 7]>");
 }
 
-// classify_high (partition+map_variant+unwrap) and the find/slices join are now self-generating in
+// classify_high (branch+map_variant+unwrap) and the find/slices join are now self-generating in
 // tests/generated.rs (`classify_a_generated_range`, `join_generated_keys`) — retired here as twins.
 
 #[test]

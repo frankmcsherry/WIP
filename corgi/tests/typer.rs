@@ -69,6 +69,15 @@ fn find_mismatched_elements_errs() {
 }
 
 #[test]
+fn judge_rejects_unrepresentable_parameters() {
+    // parameters eval cannot represent must die in the typer, not at runtime: a width outside
+    // the prim set, and sum arities beyond the u8 tag column.
+    assert!(shape_of(&one(Cast(7)), &Shape::Prim(64)).is_err());
+    assert!(shape_of(&one(Inject(0, 300)), &Shape::Prim(64)).is_err());
+    assert!(shape_of(&one(Branch(300)), &Shape::Prod(vec![Shape::Prim(64), Shape::Prim(64)])).is_err());
+}
+
+#[test]
 fn mapsum_rejects_duplicate_variant() {
     // two arms on the SAME variant breaks the disjoint-arms invariant — the typer rejects it.
     let id = || {

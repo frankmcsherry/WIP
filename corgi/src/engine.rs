@@ -7,10 +7,6 @@ use crate::value::{Prim, Value};
 
 pub(crate) use generators::*;
 
-fn count_at(b: &[usize], i: usize) -> usize {
-    b[i] - if i == 0 { 0 } else { b[i - 1] }
-}
-
 pub(crate) fn row_span(b: &[usize], i: usize) -> (usize, usize) {
     (if i == 0 { 0 } else { b[i - 1] }, b[i])
 }
@@ -24,28 +20,15 @@ pub(crate) fn fill(row: &Value, n: usize) -> Value {
 
 mod generators {
     //! Index generators — the `gather`-family currency. Each composite op is "make an index (and sometimes
-    //! re-segmented bounds), then `gather`": mask→survivors (`Filter`/`Partition`), bounds→owner-ids
-    //! (`Broadcast`), range-expand (`Slices`). The index math lives here; the op bodies in `ops::core` just
-    //! generate, gather, and re-wrap. (`Unwrap` reads the Sum's carried offset via `gather_lanes` — no generator.)
+    //! re-segmented bounds), then `gather`": mask→survivors (`Filter`), bounds→owner-ids (`CapList`),
+    //! point-resolve (`Gather`), range-expand (`Slices`). The index math lives here; the op bodies in
+    //! `ops::core` just generate, gather, and re-wrap. (`Unwrap` reads the Sum's carried offset via
+    //! `gather_lanes` — no generator; `Branch` groups by tag inline.)
 
     use super::*;
 
-    /// the mask family: split element positions by a 0/1 `mask` into `(mask==0 positions, mask!=0 positions)`,
-    /// each ascending. The shared atom under `Filter` (gathers the nonzero set, re-segmented) and `Partition`
-    /// (gathers both into a Sum). Filter ⊂ Partition: Filter's survivors are exactly Partition's nonzero lane.
-    pub(crate) fn split_by_mask(mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
-        let mut falses = Vec::new();
-        let mut trues = Vec::new();
-        for (j, &b) in mask.iter().enumerate() {
-            if b != 0 { trues.push(j) } else { falses.push(j) }
-        }
-        (falses, trues)
-    }
-
-    /// the mask family, segmented: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
-    /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`. The
-    /// seq-level sibling is `split_by_mask` (Partition's); Filter needs the segmentation, so it has its own —
-    /// the two share only the "mask nonzero" predicate, not a generator.
+    /// the mask family: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
+    /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`.
     pub(crate) fn filter_mask(bounds: &[usize], mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut nb = Vec::with_capacity(bounds.len());
@@ -62,15 +45,35 @@ mod generators {
         (idx, nb)
     }
 
-    /// the broadcast family: expand a list's `bounds` to the owner row of each element — `[2,3,6]` →
-    /// `[0,0,1,2,2,2]`. Pairs with `gather` to replicate the scalar side of `Broadcast`. (The inverse of
+    /// the capture family: expand a list's `bounds` to the owner row of each element — `[2,3,6]` →
+    /// `[0,0,1,2,2,2]`. Pairs with `gather` to replicate the context side of `CapList`. (The inverse of
     /// `bounds`: position → segment.)
     pub(crate) fn owner_ids(bounds: &[usize]) -> Vec<usize> {
         let mut idx = Vec::with_capacity(bounds.last().copied().unwrap_or(0));
         for i in 0..bounds.len() {
-            idx.extend(std::iter::repeat_n(i, count_at(bounds, i)));
+            let (s, e) = row_span(bounds, i);
+            idx.extend(std::iter::repeat_n(i, e - s));
         }
         idx
+    }
+
+    /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
+    /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
+    /// of `expand_ranges` below. An index outside its row's span is a (data-dependent) panic.
+    pub(crate) fn resolve_indices(outer: &[usize], idx: &[u64], hay: &[usize]) -> Vec<usize> {
+        let mut abs = Vec::with_capacity(idx.len());
+        let (mut os, mut hs) = (0, 0);
+        for r in 0..outer.len() {
+            let (oe, he) = (outer[r], hay[r]);
+            for &x in &idx[os..oe] {
+                let p = hs + x as usize;
+                assert!(p < he, "Gather: index {x} out of row {r}'s bounds");
+                abs.push(p);
+            }
+            os = oe;
+            hs = he;
+        }
+        abs
     }
 
     /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row

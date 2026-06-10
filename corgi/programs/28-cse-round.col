@@ -1,0 +1,30 @@
+# one congruence round of CSE over a term column — hash-consing without hashes. The node store
+# is List<Sum{Lit: U64 | Add: (U64, U64)}>, children as row indices (a flat AST, Co-dfns style):
+# even k is Lit(k and 2) (deliberate duplicates), odd k is Add((k-1) and 3, (k+1) and 7).
+# Round: `dedup` discriminates the column into congruence classes; `find` against the deduped
+# store reads each node's class id; `gather` remaps children through that table; a second
+# `dedup` then merges Adds that differ only in pre-canonical children. Eight nodes become four.
+# The closed map bodies can't see the class table, so `cap_list` performs closure conversion —
+# each element carries the table — and a child lookup is the singleton idiom enlist-gather-head.
+# (Materializing the table per element is the cost the multiplicity-View backlog item exists
+# to erase.) The fixpoint loop over rounds belongs to the host.
+# n = 8
+# = (List ends=[4] <Sum tags=[0, 0, 1, 1] [[0, 2], ([0, 1], [1, 0])]>, List ends=[8] <[0, 2, 1, 3, 0, 2, 1, 3]>)
+let ks = input iota in
+let nodes = ks map (k ->
+    (k, k and 1) branch 2
+    map_variant 0 (e -> e and 2)
+    map_variant 1 (o -> ((o, o lit 1) sub and 3, (o, o lit 1) add and 7)))
+in
+let classid = (nodes, nodes dedup) find map (p -> p.0) in
+let nodes2 = (classid, ks) cap_list map (tk ->
+    (tk, tk.1 and 1) branch 2
+    map_variant 0 (p -> p.1 and 2)
+    map_variant 1 (p ->
+        let t = p.0 in
+        let l = (p.1, p.1 lit 1) sub and 3 in
+        let r = (p.1, p.1 lit 1) add and 7 in
+        ((l enlist, t) gather head, (r enlist, t) gather head)))
+in
+let canon = nodes2 dedup in
+(canon, (nodes2, canon) find map (p -> p.0))
