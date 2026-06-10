@@ -20,8 +20,16 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 }
 
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
+/// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "branch")
+    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast")
+}
+
+/// which op idents are pair-eating binaries that accept an optional immediate: `x sub 1` is sugar
+/// for `(x, x lit 1) sub`. (`and`/`shr`/`gt`/`add_u64` above are the core's immediate KERNELS and
+/// always take their number; these desugar at the surface and the core sees the lit-pair graph.)
+pub(crate) fn pair_imm(name: &str) -> bool {
+    matches!(name, "add" | "sub" | "mul" | "eq" | "ne" | "lt" | "le")
 }
 
 /// the op-name -> `NumOp` table the front-end lowers through. `map` / `map_variant` are NOT here:

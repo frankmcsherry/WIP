@@ -4,25 +4,33 @@
 //! sums are built/eliminated via `inject`/`match`. A stage-chain runs until a token that can't begin a
 //! stage — notably the `let` body's `in`, the one identifier allowed to follow a complete chain.
 //!
-//!   expr   = 'let' pat '=' expr 'in' expr | pipe
+//!   expr   = 'let' pat '=' expr 'in' expr
+//!          | 'enum' IDENT '=' IDENT ('|' IDENT)* 'in' expr  -- a compile-time table; names ERASE here
+//!          | pipe
 //!   pat    = IDENT | '(' IDENT (',' IDENT)* ')'
 //!   pipe   = proj apply*                               -- juxtaposition; chain ends before `in`
 //!   apply  = 'map' '(' lambda ')'
-//!          | 'map_variant' NUM '(' lambda ')'
-//!          | 'match' '(' (NUM '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
-//!          | 'inject' NUM NUM                               -- sum construction (tag arity)
+//!          | 'map_variant' tag '(' lambda ')'
+//!          | 'match' '(' (tag '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
+//!          | 'inject' (NUM NUM | VARIANT)                   -- sum construction (tag arity)
+//!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
+//!          | BINARY NUM                                     -- immediate: `x sub 1` ≡ `(x, x lit 1) sub`
 //!          | IDENT NUM?
-//!   lambda = IDENT '->' expr
+//!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
+//!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
 //!   proj   = atom ('.' NUM)*
 //!   atom   = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
 //!
 //! e.g.  let (subj, vals) = input.1 transpose in vals reduce_sum
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
+//!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
 //!       xs inject 0 2                                      -- tag xs into variant 0 of 2
+//!       xs inject Lo                                       -- both numbers off the declaration
 
-use super::{resolve, str_value, takes_num};
+use super::{pair_imm, resolve, str_value, takes_num};
 use crate::graph::{Builder, Graph};
 use crate::ops::{NumOp, Op};
+use crate::value::Value;
 use std::collections::HashMap;
 
 // ----- tokens ------------------------------------------------------------
@@ -35,6 +43,7 @@ enum Tok {
     RParen,
     Comma,
     Eq,
+    Bar, // | — the variant separator in an `enum` declaration
     Ident(String),
     Num(u64),
     Str(Vec<u8>),
@@ -70,6 +79,10 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             }
             '=' => {
                 toks.push(Tok::Eq);
+                i += 1;
+            }
+            '|' => {
+                toks.push(Tok::Bar);
                 i += 1;
             }
             '"' => {
@@ -121,11 +134,12 @@ enum Pat {
 
 enum Apply {
     Op(String, Option<u64>),
+    BinImm(String, u64), // pair op + immediate: `x sub 1` desugars to `(x, x lit 1) sub`
     Str(Vec<u8>),
-    Map(String, Box<E>),
-    MapVariant(usize, String, Box<E>),
-    Match(Vec<(usize, String, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
-    Inject(usize, usize),            // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
+    Map(Pat, Box<E>),
+    MapVariant(usize, Pat, Box<E>),
+    Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
+    Inject(usize, usize),         // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
 }
 
 enum E {
@@ -141,6 +155,10 @@ enum E {
 struct P {
     toks: Vec<Tok>,
     i: usize,
+    // the `enum` declarations' compile-time tables — names resolve HERE and erase from the AST,
+    // so the core stays positional. Variant names are global (one table), hence unique program-wide.
+    variants: HashMap<String, (usize, usize)>, // variant name -> (tag, arity)
+    enums: HashMap<String, usize>,             // enum name -> arity (for `branch Name`)
 }
 
 impl P {
@@ -181,28 +199,75 @@ impl P {
     fn expr(&mut self) -> Result<E, String> {
         if self.is_kw("let") {
             self.bump();
-            let pat = if self.peek() == Some(&Tok::LParen) {
-                self.bump();
-                let mut names = vec![self.ident()?];
-                while self.peek() == Some(&Tok::Comma) {
-                    self.bump();
-                    names.push(self.ident()?);
-                }
-                self.eat(&Tok::RParen)?;
-                Pat::Tuple(names)
-            } else {
-                Pat::Name(self.ident()?)
-            };
+            let pat = self.pat()?;
             self.eat(&Tok::Eq)?;
             let bound = self.expr()?;
-            if !self.is_kw("in") {
-                return Err(format!("expected 'in', found {:?}", self.peek()));
-            }
-            self.bump();
+            self.kw_in()?;
             let body = self.expr()?;
             Ok(E::Let(pat, Box::new(bound), Box::new(body)))
+        } else if self.is_kw("enum") {
+            // `enum Name = V0 | V1 | … in body` — a declaration, not a value: it fills the tables
+            // and parses on into the body, leaving no AST node behind.
+            self.bump();
+            let name = self.ident()?;
+            self.eat(&Tok::Eq)?;
+            let mut vs = vec![self.ident()?];
+            while self.peek() == Some(&Tok::Bar) {
+                self.bump();
+                vs.push(self.ident()?);
+            }
+            self.kw_in()?;
+            let arity = vs.len();
+            if self.enums.insert(name.clone(), arity).is_some() {
+                return Err(format!("duplicate enum '{name}'"));
+            }
+            for (tag, v) in vs.into_iter().enumerate() {
+                if self.variants.insert(v.clone(), (tag, arity)).is_some() {
+                    return Err(format!("duplicate variant '{v}'"));
+                }
+            }
+            self.expr()
         } else {
             self.pipe()
+        }
+    }
+
+    /// a binding pattern: a name, or a tuple of names (used by `let` and lambda parameters alike).
+    fn pat(&mut self) -> Result<Pat, String> {
+        if self.peek() == Some(&Tok::LParen) {
+            self.bump();
+            let mut names = vec![self.ident()?];
+            while self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                names.push(self.ident()?);
+            }
+            self.eat(&Tok::RParen)?;
+            Ok(Pat::Tuple(names))
+        } else {
+            Ok(Pat::Name(self.ident()?))
+        }
+    }
+
+    /// the `in` that closes a `let` or `enum` header (an identifier, not a token, so `eat` can't).
+    fn kw_in(&mut self) -> Result<(), String> {
+        if !self.is_kw("in") {
+            return Err(format!("expected 'in', found {:?}", self.peek()));
+        }
+        self.bump();
+        Ok(())
+    }
+
+    /// a variant tag at a use site: a literal number, or a declared variant name — which also
+    /// carries its enum's arity, so `inject` by name needs no second argument.
+    fn variant(&mut self) -> Result<(usize, Option<usize>), String> {
+        match self.bump() {
+            Some(Tok::Num(n)) => Ok((n as usize, None)),
+            Some(Tok::Ident(v)) => {
+                let (tag, arity) =
+                    *self.variants.get(&v).ok_or_else(|| format!("unknown variant '{v}'"))?;
+                Ok((tag, Some(arity)))
+            }
+            other => Err(format!("expected a variant tag, found {other:?}")),
         }
     }
 
@@ -243,7 +308,7 @@ impl P {
                 Ok(Apply::Map(x, Box::new(body)))
             }
             "map_variant" => {
-                let k = self.num()? as usize;
+                let (k, _) = self.variant()?;
                 self.eat(&Tok::LParen)?;
                 let (x, body) = self.lambda()?;
                 self.eat(&Tok::RParen)?;
@@ -254,7 +319,7 @@ impl P {
                 self.eat(&Tok::LParen)?;
                 let mut arms = Vec::new();
                 loop {
-                    let k = self.num()? as usize;
+                    let (k, _) = self.variant()?;
                     self.eat(&Tok::LParen)?;
                     let (x, body) = self.lambda()?;
                     self.eat(&Tok::RParen)?;
@@ -269,20 +334,42 @@ impl P {
                 Ok(Apply::Match(arms))
             }
             // inject: construct a sum — `inject tag arity`, the payload going to variant `tag` of
-            // `arity` lanes; the other lanes are ⊥ and adopt their type at a later merge.
+            // `arity` lanes; the other lanes are ⊥ and adopt their type at a later merge. A variant
+            // name supplies both numbers from its declaration.
             "inject" => {
-                let tag = self.num()? as usize;
-                let arity = self.num()? as usize;
+                let (tag, known) = self.variant()?;
+                let arity = match known {
+                    Some(a) => a,
+                    None => self.num()? as usize,
+                };
                 Ok(Apply::Inject(tag, arity))
+            }
+            // branch: the lane count is a literal, or an enum name standing for its arity.
+            "branch" => {
+                let lanes = match self.bump() {
+                    Some(Tok::Num(n)) => n,
+                    Some(Tok::Ident(e)) => {
+                        *self.enums.get(&e).ok_or_else(|| format!("unknown enum '{e}'"))? as u64
+                    }
+                    other => return Err(format!("expected a lane count or enum, found {other:?}")),
+                };
+                Ok(Apply::Op(name, Some(lanes)))
+            }
+            // a pair-eating binary followed by a number is the immediate form: `x sub 1` is the
+            // lit-pair idiom `(x, x lit 1) sub` spelled tight (a bare number can't begin a stage,
+            // so this claims unused syntax).
+            _ if pair_imm(&name) && matches!(self.peek(), Some(Tok::Num(_))) => {
+                Ok(Apply::BinImm(name, self.num()?))
             }
             _ if takes_num(&name) => Ok(Apply::Op(name, Some(self.num()?))),
             _ => Ok(Apply::Op(name, None)),
         }
     }
 
-    fn lambda(&mut self) -> Result<(String, E), String> {
-        // a lambda is `IDENT -> body`; the `->` is the marker (no `fun` keyword).
-        let x = self.ident()?;
+    fn lambda(&mut self) -> Result<(Pat, E), String> {
+        // a lambda is `pat -> body`; the `->` is the marker (no `fun` keyword). The pattern mirrors
+        // `let`: a tuple pattern destructures the parameter.
+        let x = self.pat()?;
         self.eat(&Tok::Arrow)?;
         let body = self.expr()?;
         Ok((x, body))
@@ -319,12 +406,28 @@ impl P {
 
 type Env = HashMap<String, usize>;
 
+/// bind a pattern to a node: a name binds the node itself; a tuple pattern binds each name to a
+/// `Field` projection of it.
+fn bind(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
+    match pat {
+        Pat::Name(x) => {
+            env.insert(x.clone(), id);
+        }
+        Pat::Tuple(names) => {
+            for (i, name) in names.iter().enumerate() {
+                let fid = b.add(Op::Field(i), vec![id]);
+                env.insert(name.clone(), fid);
+            }
+        }
+    }
+}
+
 /// lower a lambda body into a closed sub-graph (its parameter is the body's `Input`).
-fn lower_body(x: &str, body: &E) -> Result<Graph<NumOp>, String> {
+fn lower_body(pat: &Pat, body: &E) -> Result<Graph<NumOp>, String> {
     let mut bb = Builder::default();
     let bin = bb.input();
     let mut benv = Env::new();
-    benv.insert(x.to_string(), bin);
+    bind(pat, bin, &mut benv, &mut bb);
     let bout = lower(body, &benv, &mut bb)?;
     Ok(bb.finish(bout))
 }
@@ -343,23 +446,18 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
         E::Let(pat, bound, body) => {
             let id = lower(bound, env, b)?;
             let mut env2 = env.clone();
-            match pat {
-                Pat::Name(x) => {
-                    env2.insert(x.clone(), id);
-                }
-                Pat::Tuple(names) => {
-                    for (i, name) in names.iter().enumerate() {
-                        let fid = b.add(Op::Field(i), vec![id]);
-                        env2.insert(name.clone(), fid);
-                    }
-                }
-            }
+            bind(pat, id, &mut env2, b);
             lower(body, &env2, b)
         }
         E::Pipe(e, ap) => {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
+                Apply::BinImm(name, n) => {
+                    let lit = b.add(Op::Lit(Value::u64(vec![*n])), vec![id]);
+                    let pair = b.tuple(vec![id, lit]);
+                    Ok(b.add(resolve(name, None)?, vec![pair]))
+                }
                 Apply::Str(bytes) => Ok(b.add(Op::Lit(str_value(bytes.clone())), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
                 Apply::MapVariant(k, x, body) => {
@@ -382,7 +480,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
 /// parse an ML-flavoured expression into a `Graph` (with `input` bound to the root).
 pub fn parse_ml(src: &str) -> Result<Graph<NumOp>, String> {
     let toks = lex(src)?;
-    let mut p = P { toks, i: 0 };
+    let mut p = P { toks, i: 0, variants: HashMap::new(), enums: HashMap::new() };
     let e = p.expr()?;
     if p.i != p.toks.len() {
         return Err(format!("trailing tokens from index {}", p.i));

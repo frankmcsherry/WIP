@@ -1,3 +1,4 @@
 # n = 5
 # = Sum tags=[0] [[5], ⊥]
-input inject 0 2
+enum Either = This | That in
+input inject This

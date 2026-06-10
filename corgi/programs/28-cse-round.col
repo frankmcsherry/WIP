@@ -10,21 +10,21 @@
 # to erase.) The fixpoint loop over rounds belongs to the host.
 # n = 8
 # = (List ends=[4] <Sum tags=[0, 0, 1, 1] [[0, 2], ([0, 1], [1, 0])]>, List ends=[8] <[0, 2, 1, 3, 0, 2, 1, 3]>)
+enum Node = Lit | Add in
 let ks = input iota in
 let nodes = ks map (k ->
-    (k, k and 1) branch 2
-    map_variant 0 (e -> e and 2)
-    map_variant 1 (o -> ((o, o lit 1) sub and 3, (o, o lit 1) add and 7)))
+    (k, k and 1) branch Node
+    map_variant Lit (e -> e and 2)
+    map_variant Add (o -> (o sub 1 and 3, o add 1 and 7)))
 in
-let classid = (nodes, nodes dedup) find map (p -> p.0) in
-let nodes2 = (classid, ks) cap_list map (tk ->
-    (tk, tk.1 and 1) branch 2
-    map_variant 0 (p -> p.1 and 2)
-    map_variant 1 (p ->
-        let t = p.0 in
-        let l = (p.1, p.1 lit 1) sub and 3 in
-        let r = (p.1, p.1 lit 1) add and 7 in
+let classid = (nodes, nodes dedup) find map ((lo, hi) -> lo) in
+let nodes2 = (classid, ks) cap_list map ((table, k) ->
+    ((table, k), k and 1) branch Node
+    map_variant Lit ((t, k) -> k and 2)
+    map_variant Add ((t, k) ->
+        let l = k sub 1 and 3 in
+        let r = k add 1 and 7 in
         ((l enlist, t) gather head, (r enlist, t) gather head)))
 in
 let canon = nodes2 dedup in
-(canon, (nodes2, canon) find map (p -> p.0))
+(canon, (nodes2, canon) find map ((lo, hi) -> lo))

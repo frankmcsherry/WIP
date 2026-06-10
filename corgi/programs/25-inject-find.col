@@ -5,11 +5,12 @@
 # The answer (3, 5) is the equal-range of `2`-in-variant-0: present twice, at [3, 5).
 # n = 10
 # = List ends=[1] <([3], [5])>
+enum Parity = Even | Odd in
 let sums = input iota map (x ->
-    (x, x and 1) branch 2
-    map_variant 0 (e -> e and 3)
-    map_variant 1 (o -> o and 3 iota))
+    (x, x and 1) branch Parity
+    map_variant Even (e -> e and 3)
+    map_variant Odd (o -> o and 3 iota))
 in
 let sorted = sums sort in
-let needle = input lit 2 inject 0 2 enlist in
+let needle = input lit 2 inject Even enlist in
 (needle, sorted) find

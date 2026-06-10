@@ -39,7 +39,7 @@ src/
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
-    ml.rs      the one surface: ML-flavoured (let / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
+    ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
 tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
@@ -121,14 +121,13 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **Recursion / μ-types** — arbitrary-depth JSON; needs a recursive-column construct, and a
   length-carrying `Unit` for `null` / `Option` None.
 - **JSONL / Extern** — `split(delim)`, `parse_int` / `parse_json` as `Op::Extern` (opaque bucket).
-- **Named declarations (the naming layer).** Salvaged from the retired rust-surface kickoff; the
-  target is the existing `ml` surface, not a new one. Declarations are a compile-time table —
-  field-name↔index, variant-name↔tag, variant shapes — and names ERASE at lowering; the core stays
-  positional. Lowerings: record literal → `tuple` in declared field order; `s.a` → `Field(i)`;
-  named-arm `match` → `MapSum`+`Unwrap` (exhaustiveness still free via the join); constructor
-  `Foo x` → `Inject(tag, arity)` with both read off the declaration, so the surface's numeric
-  annotations disappear. Mechanical closure capture (free vars threaded via `CapList`/`CapSum`)
-  is the natural companion pass.
+- **Named declarations — enum half DONE; struct half deliberately skipped.**
+  `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
+  Use sites: `inject V` (both numbers off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
+  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1` ≡ `(x, x lit 1) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are untouched).
+  Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
+  Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
+  Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; programs/10 deliberately keeps the numeric `inject 1 3` so both spellings stay exercised.
 
 - **Kind-checking numeric front-end** — where `i32` / `f32` live; type-checks kinds, inserts
   swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).

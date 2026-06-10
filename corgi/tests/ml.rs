@@ -86,10 +86,52 @@ fn workhorse_products_sums_lists() {
 }
 
 #[test]
+fn enum_names_resolve_and_erase() {
+    // the declaration is a compile-time table: `Phone` resolves to tag 1 and erases, so this is
+    // the same graph as `match_contact`.
+    let src = "enum Contact = Email | Phone in \
+               input.2 map_variant Phone (p -> p add_u64 1000000) unwrap";
+    assert_eq!(run_ml(src, &sample()), "[1111, 1002222, 3333]");
+}
+
+#[test]
+fn inject_by_name_carries_arity() {
+    // `inject Email` reads both tag and arity off the declaration (vs `inject 0 2`).
+    let src = "enum Contact = Email | Phone in input.0 inject Email unwrap";
+    assert_eq!(run_ml(src, &sample()), "[10, 20, 30]");
+}
+
+#[test]
+fn branch_by_enum_and_named_match_arms() {
+    let src = "enum Size = Lo | Hi in \
+               let (subj, vals) = input.1 transpose in \
+               vals map (v -> (v, v gt 300) branch Size match (Lo (l -> l), Hi (h -> h add 1)))";
+    assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[100, 200, 300, 401, 501, 601]>");
+}
+
+#[test]
+fn lambda_destructures_pairs() {
+    // `(subj, val) -> …` in a lambda mirrors the `let` pattern: names for the pair, no `.0`/`.1`.
+    let src = "input.1 map ((subj, val) -> val)";
+    assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[100, 200, 300, 400, 500, 600]>");
+}
+
+#[test]
+fn binary_immediate_is_the_lit_pair() {
+    // `v add 1000` desugars to `(v, v lit 1000) add` — the same output as `const_via_lit_lambda`.
+    let src = "let (subj, vals) = input.1 transpose in vals map (v -> v add 1000)";
+    assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[1100, 1200, 1300, 1400, 1500, 1600]>");
+}
+
+#[test]
 fn errors_are_reported() {
     assert!(parse_ml("let x = input in y").is_err()); // unbound y
     assert!(parse_ml("input bogus").is_err());
     assert!(parse_ml("let x = input").is_err()); // missing 'in'
+    assert!(parse_ml("input inject Bogus").is_err()); // undeclared variant
+    assert!(parse_ml("input branch Bogus").is_err()); // undeclared enum
+    assert!(parse_ml("enum E = A | A in input").is_err()); // duplicate variant
+    assert!(parse_ml("enum E = A in enum F = A in input").is_err()); // variant names are global
 }
 
 #[test]

@@ -1,3 +1,4 @@
 # n = 8
 # = List ends=[8] <[1000, 1, 1000002, 3, 1004, 5, 1000006, 7]>
-input iota map (row -> (row, row and 3) branch 4 match (0 (a -> a add_u64 1000), 2 (c -> c add_u64 1000000)))
+enum Mod4 = Zero | One | Two | Three in
+input iota map (row -> (row, row and 3) branch Mod4 match (Zero (a -> a add_u64 1000), Two (c -> c add_u64 1000000)))
