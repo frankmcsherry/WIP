@@ -14,6 +14,7 @@
 //!          | 'match' '(' (tag '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
 //!          | 'inject' (NUM NUM | VARIANT)                   -- sum construction (tag arity)
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
+//!          | 'split' STR                                    -- delimiter as a one-byte string
 //!          | BINARY NUM                                     -- immediate: `x sub 1` ≡ `(x, x lit 1) sub`
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
@@ -344,6 +345,14 @@ impl P {
                 };
                 Ok(Apply::Inject(tag, arity))
             }
+            // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
+            // it names a byte, not a count.
+            "split" => match self.bump() {
+                Some(Tok::Str(bytes)) if bytes.len() == 1 => {
+                    Ok(Apply::Op(name, Some(bytes[0] as u64)))
+                }
+                other => Err(format!("split expects a one-byte string delimiter, found {other:?}")),
+            },
             // branch: the lane count is a literal, or an enum name standing for its arity.
             "branch" => {
                 let lanes = match self.bump() {

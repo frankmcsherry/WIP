@@ -5,7 +5,9 @@
 pub(crate) mod cmp;
 pub(crate) mod core;
 pub(crate) mod numeric;
+pub(crate) mod text;
 
 pub use self::cmp::{CmpOp, Pred};
 pub use self::core::Op;
 pub use self::numeric::{dec_i64, enc_i64, ArithOp, BinOp, Kind, NumOp};
+pub use self::text::TextOp;

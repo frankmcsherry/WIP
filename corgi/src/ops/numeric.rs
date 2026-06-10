@@ -11,6 +11,7 @@
 
 use super::cmp::CmpOp;
 use super::core::Op;
+use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
 use crate::shape::Shape;
 use crate::value::{Prim, Value};
@@ -185,12 +186,14 @@ impl ArithOp {
     }
 }
 
-/// the numeric layer: the core (structural) vocabulary plus the `cmp` (comparison/order) and `arith` buckets.
+/// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),
+/// `arith`, and `text` buckets — the layer the `ml` surface and the optimizer are typed at.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum NumOp {
     Core(Op<NumOp>),
     Cmp(CmpOp),
     Arith(ArithOp),
+    Text(TextOp),
 }
 
 impl OpLike for NumOp {
@@ -199,6 +202,7 @@ impl OpLike for NumOp {
             NumOp::Core(c) => c.eval(input),
             NumOp::Cmp(c) => c.eval(input),
             NumOp::Arith(a) => a.eval(input),
+            NumOp::Text(t) => t.eval(input),
         }
     }
     fn judge(&self, input: &Shape) -> Result<Shape, String> {
@@ -206,12 +210,13 @@ impl OpLike for NumOp {
             NumOp::Core(c) => c.judge(input),
             NumOp::Cmp(c) => c.judge(input),
             NumOp::Arith(a) => a.judge(input),
+            NumOp::Text(t) => t.judge(input),
         }
     }
     fn children(&self) -> Vec<&Graph<NumOp>> {
         match self {
             NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
-            NumOp::Cmp(_) | NumOp::Arith(_) => Vec::new(),
+            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) => Vec::new(),
         }
     }
 }
@@ -230,5 +235,10 @@ impl From<CmpOp> for NumOp {
 impl From<ArithOp> for NumOp {
     fn from(a: ArithOp) -> Self {
         NumOp::Arith(a)
+    }
+}
+impl From<TextOp> for NumOp {
+    fn from(t: TextOp) -> Self {
+        NumOp::Text(t)
     }
 }

@@ -288,6 +288,13 @@ impl Value {
         }
     }
 
+    pub fn into_u8(self, who: &str) -> Vec<u8> {
+        match self {
+            Value::Prim(Prim::U8(xs)) => Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone()),
+            _ => panic!("{who}: expected U8"),
+        }
+    }
+
     pub fn into_prim(self, who: &str) -> Prim {
         match self {
             Value::Prim(p) => p,

@@ -35,12 +35,14 @@ src/
                eval/judge/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
-    numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp) } : OpLike. ArithOp = the
+    numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+    text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
+               total — ParseU64 returns Sum{Err: bytes | Ok: U64}, no data-dependent panic.
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
-tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize   (no Builder-demo file —
+tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
            an equivalence via `(A, B) eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
@@ -120,7 +122,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   Arrow-validity-bitmap is the representation reconcile point.
 - **Recursion / μ-types** — arbitrary-depth JSON; needs a recursive-column construct, and a
   length-carrying `Unit` for `null` / `Option` None.
-- **JSONL / Extern** — `split(delim)`, `parse_int` / `parse_json` as `Op::Extern` (opaque bucket).
+- **JSONL / Extern** — `split`/`parse_u64` landed as the `text` bucket (typed, not `Op::Extern`); `parse_json` remains open and still wants `Extern` or recursion (μ-types below).
 - **Named declarations — enum half DONE; struct half deliberately skipped.**
   `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
   Use sites: `inject V` (both numbers off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).

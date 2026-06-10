@@ -31,7 +31,7 @@ pub(crate) mod value;
 
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
-pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred};
+pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, TextOp};
 pub use optimize::{cse, dce, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
 pub use value::{show, Value};

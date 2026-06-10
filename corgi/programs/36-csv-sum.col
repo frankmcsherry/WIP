@@ -1,0 +1,10 @@
+# sum a CSV row, defaulting the unparseable: `parse_u64` is total — Sum{Err: original bytes |
+# Ok: U64} — so the malformed "x" is a committed Err row, not a panic. `map_variant Err`
+# defaults it to 0 (`lit` broadcasts inside the lane), the now-homogeneous sum unwraps to
+# U64, and the row reduces: 1 + 20 + 0 + 4000.
+# n = 1
+# = [4021]
+enum Parsed = Err | Ok in
+input "1,20,x,4000" split ","
+map (w -> w parse_u64 map_variant Err (e -> e lit 0) unwrap)
+reduce_sum

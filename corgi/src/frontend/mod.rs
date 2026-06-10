@@ -10,7 +10,7 @@ pub(crate) mod program;
 pub use ml::parse_ml;
 pub use program::Program;
 
-use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred};
+use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, TextOp};
 use crate::value::Value;
 
 /// a string literal as a `List<U8>` value (one list of its UTF-8 bytes). `"…"` lowers to `Op::Lit`
@@ -76,6 +76,9 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
         "reduce_sum" => ArithOp::ReduceSum.into(),
+        // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
+        "split" => TextOp::Split(n()? as u8).into(),
+        "parse_u64" => TextOp::ParseU64.into(),
         other => return Err(format!("unknown op '{other}'")),
     })
 }
