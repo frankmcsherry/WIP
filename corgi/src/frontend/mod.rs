@@ -55,7 +55,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
         "slices" => Op::Slices.into(),
-        "gather" => Op::Gather.into(), // row-relative point gather (indices, haystack)
+        "gather" => Op::Gather.into(), // row-relative point gather (indices, haystack) — PARTIAL
+        "index" => Op::Index.into(),   // total point index -> Sum{Oob:U64 | Found:T} (head = index 0)
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
         "head" => Op::Head.into(), // each row's first element (the stratum drop; empty row panics)

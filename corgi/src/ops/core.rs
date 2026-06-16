@@ -109,6 +109,13 @@ pub enum Op<L> {
     Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  row-relative point gather —
                     // the engine primitive surfaced. Chains compose in-language:
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
+                    // PARTIAL (panics out of bounds): the unchecked fast path, valid where a pass
+                    // proves the indices in-range — the demoted form of `Index` (see its note).
+    Index,          // (idx:List<U64>, haystack:List<T>) -> List<Sum{Oob:U64 | Found:T}>  TOTAL point
+                    // index: an out-of-bounds index lands in the Oob lane carrying the bad index, an
+                    // in-bounds one in Found carrying the element (the ParseU64 discipline — failure is
+                    // a committed lane, never a panic). `index 0` is total `Head`. A bounds-proof pass
+                    // demotes `Index` to `Gather` + `inject Found` when the Oob lane is provably empty.
     Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
     Select,         // (mask:U64, then:T, else:T) -> T  branchless per-row blend (the SIMD bitselect):
                     // row i takes `then` if mask[i] != 0 else `else`. The dual of `Branch(2)`+`Weave` —
@@ -396,6 +403,39 @@ impl<L: OpLike> Op<L> {
                 Value::List(ib, Box::new(gather(&hvals, &abs)))
             }
 
+            // total point index: each index either names a haystack-row element (Found) or is out of
+            // that row's bounds (Oob, carrying the bad index). The per-element test is branchless (a
+            // comparison to a u64); only the routing into the two lanes is data-dependent. Output is a
+            // list (the index list's bounds) of Sum{Oob:U64 | Found:T}.
+            Op::Index => {
+                let (idx, haystack) = input.into_pair("Index");
+                let (ib, ivals) = idx.into_list("Index indices");
+                let (hb, hvals) = haystack.into_list("Index haystack");
+                assert_eq!(ib.len(), hb.len(), "Index: indices/haystack row count");
+                let idxs = ivals.into_u64("Index indices");
+                let mut tags = Vec::with_capacity(idxs.len());
+                let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
+                let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
+                let (mut is, mut hs) = (0, 0);
+                for r in 0..ib.len() {
+                    let (ie, he) = (ib[r], hb[r]);
+                    let rowlen = he - hs;
+                    for &x in &idxs[is..ie] {
+                        if (x as usize) < rowlen {
+                            tags.push(1);
+                            abs.push(hs + x as usize);
+                        } else {
+                            tags.push(0);
+                            oob.push(x);
+                        }
+                    }
+                    is = ie;
+                    hs = he;
+                }
+                let sum = Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)]);
+                Value::List(ib, Box::new(sum))
+            }
+
             // DESTRUCTURE one list layer: return the per-inner-list ranges (relative to
             // each top row's flattened span) AND the one-level-flattened values. Both
             // outputs are lists at the SAME top stratum, so they bundle as a Prod, and
@@ -619,6 +659,17 @@ impl<L: OpLike> Op<L> {
                     _ => return err("Gather expects (List<U64>, List<T>)"),
                 },
                 _ => return err("Gather expects a pair"),
+            },
+
+            // total index: List<Sum{Oob: U64 | Found: T}> — the Oob lane carries the bad index.
+            Op::Index => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (List(i), List(t)) if **i == Prim(64) => {
+                        List(Box::new(Sum(vec![Some(Prim(64)), Some((**t).clone())])))
+                    }
+                    _ => return err("Index expects (List<U64>, List<T>)"),
+                },
+                _ => return err("Index expects a pair"),
             },
 
             Op::Flatten => match input {
