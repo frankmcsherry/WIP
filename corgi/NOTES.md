@@ -49,6 +49,42 @@ programs/  *.col — the self-generating example corpus (program + `# n =` seed 
 examples/tour.rs   benches/eval.rs   dev/*-kickoff.md
 ```
 
+## Structural completeness — the functor commutation table
+
+The structural layer (PROD/SUM/LIST, leaving PRIM in its corner) is complete when every way the three
+functors *commute* is either a named iso with a witnessing `law` program, or a documented hole with a
+reason. The combinators are the **distributive laws** (functor-through-functor) and the **strengths**
+(× through a functor); with three functors the table is finite and small. Two families carry it:
+
+**Push LIST inward (the AoS→SoA transform — why corgi is columnar):**
+
+| value | ↔ | columnar form | ops | law |
+|-------|---|---------------|-----|-----|
+| `List<(X,Y)>` | ↔ | `(List<X>, List<Y>)` | Transpose / Zip | programs/32 |
+| `List<Sum{A\|B}>` | ↔ | `(tags, List<A>, List<B>)` | Unweave / Weave | programs/33 |
+| `List<List<X>>` | ↔ | `(ranges, flat)` | Flatten / Slices | programs/17, 31 |
+
+Note `List<Sum{A|B}>` is **not** `Sum{List<A>|List<B>}` — a list mixes variants, so the SoA form is the
+*shredded* `(tag-list, per-variant payload columns)` (Dremel/Parquet record shredding). That is exactly
+what Unweave produces; the "obvious" `List<Sum> → Sum<List>` does not exist.
+
+**Distribute × into a functor (the CAPTURE / strength family):**
+
+| value | ↔ | distributed | op | law |
+|-------|---|-------------|-----|-----|
+| `(X, Sum{A\|B})` | ↔ | `Sum{(X,A)\|(X,B)}` | CapSum (= `(X,A+B)≅(X,A)+(X,B)`) | programs/30 |
+| `(X, List<Y>)` | → | `List<(X,Y)>` | CapList (List strength) | programs/40 |
+| `(X, (A,B))` | ↔ | reassociation | Tuple/Field | trivial |
+
+**The principled holes (no iso — documented, not missing):**
+- **Sum over Prod** — `(A,B)+(C,D) ↛ (A+C, B+D)`: re-pairing loses the field correlation. Not iso.
+- **Sum/List over List `→` Sum** — `List<Sum>` cannot become `Sum<List>` (mixed variants); this is the
+  reason Unweave's target is the shredded triple, above.
+- diagonals (Prod∘Prod, Sum∘Sum) — trivial reassociation, no op.
+
+So the live cells (LIST-inward ×3, ×-into-{Sum,List} ×2) are all suite-checked; the rest are holes with
+reasons. Adding a structural op means either filling a hole (and writing its law) or it is redundant.
+
 ## Design invariants (don't break)
 
 - **Every semantic op is a unary `T0 -> T1`** (the 1:1 map), run by `eval`. `Input`/`Tuple` are the
