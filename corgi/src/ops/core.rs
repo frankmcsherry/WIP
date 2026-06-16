@@ -9,6 +9,35 @@ use crate::graph::{eval_graph, shape_of, Graph, OpLike};
 use crate::shape::{join, shape_of_value, Shape};
 use crate::value::Value;
 
+/// overwrite `old`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
+/// `gather`. Two-source `gather_lanes`: an active row reads `new` at its slot, others read `old` at
+/// their own. Shape-generic, like `gather`. The accumulator update for `Fold`/`Scan`.
+fn scatter(old: Value, active: &[usize], new: Value) -> Value {
+    let n = old.len();
+    let mut tags = vec![0usize; n];
+    let mut off: Vec<usize> = (0..n).collect();
+    for (slot, &r) in active.iter().enumerate() {
+        tags[r] = 1;
+        off[r] = slot;
+    }
+    gather_lanes(&[Some(&old), Some(&new)], &tags, &off)
+}
+
+/// the rows still long enough to have a `t`-th element, and the absolute index of that element in the
+/// flat values — the per-round work-list of the cross-row lockstep that drives `Fold`/`Scan`.
+fn round_active(bounds: &[usize], t: usize) -> (Vec<usize>, Vec<usize>) {
+    let (mut active, mut elem) = (Vec::new(), Vec::new());
+    let mut start = 0;
+    for (r, &end) in bounds.iter().enumerate() {
+        if end - start > t {
+            active.push(r);
+            elem.push(start + t);
+        }
+        start = end;
+    }
+    (active, elem)
+}
+
 /// the core op vocabulary: structure only — comparison/order is the `cmp` bucket (`ops::cmp`) and
 /// arithmetic the `numeric` layer. Generic over `L`, the layer used for body sub-graphs, so a higher layer's
 /// `map` bodies can use the higher vocabulary. `Op<L>` is not itself `OpLike` — the layer enum is (e.g.
@@ -43,6 +72,15 @@ pub enum Op<L> {
                     // Enlist's retraction and the one general stratum-dropping judgment;
                     // `sort head` is structural min for any shape.
     MapList(Box<Graph<L>>), // map: closed body on a list's values (in the *layer* L)
+    Fold(Box<Graph<L>>), // elim: (B, List<A>) -> B  seeded left fold of a binary body (B,A)->B along
+                    // each row's list. The accumulator-carrying list eliminator (Head is the 0-step
+                    // case; the named monoid reductions like ReduceSum are the SIMD fast paths). Body
+                    // runs once per ROUND, vectorized across rows: round t folds in every row's t-th
+                    // element in lockstep, so #invocations = the longest row, not the element count.
+    Scan(Box<Graph<L>>), // transform: (B, List<A>) -> List<B>  inclusive scan — `Fold` retaining each
+                    // step. out[r][t] = the accumulator after folding element t of row r; same bounds
+                    // as the input list (one B per A). `scan` then last-element = `fold`. Same lockstep
+                    // eval as Fold; the per-round results are scattered into the output list.
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
                     // (né Broadcast); the list-side closure capture.
 
@@ -248,6 +286,70 @@ impl<L: OpLike> Op<L> {
             Op::MapList(body) => {
                 let (bounds, inner) = input.into_list("MapList");
                 Value::List(bounds, Box::new(eval_graph(body, inner)))
+            }
+
+            // seeded left fold, vectorized across rows. `acc` is a column of one accumulator per row
+            // (starts as the seed). Round t pairs every still-long-enough row's acc with its t-th
+            // element, runs the body once over those active rows, scatters the results back. Rounds =
+            // the longest row; empty rows never become active, so it is total (empty list -> seed).
+            Op::Fold(body) => {
+                let (seed, list) = input.into_pair("Fold");
+                let (bounds, vals) = list.into_list("Fold list");
+                let mut acc = seed;
+                let mut t = 0;
+                loop {
+                    let (active, elem_idx) = round_active(&bounds, t);
+                    if active.is_empty() {
+                        break;
+                    }
+                    let acc_active = gather(&acc, &active);
+                    let elt = gather(&vals, &elem_idx);
+                    let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
+                    assert_eq!(updated.len(), active.len(), "Fold body changed the row count");
+                    acc = scatter(acc, &active, updated);
+                    t += 1;
+                }
+                acc
+            }
+
+            // inclusive scan: `Fold` that keeps each step. Same lockstep, but round t records its result
+            // at each active row's t-th output position. The recorded chunks (one per round) reassemble
+            // into the flat output by `gather_lanes`: output position p was produced in round `tags[p]`
+            // at within-round slot `off[p]`. Output bounds = input bounds (one B per A element).
+            Op::Scan(body) => {
+                let (seed, list) = input.into_pair("Scan");
+                let (bounds, vals) = list.into_list("Scan list");
+                let total = vals.len();
+                let mut acc = seed;
+                let mut chunks: Vec<Value> = Vec::new();
+                let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                let mut t = 0;
+                loop {
+                    let (active, elem_idx) = round_active(&bounds, t);
+                    if active.is_empty() {
+                        break;
+                    }
+                    let acc_active = gather(&acc, &active);
+                    let elt = gather(&vals, &elem_idx);
+                    let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
+                    assert_eq!(updated.len(), active.len(), "Scan body changed the row count");
+                    for (slot, &pos) in elem_idx.iter().enumerate() {
+                        tags[pos] = chunks.len();
+                        off[pos] = slot;
+                    }
+                    acc = scatter(acc, &active, updated.clone());
+                    chunks.push(updated);
+                    t += 1;
+                }
+                // total == 0 (every row empty): an empty B-shaped column, taken as `acc` gathered at no
+                // rows (acc still carries shape B). Else stitch the per-round chunks into element order.
+                let out_vals = if chunks.is_empty() {
+                    gather(&acc, &[])
+                } else {
+                    let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+                    gather_lanes(&refs, &tags, &off)
+                };
+                Value::List(bounds, Box::new(out_vals))
             }
 
             Op::MapSum(arms) => {
@@ -555,6 +657,31 @@ impl<L: OpLike> Op<L> {
                 _ => return err("MapList expects a list"),
             },
 
+            // (B, List<A>) -> B. The body, on (B, A), must again yield B (joined ⊥-tolerantly with the
+            // seed shape). Heterogeneous: the accumulator B and element A need not match.
+            Op::Fold(body) => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    List(a) => {
+                        let body_out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
+                        join(&ts[0], &body_out)?
+                    }
+                    _ => return err("Fold expects (B, List<A>)"),
+                },
+                _ => return err("Fold expects a pair"),
+            },
+
+            // (B, List<A>) -> List<B>. Same body judgment as Fold; the output is a list of the running B.
+            Op::Scan(body) => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    List(a) => {
+                        let body_out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
+                        List(Box::new(join(&ts[0], &body_out)?))
+                    }
+                    _ => return err("Scan expects (B, List<A>)"),
+                },
+                _ => return err("Scan expects a pair"),
+            },
+
             Op::MapSum(arms) => match input {
                 Sum(ts) => {
                     let mut out = ts.clone();
@@ -583,6 +710,7 @@ impl<L: OpLike> Op<L> {
     pub(crate) fn children(&self) -> Vec<&Graph<L>> {
         match self {
             Op::MapList(b) => vec![b],
+            Op::Fold(b) | Op::Scan(b) => vec![b],
             Op::MapSum(arms) => arms.iter().map(|(_, b)| b).collect(),
             _ => Vec::new(),
         }

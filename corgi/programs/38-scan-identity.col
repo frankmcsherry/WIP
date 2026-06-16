@@ -1,0 +1,7 @@
+# scan plumbing, isolated from accumulation: a body that ignores the accumulator and emits the element
+# reproduces the input list exactly — checks bounds, ordering, and the per-round reassembly (gather_lanes
+# stitch) independent of what the fold computes. Ragged input (row r = [0..r)) exercises per-row spans.
+# n = 4
+# = [1]
+let g = input iota map (x -> x iota) in
+((g map (r -> (r lit 0, r) scan ((a, x) -> x))), g) eq

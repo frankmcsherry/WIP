@@ -12,6 +12,12 @@ fn map_kind(kind: &NodeKind<NumOp>, f: fn(&Graph<NumOp>) -> Graph<NumOp>) -> Nod
         NodeKind::Op(NumOp::Core(Op::MapList(b))) => {
             NodeKind::Op(NumOp::Core(Op::MapList(Box::new(f(b)))))
         }
+        NodeKind::Op(NumOp::Core(Op::Fold(b))) => {
+            NodeKind::Op(NumOp::Core(Op::Fold(Box::new(f(b)))))
+        }
+        NodeKind::Op(NumOp::Core(Op::Scan(b))) => {
+            NodeKind::Op(NumOp::Core(Op::Scan(Box::new(f(b)))))
+        }
         NodeKind::Op(NumOp::Core(Op::MapSum(arms))) => {
             NodeKind::Op(NumOp::Core(Op::MapSum(arms.iter().map(|(k, b)| (*k, f(b))).collect())))
         }
