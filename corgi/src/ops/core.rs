@@ -110,6 +110,10 @@ pub enum Op<L> {
                     // the engine primitive surfaced. Chains compose in-language:
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
     Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
+    Select,         // (mask:U64, then:T, else:T) -> T  branchless per-row blend (the SIMD bitselect):
+                    // row i takes `then` if mask[i] != 0 else `else`. The dual of `Branch(2)`+`Weave` —
+                    // Branch avoids computing the unused side, Select avoids the partition; cheap bodies
+                    // favour Select. Shape-generic: it IS `gather_lanes([else, then], mask, identity)`.
 }
 
 impl<L: OpLike> Op<L> {
@@ -456,6 +460,20 @@ impl<L: OpLike> Op<L> {
                 }
                 Value::List(bounds, Box::new(Value::u64(vals)))
             }
+
+            // branchless blend: a two-source `gather_lanes` reading each row's own position from the
+            // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
+            // identity offset reads row i from row i — the whole "computed both sides, pick per lane".
+            Op::Select => {
+                let mut cols = input.into_prod("Select");
+                assert_eq!(cols.len(), 3, "Select: expected (mask, then, else)");
+                let els = cols.pop().unwrap();
+                let then = cols.pop().unwrap();
+                let mask = cols.pop().unwrap().into_u64("Select mask");
+                let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
+                let off: Vec<usize> = (0..tags.len()).collect();
+                gather_lanes(&[Some(&els), Some(&then)], &tags, &off)
+            }
         }
     }
 
@@ -621,6 +639,13 @@ impl<L: OpLike> Op<L> {
             Op::Iota => match input {
                 Prim(64) => List(Box::new(Prim(64))),
                 _ => return err("Iota expects U64"),
+            },
+
+            // (U64 mask, T, T) -> T. The two branches join (a ⊥ lane adopts its sibling, as in Unwrap);
+            // eval never reads a branch the mask doesn't select, so the join is total.
+            Op::Select => match input {
+                Prod(ts) if ts.len() == 3 && ts[0] == Prim(64) => join(&ts[1], &ts[2])?,
+                _ => return err("Select expects (U64 mask, T, T)"),
             },
 
             // homogeneous up to `⊥`: fold the committed (`Some`) lanes by `join`, so `⊥` lanes adopt the

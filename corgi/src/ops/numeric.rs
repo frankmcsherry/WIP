@@ -30,6 +30,8 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    Min, // lane-wise minimum — order-sensitive, so kind-aware (a SIMD-LCD reduction's binary core)
+    Max, // lane-wise maximum
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,6 +102,13 @@ macro_rules! grid {
                     (Kind::I, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
                     (Kind::I, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
                     (Kind::I, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
+                    // min/max are total (no overflow). Unsigned is native; signed picks via the swizzle —
+                    // and since the swizzle is ORDER-PRESERVING, the deswizzle is unnecessary, but `swiz!`
+                    // keeps the grid uniform and the result is identical.
+                    (Kind::U, BinOp::Min) => bin_into(av, bv, |x: $u, y: $u| x.min(y)),
+                    (Kind::U, BinOp::Max) => bin_into(av, bv, |x: $u, y: $u| x.max(y)),
+                    (Kind::I, BinOp::Min) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, min)),
+                    (Kind::I, BinOp::Max) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, max)),
                 }), )+
                 _ => panic!("arith: operand width mismatch"),
             }

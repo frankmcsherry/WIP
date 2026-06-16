@@ -29,7 +29,7 @@ pub(crate) fn takes_num(name: &str) -> bool {
 /// for `(x, x lit 1) sub`. (`and`/`shr`/`gt`/`add_u64` above are the core's immediate KERNELS and
 /// always take their number; these desugar at the surface and the core sees the lit-pair graph.)
 pub(crate) fn pair_imm(name: &str) -> bool {
-    matches!(name, "add" | "sub" | "mul" | "eq" | "ne" | "lt" | "le")
+    matches!(name, "add" | "sub" | "mul" | "min" | "max" | "eq" | "ne" | "lt" | "le")
 }
 
 /// the op-name -> `NumOp` table the front-end lowers through. `map` / `map_variant` are NOT here:
@@ -71,7 +71,11 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "add" => ArithOp::Bin(BinOp::Add, Kind::U, 64).into(),
         "sub" => ArithOp::Bin(BinOp::Sub, Kind::U, 64).into(),
         "mul" => ArithOp::Bin(BinOp::Mul, Kind::U, 64).into(),
+        "min" => ArithOp::Bin(BinOp::Min, Kind::U, 64).into(),
+        "max" => ArithOp::Bin(BinOp::Max, Kind::U, 64).into(),
         "neg" => ArithOp::Neg(Kind::U, 64).into(),
+        // branchless blend: (mask, then, else) -> picked column (the SIMD bitselect, see Op::Select)
+        "select" => Op::Select.into(),
         "add_u64" => ArithOp::AddU64(n()?).into(),
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
