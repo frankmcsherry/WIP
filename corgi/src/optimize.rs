@@ -89,7 +89,104 @@ pub fn peephole(g: &Graph<NumOp>) -> Graph<NumOp> {
     Graph { nodes: new_nodes, output: remap[g.output] }
 }
 
-/// run the passes together (peephole exposes dead tuples → cse → dce sweeps).
+/// inline `g1: A -> B` into `g2: B -> C`, returning `g1 ; g2 : A -> C`. `g2`'s `Input` is replaced by
+/// `g1`'s output; its other nodes are appended with edges remapped. Body sub-graphs are self-contained
+/// (their `Input` is local), so they copy verbatim — only top-level edges shift.
+fn compose(g1: &Graph<NumOp>, g2: &Graph<NumOp>) -> Graph<NumOp> {
+    let mut nodes = g1.nodes.clone();
+    let mut remap = vec![0usize; g2.nodes.len()];
+    for (i, node) in g2.nodes.iter().enumerate() {
+        match &node.kind {
+            NodeKind::Input => remap[i] = g1.output, // g2's parameter becomes g1's result
+            _ => {
+                let inputs = node.inputs.iter().map(|&e| remap[e]).collect();
+                remap[i] = nodes.len();
+                nodes.push(Node { kind: node.kind.clone(), inputs });
+            }
+        }
+    }
+    Graph { nodes, output: remap[g2.output] }
+}
+
+/// map fusion — the memory-bound lever: two passes over a list become one. `MapList(b1)` feeding
+/// `MapList(b2)`, where the first is consumed ONLY by the second, fuse to `MapList(b1 ; b2)` — the
+/// intermediate `List<Y>` is never materialized (MapList preserves bounds, so the body composition is
+/// exact). Recurses into bodies first, so inner chains fuse before outer ones.
+pub fn fuse_maps(g: &Graph<NumOp>) -> Graph<NumOp> {
+    let mut uses = vec![0usize; g.nodes.len()];
+    for n in &g.nodes {
+        for &e in &n.inputs {
+            uses[e] += 1;
+        }
+    }
+    uses[g.output] += 1;
+
+    let mut remap = vec![0usize; g.nodes.len()];
+    let mut new_nodes: Vec<Node<NumOp>> = Vec::new();
+    for (old, node) in g.nodes.iter().enumerate() {
+        let inputs: Vec<usize> = node.inputs.iter().map(|&i| remap[i]).collect();
+        let kind = map_kind(&node.kind, fuse_maps); // fuse the body's own chains first
+        if let NodeKind::Op(NumOp::Core(Op::MapList(b2))) = &kind {
+            // the producer is a MapList used nowhere else → safe to fold the two bodies into one pass.
+            let fused = if uses[node.inputs[0]] == 1 {
+                match &new_nodes[inputs[0]].kind {
+                    NodeKind::Op(NumOp::Core(Op::MapList(b1))) => {
+                        Some((compose(b1, b2), new_nodes[inputs[0]].inputs[0]))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((body, producer)) = fused {
+                remap[old] = new_nodes.len();
+                new_nodes.push(Node {
+                    kind: NodeKind::Op(NumOp::Core(Op::MapList(Box::new(body)))),
+                    inputs: vec![producer],
+                });
+                continue;
+            }
+        }
+        remap[old] = new_nodes.len();
+        new_nodes.push(Node { kind, inputs });
+    }
+    Graph { nodes: new_nodes, output: remap[g.output] }
+}
+
+/// adjacent structural isos that are exact inverses (`Zip∘Transpose`, `Weave∘Unweave`, and their
+/// mirrors) cancel: `outer(inner(x)) = x`, so the consumer reads `inner`'s input directly. Sound
+/// regardless of fan-out — only this edge is redirected; a still-shared `inner` survives for dce.
+fn is_inverse(outer: &Op<NumOp>, inner: &Op<NumOp>) -> bool {
+    use Op::*;
+    matches!(
+        (outer, inner),
+        (Zip, Transpose) | (Transpose, Zip) | (Weave, Unweave) | (Unweave, Weave)
+    )
+}
+
+/// cancel adjacent inverse isos (see [`is_inverse`]). The iso analogue of `peephole`'s Field-of-Tuple.
+pub fn cancel_isos(g: &Graph<NumOp>) -> Graph<NumOp> {
+    let mut remap = vec![0usize; g.nodes.len()];
+    let mut new_nodes: Vec<Node<NumOp>> = Vec::new();
+    for (old, node) in g.nodes.iter().enumerate() {
+        let inputs: Vec<usize> = node.inputs.iter().map(|&i| remap[i]).collect();
+        let kind = map_kind(&node.kind, cancel_isos);
+        if let NodeKind::Op(NumOp::Core(outer)) = &kind {
+            if let NodeKind::Op(NumOp::Core(inner)) = &new_nodes[inputs[0]].kind {
+                if is_inverse(outer, inner) {
+                    remap[old] = new_nodes[inputs[0]].inputs[0];
+                    continue;
+                }
+            }
+        }
+        remap[old] = new_nodes.len();
+        new_nodes.push(Node { kind, inputs });
+    }
+    Graph { nodes: new_nodes, output: remap[g.output] }
+}
+
+/// run the passes together: peephole and iso-cancellation expose dead/foldable structure, map fusion
+/// collapses adjacent list passes, then cse → dce sweep.
 pub fn optimize(g: &Graph<NumOp>) -> Graph<NumOp> {
-    dce(&cse(&peephole(g)))
+    dce(&cse(&fuse_maps(&cancel_isos(&peephole(g)))))
 }
