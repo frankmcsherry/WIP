@@ -71,6 +71,18 @@ macro_rules! prim {
                 }
             }
 
+            /// XOR the top (sign) bit of every element, at this width — the order-preserving signed
+            /// swizzle (`enc_i64` generalized), an involution. Converts an unsigned column to the
+            /// signed encoding of the same non-negative values and back; the numeric layer's `signed`.
+            pub(crate) fn xor_signbit(&self) -> Prim {
+                match self {
+                    $( Prim::$V(v) => {
+                        let m = !(<$t>::MAX >> 1);
+                        Prim::$V(Arc::new(v.iter().map(|&x| x ^ m).collect()))
+                    } )+
+                }
+            }
+
             /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives the
             /// buffer mutably when uniquely owned (the common case), or clones it once if shared. Touches
             /// only the `active` rows; no allocation in the unique case. The leaf of [`scatter`].

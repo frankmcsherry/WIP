@@ -96,6 +96,17 @@ reasons. Adding a structural op means either filling a hole (and writing its law
 - **The core is numeric-blind.** Arithmetic is `ops/numeric`; comparison is `ops/cmp`. The leaf is
   stored order-preserving (signed = top-bit swizzle), so ONE kind-blind comparator serves `sort`,
   `find`, and `Rel` alike.
+- **Float semantics are TOTAL-ORDER, not IEEE (deliberate).** `Kind::F` (widths 32/64) stores the
+  IEEE bits under the total-order swizzle (`f64::total_cmp`: negatives flip all bits, others flip the
+  sign bit). The kind-blind comparator then orders floats correctly with NO special case — *the
+  swizzle never mis-orders two values IEEE orders; it only supplies a definite position where IEEE
+  declines.* The deviations, all on the "naughty" sort/eq path: NaN is orderable (sorts to the top)
+  and equals itself bit-for-bit; `-0 != +0` (distinct bits — no canonicalization, by choice). The
+  win: no NaN-poisons-comparison surprise. *Arithmetic stays IEEE* (NaN/inf propagate; `x/0 -> ±inf`,
+  `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
+  via `to_f32`/`to_f64` (no float literal token: a constant is `lit_uN K to_fN`); the typed grid is
+  reached by suffix (`add_i32`, `div_f64`, `lit_i16 N`, `signed`). Integer `div` is deferred (no NEON
+  op; div-by-zero would panic) — the judge rejects it.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the

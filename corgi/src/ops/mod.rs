@@ -9,5 +9,5 @@ pub(crate) mod text;
 
 pub use self::cmp::{CmpOp, Pred};
 pub use self::core::Op;
-pub use self::numeric::{dec_i64, enc_i64, ArithOp, BinOp, Kind, NumOp};
+pub use self::numeric::{dec_i64, enc_i64, lit_value, ArithOp, BinOp, Kind, NumOp};
 pub use self::text::TextOp;
