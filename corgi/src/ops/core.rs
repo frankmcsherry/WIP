@@ -9,18 +9,53 @@ use crate::graph::{eval_graph, shape_of, Graph, OpLike};
 use crate::shape::{join, shape_of_value, Shape};
 use crate::value::Value;
 
-/// overwrite `old`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
-/// `gather`. Two-source `gather_lanes`: an active row reads `new` at its slot, others read `old` at
-/// their own. Shape-generic, like `gather`. The accumulator update for `Fold`/`Scan`.
-fn scatter(old: Value, active: &[usize], new: Value) -> Value {
-    let n = old.len();
-    let mut tags = vec![0usize; n];
-    let mut off: Vec<usize> = (0..n).collect();
-    for (slot, &r) in active.iter().enumerate() {
-        tags[r] = 1;
-        off[r] = slot;
+/// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
+/// `gather`, the accumulator update for `Fold`/`Scan`.
+///
+/// FIXED-WIDTH `acc` (a leaf, or a product of leaves) is mutated IN PLACE: each row has a constant
+/// slot, so we overwrite only the `active` rows, reusing the buffer round-to-round — no per-round
+/// allocation, no copying of the unchanged rows. VARIABLE-WIDTH `acc` (containing a `List`/`Sum`,
+/// whose rows differ in size) can't be slot-overwritten, so it falls back to the rebuild via
+/// two-source `gather_lanes` (correct, the prior behaviour; an uncommon accumulator shape).
+fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
+    if fixed_width(&acc) {
+        scatter_fixed(&mut acc, active, &new);
+        acc
+    } else {
+        let n = acc.len();
+        let mut tags = vec![0usize; n];
+        let mut off: Vec<usize> = (0..n).collect();
+        for (slot, &r) in active.iter().enumerate() {
+            tags[r] = 1;
+            off[r] = slot;
+        }
+        gather_lanes(&[Some(&acc), Some(&new)], &tags, &off)
     }
-    gather_lanes(&[Some(&old), Some(&new)], &tags, &off)
+}
+
+/// every row occupies a constant byte slot — true for a leaf and a product of fixed-width fields,
+/// false once a `List` or `Sum` (variable-size rows) appears. Checked WHOLE before any mutation, so
+/// the in-place pass below can't half-write a value that turns out to be variable-width deeper down.
+fn fixed_width(v: &Value) -> bool {
+    match v {
+        Value::Prim(_) => true,
+        Value::Prod(cs) => cs.iter().all(fixed_width),
+        Value::List(..) | Value::Sum(..) => false,
+    }
+}
+
+/// in-place scatter for a fixed-width `acc` (precondition: `fixed_width(acc)`), recursing products to
+/// the leaves where the actual write happens.
+fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
+    match (acc, new) {
+        (Value::Prim(d), Value::Prim(s)) => d.scatter_into(active, s),
+        (Value::Prod(ca), Value::Prod(cn)) => {
+            for (fa, fb) in ca.iter_mut().zip(cn) {
+                scatter_fixed(fa, active, fb);
+            }
+        }
+        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod"),
+    }
 }
 
 /// the rows still long enough to have a `t`-th element, and the absolute index of that element in the

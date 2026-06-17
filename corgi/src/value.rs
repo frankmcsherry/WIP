@@ -71,6 +71,19 @@ macro_rules! prim {
                 }
             }
 
+            /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives the
+            /// buffer mutably when uniquely owned (the common case), or clones it once if shared. Touches
+            /// only the `active` rows; no allocation in the unique case. The leaf of [`scatter`].
+            pub(crate) fn scatter_into(&mut self, active: &[usize], src: &Prim) {
+                match (self, src) {
+                    $( (Prim::$V(dst), Prim::$V(s)) => {
+                        let dst = Arc::make_mut(dst);
+                        for (p, &r) in active.iter().enumerate() { dst[r] = s[p]; }
+                    } )+
+                    _ => panic!("scatter_into: prim width mismatch"),
+                }
+            }
+
             /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]` (all
             /// same width). The leaf of [`crate::engine::gather_lanes`]; `gather` is the 1-source case.
             pub(crate) fn gather_lanes(srcs: &[&Prim], tags: &[usize], off: &[usize]) -> Prim {
