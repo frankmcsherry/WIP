@@ -1,0 +1,9 @@
+# SHOWCASE — min, max, and sum in ONE pass via a heterogeneous `fold`. The accumulator B = (U64,U64,
+# U64) is a different shape than the element A = U64; the body folds all three monoids at once
+# (min/max from the SIMD grid, add). Over [0,1,2,3,0,1,2,3]: min 0, max 3, sum 12. One traversal,
+# three aggregates — the heterogeneous accumulator is what makes it a single fold instead of three.
+# n = 8
+# = ([0], [3], [12])
+let xs = input iota map (x -> x and 3) in
+let seed = (xs lit 999, xs lit 0, xs lit 0) in
+(seed, xs) fold ((acc, x) -> ((acc.0, x) min, (acc.1, x) max, (acc.2, x) add))
