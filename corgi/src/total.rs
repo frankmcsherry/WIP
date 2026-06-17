@@ -8,7 +8,7 @@
 //! still has only the unchecked tier.
 
 use crate::graph::{Graph, NodeKind, OpLike};
-use crate::ops::{NumOp, Op};
+use crate::ops::NumOp;
 
 /// `Ok(())` iff the graph (and every body sub-graph) is in the guaranteed-total subset; otherwise the
 /// names of the unchecked-tier ops it uses, in node order.
@@ -25,11 +25,12 @@ pub fn check_total(g: &Graph<NumOp>) -> Result<(), Vec<&'static str>> {
 fn scan(g: &Graph<NumOp>, sites: &mut Vec<&'static str>) {
     for node in &g.nodes {
         let NodeKind::Op(op) = &node.kind else { continue };
-        match op {
-            NumOp::Core(Op::Get) => sites.push("get_uns"), // also `head_uns`, which lowers to `get_uns 0`
-            NumOp::Core(Op::Gather) => sites.push("gather_uns"),
-            NumOp::Core(Op::Slices) => sites.push("slices_uns"),
-            _ => {}
+        // only Core carries the unchecked kernels; each Core op self-reports its tier (`unchecked_site`
+        // is exhaustive, so a new op can't slip through as total). The other buckets are total.
+        if let NumOp::Core(c) = op {
+            if let Some(site) = c.unchecked_site() {
+                sites.push(site);
+            }
         }
         for child in op.children() {
             scan(child, sites); // a kernel op inside a map/fold/scan body counts too
