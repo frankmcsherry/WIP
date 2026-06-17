@@ -44,10 +44,14 @@ impl Program {
     }
 
     /// run the program on an input, consuming it — after shape-checking the graph against the input's
-    /// shape, so an ill-typed program is a located `Err` here rather than a panic deep inside an op.
-    /// This is the enforced surface boundary: nothing reaches `eval_graph` without passing the typer.
+    /// shape AND proving its Class-A bounds preconditions (`Zip`/`Filter` agreement), so an ill-typed
+    /// or unprovable program is a located `Err` here rather than a panic deep inside an op. This is the
+    /// enforced surface boundary: nothing reaches `eval_graph` without passing the typer and the length
+    /// checker, which together guarantee a well-typed program runs to a value.
     pub fn run(&self, input: Value) -> Result<Value, String> {
-        shape_of(&self.graph, &shape_of_value(&input))?;
+        let shape = shape_of_value(&input);
+        shape_of(&self.graph, &shape)?;
+        crate::lengths::check_lengths(&self.graph, &shape)?;
         Ok(eval_graph(&self.graph, input))
     }
 }
