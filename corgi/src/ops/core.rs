@@ -38,7 +38,7 @@ fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
 /// the in-place pass below can't half-write a value that turns out to be variable-width deeper down.
 fn fixed_width(v: &Value) -> bool {
     match v {
-        Value::Prim(_) => true,
+        Value::Prim(_) | Value::Unit(_) => true, // a unit row is a (zero-byte) constant slot
         Value::Prod(cs) => cs.iter().all(fixed_width),
         Value::List(..) | Value::Sum(..) => false,
     }
@@ -54,7 +54,8 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
                 scatter_fixed(fa, active, fb);
             }
         }
-        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod"),
+        (Value::Unit(_), Value::Unit(_)) => {} // no payload to overwrite (length is unchanged)
+        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod/Unit"),
     }
 }
 
@@ -161,6 +162,8 @@ pub enum Op<L> {
                     // a committed lane, never a panic). `index 0` is total `Head`. A bounds-proof pass
                     // demotes `Index` to `Gather` + `inject Found` when the Oob lane is provably empty.
     Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
+    Unit,           // X -> Unit  forget the payload, keep the length — how a column becomes the `None`
+                    // lane of `Option = Sum{Unit | T}` (e.g. `branch 2 map_variant 1 (x -> x unit)`).
     Select,         // (mask:U64, then:T, else:T) -> T  branchless per-row blend (the SIMD bitselect):
                     // row i takes `then` if mask[i] != 0 else `else`. The dual of `Branch(2)`+`Weave` —
                     // Branch avoids computing the unused side, Select avoids the partition; cheap bodies
@@ -621,6 +624,9 @@ impl<L: OpLike> Op<L> {
                 Value::List(bounds, Box::new(Value::u64(vals)))
             }
 
+            // forget the payload, keep the row count — the constructor for unit/`None` columns.
+            Op::Unit => Value::Unit(input.len()),
+
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the
             // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
             // identity offset reads row i from row i — the whole "computed both sides, pick per lane".
@@ -837,6 +843,8 @@ impl<L: OpLike> Op<L> {
                 Prim(64) => List(Box::new(Prim(64))),
                 _ => return err("Iota expects U64"),
             },
+
+            Op::Unit => Unit, // any shape -> Unit
 
             // (U64 mask, T, T) -> T. The two branches join (a ⊥ lane adopts its sibling, as in Unwrap);
             // eval never reads a branch the mask doesn't select, so the join is total.

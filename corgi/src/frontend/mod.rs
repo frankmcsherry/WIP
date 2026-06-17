@@ -113,6 +113,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "index" => Op::Index.into(),   // total point index -> Sum{Oob:U64 | Found:T} (gather's safe form)
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
+        "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
         "head_uns" => Op::Head.into(), // each row's first element; non-empty asserted (index 0 is safe)
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),

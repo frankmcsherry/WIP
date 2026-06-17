@@ -13,6 +13,9 @@ pub enum Value {
                                   // one lane per variant; a `None` lane is `⊥` — uncommitted, holds no rows
                                   // (no row carries its tag) and adopts a sibling's shape at a merge.
     List(Vec<usize>, Box<Value>), // end-offset per row; flattened values
+    Unit(usize),                  // a length-carrying unit column: `n` rows, no payload. The terminal
+                                  // object as a COLUMN (a fieldless `Prod` has no length witness); the
+                                  // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
 }
 
 /// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
@@ -254,6 +257,7 @@ impl Value {
                 ss.iter().map(|o| o.as_ref().map(Value::empty)).collect(),
             ),
             Shape::List(s) => Value::List(Vec::new(), Box::new(Value::empty(s))),
+            Shape::Unit => Value::Unit(0),
         }
     }
 
@@ -264,6 +268,7 @@ impl Value {
             Value::Prod(c) => c.first().map_or(0, |c| c.len()),
             Value::Sum(t, _, _) => t.len(),
             Value::List(b, _) => b.len(),
+            Value::Unit(n) => *n,
         }
     }
 
@@ -338,5 +343,6 @@ pub fn show(v: &Value) -> String {
             format!("Sum tags={:?} [{}]", t.usize_vec(), lanes.join(", "))
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b, show(vals)),
+        Value::Unit(n) => format!("()x{n}"),
     }
 }

@@ -27,6 +27,7 @@ enum BShape {
     Prod(Vec<BShape>),
     Sum(Vec<Option<BShape>>),
     List(u32, Box<BShape>),
+    Unit, // no bounds to track
 }
 
 impl BShape {
@@ -38,6 +39,7 @@ impl BShape {
                 Shape::Sum(ls.iter().map(|o| o.as_ref().map(BShape::to_shape)).collect())
             }
             BShape::List(_, i) => Shape::List(Box::new(i.to_shape())),
+            BShape::Unit => Shape::Unit,
         }
     }
 }
@@ -53,6 +55,7 @@ fn fresh(s: &Shape, c: &mut u32) -> BShape {
             *c += 1;
             BShape::List(t, Box::new(fresh(i, c)))
         }
+        Shape::Unit => BShape::Unit,
     }
 }
 

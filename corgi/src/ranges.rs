@@ -27,6 +27,7 @@ enum RShape {
     Prod(Vec<RShape>),
     Sum(Vec<Option<RShape>>),
     List(Box<RShape>),
+    Unit, // no leaf to range
 }
 
 impl RShape {
@@ -38,6 +39,7 @@ impl RShape {
                 Shape::Sum(ls.iter().map(|o| o.as_ref().map(RShape::to_shape)).collect())
             }
             RShape::List(i) => Shape::List(Box::new(i.to_shape())),
+            RShape::Unit => Shape::Unit,
         }
     }
     /// the range if this is a leaf, else ⊤.
@@ -56,6 +58,7 @@ fn top(s: &Shape) -> RShape {
         Shape::Prod(fs) => RShape::Prod(fs.iter().map(top).collect()),
         Shape::Sum(ls) => RShape::Sum(ls.iter().map(|o| o.as_ref().map(top)).collect()),
         Shape::List(i) => RShape::List(Box::new(top(i))),
+        Shape::Unit => RShape::Unit,
     }
 }
 

@@ -130,6 +130,7 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             let nv = variants.iter().zip(&per).map(|(v, s)| v.as_ref().map(|vv| gather(vv, s))).collect();
             Value::sum_from_prim(new_tags, nv)
         }
+        Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
     }
 }
 
@@ -229,6 +230,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 .collect();
             Value::sum_from_prim(out_tags, out_vars)
         }
+        Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
     }
 }
 
@@ -298,6 +300,7 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             let lanes = per.into_iter().map(|ps| (!ps.is_empty()).then(|| concat(&ps))).collect();
             Value::sum_from_prim(Prim::concat(&tag_parts), lanes)
         }
+        Value::Unit(_) => Value::Unit(parts.iter().map(Value::len).sum()),
     }
 }
 
