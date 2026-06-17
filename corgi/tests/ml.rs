@@ -139,3 +139,14 @@ fn string_literal_broadcasts() {
     // a string literal as a stage is a constant List<U8>, broadcast to the value.
     assert_eq!(run_ml("input \"hi\"", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
 }
+
+#[test]
+fn head_sugar_is_total() {
+    // `head` lowers to `get_try 0`, `head_uns` to `get_uns 0`. Cover the total branch the corpus
+    // (which uses only head_uns) misses: a non-empty row yields Found(first), an EMPTY row yields
+    // Oob 0 — no panic. (`input add_u64 1 iota` is [0..n+1); `input iota` at n=0 is the empty row.)
+    assert_eq!(run_ml("input add_u64 1 iota head", &u64(&[3])), "Sum tags=[1] [[], [0]]");
+    assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[0] [[0], []]");
+    // head_uns on a non-empty row extracts the bare element.
+    assert_eq!(run_ml("input add_u64 1 iota head_uns", &u64(&[3])), "[0]");
+}

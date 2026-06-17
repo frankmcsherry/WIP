@@ -1,7 +1,7 @@
-# the retraction law: head undoes enlist — `head ∘ enlist` is the identity, per element here
-# (each element wrapped in its own singleton list, then extracted). And as a bonus of the
-# structural order, `sort head` is the minimum of each row's list for ANY element shape;
-# the second conjunct checks it against the known minimum (0) of each iota row.
+# the retraction law: head_uns undoes enlist — `head_uns ∘ enlist` is the identity, per element here
+# (each element wrapped in its own singleton list, then extracted; both `head*` lower to `get* 0`).
+# And as a bonus of the structural order, `sort head_uns` is the minimum of each row's list for ANY
+# element shape; the second conjunct checks it against the known minimum (0) of each iota row.
 # n = 8
 # = [1]
 let xs = input iota in
