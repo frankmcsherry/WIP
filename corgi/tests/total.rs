@@ -14,11 +14,11 @@ fn total_subset_program_is_ok() {
 }
 
 #[test]
-fn flags_gather_uns() {
-    let g = parse_ml("input iota map (x -> x shr 1) map (p -> (p, p) gather_uns)");
-    // the above is one graph; the gather_uns must be reported.
+fn flags_index_uns() {
+    let g = parse_ml("input iota map (x -> x shr 1) map (p -> (p, p) index_uns)");
+    // the above is one graph; the index_uns must be reported.
     let g = g.unwrap();
-    assert_eq!(check_total(&g), Err(vec!["gather_uns"]));
+    assert_eq!(check_total(&g), Err(vec!["index_uns"]));
 }
 
 #[test]

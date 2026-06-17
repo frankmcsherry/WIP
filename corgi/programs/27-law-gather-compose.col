@@ -8,4 +8,4 @@ let xs = input iota in
 let v = xs map (x -> (x, x) mul) in
 let i = xs map (x -> (x, x lit 3) mul and 7) in
 let j = xs map (x -> (x, x lit 5) mul and 7) in
-((j, (i, v) gather_uns) gather_uns, ((j, i) gather_uns, v) gather_uns) eq
+((j, (i, v) index_uns) index_uns, ((j, i) index_uns, v) index_uns) eq

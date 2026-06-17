@@ -108,7 +108,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // these as outside the guaranteed-total subset. `index` (total) is gather's safe form; `index 0`
         // is head's; a total `slices_try` (range-index) is the future safe form for `slices_uns`.
         "slices_uns" => Op::Slices.into(), // (ranges, haystack) -> List<List<T>>  ranges asserted in-bounds
-        "gather_uns" => Op::Gather.into(), // row-relative point gather; indices asserted in-bounds
+        "index_uns" => Op::Gather.into(), // row-relative point gather; indices asserted in-bounds
         "index" => Op::Index.into(),   // total point index -> Sum{Oob:U64 | Found:T} (gather's safe form)
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),

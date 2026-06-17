@@ -6,6 +6,6 @@
 # n = 8
 # = (List ends=[8] <[0, 0, 0, 0, 1, 1, 1, 1]>, List ends=[8] <[0, 0, 0, 0, 0, 0, 0, 0]>)
 let p = input iota map (x -> x shr 1) in
-let pp = (p, p) gather_uns in
-let p4 = (pp, pp) gather_uns in
+let pp = (p, p) index_uns in
+let p4 = (pp, pp) index_uns in
 (pp, p4)
