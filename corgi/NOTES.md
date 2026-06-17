@@ -170,6 +170,23 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **Fusion / vector-at-a-time (the perf multiplier).** Single ops are memory-bound, so the lever is
   fewer passes, not SIMD. Tile execution ~1024 rows to L1 (the Polars/X100 model), composing the
   existing SIMD kernels — no per-row interpreter. Needs a slice-capable op path + a fusable-run pass.
+- **Destination-passing style (DPS) — the intentional discipline for the fusion above (not yet built).**
+  DPS (Shaikhha/Fitzgibbon/PeytonJones/Vytiniotis) is the calling convention that makes the tile fusion
+  work: thread a destination buffer through a chain of ops, each writes into it, no intermediates. The
+  seam is already corgi's central invariant — **DPS along the 1:1 SEQ spine** (pointwise/leaf/cast/
+  select/fold-accumulator: `dest size = input size`, pre-sizable), **allocate-and-return at `List`
+  introductions** (filter/group/iota/slices: data-dependent size). Relation to FBIP: corgi ALREADY does
+  opportunistic refcount reuse (`get_mut`/`make_mut` in `bin_into`/`scatter_into`/`AddU64`/move-to-last-
+  use) — that's reuse *discovered* at runtime; DPS makes it *intentional* (explicit destination →
+  guaranteed in-place, AND it threads through a chain, which is what unlocks fusion; per-op reuse
+  already works, so the new value is specifically cross-op intermediate elimination). The `None`
+  destination = "output is dead" idiom collapses `FoldScan -> Fold` (skip the tags/off recording + DCE
+  the dead output), which would retire `Op::Fold` the way `Op::Scan` was retired. THE fork to settle
+  first is the ownership model: a true destination can't be a shared `Arc`, so DPS pressures the hot
+  spine toward a linear/owned tile buffer (giving up free `Arc`-clone fan-out there) vs staying
+  `Arc`-shared (free clones, no fusion). First spike: compile ONE stratum-stable run (e.g. `iota ; add
+  ; mul ; gt`) to a single-tile DPS kernel and measure vs the per-op passes — that forces the ownership
+  decision on a small surface before committing the convention.
 - **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying
