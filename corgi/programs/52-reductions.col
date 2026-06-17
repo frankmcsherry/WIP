@@ -1,0 +1,8 @@
+# the named monoid reductions over [1,2,3,4,5] (each a one-pass SIMD horizontal fold — the fast paths
+# a general `fold` over the same monoid would be far slower than). sum 15, prod 120, min 1, max 5, and
+# `reduce_all` is 1 (every element nonzero). reduce_min/max are kind-blind (the order-preserving bytes
+# make them correct for signed/float too); sum/prod are unsigned; all/any are the 0/1-mask AND/OR.
+# n = 5
+# = ([15], [120], [1], [5], [1])
+let xs = input iota map (x -> x add_u64 1) in
+(xs reduce_sum, xs reduce_prod, xs reduce_min, xs reduce_max, xs reduce_all)

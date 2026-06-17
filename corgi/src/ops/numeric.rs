@@ -39,6 +39,20 @@ pub fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
     Value::Prim(if matches!(kind, Kind::I) { raw.xor_signbit() } else { raw })
 }
 
+/// the named monoid reductions — `List<U64> -> U64` per row, each a one-pass SIMD-friendly horizontal
+/// fold (the fast paths a general `fold` over the same monoid would be ~20x slower than). `Min`/`Max`
+/// are kind-blind (the order-preserving bytes make them correct for signed/float too); `Sum`/`Prod`
+/// are unsigned; `All`/`Any` are the 0/1-mask AND/OR.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Red {
+    Sum,
+    Prod,
+    Min,
+    Max,
+    All,
+    Any,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
@@ -87,7 +101,7 @@ pub enum ArithOp {
     AddU64(u64),           // U64 -> U64   x + c   (sugar)
     Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
     And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
-    ReduceSum,             // List<U64> -> U64      (unsigned reduce)
+    Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
 }
 
 // deswizzle the order-preserving signed encoding (XOR the top bit `m`), apply a native wrapping op,
@@ -247,13 +261,21 @@ impl ArithOp {
                 xs.iter_mut().for_each(|x| *x &= *m);
                 Value::u64(xs)
             }
-            ArithOp::ReduceSum => {
-                let (bounds, vals) = input.into_list("ReduceSum");
-                let xs = vals.into_u64("ReduceSum values");
+            ArithOp::Reduce(r) => {
+                let (bounds, vals) = input.into_list("reduce");
+                let xs = vals.into_u64("reduce values");
                 let mut out = Vec::with_capacity(bounds.len());
                 let mut start = 0;
                 for end in bounds {
-                    out.push(xs[start..end].iter().sum());
+                    let s = &xs[start..end]; // empty row -> the monoid identity
+                    out.push(match r {
+                        Red::Sum => s.iter().sum(),
+                        Red::Prod => s.iter().product(),
+                        Red::Min => s.iter().copied().min().unwrap_or(u64::MAX),
+                        Red::Max => s.iter().copied().max().unwrap_or(0),
+                        Red::All => s.iter().all(|&x| x != 0) as u64,
+                        Red::Any => s.iter().any(|&x| x != 0) as u64,
+                    });
                     start = end;
                 }
                 Value::u64(out)
@@ -298,9 +320,9 @@ impl ArithOp {
                 Prim(64) => Prim(64),
                 _ => return Err(format!("U64-constant arith expects U64, got {input}")),
             },
-            ArithOp::ReduceSum => match input {
+            ArithOp::Reduce(_) => match input {
                 List(t) if **t == Prim(64) => Prim(64),
-                _ => return Err(format!("ReduceSum expects List<U64>, got {input}")),
+                _ => return Err(format!("reduce expects List<U64>, got {input}")),
             },
         })
     }

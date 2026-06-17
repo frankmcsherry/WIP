@@ -10,7 +10,7 @@ pub(crate) mod program;
 pub use ml::parse_ml;
 pub use program::Program;
 
-use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, TextOp};
+use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
 use crate::value::Value;
 
 /// a string literal as a `List<U8>` value (one list of its UTF-8 bytes). `"…"` lowers to `Op::Lit`
@@ -139,7 +139,12 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "add_u64" => ArithOp::AddU64(n()?).into(),
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
-        "reduce_sum" => ArithOp::ReduceSum.into(),
+        "reduce_sum" => ArithOp::Reduce(Red::Sum).into(),
+        "reduce_prod" => ArithOp::Reduce(Red::Prod).into(),
+        "reduce_min" => ArithOp::Reduce(Red::Min).into(),
+        "reduce_max" => ArithOp::Reduce(Red::Max).into(),
+        "reduce_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)
+        "reduce_any" => ArithOp::Reduce(Red::Any).into(), // 1 iff any element nonzero (mask OR)
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
         "parse_u64" => TextOp::ParseU64.into(),
