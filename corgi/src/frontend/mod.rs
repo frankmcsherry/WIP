@@ -22,7 +22,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast")
+    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "try_branch")
 }
 
 /// which op idents are pair-eating binaries that accept an optional immediate: `x sub 1` is sugar
@@ -43,6 +43,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
         "zip" => Op::Zip.into(),         // Transpose's inverse: parallel lists -> list of products
+        "try_zip" => Op::TryZip.into(),  // total Zip (pair): per-row Sum{Err | Ok}
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
         // iso-inverses (Zip pairs any two columns; Slices materializes any ranges, incl. Find's),
@@ -55,6 +56,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
         "branch" => Op::Branch(n()? as usize).into(), // N-way partition by a discriminant column;
                                                       // `branch 2` on a 0/1 mask is the boolean split
+        "try_branch" => Op::TryBranch(n()? as usize).into(), // total Branch: tag>=n -> Oob:U64 lane 0
         "filter" => Op::Filter.into(),
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),

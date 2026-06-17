@@ -56,6 +56,11 @@ pub enum Op<L> {
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, U64-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
+                    //        PARTIAL: panics on tag >= n. The clean kernel; surface-usable once a
+                    //        range pass proves tags < n (else write TryBranch).
+    TryBranch(usize), // intro: (X, U64-tags) -> Sum{Oob:U64 | X × n}  TOTAL Branch: an out-of-range
+                    // tag lands in lane 0 (Oob) carrying the bad tag; tag t<n lands in lane t+1. The
+                    // FOO_TRY of Branch — usable with no proof (the index/ParseU64 discipline).
     Inject(usize, usize), // intro: X -> Sum{tag: X, ⊥..} — the constant-tag Branch; the other
                     //        lanes are ⊥ (empty, shape uncommitted, pinned later by `join`).
     Unwrap,         // elim:  homogeneous (up to ⊥) Sum -> payload
@@ -89,7 +94,11 @@ pub enum Op<L> {
     // List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave).
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
     Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse; bounds must
-                    // agree (asserted). A pure rewrap — no data moves.
+                    // agree (asserted). A pure rewrap — no data moves. PARTIAL: panics on differing
+                    // bounds; surface-usable once the size pass proves the bounds agree (else TryZip).
+    TryZip,         // (List<X>, List<Y>) -> Sum{Err:(List<X>,List<Y>) | Ok:List<(X,Y)>}  TOTAL Zip,
+                    // per row: a row whose two inner lists have equal length zips into Ok; a mismatched
+                    // row lands in Err carrying its two inner lists. (Pair-only for now; N-ary later.)
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
     Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>  materialize each range —
                     // Flatten's inverse and the range form of Gather.
@@ -158,6 +167,58 @@ impl<L: OpLike> Op<L> {
                     inner.push(v);
                 }
                 Value::List(bounds.expect("Zip: empty product"), Box::new(Value::Prod(inner)))
+            }
+
+            // total Zip (pair): each SEQ row whose two inner lists have equal length zips into the Ok
+            // lane (a List<(X,Y)>); a length-mismatched row goes to Err carrying its two inner lists.
+            // Failure is per-row and a committed lane — never the whole-column panic Zip would raise.
+            Op::TryZip => {
+                let (lx, ly) = input.into_pair("TryZip");
+                let (bx, vx) = lx.into_list("TryZip lhs");
+                let (by, vy) = ly.into_list("TryZip rhs");
+                assert_eq!(bx.len(), by.len(), "TryZip: row count"); // outer agreement (scope length)
+                let mut tags = Vec::with_capacity(bx.len());
+                let (mut ok_outer, mut ok_x, mut ok_y) = (Vec::new(), Vec::new(), Vec::new());
+                let (mut ex_outer, mut ex_idx) = (Vec::new(), Vec::new());
+                let (mut ey_outer, mut ey_idx) = (Vec::new(), Vec::new());
+                let (mut sx, mut sy) = (0, 0);
+                let (mut oka, mut exa, mut eya) = (0, 0, 0);
+                for r in 0..bx.len() {
+                    let (ex, ey) = (bx[r], by[r]);
+                    let (lenx, leny) = (ex - sx, ey - sy);
+                    if lenx == leny {
+                        tags.push(1); // Ok
+                        for k in 0..lenx {
+                            ok_x.push(sx + k);
+                            ok_y.push(sy + k);
+                        }
+                        oka += lenx;
+                        ok_outer.push(oka);
+                    } else {
+                        tags.push(0); // Err
+                        for k in 0..lenx {
+                            ex_idx.push(sx + k);
+                        }
+                        for k in 0..leny {
+                            ey_idx.push(sy + k);
+                        }
+                        exa += lenx;
+                        ex_outer.push(exa);
+                        eya += leny;
+                        ey_outer.push(eya);
+                    }
+                    sx = ex;
+                    sy = ey;
+                }
+                let ok = Value::List(
+                    ok_outer,
+                    Box::new(Value::Prod(vec![gather(&vx, &ok_x), gather(&vy, &ok_y)])),
+                );
+                let err = Value::Prod(vec![
+                    Value::List(ex_outer, Box::new(gather(&vx, &ex_idx))),
+                    Value::List(ey_outer, Box::new(gather(&vy, &ey_idx))),
+                ]);
+                Value::sum(tags, vec![err, ok]) // lane 0 = Err, lane 1 = Ok
             }
 
             // destructure a sum column: the tag list plus each lane re-sliced per outer row. A
@@ -275,6 +336,30 @@ impl<L: OpLike> Op<L> {
                 }
                 let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
                 Value::sum(tags.iter().map(|&t| t as usize).collect(), variants)
+            }
+
+            // total Branch: tag t<n routes to lane t+1 (payload), tag>=n to lane 0 (Oob, carrying the
+            // bad tag). No panic — out-of-range is a committed lane, exactly like Index's Oob.
+            Op::TryBranch(n) => {
+                let (data, tags_v) = input.into_pair("TryBranch");
+                let tags = tags_v.into_u64("TryBranch tags");
+                assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
+                let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n + 1];
+                let mut oob = Vec::new();
+                let mut lanes = Vec::with_capacity(tags.len());
+                for (i, &t) in tags.iter().enumerate() {
+                    if (t as usize) < *n {
+                        lanes.push(t as usize + 1); // payload lanes are 1..=n
+                        groups[t as usize + 1].push(i);
+                    } else {
+                        lanes.push(0); // the Oob lane
+                        groups[0].push(i);
+                        oob.push(t);
+                    }
+                }
+                let mut variants = vec![Value::u64(oob)]; // lane 0 = the out-of-range tags
+                variants.extend(groups[1..].iter().map(|idx| gather(&data, idx)));
+                Value::sum(lanes, variants)
             }
 
             Op::Unwrap => {
@@ -554,6 +639,18 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Zip expects a nonempty product of lists"),
             },
 
+            // total Zip (pair): Sum{ Err: (List<X>, List<Y>) | Ok: List<(X,Y)> }.
+            Op::TryZip => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (List(x), List(y)) => Sum(vec![
+                        Some(Prod(vec![List(x.clone()), List(y.clone())])),
+                        Some(List(Box::new(Prod(vec![(**x).clone(), (**y).clone()])))),
+                    ]),
+                    _ => return err("TryZip expects (List<X>, List<Y>)"),
+                },
+                _ => return err("TryZip expects a pair of lists"),
+            },
+
             // every lane must be committed: a ⊥ lane would need a standalone List<⊥>, and ⊥ lives
             // only inside Sum shapes. (Merge the sum first if a lane is uncommitted.)
             Op::Unweave => match input {
@@ -625,6 +722,20 @@ impl<L: OpLike> Op<L> {
                     Sum(vec![Some(ts[0].clone()); *n])
                 }
                 _ => return err("Branch expects (X, U64-tags)"),
+            },
+
+            // total Branch: an extra leading Oob:U64 lane, then the n payload lanes (n+1 total, so the
+            // u8 tag bound is n+1).
+            Op::TryBranch(n) => match input {
+                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
+                    if *n + 1 > 256 {
+                        return err(&format!("TryBranch: arity {n}+1 exceeds the u8 tag width"));
+                    }
+                    let mut lanes = vec![Some(Prim(64))];
+                    lanes.extend(std::iter::repeat_n(Some(ts[0].clone()), *n));
+                    Sum(lanes)
+                }
+                _ => return err("TryBranch expects (X, U64-tags)"),
             },
 
             // only the widths the `prim!` macro generates exist; any other would judge fine and
