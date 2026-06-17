@@ -9,9 +9,9 @@
 //! which proves nothing (sound). It is NOT dependent types: ranges are an auxiliary lattice, never in
 //! the shape.
 //!
-//! Scope: `branch` only. `gather`/`slices` out-of-bounds is also Class-B but its bound is a
-//! data-dependent length, not a constant, so interval AI can't prove it — `index` (total) is the
-//! answer there, not a range proof.
+//! Scope: `branch` only. `get_uns`/`gather_uns`/`slices_uns` out-of-bounds is also Class-B but its
+//! bound is a data-dependent length, not a constant, so interval AI can't prove it — the `_try` forms
+//! (total, an Oob lane) are the answer there, not a range proof.
 
 use crate::graph::{Graph, NodeKind, OpLike};
 use crate::ops::{ArithOp, CmpOp, NumOp, Op};

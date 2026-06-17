@@ -1,7 +1,0 @@
-# total point index: indices [0..n+2) against a haystack [0..n). The first n land in-bounds (Found,
-# carrying the element), the last two are out of range (Oob, carrying the bad index) — failure is a
-# committed Sum lane, never a panic (the ParseU64 discipline). This is the total replacement for the
-# partial `gather`; `index 0` is likewise a total `head` (an empty row yields Oob 0, not a panic).
-# n = 5
-# = List ends=[7] <Sum tags=[1, 1, 1, 1, 1, 0, 0] [[5, 6], [0, 1, 2, 3, 4]]>
-(input add_u64 2 iota, input iota) index

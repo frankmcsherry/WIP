@@ -26,11 +26,13 @@ src/
                           intro          elim     map       capture
                    PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
-                   LIST   Enlist         Head     MapList   CapList  (witness: bounds column)
-               LIST also: Fold (B,List<A>)->B (seeded accumulating elim), FoldScan (T,List<A>)->(T,List<R>)
-               (mapAccumL — the scan kernel; `scan` is sugar = FoldScan with body (a,x)->(b,b), field 1),
-               Index (total point elim -> Sum{Oob|Found}), Unit (X -> Unit). Plus the typed numeric grid
-               + named reductions in `numeric`.
+                   LIST   Enlist         Get      MapList   CapList  (witness: bounds column)
+               LIST elim: Get (U64,List<X>)->X is the point eliminator (`head` = sugar `Get 0`, so an
+               empty row is Oob 0 — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
+               elim; FoldScan (T,List<A>)->(T,List<R>) (mapAccumL — the scan kernel; `scan` is sugar =
+               FoldScan with body (a,x)->(b,b), field 1). Get/Gather come in _uns (assert) and _try
+               (total -> Sum{Oob|Found}) tiers; Gather is Get vectorized (a list of indices). Plus Unit
+               (X -> Unit) and the typed numeric grid + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
                List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave) — and the fused forms/producers
                (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
@@ -145,11 +147,12 @@ abort. The claim is witnessed, not asserted — every reachable `assert!`/`panic
 by exactly one of:
 
 - **a gate** — `Zip`/`Filter` bounds by `lengths`; `Branch` tag-in-range by `ranges`.
-- **a tier `check_total` reports** — `gather`/`head`/`slices` (`_uns`): the located opt-out.
+- **a tier `check_total` reports** — `get`/`gather`/`slices` (`_uns`): the located opt-out (`head_uns`
+  lowers to `get_uns 0`, so it surfaces as `get_uns`).
 - **a defensive check of the 1:1 SEQ invariant the typer already enforces** — the "body changed the
   row count" asserts in `Fold`/`FoldScan` (unreachable given the typer).
 - **made total instead** — integer arith is `wrapping_*`; float `div` yields inf/NaN; integer `div`
-  is judge-rejected; `index`/`try_*`/`ParseU64` carry failure in an `Oob`/`Err` lane.
+  is judge-rejected; `get_try`/`gather_try`/`try_*`/`ParseU64` carry failure in an `Oob`/`Err` lane.
 
 **Audit rule for the gates (learned the hard way):** any analysis threaded through a *fixpoint*
 operator (`Fold`/`FoldScan`'s accumulator back-edge) must treat the fed-back value as unknown — ⊤ for
@@ -175,6 +178,17 @@ with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (in
 unify with committed operands); the judge rejects what eval can't represent (`Cast` widths, sum
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
+
+Then the point-access factoring. `Index`/`Head` were retired in favour of one indexed-access concept
+at two strata: the atom is the **scalar `Get (U64,List<X>)->X`** (one O(1) lookup per row, the genuine
+list eliminator), `Gather` is its **vectorization** (the index arrives as a list), and `head` is **sugar
+`Get 0`** — so `Op::Head` left the engine and a *total* head needs no non-emptiness proof (an empty row
+is `Oob 0`). Each of get/gather carries a `_uns` tier (assert in-bounds) and a `_try` tier (total ->
+`Sum{Oob|Found}`); the plain checked tier (a proven bound) is reserved. Why this direction and not
+`Get = enlist;gather;head`: `gather` is list-*preserving* so it can't eliminate, and the only
+irreducible piece is the bare-`X` outro — making `Get` the atom keeps one index kernel and yields the
+total head for free, where the HEAD-atom route would have needed new non-emptiness analysis. (`Fold`/
+`FoldScan` remain the accumulating eliminators; `head_try`→Option is expressible as a fold if wanted.)
 
 ## Live work — the DDIR consumer
 

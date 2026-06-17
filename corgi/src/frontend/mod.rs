@@ -104,16 +104,20 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
-        // the UNCHECKED kernel tier — data-dependent bounds no static pass proves; `check_total` flags
-        // these as outside the guaranteed-total subset. `index` (total) is gather's safe form; `index 0`
-        // is head's; a total `slices_try` (range-index) is the future safe form for `slices_uns`.
+        // point access — `get` is scalar (one index per row), `gather` is its vector form (a list of
+        // indices). Each follows the uniform tier rubric: plain `Foo` is the CHECKED form (a proven
+        // bound; reserved even where unbuilt), `Foo_try` the TOTAL form (an Oob lane), `Foo_uns` the
+        // unchecked kernel `check_total` flags. `get`/`gather` (plain) are RESERVED for a future checked
+        // access (a bound proven `< len`, or sourced from `find`). `head` is sugar for `get_try 0` (see
+        // ml.rs) — an empty row is `Oob 0`, so a total head needs no separate non-emptiness proof.
         "slices_uns" => Op::Slices.into(), // (ranges, haystack) -> List<List<T>>  ranges asserted in-bounds
-        "index_uns" => Op::Gather.into(), // row-relative point gather; indices asserted in-bounds
-        "index" => Op::Index.into(),   // total point index -> Sum{Oob:U64 | Found:T} (gather's safe form)
+        "get_uns" => Op::Get.into(),       // (idx, haystack) -> T          scalar; index asserted in-bounds
+        "get_try" => Op::GetTry.into(),    // (idx, haystack) -> Sum{Oob | Found}    total scalar access
+        "gather_uns" => Op::Gather.into(), // (idxs, haystack) -> [T]       vector; indices asserted in-bounds
+        "gather_try" => Op::GatherTry.into(), // (idxs, haystack) -> [Sum{Oob | Found}]  total vector access
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
-        "head_uns" => Op::Head.into(), // each row's first element; non-empty asserted (index 0 is safe)
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
         // relational compares: two equal-width leaf columns -> 0/1 mask. `gt`/`ge` are these with

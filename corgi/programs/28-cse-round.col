@@ -5,7 +5,7 @@
 # store reads each node's class id; `gather` remaps children through that table; a second
 # `dedup` then merges Adds that differ only in pre-canonical children. Eight nodes become four.
 # The closed map bodies can't see the class table, so `cap_list` performs closure conversion —
-# each element carries the table — and a child lookup is the singleton idiom enlist-gather-head.
+# each element carries the table — and a child lookup is a scalar `get_uns` (index into the table).
 # (Materializing the table per element is the cost the multiplicity-View backlog item exists
 # to erase.) The fixpoint loop over rounds belongs to the host.
 # n = 8
@@ -24,7 +24,7 @@ let nodes2 = (classid, ks) cap_list map ((table, k) ->
     map_variant Add ((t, k) ->
         let l = k sub 1 and 3 in
         let r = k add 1 and 7 in
-        ((l enlist, t) index_uns head_uns, (r enlist, t) index_uns head_uns)))
+        ((l, t) get_uns, (r, t) get_uns)))
 in
 let canon = nodes2 dedup in
 (canon, (nodes2, canon) find map ((lo, hi) -> lo))

@@ -111,9 +111,6 @@ pub enum Op<L> {
                     // value (closure capture, made explicit).
     // LIST — witness: the bounds column.
     Enlist,         // intro: X -> List<X>  each element its own length-1 list (list-monad unit)
-    Head,           // elim:  List<X> -> X  each row's first element (an empty row panics) —
-                    // Enlist's retraction and the one general stratum-dropping judgment;
-                    // `sort head` is structural min for any shape.
     MapList(Box<Graph<L>>), // map: closed body on a list's values (in the *layer* L)
     Fold(Box<Graph<L>>), // elim: (B, List<A>) -> B  seeded left fold of a binary body (B,A)->B along
                     // each row's list. The accumulator-carrying list eliminator (Head is the 0-step
@@ -155,16 +152,23 @@ pub enum Op<L> {
     Cast(u32),      // leaf -> leaf  re-width to N bits (low bytes / zero-pad), kind-blind
     Filter,         // (List<X>, List<U64-mask>) -> List<X>  keep mask-nonzero elements in one
                     // pass (the kernel expansion is zip; map(branch); unweave; field — see the law)
-    Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  row-relative point gather —
-                    // the engine primitive surfaced. Chains compose in-language:
+    // point access — fetch a haystack element by index. The atom is the SCALAR `Get` (one O(1)
+    // lookup per row); `Gather` is its vectorization (the index arrives as a list), and `head` is
+    // sugar for `Get 0` (an empty row is `Oob 0`, so a TOTAL head needs no non-emptiness proof).
+    // Each comes in a `_uns` (assert in-bounds, panic) and a `_try` (total, Oob lane) tier; the plain
+    // checked tier (`get`/`gather`, a proven bound) is reserved for later.
+    Get,            // (idx:U64, haystack:List<T>) -> T  scalar point access — one index per row into
+                    // that row's list. PARTIAL (panics out of bounds): the unchecked fast path.
+    GetTry,         // (idx:U64, haystack:List<T>) -> Sum{Oob:U64 | Found:T}  TOTAL scalar access: an
+                    // out-of-bounds index lands in Oob carrying the bad index, in-bounds in Found
+                    // (the ParseU64 discipline — failure is a committed lane, never a panic).
+    Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  the vector form: a list of indices.
+                    // The engine primitive surfaced; chains compose in-language —
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
-                    // PARTIAL (panics out of bounds): the unchecked fast path, valid where a pass
-                    // proves the indices in-range — the demoted form of `Index` (see its note).
-    Index,          // (idx:List<U64>, haystack:List<T>) -> List<Sum{Oob:U64 | Found:T}>  TOTAL point
-                    // index: an out-of-bounds index lands in the Oob lane carrying the bad index, an
-                    // in-bounds one in Found carrying the element (the ParseU64 discipline — failure is
-                    // a committed lane, never a panic). `index 0` is total `Head`. A bounds-proof pass
-                    // demotes `Index` to `Gather` + `inject Found` when the Oob lane is provably empty.
+                    // PARTIAL (panics out of bounds): the unchecked fast path. `Get` is the 1-index case.
+    GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Oob:U64 | Found:T}>  TOTAL vector
+                    // access — `GetTry` lifted over a list of indices. A bounds-proof pass demotes
+                    // `GatherTry` to `Gather` + `inject Found` when the Oob lane is provably empty.
     Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
     Unit,           // X -> Unit  forget the payload, keep the length — how a column becomes the `None`
                     // lane of `Option = Sum{Unit | T}` (e.g. `branch 2 map_variant 1 (x -> x unit)`).
@@ -519,7 +523,52 @@ impl<L: OpLike> Op<L> {
                 Value::List(lb, Box::new(inner))
             }
 
-            // point gather: each row-relative index becomes the haystack element it names.
+            // scalar point access: one index per row into that row's haystack list. Output is a
+            // bare T column (the list stratum is DROPPED — this is the eliminator). Partial: an
+            // out-of-bounds index is a data-dependent panic, like Gather's bounds check.
+            Op::Get => {
+                let (idx, haystack) = input.into_pair("Get");
+                let idxs = idx.into_u64("Get index");
+                let (hb, hvals) = haystack.into_list("Get haystack");
+                assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
+                let mut abs = Vec::with_capacity(idxs.len());
+                let mut hs = 0;
+                for (r, &he) in hb.iter().enumerate() {
+                    let x = idxs[r];
+                    assert!((x as usize) < he - hs, "Get: index {x} out of row {r}'s bounds");
+                    abs.push(hs + x as usize);
+                    hs = he;
+                }
+                gather(&hvals, &abs)
+            }
+
+            // total scalar access: each index either names its row's element (Found) or is out of
+            // bounds (Oob, carrying the bad index). The empty-row case is just Oob 0 — which is why
+            // `head = GetTry 0` is total with no non-emptiness proof. Output is a bare Sum column.
+            Op::GetTry => {
+                let (idx, haystack) = input.into_pair("GetTry");
+                let idxs = idx.into_u64("GetTry index");
+                let (hb, hvals) = haystack.into_list("GetTry haystack");
+                assert_eq!(idxs.len(), hb.len(), "GetTry: index/haystack row count");
+                let mut tags = Vec::with_capacity(idxs.len());
+                let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
+                let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
+                let mut hs = 0;
+                for (r, &he) in hb.iter().enumerate() {
+                    let x = idxs[r];
+                    if (x as usize) < he - hs {
+                        tags.push(1);
+                        abs.push(hs + x as usize);
+                    } else {
+                        tags.push(0);
+                        oob.push(x);
+                    }
+                    hs = he;
+                }
+                Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)])
+            }
+
+            // vector point gather: each row-relative index becomes the haystack element it names.
             // Output bounds are the index list's bounds (the indices decide the cardinality).
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather");
@@ -530,16 +579,16 @@ impl<L: OpLike> Op<L> {
                 Value::List(ib, Box::new(gather(&hvals, &abs)))
             }
 
-            // total point index: each index either names a haystack-row element (Found) or is out of
+            // total vector access: each index either names a haystack-row element (Found) or is out of
             // that row's bounds (Oob, carrying the bad index). The per-element test is branchless (a
             // comparison to a u64); only the routing into the two lanes is data-dependent. Output is a
             // list (the index list's bounds) of Sum{Oob:U64 | Found:T}.
-            Op::Index => {
-                let (idx, haystack) = input.into_pair("Index");
-                let (ib, ivals) = idx.into_list("Index indices");
-                let (hb, hvals) = haystack.into_list("Index haystack");
-                assert_eq!(ib.len(), hb.len(), "Index: indices/haystack row count");
-                let idxs = ivals.into_u64("Index indices");
+            Op::GatherTry => {
+                let (idx, haystack) = input.into_pair("GatherTry");
+                let (ib, ivals) = idx.into_list("GatherTry indices");
+                let (hb, hvals) = haystack.into_list("GatherTry haystack");
+                assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
+                let idxs = ivals.into_u64("GatherTry indices");
                 let mut tags = Vec::with_capacity(idxs.len());
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
@@ -597,20 +646,6 @@ impl<L: OpLike> Op<L> {
             Op::Enlist => {
                 let n = input.len();
                 Value::List((1..=n).collect(), Box::new(input))
-            }
-
-            // each row's first element — the stratum drop back out of a List. Partial: an empty
-            // row has no head, a data-dependent panic like Gather's bounds check.
-            Op::Head => {
-                let (bounds, vals) = input.into_list("Head");
-                let mut idx = Vec::with_capacity(bounds.len());
-                let mut start = 0;
-                for (r, &end) in bounds.iter().enumerate() {
-                    assert!(start < end, "Head: row {r} is empty");
-                    idx.push(start);
-                    start = end;
-                }
-                gather(&vals, &idx)
             }
 
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
@@ -809,6 +844,24 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Slices expects a pair"),
             },
 
+            // scalar access: (U64, List<T>) -> T — the index is a leaf column, the list stratum drops.
+            Op::Get => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (Prim(64), List(t)) => (**t).clone(),
+                    _ => return err("Get expects (U64, List<T>)"),
+                },
+                _ => return err("Get expects a pair"),
+            },
+
+            // total scalar access: (U64, List<T>) -> Sum{Oob: U64 | Found: T} — Oob carries the index.
+            Op::GetTry => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (Prim(64), List(t)) => Sum(vec![Some(Prim(64)), Some((**t).clone())]),
+                    _ => return err("GetTry expects (U64, List<T>)"),
+                },
+                _ => return err("GetTry expects a pair"),
+            },
+
             Op::Gather => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
                     (List(i), List(t)) if **i == Prim(64) => List(t.clone()),
@@ -817,15 +870,15 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Gather expects a pair"),
             },
 
-            // total index: List<Sum{Oob: U64 | Found: T}> — the Oob lane carries the bad index.
-            Op::Index => match input {
+            // total vector access: List<Sum{Oob: U64 | Found: T}> — the Oob lane carries the bad index.
+            Op::GatherTry => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
                     (List(i), List(t)) if **i == Prim(64) => {
                         List(Box::new(Sum(vec![Some(Prim(64)), Some((**t).clone())])))
                     }
-                    _ => return err("Index expects (List<U64>, List<T>)"),
+                    _ => return err("GatherTry expects (List<U64>, List<T>)"),
                 },
-                _ => return err("Index expects a pair"),
+                _ => return err("GatherTry expects a pair"),
             },
 
             Op::Flatten => match input {
@@ -837,11 +890,6 @@ impl<L: OpLike> Op<L> {
             },
 
             Op::Enlist => List(Box::new(input.clone())),
-
-            Op::Head => match input {
-                List(x) => (**x).clone(),
-                _ => return err("Head expects a list"),
-            },
 
             Op::Iota => match input {
                 Prim(64) => List(Box::new(Prim(64))),
