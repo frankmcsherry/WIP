@@ -119,6 +119,12 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   level is always 1:1.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
   sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
+  *Reuse policy:* an op that is elementwise AND same-width (`AddU64`/`Shr`/`And`, `bin_into`, `neg_into`,
+  `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
+  `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
+  fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, `cast` = re-width, `rel`/`cmp_idx`/
+  `sort_block` = a differently-typed result) allocate *by necessity*, not oversight — the access pattern
+  or output type rules reuse out. (Cross-op intermediate elimination is the separate DPS backlog item.)
 - **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
   sequential *within* a row but vectorized *across* rows: round `t` folds in every still-active row's
   `t`-th element in one body call, so `#rounds = the longest row`, not the element count. The active

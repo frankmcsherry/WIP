@@ -1004,4 +1004,23 @@ impl<L: OpLike> Op<L> {
             _ => Vec::new(),
         }
     }
+
+    /// the surface name of the UNCHECKED tier, for the ops whose in-bounds precondition no static gate
+    /// proves (`check_total` reports these); `None` for every total/gated/structural op. The match is
+    /// EXHAUSTIVE on purpose: a new `Op` must classify itself here, so the totality guarantee can't
+    /// silently regress (the old `_ => {}` in `check_total` let a new partial op pass as total).
+    pub(crate) fn unchecked_site(&self) -> Option<&'static str> {
+        match self {
+            // data-dependent bounds, no static proof — the `_uns` kernels (`head_uns` lowers to `Get`):
+            Op::Get => Some("get_uns"),
+            Op::Gather => Some("gather_uns"),
+            Op::Slices => Some("slices_uns"),
+            // total (run to a value), gated (lengths/ranges prove the precondition), or pure structural:
+            Op::Field(_) | Op::Lit(_) | Op::Transpose | Op::Zip | Op::TryZip | Op::Unweave
+            | Op::Weave | Op::CapList | Op::CapSum | Op::Cast(_) | Op::Filter | Op::Branch(_)
+            | Op::TryBranch(_) | Op::Unwrap | Op::Inject(_, _) | Op::MapList(_) | Op::Fold(_)
+            | Op::FoldScan(_) | Op::MapSum(_) | Op::GetTry | Op::GatherTry | Op::Flatten
+            | Op::Enlist | Op::Iota | Op::Unit | Op::Select => None,
+        }
+    }
 }
