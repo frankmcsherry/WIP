@@ -2,8 +2,8 @@
 //! core's (kind-blind) sort/shape machinery serves it unchanged.
 
 use corgi::{
-    dec_i64, enc_i64, eval_graph, shape_of, shape_of_value, ArithOp, BinOp, Builder, CmpOp, Kind,
-    NumOp, Op, Pred, Shape, Value,
+    dec_i64, enc_i64, eval_graph, parse_ml, shape_of, shape_of_value, ArithOp, BinOp, Builder, CmpOp,
+    Kind, NumOp, Op, Pred, Shape, Value,
 };
 
 /// a leaf column of signed integers, stored order-preserving.
@@ -123,4 +123,16 @@ fn grid_signed_is_order_preserving_at_any_width() {
     let inp = bld.input();
     let out = bld.add(ArithOp::Neg(Kind::I, 16), vec![inp]);
     assert_eq!(eval_graph(&bld.finish(out), Value::u16(vec![enc(7), enc(-3)])), Value::u16(vec![enc(-7), enc(3)]));
+}
+
+#[test]
+fn no_float_literal_token() {
+    // `lit_f32 N` would store the raw bits N, not the float N.0 — `lit_value` only encodes integers.
+    // So a float-literal token is rejected (unknown op); the float path is `lit_uN K to_fN`.
+    assert!(parse_ml("input lit_f32 3").is_err());
+    assert!(parse_ml("input lit_f64 3").is_err());
+    // the integer literal tokens still resolve, and the documented float path parses.
+    assert!(parse_ml("input lit_u32 3").is_ok());
+    assert!(parse_ml("input lit_i16 3").is_ok());
+    assert!(parse_ml("input lit_u32 3 to_f32").is_ok());
 }

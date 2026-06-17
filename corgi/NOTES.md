@@ -20,7 +20,9 @@ src/
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph, shape_of,
                check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
-  optimize.rs  cse / dce / peephole / optimize over Graph<NumOp>.
+  optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
+               the unoptimized graph (like `check_total`, a caller opts in); tested for semantic
+               preservation on every corpus program, so the passes are latent, not dead.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture

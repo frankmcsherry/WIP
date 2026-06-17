@@ -49,6 +49,12 @@ fn parse_kw(suf: &str) -> Option<(Kind, u32)> {
 fn typed_arith(name: &str, arg: Option<u64>) -> Option<NumOp> {
     if let Some(suf) = name.strip_prefix("lit_") {
         let (k, w) = parse_kw(suf)?;
+        // no float literal token: `lit_f32 3` would store the raw bits 3, not 3.0 (`lit_value` only
+        // encodes integers). Reject `F` so it's an unknown op, not a silent NaN; the float path is
+        // `lit_uN K to_fN` (a literal integer, then the documented encode).
+        if matches!(k, Kind::F) {
+            return None;
+        }
         return Some(Op::Lit(crate::ops::lit_value(k, w, arg?)).into());
     }
     let (base, suf) = name.rsplit_once('_')?;
