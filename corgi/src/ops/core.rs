@@ -59,19 +59,21 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
     }
 }
 
-/// the rows still long enough to have a `t`-th element, and the absolute index of that element in the
-/// flat values — the per-round work-list of the cross-row lockstep that drives `Fold`/`Scan`.
-fn round_active(bounds: &[usize], t: usize) -> (Vec<usize>, Vec<usize>) {
-    let (mut active, mut elem) = (Vec::new(), Vec::new());
+/// the lockstep work-list for `Fold`/`Scan`, maintained incrementally. `(row, start, len)` for each
+/// non-empty row, in row order. A row stays until round `len`; after each round the caller `retain`s
+/// `len > t`, so the per-round cost tracks the *active* rows, not all N (the win for ragged lengths —
+/// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
+/// targets: row `r`'s round-`t` element is at flat index `start + t`.
+fn init_active(bounds: &[usize]) -> Vec<(usize, usize, usize)> {
+    let mut v = Vec::with_capacity(bounds.len());
     let mut start = 0;
     for (r, &end) in bounds.iter().enumerate() {
-        if end - start > t {
-            active.push(r);
-            elem.push(start + t);
+        if end > start {
+            v.push((r, start, end - start));
         }
         start = end;
     }
-    (active, elem)
+    v
 }
 
 /// the core op vocabulary: structure only — comparison/order is the `cmp` bucket (`ops::cmp`) and
@@ -430,18 +432,18 @@ impl<L: OpLike> Op<L> {
                 let (seed, list) = input.into_pair("Fold");
                 let (bounds, vals) = list.into_list("Fold list");
                 let mut acc = seed;
+                let mut active = init_active(&bounds);
                 let mut t = 0;
-                loop {
-                    let (active, elem_idx) = round_active(&bounds, t);
-                    if active.is_empty() {
-                        break;
-                    }
-                    let acc_active = gather(&acc, &active);
-                    let elt = gather(&vals, &elem_idx);
+                while !active.is_empty() {
+                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
+                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
+                    let acc_active = gather(&acc, &rows);
+                    let elt = gather(&vals, &elem);
                     let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
-                    assert_eq!(updated.len(), active.len(), "Fold body changed the row count");
-                    acc = scatter(acc, &active, updated);
+                    assert_eq!(updated.len(), rows.len(), "Fold body changed the row count");
+                    acc = scatter(acc, &rows, updated);
                     t += 1;
+                    active.retain(|&(_, _, len)| len > t); // rows that just ran out drop here
                 }
                 acc
             }
@@ -457,23 +459,23 @@ impl<L: OpLike> Op<L> {
                 let mut acc = seed;
                 let mut chunks: Vec<Value> = Vec::new();
                 let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                let mut active = init_active(&bounds);
                 let mut t = 0;
-                loop {
-                    let (active, elem_idx) = round_active(&bounds, t);
-                    if active.is_empty() {
-                        break;
-                    }
-                    let acc_active = gather(&acc, &active);
-                    let elt = gather(&vals, &elem_idx);
+                while !active.is_empty() {
+                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
+                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
+                    let acc_active = gather(&acc, &rows);
+                    let elt = gather(&vals, &elem);
                     let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
-                    assert_eq!(updated.len(), active.len(), "Scan body changed the row count");
-                    for (slot, &pos) in elem_idx.iter().enumerate() {
+                    assert_eq!(updated.len(), rows.len(), "Scan body changed the row count");
+                    for (slot, &pos) in elem.iter().enumerate() {
                         tags[pos] = chunks.len();
                         off[pos] = slot;
                     }
-                    acc = scatter(acc, &active, updated.clone());
+                    acc = scatter(acc, &rows, updated.clone());
                     chunks.push(updated);
                     t += 1;
+                    active.retain(|&(_, _, len)| len > t);
                 }
                 // total == 0 (every row empty): an empty B-shaped column, taken as `acc` gathered at no
                 // rows (acc still carries shape B). Else stitch the per-round chunks into element order.
