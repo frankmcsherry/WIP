@@ -141,6 +141,7 @@ enum Apply {
     Map(Pat, Box<E>),
     Fold(Pat, Box<E>), // (B, List<A>) folded by a binary body; the lambda's tuple pattern is (acc, x)
     Scan(Pat, Box<E>), // (B, List<A>) scanned by a binary body; inclusive running accumulator
+    FoldScan(Pat, Box<E>), // (T, List<A>) -> (T, List<R>); body (acc, x) -> (new state, output R)
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, usize),         // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
@@ -324,6 +325,12 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(Apply::Scan(x, Box::new(body)))
             }
+            "foldscan" => {
+                self.eat(&Tok::LParen)?;
+                let (x, body) = self.lambda()?;
+                self.eat(&Tok::RParen)?;
+                Ok(Apply::FoldScan(x, Box::new(body)))
+            }
             "map_variant" => {
                 let (k, _) = self.variant()?;
                 self.eat(&Tok::LParen)?;
@@ -487,6 +494,9 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
                 Apply::Fold(x, body) => Ok(b.add(Op::Fold(Box::new(lower_body(x, body)?)), vec![id])),
                 Apply::Scan(x, body) => Ok(b.add(Op::Scan(Box::new(lower_body(x, body)?)), vec![id])),
+                Apply::FoldScan(x, body) => {
+                    Ok(b.add(Op::FoldScan(Box::new(lower_body(x, body)?)), vec![id]))
+                }
                 Apply::MapVariant(k, x, body) => {
                     Ok(b.add(Op::MapSum(vec![(*k, lower_body(x, body)?)]), vec![id]))
                 }

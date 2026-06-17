@@ -165,7 +165,7 @@ fn rshape_op(op: &NumOp, inr: &RShape) -> Result<RShape, String> {
             }
             top_out(op, inr)
         }
-        NumOp::Core(Op::Fold(body)) | NumOp::Core(Op::Scan(body)) => {
+        NumOp::Core(Op::Fold(body)) | NumOp::Core(Op::Scan(body)) | NumOp::Core(Op::FoldScan(body)) => {
             if let RShape::Prod(fs) = inr {
                 if let [seed, RShape::List(a)] = fs.as_slice() {
                     rgraph(body, RShape::Prod(vec![seed.clone(), (**a).clone()]))?;

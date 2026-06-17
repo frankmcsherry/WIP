@@ -124,6 +124,11 @@ pub enum Op<L> {
                     // step. out[r][t] = the accumulator after folding element t of row r; same bounds
                     // as the input list (one B per A). `scan` then last-element = `fold`. Same lockstep
                     // eval as Fold; the per-round results are scattered into the output list.
+    FoldScan(Box<Graph<L>>), // (T, List<A>) -> (T, List<R>)  the mapAccumL / Mealy-machine fold: a body
+                    // (T,A)->(T,R) threads a STATE T and emits an output R per element; returns the final
+                    // state AND the output stream. `fold` = FoldScan with R=Unit, project .0; `scan` =
+                    // FoldScan emitting (newstate, newstate), project .1. Expresses stateful maps neither
+                    // does (running deltas, indexing, RLE). Same lockstep; the unifying kernel.
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
                     // (né Broadcast); the list-side closure capture.
 
@@ -486,6 +491,46 @@ impl<L: OpLike> Op<L> {
                     gather_lanes(&refs, &tags, &off)
                 };
                 Value::List(bounds, Box::new(out_vals))
+            }
+
+            // mapAccumL: like Scan, but the body returns a PAIR (new state, output R). We thread field 0
+            // (the state) into `acc` and record field 1 (R) into the chunks; return (final state, [R]).
+            Op::FoldScan(body) => {
+                let (seed, list) = input.into_pair("FoldScan");
+                let (bounds, vals) = list.into_list("FoldScan list");
+                let total = vals.len();
+                let mut acc = seed;
+                let mut chunks: Vec<Value> = Vec::new();
+                let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                let mut active = init_active(&bounds);
+                let mut t = 0;
+                while !active.is_empty() {
+                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
+                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
+                    let acc_active = gather(&acc, &rows);
+                    let elt = gather(&vals, &elem);
+                    let (new_state, r) =
+                        eval_graph(body, Value::Prod(vec![acc_active, elt])).into_pair("FoldScan body");
+                    assert_eq!(new_state.len(), rows.len(), "FoldScan body changed the row count");
+                    for (slot, &pos) in elem.iter().enumerate() {
+                        tags[pos] = chunks.len();
+                        off[pos] = slot;
+                    }
+                    acc = scatter(acc, &rows, new_state);
+                    chunks.push(r);
+                    t += 1;
+                    active.retain(|&(_, _, len)| len > t);
+                }
+                // empty (no rounds): an empty R-shaped column, obtained by running the body on zero rows
+                // (R may differ from the state, so we can't reuse `acc`). Else stitch the recorded chunks.
+                let out_vals = if chunks.is_empty() {
+                    let z = eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]));
+                    z.into_pair("FoldScan body").1
+                } else {
+                    let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+                    gather_lanes(&refs, &tags, &off)
+                };
+                Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))])
             }
 
             Op::MapSum(arms) => {
@@ -914,6 +959,25 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Scan expects a pair"),
             },
 
+            // (T, List<A>) -> (T, List<R>). The body, on (T, A), must return (T', R) with T' joining the
+            // state T; the result is the final state and the list of emitted R.
+            Op::FoldScan(body) => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    List(a) => {
+                        let out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
+                        match out {
+                            Prod(os) if os.len() == 2 => {
+                                let state = join(&ts[0], &os[0])?;
+                                Prod(vec![state, List(Box::new(os[1].clone()))])
+                            }
+                            _ => return err("FoldScan body must return (T, R)"),
+                        }
+                    }
+                    _ => return err("FoldScan expects (T, List<A>)"),
+                },
+                _ => return err("FoldScan expects a pair"),
+            },
+
             Op::MapSum(arms) => match input {
                 Sum(ts) => {
                     let mut out = ts.clone();
@@ -942,7 +1006,7 @@ impl<L: OpLike> Op<L> {
     pub(crate) fn children(&self) -> Vec<&Graph<L>> {
         match self {
             Op::MapList(b) => vec![b],
-            Op::Fold(b) | Op::Scan(b) => vec![b],
+            Op::Fold(b) | Op::Scan(b) | Op::FoldScan(b) => vec![b],
             Op::MapSum(arms) => arms.iter().map(|(_, b)| b).collect(),
             _ => Vec::new(),
         }
