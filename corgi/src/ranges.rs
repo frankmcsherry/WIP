@@ -168,7 +168,13 @@ fn rshape_op(op: &NumOp, inr: &RShape) -> Result<RShape, String> {
         NumOp::Core(Op::Fold(body)) | NumOp::Core(Op::FoldScan(body)) => {
             if let RShape::Prod(fs) = inr {
                 if let [seed, RShape::List(a)] = fs.as_slice() {
-                    rgraph(body, RShape::Prod(vec![seed.clone(), (**a).clone()]))?;
+                    // CRITICAL: the body's accumulator is the FED-BACK output, not the seed — on every
+                    // round after the first it is whatever the body produced, so the seed's interval is
+                    // only valid at round 0. Thread ⊤ for the accumulator (it's the loop back-edge of a
+                    // concrete lattice — must widen to ⊤); the element, gathered fresh each round, keeps
+                    // its range. (Without this, `branch` on a climbing accumulator escapes the proof.)
+                    let acc = top(&seed.to_shape());
+                    rgraph(body, RShape::Prod(vec![acc, (**a).clone()]))?;
                 }
             }
             top_out(op, inr)

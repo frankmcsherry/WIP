@@ -168,7 +168,13 @@ fn bshape_op(op: &NumOp, inb: &BShape, c: &mut u32) -> Result<BShape, String> {
         NumOp::Core(Op::Fold(body)) | NumOp::Core(Op::FoldScan(body)) => {
             if let BShape::Prod(fs) = inb {
                 if let [seed, BShape::List(_, a)] = fs.as_slice() {
-                    check_graph(body, BShape::Prod(vec![seed.clone(), (**a).clone()]), c)?;
+                    // the accumulator is the FED-BACK output (not the seed) past round 0, so its bounds
+                    // can differ from the seed's; thread FRESH tokens for it (the fixpoint back-edge —
+                    // same rule as `ranges`). A body's self-derived equalities still hold (shared fresh
+                    // token); only a zip/filter that leans on the seed's bounds for the per-round
+                    // accumulator is rejected — which is correct, those bounds can change each round.
+                    let acc = fresh(&seed.to_shape(), c);
+                    check_graph(body, BShape::Prod(vec![acc, (**a).clone()]), c)?;
                 }
             }
             fresh_out(op, inb, c)

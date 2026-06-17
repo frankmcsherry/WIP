@@ -136,6 +136,30 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
   identity acc-gather + scatter) for the uniform-length regime where every row is active every round.
 
+## Totality — the claim, scoped, and the assert→gate cover map
+
+The guarantee is precise: **every program in the GATED SUBSET runs to a value — no panic — for every
+input.** "Gated subset" = passes the typer + the length gate + the range gate, and `check_total` = Ok
+(no `_uns` op). Not "no panics, ever": a `_uns` op or a checker-bypassing hand-built `Graph` can still
+abort. The claim is witnessed, not asserted — every reachable `assert!`/`panic!` in `eval` is covered
+by exactly one of:
+
+- **a gate** — `Zip`/`Filter` bounds by `lengths`; `Branch` tag-in-range by `ranges`.
+- **a tier `check_total` reports** — `gather`/`head`/`slices` (`_uns`): the located opt-out.
+- **a defensive check of the 1:1 SEQ invariant the typer already enforces** — the "body changed the
+  row count" asserts in `Fold`/`FoldScan` (unreachable given the typer).
+- **made total instead** — integer arith is `wrapping_*`; float `div` yields inf/NaN; integer `div`
+  is judge-rejected; `index`/`try_*`/`ParseU64` carry failure in an `Oob`/`Err` lane.
+
+**Audit rule for the gates (learned the hard way):** any analysis threaded through a *fixpoint*
+operator (`Fold`/`FoldScan`'s accumulator back-edge) must treat the fed-back value as unknown — ⊤ for
+a concrete lattice (`ranges`' intervals), fresh tokens for a unification lattice (`lengths`). The seed
+describes only round 0; the accumulator at round *t* is the body's prior output. Both gates now ⊤ the
+accumulator slot (the element keeps its annotation). A `branch` on a fold accumulator therefore needs
+`try_branch` (or a fixpoint proof), not a range proof — which is correct. The missing test class that
+let this slip: "gate-passing-but-faulting," run adversarially over fold/scan *body* contexts (a green
+corpus only certifies programs someone wrote, not the reachable space).
+
 ## Done (foundations in place)
 
 The byte-width-leaf migration, the (op×kind×width) numeric grid, the linear discrimination sort,

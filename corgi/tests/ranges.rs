@@ -10,6 +10,19 @@ fn ok(src: &str) -> bool {
 }
 
 #[test]
+fn rejects_branch_on_fold_accumulator() {
+    // REGRESSION: the accumulator is the fed-back output, so the seed's range is valid only at round 0.
+    // Branching on a climbing accumulator must be rejected even though the seed is in range — earlier
+    // this passed all gates and then panicked at eval (Branch: tag out of range). The accumulator slot
+    // must be ⊤ at the fold back-edge.
+    assert!(!ok("let xs = input iota in let seed = input and 1 in \
+                 (seed, xs) foldscan ((acc, x) -> (acc add_u64 1, (x, acc) branch 2))"));
+    // the element keeps its range, so a branch on a freshly-masked ELEMENT inside a fold body is fine.
+    assert!(ok("let xs = input iota in let seed = input and 1 in \
+                (seed, xs) foldscan ((acc, x) -> (acc add_u64 1, (x, x and 1) branch 2))"));
+}
+
+#[test]
 fn rejects_unbounded_tag() {
     // the tag is the iota element itself (range [0,n), unknown) — branch 2 could route past lane 1.
     assert!(!ok("input iota map (x -> (x, x) branch 2)"));
