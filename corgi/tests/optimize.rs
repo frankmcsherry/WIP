@@ -76,7 +76,7 @@ type Case = (&'static str, fn() -> Value);
 #[test]
 fn optimize_preserves_eval_everywhere() {
     let cases: &[Case] = &[
-        ("input.1 transpose field 1 reduce_sum", sample),
+        ("input.1 transpose field 1 reduce_add", sample),
         ("(input.0, input.1 transpose field 1) cap_list map (p -> p add)", sample),
         ("input.2 map_variant 1 (h -> h add_u64 1000000) unwrap", sample),
         // map fusion: a three-deep MapList chain must collapse without changing the result.

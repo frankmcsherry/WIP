@@ -58,10 +58,9 @@ fn typed_arith(name: &str, arg: Option<u64>) -> Option<NumOp> {
         "add" => bin(BinOp::Add),
         "sub" => bin(BinOp::Sub),
         "mul" => bin(BinOp::Mul),
-        "min" => bin(BinOp::Min),
-        "max" => bin(BinOp::Max),
         "div" => bin(BinOp::Div),
         "neg" => Some(ArithOp::Neg(k, w).into()),
+        // min/max take no kind/width suffix — they're kind-blind and width-inferred (`min`/`max`).
         _ => None,
     }
 }
@@ -127,8 +126,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "add" => ArithOp::Bin(BinOp::Add, Kind::U, 64).into(),
         "sub" => ArithOp::Bin(BinOp::Sub, Kind::U, 64).into(),
         "mul" => ArithOp::Bin(BinOp::Mul, Kind::U, 64).into(),
-        "min" => ArithOp::Bin(BinOp::Min, Kind::U, 64).into(),
-        "max" => ArithOp::Bin(BinOp::Max, Kind::U, 64).into(),
+        "min" => CmpOp::Min.into(), // kind-blind lane min/max — order ops, in `cmp` not the arith grid
+        "max" => CmpOp::Max.into(),
         "neg" => ArithOp::Neg(Kind::U, 64).into(),
         // the typed grid (signed/float/narrow) is reached by suffix: `add_i32`, `div_f64`, `lit_u8 N`,
         // … — see `typed_arith`. Plus the two kind conversions:
@@ -140,8 +139,9 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "add_u64" => ArithOp::AddU64(n()?).into(),
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
-        "reduce_sum" => ArithOp::Reduce(Red::Sum).into(),
-        "reduce_prod" => ArithOp::Reduce(Red::Prod).into(),
+        // named monoid reductions, each `reduce_<binop>` (reduce_add = sum, reduce_mul = product):
+        "reduce_add" => ArithOp::Reduce(Red::Add).into(),
+        "reduce_mul" => ArithOp::Reduce(Red::Mul).into(),
         "reduce_min" => ArithOp::Reduce(Red::Min).into(),
         "reduce_max" => ArithOp::Reduce(Red::Max).into(),
         "reduce_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)

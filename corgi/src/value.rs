@@ -74,6 +74,18 @@ macro_rules! prim {
                 }
             }
 
+            /// lane-wise min (`take_max=false`) or max (`true`) of two same-width columns, KIND-BLIND:
+            /// the leaf is stored order-preserving (unsigned native, signed/float swizzled), so byte
+            /// min/max IS value min/max for every kind — no deswizzle. An order op, hence `cmp`'s, not
+            /// arithmetic's. (The `cmp` analogue of `rel`: same kind-blindness, picks a value not a mask.)
+            pub(crate) fn lane_pick(&self, other: &Prim, take_max: bool) -> Prim {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => Prim::$V(Arc::new(a.iter().zip(b.iter())
+                        .map(|(&x, &y)| if take_max { x.max(y) } else { x.min(y) }).collect())), )+
+                    _ => panic!("min/max: prim width mismatch"),
+                }
+            }
+
             /// XOR the top (sign) bit of every element, at this width — the order-preserving signed
             /// swizzle (`enc_i64` generalized), an involution. Converts an unsigned column to the
             /// signed encoding of the same non-negative values and back; the numeric layer's `signed`.

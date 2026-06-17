@@ -45,8 +45,8 @@ pub fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
 /// are unsigned; `All`/`Any` are the 0/1-mask AND/OR.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Red {
-    Sum,
-    Prod,
+    Add, // `reduce_add` (sum)
+    Mul, // `reduce_mul` (product)
     Min,
     Max,
     All,
@@ -59,8 +59,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div, // FLOAT-ONLY (integer div deferred: no NEON op, div-by-zero would panic). x/0 -> ±inf, 0/0 -> NaN.
-    Min, // lane-wise minimum — order-sensitive, so kind-aware (a SIMD-LCD reduction's binary core)
-    Max, // lane-wise maximum
+    // NB: lane-wise min/max are NOT here — they're kind-blind order ops (byte min/max on the
+    // order-preserving leaf needs no deswizzle), so they live in `cmp` as `CmpOp::Min`/`Max`.
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,13 +156,6 @@ macro_rules! grid {
                     (Kind::I, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
                     (Kind::I, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
                     (Kind::I, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
-                    // min/max are total (no overflow). Unsigned is native; signed picks via the swizzle —
-                    // and since the swizzle is ORDER-PRESERVING, the deswizzle is unnecessary, but `swiz!`
-                    // keeps the grid uniform and the result is identical.
-                    (Kind::U, BinOp::Min) => bin_into(av, bv, |x: $u, y: $u| x.min(y)),
-                    (Kind::U, BinOp::Max) => bin_into(av, bv, |x: $u, y: $u| x.max(y)),
-                    (Kind::I, BinOp::Min) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, min)),
-                    (Kind::I, BinOp::Max) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, max)),
                     // integer division is deferred; the judge rejects it, so this is never reached.
                     (Kind::U, BinOp::Div) | (Kind::I, BinOp::Div) => {
                         unreachable!("integer Div is rejected by judge")
@@ -217,7 +210,6 @@ fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
     macro_rules! f { ($V:ident, $dec:ident, $enc:ident, $av:ident, $bv:ident) => {
         Prim::$V(bin_into($av, $bv, |x, y| { let (x, y) = ($dec(x), $dec(y)); $enc(match op {
             BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
-            BinOp::Min => x.min(y), BinOp::Max => x.max(y),
         })}))
     }}
     match (a, b) {
@@ -269,8 +261,8 @@ impl ArithOp {
                 for end in bounds {
                     let s = &xs[start..end]; // empty row -> the monoid identity
                     out.push(match r {
-                        Red::Sum => s.iter().sum(),
-                        Red::Prod => s.iter().product(),
+                        Red::Add => s.iter().sum(),
+                        Red::Mul => s.iter().product(),
                         Red::Min => s.iter().copied().min().unwrap_or(u64::MAX),
                         Red::Max => s.iter().copied().max().unwrap_or(0),
                         Red::All => s.iter().all(|&x| x != 0) as u64,
