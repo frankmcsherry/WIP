@@ -1,0 +1,11 @@
+# the List⊗Sum shred: `unweave` splits a heterogeneous sum column (evens carry U64, odds carry
+# List<U64>) into its tag stream plus per-variant lane lists — the columnar SoA form of List<Sum>
+# (Dremel record shredding). The surface-checkable fact: unweave's first field IS the tag column, so
+# tag extraction is a projection, not a match-with-lit contortion. The inverse round-trip
+# `weave(unweave x) = x` is now a kernel law (Builder test `weave_unweaves_round_trip`), since `weave`
+# left the surface — it is the one iso-inverse whose inputs arise only from its partner.
+# n = 8
+# = [1]
+let xs = input iota in
+let sums = xs map (x -> (x, x and 1) branch 2 map_variant 1 (o -> o iota)) in
+(sums unweave field 0, xs map (x -> x and 1)) eq

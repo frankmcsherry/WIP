@@ -1,9 +1,0 @@
-# the List⊗Sum iso: weave undoes unweave on a heterogeneous sum column (evens carry U64,
-# odds carry List<U64>) — the lanes are already stored packed, so the round trip moves no
-# payload data. Second conjunct: unweave's first field IS the tag column, so tag extraction
-# is a projection rather than the match-with-lit contortion.
-# n = 8
-# = [1]
-let xs = input iota in
-let sums = xs map (x -> (x, x and 1) branch 2 map_variant 1 (o -> o iota)) in
-((sums unweave weave, sums) eq, (sums unweave field 0, xs map (x -> x and 1)) eq) mul

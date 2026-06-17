@@ -44,7 +44,13 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "transpose" => Op::Transpose.into(),
         "zip" => Op::Zip.into(),         // Transpose's inverse: parallel lists -> list of products
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
-        "weave" => Op::Weave.into(),     // (tags, lane lists) -> sum column
+        // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
+        // iso-inverses (Zip pairs any two columns; Slices materializes any ranges, incl. Find's),
+        // Weave's input — a tag stream whose per-row counts match a set of lane lengths — arises ONLY
+        // from Unweave; a free-standing Weave is either provably the Unweave-inverse or a bug, and its
+        // precondition is a histogram relation no static analysis cheaply proves. So `Op::Weave` stays
+        // a KERNEL op (the optimizer's `Weave(Unweave x)=x` round-trip; tested at Builder level), never
+        // a verb. (A `try_weave` would only carry an unactionable "inconsistent columns" error.)
         "cap_list" => Op::CapList.into(), // capture: pair a context with every list element
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
         "branch" => Op::Branch(n()? as usize).into(), // N-way partition by a discriminant column;
