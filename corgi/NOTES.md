@@ -27,9 +27,10 @@ src/
                    PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
                    LIST   Enlist         Head     MapList   CapList  (witness: bounds column)
-               LIST also: Fold (B,List<A>)->B (seeded accumulating elim), Scan ->List<B> (Fold keeping
-               each step), Index (total point elim -> Sum{Oob|Found}), Unit (X -> Unit). Plus the typed
-               numeric grid + the named reductions in `numeric`.
+               LIST also: Fold (B,List<A>)->B (seeded accumulating elim), FoldScan (T,List<A>)->(T,List<R>)
+               (mapAccumL — the scan kernel; `scan` is sugar = FoldScan with body (a,x)->(b,b), field 1),
+               Index (total point elim -> Sum{Oob|Found}), Unit (X -> Unit). Plus the typed numeric grid
+               + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
                List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave) — and the fused forms/producers
                (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
@@ -114,15 +115,24 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   level is always 1:1.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
   sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
-- **`Fold`/`Scan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
+- **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
   sequential *within* a row but vectorized *across* rows: round `t` folds in every still-active row's
   `t`-th element in one body call, so `#rounds = the longest row`, not the element count. The active
   set is maintained incrementally (`init_active` + per-round `retain(len > t)`), so per-round cost
   tracks the *active* rows — total work `O(total elements)`, asymptotically optimal (each element
   touched a constant number of times). The accumulator is scattered back **in place** for fixed-width
-  `B` (a leaf or product of leaves); a `List`/`Sum` `B` falls back to the `gather_lanes` rebuild. The
-  **named monoid reductions** (`reduce_sum`/`min`/`max`/`prod`/`all`/`any`) are the one-SIMD-pass fast
-  paths for the associative case — prefer them; `Fold`/`Scan` are for non-monoid bodies. Remaining
+  `B` (a leaf or product of leaves); a `List`/`Sum` `B` falls back to the `gather_lanes` rebuild.
+- **`FoldScan` (mapAccumL) is the scan kernel; `Fold` is its R=Unit specialization, kept for cost.**
+  `FoldScan : (T,List<A>)->(T,List<R>)` by `(T,A)->(T,R)` threads a state and emits an output stream;
+  `scan` lowers to it (body `(a,x)->(b,b)`, take field 1) — measured identical to a dedicated scan.
+  `Fold` does NOT lower to it: `FoldScan` with `R=Unit, .0` measured ~3.4x slower, because the body is
+  forced to emit a `(state, output)` PAIR each round (extra `Prod` build/teardown + it breaks the
+  body's in-place accumulator mutation) and the lockstep records output positions even for a dead
+  `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
+  the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
+  recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
+- **Named monoid reductions** (`reduce_sum`/`min`/`max`/`prod`/`all`/`any`) are the one-SIMD-pass fast
+  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Remaining
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
   identity acc-gather + scatter) for the uniform-length regime where every row is active every round.
 

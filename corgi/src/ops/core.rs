@@ -120,15 +120,12 @@ pub enum Op<L> {
                     // case; the named monoid reductions like ReduceSum are the SIMD fast paths). Body
                     // runs once per ROUND, vectorized across rows: round t folds in every row's t-th
                     // element in lockstep, so #invocations = the longest row, not the element count.
-    Scan(Box<Graph<L>>), // transform: (B, List<A>) -> List<B>  inclusive scan — `Fold` retaining each
-                    // step. out[r][t] = the accumulator after folding element t of row r; same bounds
-                    // as the input list (one B per A). `scan` then last-element = `fold`. Same lockstep
-                    // eval as Fold; the per-round results are scattered into the output list.
     FoldScan(Box<Graph<L>>), // (T, List<A>) -> (T, List<R>)  the mapAccumL / Mealy-machine fold: a body
                     // (T,A)->(T,R) threads a STATE T and emits an output R per element; returns the final
-                    // state AND the output stream. `fold` = FoldScan with R=Unit, project .0; `scan` =
-                    // FoldScan emitting (newstate, newstate), project .1. Expresses stateful maps neither
-                    // does (running deltas, indexing, RLE). Same lockstep; the unifying kernel.
+                    // state AND the output stream. The unifying scan kernel: `scan` is sugar for this
+                    // (body `(a,x)->b` becomes `(a,x)->(b,b)`, take field 1). Expresses stateful maps a
+                    // plain scan can't (running deltas, indexing, RLE). `Fold` is kept separate — the
+                    // R=Unit specialization, ~3x cheaper than FoldScan (no output pair, no recording).
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
                     // (né Broadcast); the list-side closure capture.
 
@@ -453,47 +450,7 @@ impl<L: OpLike> Op<L> {
                 acc
             }
 
-            // inclusive scan: `Fold` that keeps each step. Same lockstep, but round t records its result
-            // at each active row's t-th output position. The recorded chunks (one per round) reassemble
-            // into the flat output by `gather_lanes`: output position p was produced in round `tags[p]`
-            // at within-round slot `off[p]`. Output bounds = input bounds (one B per A element).
-            Op::Scan(body) => {
-                let (seed, list) = input.into_pair("Scan");
-                let (bounds, vals) = list.into_list("Scan list");
-                let total = vals.len();
-                let mut acc = seed;
-                let mut chunks: Vec<Value> = Vec::new();
-                let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
-                let mut active = init_active(&bounds);
-                let mut t = 0;
-                while !active.is_empty() {
-                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
-                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
-                    let acc_active = gather(&acc, &rows);
-                    let elt = gather(&vals, &elem);
-                    let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
-                    assert_eq!(updated.len(), rows.len(), "Scan body changed the row count");
-                    for (slot, &pos) in elem.iter().enumerate() {
-                        tags[pos] = chunks.len();
-                        off[pos] = slot;
-                    }
-                    acc = scatter(acc, &rows, updated.clone());
-                    chunks.push(updated);
-                    t += 1;
-                    active.retain(|&(_, _, len)| len > t);
-                }
-                // total == 0 (every row empty): an empty B-shaped column, taken as `acc` gathered at no
-                // rows (acc still carries shape B). Else stitch the per-round chunks into element order.
-                let out_vals = if chunks.is_empty() {
-                    gather(&acc, &[])
-                } else {
-                    let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
-                    gather_lanes(&refs, &tags, &off)
-                };
-                Value::List(bounds, Box::new(out_vals))
-            }
-
-            // mapAccumL: like Scan, but the body returns a PAIR (new state, output R). We thread field 0
+            // mapAccumL: the body returns a PAIR (new state, output R). We thread field 0
             // (the state) into `acc` and record field 1 (R) into the chunks; return (final state, [R]).
             Op::FoldScan(body) => {
                 let (seed, list) = input.into_pair("FoldScan");
@@ -947,18 +904,6 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Fold expects a pair"),
             },
 
-            // (B, List<A>) -> List<B>. Same body judgment as Fold; the output is a list of the running B.
-            Op::Scan(body) => match input {
-                Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    List(a) => {
-                        let body_out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
-                        List(Box::new(join(&ts[0], &body_out)?))
-                    }
-                    _ => return err("Scan expects (B, List<A>)"),
-                },
-                _ => return err("Scan expects a pair"),
-            },
-
             // (T, List<A>) -> (T, List<R>). The body, on (T, A), must return (T', R) with T' joining the
             // state T; the result is the final state and the list of emitted R.
             Op::FoldScan(body) => match input {
@@ -1006,7 +951,7 @@ impl<L: OpLike> Op<L> {
     pub(crate) fn children(&self) -> Vec<&Graph<L>> {
         match self {
             Op::MapList(b) => vec![b],
-            Op::Fold(b) | Op::Scan(b) | Op::FoldScan(b) => vec![b],
+            Op::Fold(b) | Op::FoldScan(b) => vec![b],
             Op::MapSum(arms) => arms.iter().map(|(_, b)| b).collect(),
             _ => Vec::new(),
         }

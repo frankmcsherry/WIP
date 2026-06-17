@@ -165,7 +165,7 @@ fn bshape_op(op: &NumOp, inb: &BShape, c: &mut u32) -> Result<BShape, String> {
             }
             fresh_out(op, inb, c)
         }
-        NumOp::Core(Op::Fold(body)) | NumOp::Core(Op::Scan(body)) | NumOp::Core(Op::FoldScan(body)) => {
+        NumOp::Core(Op::Fold(body)) | NumOp::Core(Op::FoldScan(body)) => {
             if let BShape::Prod(fs) = inb {
                 if let [seed, BShape::List(_, a)] = fs.as_slice() {
                     check_graph(body, BShape::Prod(vec![seed.clone(), (**a).clone()]), c)?;

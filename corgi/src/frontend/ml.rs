@@ -30,7 +30,7 @@
 //!       xs inject Lo                                       -- both numbers off the declaration
 
 use super::{pair_imm, resolve, str_value, takes_num};
-use crate::graph::{Builder, Graph};
+use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::{NumOp, Op};
 use crate::value::Value;
 use std::collections::HashMap;
@@ -464,6 +464,15 @@ fn lower_body(pat: &Pat, body: &E) -> Result<Graph<NumOp>, String> {
     Ok(bb.finish(bout))
 }
 
+/// append `Tuple([out, out])` to a body `(T,A)->B`, making it `(T,A)->(B,B)` — the `FoldScan` body
+/// that re-expresses `scan`: the new state and the emitted output are both the running accumulator.
+fn dup_output(mut g: Graph<NumOp>) -> Graph<NumOp> {
+    let out = g.output;
+    let tup = g.nodes.len();
+    g.nodes.push(Node { kind: NodeKind::Tuple, inputs: vec![out, out] });
+    Graph { nodes: g.nodes, output: tup }
+}
+
 fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
     match e {
         E::Var(name) => env.get(name).copied().ok_or_else(|| format!("unbound variable '{name}'")),
@@ -493,7 +502,13 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 Apply::Str(bytes) => Ok(b.add(Op::Lit(str_value(bytes.clone())), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
                 Apply::Fold(x, body) => Ok(b.add(Op::Fold(Box::new(lower_body(x, body)?)), vec![id])),
-                Apply::Scan(x, body) => Ok(b.add(Op::Scan(Box::new(lower_body(x, body)?)), vec![id])),
+                // scan IS foldscan: a body `(a,x) -> b` becomes `(a,x) -> (b, b)` (state = output), and
+                // the running-accumulator list is field 1 of the result. Measured identical to a
+                // dedicated Scan, so `Op::Scan` is retired in favour of this lowering.
+                Apply::Scan(x, body) => {
+                    let fs = b.add(Op::FoldScan(Box::new(dup_output(lower_body(x, body)?))), vec![id]);
+                    Ok(b.add(Op::Field(1), vec![fs]))
+                }
                 Apply::FoldScan(x, body) => {
                     Ok(b.add(Op::FoldScan(Box::new(lower_body(x, body)?)), vec![id]))
                 }
