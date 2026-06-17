@@ -52,6 +52,7 @@ impl Program {
         let shape = shape_of_value(&input);
         shape_of(&self.graph, &shape)?;
         crate::lengths::check_lengths(&self.graph, &shape)?;
+        crate::ranges::check_ranges(&self.graph, &shape)?;
         Ok(eval_graph(&self.graph, input))
     }
 }

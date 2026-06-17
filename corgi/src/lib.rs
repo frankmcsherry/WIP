@@ -27,12 +27,14 @@ pub(crate) mod graph;
 pub(crate) mod lengths;
 pub(crate) mod ops;
 pub(crate) mod optimize;
+pub(crate) mod ranges;
 pub(crate) mod shape;
 pub(crate) mod value;
 
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use lengths::check_lengths;
+pub use ranges::check_ranges;
 pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
