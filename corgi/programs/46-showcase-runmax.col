@@ -1,0 +1,8 @@
+# SHOWCASE — running maximum (high-water mark) via `scan`. The accumulator carries the max so far;
+# inclusive scan emits it at every step. Input is the zig-zag [0,1,2,3,0,1,2,3] (iota masked to 0..3),
+# so the running max climbs then plateaus. Prefix computations like this were the one SOAC corgi
+# couldn't express before; now it's one stage, vectorized across rows.
+# n = 8
+# = List ends=[8] <[0, 1, 2, 3, 3, 3, 3, 3]>
+let xs = input iota map (x -> x and 3) in
+(xs lit 0, xs) scan ((a, x) -> (a, x) max)

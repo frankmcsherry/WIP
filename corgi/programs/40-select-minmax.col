@@ -1,0 +1,13 @@
+# the SIMD least-common-denominator additions: lane-wise `min`/`max` (the grid grown by two ops) and
+# `select` (the branchless bitselect blend). Per element x of [0..n), let b = 7 - x. `max(x,b)` and the
+# hand-rolled blend `select(x<b, b, x)` must agree element-wise — select picks `b` (its 2nd operand)
+# where the mask is set, `x` (its 3rd) elsewhere — so this is `max` spelled with a mask and a blend.
+# Also checks `min(x,b)` is the complementary pick.
+# n = 8
+# = ([1], [1])
+let xs = input iota in
+let via_max    = xs map (x -> (x, (x lit 7, x) sub) max) in
+let via_select = xs map (x -> let b = (x lit 7, x) sub in ((x, b) lt, b, x) select) in
+let via_min    = xs map (x -> (x, (x lit 7, x) sub) min) in
+let min_select = xs map (x -> let b = (x lit 7, x) sub in ((x, b) lt, x, b) select) in
+((via_max, via_select) eq, (via_min, min_select) eq)

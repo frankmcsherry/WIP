@@ -41,6 +41,8 @@ impl Pred {
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
     Gt(u64),   // X -> U64 mask    (x > c) as 0/1   — the column-vs-immediate sugar form
+    Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
+    Max,       // (X, X) -> X   lane-wise maximum
     SortList,  // List<X> -> List<X>   structural order
     DedupList, // List<X> -> List<X>   distinct, per row (sorted)
     GroupKey,  // List<(K,V)> -> List<(K, List<V>)>   group by key, per row (sorted)
@@ -63,6 +65,14 @@ impl CmpOp {
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                 };
                 Value::u64(mask)
+            }
+
+            CmpOp::Min | CmpOp::Max => {
+                let take_max = matches!(self, CmpOp::Max);
+                let (a, b) = input.into_pair("min/max");
+                let (pa, pb) = (a.into_prim("min/max lhs"), b.into_prim("min/max rhs"));
+                assert_eq!(pa.len(), pb.len(), "min/max: operands at different strata");
+                Value::Prim(pa.lane_pick(pb, take_max))
             }
 
             CmpOp::Gt(c) => {
@@ -155,6 +165,14 @@ impl CmpOp {
             CmpOp::Gt(_) => match input {
                 Prim(64) => Prim(64),
                 _ => return err("Gt expects U64"),
+            },
+            // (X, X) -> X for two equal-width leaves; kind-blind, so width is the only constraint.
+            CmpOp::Min | CmpOp::Max => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (Prim(a), Prim(b)) if a == b => Prim(*a),
+                    _ => return err("min/max expects two equal-width leaves"),
+                },
+                _ => return err("min/max expects a pair"),
             },
             CmpOp::SortList | CmpOp::DedupList => match input {
                 List(_) => input.clone(),

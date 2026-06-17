@@ -20,13 +20,21 @@ src/
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph, shape_of,
                check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
-  optimize.rs  cse / dce / peephole / optimize over Graph<NumOp>.
+  optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
+               the unoptimized graph (like `check_total`, a caller opts in); tested for semantic
+               preservation on every corpus program, so the passes are latent, not dead.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture
                    PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
-                   LIST   Enlist         Head     MapList   CapList  (witness: bounds column)
+                   LIST   Enlist         Get      MapList   CapList  (witness: bounds column)
+               LIST elim: Get (U64,List<X>)->X is the point eliminator (`head` = sugar `Get 0`, so an
+               empty row is Oob 0 — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
+               elim; FoldScan (T,List<A>)->(T,List<R>) (mapAccumL — the scan kernel; `scan` is sugar =
+               FoldScan with body (a,x)->(b,b), field 1). Get/Gather come in _uns (assert) and _try
+               (total -> Sum{Oob|Found}) tiers; Gather is Get vectorized (a list of indices). Plus Unit
+               (X -> Unit) and the typed numeric grid + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
                List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave) — and the fused forms/producers
                (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
@@ -49,6 +57,42 @@ programs/  *.col — the self-generating example corpus (program + `# n =` seed 
 examples/tour.rs   benches/eval.rs   dev/*-kickoff.md
 ```
 
+## Structural completeness — the functor commutation table
+
+The structural layer (PROD/SUM/LIST, leaving PRIM in its corner) is complete when every way the three
+functors *commute* is either a named iso with a witnessing `law` program, or a documented hole with a
+reason. The combinators are the **distributive laws** (functor-through-functor) and the **strengths**
+(× through a functor); with three functors the table is finite and small. Two families carry it:
+
+**Push LIST inward (the AoS→SoA transform — why corgi is columnar):**
+
+| value | ↔ | columnar form | ops | law |
+|-------|---|---------------|-----|-----|
+| `List<(X,Y)>` | ↔ | `(List<X>, List<Y>)` | Transpose / Zip | programs/32 |
+| `List<Sum{A\|B}>` | ↔ | `(tags, List<A>, List<B>)` | Unweave / Weave | programs/33 |
+| `List<List<X>>` | ↔ | `(ranges, flat)` | Flatten / Slices | programs/17, 31 |
+
+Note `List<Sum{A|B}>` is **not** `Sum{List<A>|List<B>}` — a list mixes variants, so the SoA form is the
+*shredded* `(tag-list, per-variant payload columns)` (Dremel/Parquet record shredding). That is exactly
+what Unweave produces; the "obvious" `List<Sum> → Sum<List>` does not exist.
+
+**Distribute × into a functor (the CAPTURE / strength family):**
+
+| value | ↔ | distributed | op | law |
+|-------|---|-------------|-----|-----|
+| `(X, Sum{A\|B})` | ↔ | `Sum{(X,A)\|(X,B)}` | CapSum (= `(X,A+B)≅(X,A)+(X,B)`) | programs/30 |
+| `(X, List<Y>)` | → | `List<(X,Y)>` | CapList (List strength) | programs/40 |
+| `(X, (A,B))` | ↔ | reassociation | Tuple/Field | trivial |
+
+**The principled holes (no iso — documented, not missing):**
+- **Sum over Prod** — `(A,B)+(C,D) ↛ (A+C, B+D)`: re-pairing loses the field correlation. Not iso.
+- **Sum/List over List `→` Sum** — `List<Sum>` cannot become `Sum<List>` (mixed variants); this is the
+  reason Unweave's target is the shredded triple, above.
+- diagonals (Prod∘Prod, Sum∘Sum) — trivial reassociation, no op.
+
+So the live cells (LIST-inward ×3, ×-into-{Sum,List} ×2) are all suite-checked; the rest are holes with
+reasons. Adding a structural op means either filling a hole (and writing its law) or it is redundant.
+
 ## Design invariants (don't break)
 
 - **Every semantic op is a unary `T0 -> T1`** (the 1:1 map), run by `eval`. `Input`/`Tuple` are the
@@ -60,10 +104,66 @@ examples/tour.rs   benches/eval.rs   dev/*-kickoff.md
 - **The core is numeric-blind.** Arithmetic is `ops/numeric`; comparison is `ops/cmp`. The leaf is
   stored order-preserving (signed = top-bit swizzle), so ONE kind-blind comparator serves `sort`,
   `find`, and `Rel` alike.
+- **Float semantics are TOTAL-ORDER, not IEEE (deliberate).** `Kind::F` (widths 32/64) stores the
+  IEEE bits under the total-order swizzle (`f64::total_cmp`: negatives flip all bits, others flip the
+  sign bit). The kind-blind comparator then orders floats correctly with NO special case — *the
+  swizzle never mis-orders two values IEEE orders; it only supplies a definite position where IEEE
+  declines.* The deviations, all on the "naughty" sort/eq path: NaN is orderable (sorts to the top)
+  and equals itself bit-for-bit; `-0 != +0` (distinct bits — no canonicalization, by choice). The
+  win: no NaN-poisons-comparison surprise. *Arithmetic stays IEEE* (NaN/inf propagate; `x/0 -> ±inf`,
+  `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
+  via `to_f32`/`to_f64` (no float literal token: a constant is `lit_uN K to_fN`); the typed grid is
+  reached by suffix (`add_i32`, `div_f64`, `lit_i16 N`, `signed`). Integer `div` is deferred (no NEON
+  op; div-by-zero would panic) — the judge rejects it.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
   sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
+- **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
+  sequential *within* a row but vectorized *across* rows: round `t` folds in every still-active row's
+  `t`-th element in one body call, so `#rounds = the longest row`, not the element count. The active
+  set is maintained incrementally (`init_active` + per-round `retain(len > t)`), so per-round cost
+  tracks the *active* rows — total work `O(total elements)`, asymptotically optimal (each element
+  touched a constant number of times). The accumulator is scattered back **in place** for fixed-width
+  `B` (a leaf or product of leaves); a `List`/`Sum` `B` falls back to the `gather_lanes` rebuild.
+- **`FoldScan` (mapAccumL) is the scan kernel; `Fold` is its R=Unit specialization, kept for cost.**
+  `FoldScan : (T,List<A>)->(T,List<R>)` by `(T,A)->(T,R)` threads a state and emits an output stream;
+  `scan` lowers to it (body `(a,x)->(b,b)`, take field 1) — measured identical to a dedicated scan.
+  `Fold` does NOT lower to it: `FoldScan` with `R=Unit, .0` measured ~3.4x slower, because the body is
+  forced to emit a `(state, output)` PAIR each round (extra `Prod` build/teardown + it breaks the
+  body's in-place accumulator mutation) and the lockstep records output positions even for a dead
+  `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
+  the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
+  recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
+- **Named monoid reductions** (`reduce_sum`/`min`/`max`/`prod`/`all`/`any`) are the one-SIMD-pass fast
+  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Remaining
+  constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
+  identity acc-gather + scatter) for the uniform-length regime where every row is active every round.
+
+## Totality — the claim, scoped, and the assert→gate cover map
+
+The guarantee is precise: **every program in the GATED SUBSET runs to a value — no panic — for every
+input.** "Gated subset" = passes the typer + the length gate + the range gate, and `check_total` = Ok
+(no `_uns` op). Not "no panics, ever": a `_uns` op or a checker-bypassing hand-built `Graph` can still
+abort. The claim is witnessed, not asserted — every reachable `assert!`/`panic!` in `eval` is covered
+by exactly one of:
+
+- **a gate** — `Zip`/`Filter` bounds by `lengths`; `Branch` tag-in-range by `ranges`.
+- **a tier `check_total` reports** — `get`/`gather`/`slices` (`_uns`): the located opt-out (`head_uns`
+  lowers to `get_uns 0`, so it surfaces as `get_uns`).
+- **a defensive check of the 1:1 SEQ invariant the typer already enforces** — the "body changed the
+  row count" asserts in `Fold`/`FoldScan` (unreachable given the typer).
+- **made total instead** — integer arith is `wrapping_*`; float `div` yields inf/NaN; integer `div`
+  is judge-rejected; `get_try`/`gather_try`/`try_*`/`ParseU64` carry failure in an `Oob`/`Err` lane.
+
+**Audit rule for the gates (learned the hard way):** any analysis threaded through a *fixpoint*
+operator (`Fold`/`FoldScan`'s accumulator back-edge) must treat the fed-back value as unknown — ⊤ for
+a concrete lattice (`ranges`' intervals), fresh tokens for a unification lattice (`lengths`). The seed
+describes only round 0; the accumulator at round *t* is the body's prior output. Both gates now ⊤ the
+accumulator slot (the element keeps its annotation). A `branch` on a fold accumulator therefore needs
+`try_branch` (or a fixpoint proof), not a range proof — which is correct. The missing test class that
+let this slip: "gate-passing-but-faulting," run adversarially over fold/scan *body* contexts (a green
+corpus only certifies programs someone wrote, not the reachable space).
 
 ## Done (foundations in place)
 
@@ -80,6 +180,17 @@ with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (in
 unify with committed operands); the judge rejects what eval can't represent (`Cast` widths, sum
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
+
+Then the point-access factoring. `Index`/`Head` were retired in favour of one indexed-access concept
+at two strata: the atom is the **scalar `Get (U64,List<X>)->X`** (one O(1) lookup per row, the genuine
+list eliminator), `Gather` is its **vectorization** (the index arrives as a list), and `head` is **sugar
+`Get 0`** — so `Op::Head` left the engine and a *total* head needs no non-emptiness proof (an empty row
+is `Oob 0`). Each of get/gather carries a `_uns` tier (assert in-bounds) and a `_try` tier (total ->
+`Sum{Oob|Found}`); the plain checked tier (a proven bound) is reserved. Why this direction and not
+`Get = enlist;gather;head`: `gather` is list-*preserving* so it can't eliminate, and the only
+irreducible piece is the bare-`X` outro — making `Get` the atom keeps one index kernel and yields the
+total head for free, where the HEAD-atom route would have needed new non-emptiness analysis. (`Fold`/
+`FoldScan` remain the accumulating eliminators; `head_try`→Option is expressible as a fold if wanted.)
 
 ## Live work — the DDIR consumer
 
@@ -99,6 +210,23 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **Fusion / vector-at-a-time (the perf multiplier).** Single ops are memory-bound, so the lever is
   fewer passes, not SIMD. Tile execution ~1024 rows to L1 (the Polars/X100 model), composing the
   existing SIMD kernels — no per-row interpreter. Needs a slice-capable op path + a fusable-run pass.
+- **Destination-passing style (DPS) — the intentional discipline for the fusion above (not yet built).**
+  DPS (Shaikhha/Fitzgibbon/PeytonJones/Vytiniotis) is the calling convention that makes the tile fusion
+  work: thread a destination buffer through a chain of ops, each writes into it, no intermediates. The
+  seam is already corgi's central invariant — **DPS along the 1:1 SEQ spine** (pointwise/leaf/cast/
+  select/fold-accumulator: `dest size = input size`, pre-sizable), **allocate-and-return at `List`
+  introductions** (filter/group/iota/slices: data-dependent size). Relation to FBIP: corgi ALREADY does
+  opportunistic refcount reuse (`get_mut`/`make_mut` in `bin_into`/`scatter_into`/`AddU64`/move-to-last-
+  use) — that's reuse *discovered* at runtime; DPS makes it *intentional* (explicit destination →
+  guaranteed in-place, AND it threads through a chain, which is what unlocks fusion; per-op reuse
+  already works, so the new value is specifically cross-op intermediate elimination). The `None`
+  destination = "output is dead" idiom collapses `FoldScan -> Fold` (skip the tags/off recording + DCE
+  the dead output), which would retire `Op::Fold` the way `Op::Scan` was retired. THE fork to settle
+  first is the ownership model: a true destination can't be a shared `Arc`, so DPS pressures the hot
+  spine toward a linear/owned tile buffer (giving up free `Arc`-clone fan-out there) vs staying
+  `Arc`-shared (free clones, no fusion). First spike: compile ONE stratum-stable run (e.g. `iota ; add
+  ; mul ; gt`) to a single-tile DPS kernel and measure vs the per-op passes — that forces the ownership
+  decision on a small surface before committing the convention.
 - **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying

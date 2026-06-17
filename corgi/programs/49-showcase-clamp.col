@@ -1,0 +1,7 @@
+# SHOWCASE — a branchless clamp via `select`, the SIMD bitselect. `select(mask, then, else)` picks
+# per row with no partition: clamp(x, 5) = select(x > 5, 5, x). Over [0..8) it caps at 5. This is the
+# branchless dual of a `branch 2` + match — Branch avoids computing the unused side, `select` avoids
+# the partition; for a cheap body like this, select wins. Reads like the scalar code, runs as a blend.
+# n = 8
+# = List ends=[8] <[0, 1, 2, 3, 4, 5, 5, 5]>
+input iota map (x -> (x gt 5, x lit 5, x) select)

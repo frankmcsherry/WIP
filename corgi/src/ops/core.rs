@@ -9,6 +9,73 @@ use crate::graph::{eval_graph, shape_of, Graph, OpLike};
 use crate::shape::{join, shape_of_value, Shape};
 use crate::value::Value;
 
+/// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
+/// `gather`, the accumulator update for `Fold`/`Scan`.
+///
+/// FIXED-WIDTH `acc` (a leaf, or a product of leaves) is mutated IN PLACE: each row has a constant
+/// slot, so we overwrite only the `active` rows, reusing the buffer round-to-round — no per-round
+/// allocation, no copying of the unchanged rows. VARIABLE-WIDTH `acc` (containing a `List`/`Sum`,
+/// whose rows differ in size) can't be slot-overwritten, so it falls back to the rebuild via
+/// two-source `gather_lanes` (correct, the prior behaviour; an uncommon accumulator shape).
+fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
+    if fixed_width(&acc) {
+        scatter_fixed(&mut acc, active, &new);
+        acc
+    } else {
+        let n = acc.len();
+        let mut tags = vec![0usize; n];
+        let mut off: Vec<usize> = (0..n).collect();
+        for (slot, &r) in active.iter().enumerate() {
+            tags[r] = 1;
+            off[r] = slot;
+        }
+        gather_lanes(&[Some(&acc), Some(&new)], &tags, &off)
+    }
+}
+
+/// every row occupies a constant byte slot — true for a leaf and a product of fixed-width fields,
+/// false once a `List` or `Sum` (variable-size rows) appears. Checked WHOLE before any mutation, so
+/// the in-place pass below can't half-write a value that turns out to be variable-width deeper down.
+fn fixed_width(v: &Value) -> bool {
+    match v {
+        Value::Prim(_) | Value::Unit(_) => true, // a unit row is a (zero-byte) constant slot
+        Value::Prod(cs) => cs.iter().all(fixed_width),
+        Value::List(..) | Value::Sum(..) => false,
+    }
+}
+
+/// in-place scatter for a fixed-width `acc` (precondition: `fixed_width(acc)`), recursing products to
+/// the leaves where the actual write happens.
+fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
+    match (acc, new) {
+        (Value::Prim(d), Value::Prim(s)) => d.scatter_into(active, s),
+        (Value::Prod(ca), Value::Prod(cn)) => {
+            for (fa, fb) in ca.iter_mut().zip(cn) {
+                scatter_fixed(fa, active, fb);
+            }
+        }
+        (Value::Unit(_), Value::Unit(_)) => {} // no payload to overwrite (length is unchanged)
+        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod/Unit"),
+    }
+}
+
+/// the lockstep work-list for `Fold`/`Scan`, maintained incrementally. `(row, start, len)` for each
+/// non-empty row, in row order. A row stays until round `len`; after each round the caller `retain`s
+/// `len > t`, so the per-round cost tracks the *active* rows, not all N (the win for ragged lengths —
+/// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
+/// targets: row `r`'s round-`t` element is at flat index `start + t`.
+fn init_active(bounds: &[usize]) -> Vec<(usize, usize, usize)> {
+    let mut v = Vec::with_capacity(bounds.len());
+    let mut start = 0;
+    for (r, &end) in bounds.iter().enumerate() {
+        if end > start {
+            v.push((r, start, end - start));
+        }
+        start = end;
+    }
+    v
+}
+
 /// the core op vocabulary: structure only — comparison/order is the `cmp` bucket (`ops::cmp`) and
 /// arithmetic the `numeric` layer. Generic over `L`, the layer used for body sub-graphs, so a higher layer's
 /// `map` bodies can use the higher vocabulary. `Op<L>` is not itself `OpLike` — the layer enum is (e.g.
@@ -27,6 +94,11 @@ pub enum Op<L> {
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, U64-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
+                    //        PARTIAL: panics on tag >= n. The clean kernel; surface-usable once a
+                    //        range pass proves tags < n (else write TryBranch).
+    TryBranch(usize), // intro: (X, U64-tags) -> Sum{Oob:U64 | X × n}  TOTAL Branch: an out-of-range
+                    // tag lands in lane 0 (Oob) carrying the bad tag; tag t<n lands in lane t+1. The
+                    // FOO_TRY of Branch — usable with no proof (the index/ParseU64 discipline).
     Inject(usize, usize), // intro: X -> Sum{tag: X, ⊥..} — the constant-tag Branch; the other
                     //        lanes are ⊥ (empty, shape uncommitted, pinned later by `join`).
     Unwrap,         // elim:  homogeneous (up to ⊥) Sum -> payload
@@ -39,10 +111,18 @@ pub enum Op<L> {
                     // value (closure capture, made explicit).
     // LIST — witness: the bounds column.
     Enlist,         // intro: X -> List<X>  each element its own length-1 list (list-monad unit)
-    Head,           // elim:  List<X> -> X  each row's first element (an empty row panics) —
-                    // Enlist's retraction and the one general stratum-dropping judgment;
-                    // `sort head` is structural min for any shape.
     MapList(Box<Graph<L>>), // map: closed body on a list's values (in the *layer* L)
+    Fold(Box<Graph<L>>), // elim: (B, List<A>) -> B  seeded left fold of a binary body (B,A)->B along
+                    // each row's list. The accumulator-carrying list eliminator (Head is the 0-step
+                    // case; the named monoid reductions like ReduceSum are the SIMD fast paths). Body
+                    // runs once per ROUND, vectorized across rows: round t folds in every row's t-th
+                    // element in lockstep, so #invocations = the longest row, not the element count.
+    FoldScan(Box<Graph<L>>), // (T, List<A>) -> (T, List<R>)  the mapAccumL / Mealy-machine fold: a body
+                    // (T,A)->(T,R) threads a STATE T and emits an output R per element; returns the final
+                    // state AND the output stream. The unifying scan kernel: `scan` is sugar for this
+                    // (body `(a,x)->b` becomes `(a,x)->(b,b)`, take field 1). Expresses stateful maps a
+                    // plain scan can't (running deltas, indexing, RLE). `Fold` is kept separate — the
+                    // R=Unit specialization, ~3x cheaper than FoldScan (no output pair, no recording).
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
                     // (né Broadcast); the list-side closure capture.
 
@@ -51,7 +131,11 @@ pub enum Op<L> {
     // List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave).
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
     Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse; bounds must
-                    // agree (asserted). A pure rewrap — no data moves.
+                    // agree (asserted). A pure rewrap — no data moves. PARTIAL: panics on differing
+                    // bounds; surface-usable once the size pass proves the bounds agree (else TryZip).
+    TryZip,         // (List<X>, List<Y>) -> Sum{Err:(List<X>,List<Y>) | Ok:List<(X,Y)>}  TOTAL Zip,
+                    // per row: a row whose two inner lists have equal length zips into Ok; a mismatched
+                    // row lands in Err carrying its two inner lists. (Pair-only for now; N-ary later.)
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
     Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>  materialize each range —
                     // Flatten's inverse and the range form of Gather.
@@ -68,10 +152,30 @@ pub enum Op<L> {
     Cast(u32),      // leaf -> leaf  re-width to N bits (low bytes / zero-pad), kind-blind
     Filter,         // (List<X>, List<U64-mask>) -> List<X>  keep mask-nonzero elements in one
                     // pass (the kernel expansion is zip; map(branch); unweave; field — see the law)
-    Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  row-relative point gather —
-                    // the engine primitive surfaced. Chains compose in-language:
+    // point access — fetch a haystack element by index. The atom is the SCALAR `Get` (one O(1)
+    // lookup per row); `Gather` is its vectorization (the index arrives as a list), and `head` is
+    // sugar for `Get 0` (an empty row is `Oob 0`, so a TOTAL head needs no non-emptiness proof).
+    // Each comes in a `_uns` (assert in-bounds, panic) and a `_try` (total, Oob lane) tier; the plain
+    // checked tier (`get`/`gather`, a proven bound) is reserved for later.
+    Get,            // (idx:U64, haystack:List<T>) -> T  scalar point access — one index per row into
+                    // that row's list. PARTIAL (panics out of bounds): the unchecked fast path.
+    GetTry,         // (idx:U64, haystack:List<T>) -> Sum{Oob:U64 | Found:T}  TOTAL scalar access: an
+                    // out-of-bounds index lands in Oob carrying the bad index, in-bounds in Found
+                    // (the ParseU64 discipline — failure is a committed lane, never a panic).
+    Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  the vector form: a list of indices.
+                    // The engine primitive surfaced; chains compose in-language —
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
+                    // PARTIAL (panics out of bounds): the unchecked fast path. `Get` is the 1-index case.
+    GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Oob:U64 | Found:T}>  TOTAL vector
+                    // access — `GetTry` lifted over a list of indices. A bounds-proof pass demotes
+                    // `GatherTry` to `Gather` + `inject Found` when the Oob lane is provably empty.
     Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
+    Unit,           // X -> Unit  forget the payload, keep the length — how a column becomes the `None`
+                    // lane of `Option = Sum{Unit | T}` (e.g. `branch 2 map_variant 1 (x -> x unit)`).
+    Select,         // (mask:U64, then:T, else:T) -> T  branchless per-row blend (the SIMD bitselect):
+                    // row i takes `then` if mask[i] != 0 else `else`. The dual of `Branch(2)`+`Weave` —
+                    // Branch avoids computing the unused side, Select avoids the partition; cheap bodies
+                    // favour Select. Shape-generic: it IS `gather_lanes([else, then], mask, identity)`.
 }
 
 impl<L: OpLike> Op<L> {
@@ -109,6 +213,58 @@ impl<L: OpLike> Op<L> {
                     inner.push(v);
                 }
                 Value::List(bounds.expect("Zip: empty product"), Box::new(Value::Prod(inner)))
+            }
+
+            // total Zip (pair): each SEQ row whose two inner lists have equal length zips into the Ok
+            // lane (a List<(X,Y)>); a length-mismatched row goes to Err carrying its two inner lists.
+            // Failure is per-row and a committed lane — never the whole-column panic Zip would raise.
+            Op::TryZip => {
+                let (lx, ly) = input.into_pair("TryZip");
+                let (bx, vx) = lx.into_list("TryZip lhs");
+                let (by, vy) = ly.into_list("TryZip rhs");
+                assert_eq!(bx.len(), by.len(), "TryZip: row count"); // outer agreement (scope length)
+                let mut tags = Vec::with_capacity(bx.len());
+                let (mut ok_outer, mut ok_x, mut ok_y) = (Vec::new(), Vec::new(), Vec::new());
+                let (mut ex_outer, mut ex_idx) = (Vec::new(), Vec::new());
+                let (mut ey_outer, mut ey_idx) = (Vec::new(), Vec::new());
+                let (mut sx, mut sy) = (0, 0);
+                let (mut oka, mut exa, mut eya) = (0, 0, 0);
+                for r in 0..bx.len() {
+                    let (ex, ey) = (bx[r], by[r]);
+                    let (lenx, leny) = (ex - sx, ey - sy);
+                    if lenx == leny {
+                        tags.push(1); // Ok
+                        for k in 0..lenx {
+                            ok_x.push(sx + k);
+                            ok_y.push(sy + k);
+                        }
+                        oka += lenx;
+                        ok_outer.push(oka);
+                    } else {
+                        tags.push(0); // Err
+                        for k in 0..lenx {
+                            ex_idx.push(sx + k);
+                        }
+                        for k in 0..leny {
+                            ey_idx.push(sy + k);
+                        }
+                        exa += lenx;
+                        ex_outer.push(exa);
+                        eya += leny;
+                        ey_outer.push(eya);
+                    }
+                    sx = ex;
+                    sy = ey;
+                }
+                let ok = Value::List(
+                    ok_outer,
+                    Box::new(Value::Prod(vec![gather(&vx, &ok_x), gather(&vy, &ok_y)])),
+                );
+                let err = Value::Prod(vec![
+                    Value::List(ex_outer, Box::new(gather(&vx, &ex_idx))),
+                    Value::List(ey_outer, Box::new(gather(&vy, &ey_idx))),
+                ]);
+                Value::sum(tags, vec![err, ok]) // lane 0 = Err, lane 1 = Ok
             }
 
             // destructure a sum column: the tag list plus each lane re-sliced per outer row. A
@@ -228,6 +384,30 @@ impl<L: OpLike> Op<L> {
                 Value::sum(tags.iter().map(|&t| t as usize).collect(), variants)
             }
 
+            // total Branch: tag t<n routes to lane t+1 (payload), tag>=n to lane 0 (Oob, carrying the
+            // bad tag). No panic — out-of-range is a committed lane, exactly like Index's Oob.
+            Op::TryBranch(n) => {
+                let (data, tags_v) = input.into_pair("TryBranch");
+                let tags = tags_v.into_u64("TryBranch tags");
+                assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
+                let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n + 1];
+                let mut oob = Vec::new();
+                let mut lanes = Vec::with_capacity(tags.len());
+                for (i, &t) in tags.iter().enumerate() {
+                    if (t as usize) < *n {
+                        lanes.push(t as usize + 1); // payload lanes are 1..=n
+                        groups[t as usize + 1].push(i);
+                    } else {
+                        lanes.push(0); // the Oob lane
+                        groups[0].push(i);
+                        oob.push(t);
+                    }
+                }
+                let mut variants = vec![Value::u64(oob)]; // lane 0 = the out-of-range tags
+                variants.extend(groups[1..].iter().map(|idx| gather(&data, idx)));
+                Value::sum(lanes, variants)
+            }
+
             Op::Unwrap => {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
@@ -248,6 +428,70 @@ impl<L: OpLike> Op<L> {
             Op::MapList(body) => {
                 let (bounds, inner) = input.into_list("MapList");
                 Value::List(bounds, Box::new(eval_graph(body, inner)))
+            }
+
+            // seeded left fold, vectorized across rows. `acc` is a column of one accumulator per row
+            // (starts as the seed). Round t pairs every still-long-enough row's acc with its t-th
+            // element, runs the body once over those active rows, scatters the results back. Rounds =
+            // the longest row; empty rows never become active, so it is total (empty list -> seed).
+            Op::Fold(body) => {
+                let (seed, list) = input.into_pair("Fold");
+                let (bounds, vals) = list.into_list("Fold list");
+                let mut acc = seed;
+                let mut active = init_active(&bounds);
+                let mut t = 0;
+                while !active.is_empty() {
+                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
+                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
+                    let acc_active = gather(&acc, &rows);
+                    let elt = gather(&vals, &elem);
+                    let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
+                    assert_eq!(updated.len(), rows.len(), "Fold body changed the row count");
+                    acc = scatter(acc, &rows, updated);
+                    t += 1;
+                    active.retain(|&(_, _, len)| len > t); // rows that just ran out drop here
+                }
+                acc
+            }
+
+            // mapAccumL: the body returns a PAIR (new state, output R). We thread field 0
+            // (the state) into `acc` and record field 1 (R) into the chunks; return (final state, [R]).
+            Op::FoldScan(body) => {
+                let (seed, list) = input.into_pair("FoldScan");
+                let (bounds, vals) = list.into_list("FoldScan list");
+                let total = vals.len();
+                let mut acc = seed;
+                let mut chunks: Vec<Value> = Vec::new();
+                let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                let mut active = init_active(&bounds);
+                let mut t = 0;
+                while !active.is_empty() {
+                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
+                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
+                    let acc_active = gather(&acc, &rows);
+                    let elt = gather(&vals, &elem);
+                    let (new_state, r) =
+                        eval_graph(body, Value::Prod(vec![acc_active, elt])).into_pair("FoldScan body");
+                    assert_eq!(new_state.len(), rows.len(), "FoldScan body changed the row count");
+                    for (slot, &pos) in elem.iter().enumerate() {
+                        tags[pos] = chunks.len();
+                        off[pos] = slot;
+                    }
+                    acc = scatter(acc, &rows, new_state);
+                    chunks.push(r);
+                    t += 1;
+                    active.retain(|&(_, _, len)| len > t);
+                }
+                // empty (no rounds): an empty R-shaped column, obtained by running the body on zero rows
+                // (R may differ from the state, so we can't reuse `acc`). Else stitch the recorded chunks.
+                let out_vals = if chunks.is_empty() {
+                    let z = eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]));
+                    z.into_pair("FoldScan body").1
+                } else {
+                    let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+                    gather_lanes(&refs, &tags, &off)
+                };
+                Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))])
             }
 
             Op::MapSum(arms) => {
@@ -279,7 +523,52 @@ impl<L: OpLike> Op<L> {
                 Value::List(lb, Box::new(inner))
             }
 
-            // point gather: each row-relative index becomes the haystack element it names.
+            // scalar point access: one index per row into that row's haystack list. Output is a
+            // bare T column (the list stratum is DROPPED — this is the eliminator). Partial: an
+            // out-of-bounds index is a data-dependent panic, like Gather's bounds check.
+            Op::Get => {
+                let (idx, haystack) = input.into_pair("Get");
+                let idxs = idx.into_u64("Get index");
+                let (hb, hvals) = haystack.into_list("Get haystack");
+                assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
+                let mut abs = Vec::with_capacity(idxs.len());
+                let mut hs = 0;
+                for (r, &he) in hb.iter().enumerate() {
+                    let x = idxs[r];
+                    assert!((x as usize) < he - hs, "Get: index {x} out of row {r}'s bounds");
+                    abs.push(hs + x as usize);
+                    hs = he;
+                }
+                gather(&hvals, &abs)
+            }
+
+            // total scalar access: each index either names its row's element (Found) or is out of
+            // bounds (Oob, carrying the bad index). The empty-row case is just Oob 0 — which is why
+            // `head = GetTry 0` is total with no non-emptiness proof. Output is a bare Sum column.
+            Op::GetTry => {
+                let (idx, haystack) = input.into_pair("GetTry");
+                let idxs = idx.into_u64("GetTry index");
+                let (hb, hvals) = haystack.into_list("GetTry haystack");
+                assert_eq!(idxs.len(), hb.len(), "GetTry: index/haystack row count");
+                let mut tags = Vec::with_capacity(idxs.len());
+                let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
+                let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
+                let mut hs = 0;
+                for (r, &he) in hb.iter().enumerate() {
+                    let x = idxs[r];
+                    if (x as usize) < he - hs {
+                        tags.push(1);
+                        abs.push(hs + x as usize);
+                    } else {
+                        tags.push(0);
+                        oob.push(x);
+                    }
+                    hs = he;
+                }
+                Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)])
+            }
+
+            // vector point gather: each row-relative index becomes the haystack element it names.
             // Output bounds are the index list's bounds (the indices decide the cardinality).
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather");
@@ -288,6 +577,39 @@ impl<L: OpLike> Op<L> {
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
                 let abs = resolve_indices(&ib, &ivals.into_u64("Gather indices"), &hb);
                 Value::List(ib, Box::new(gather(&hvals, &abs)))
+            }
+
+            // total vector access: each index either names a haystack-row element (Found) or is out of
+            // that row's bounds (Oob, carrying the bad index). The per-element test is branchless (a
+            // comparison to a u64); only the routing into the two lanes is data-dependent. Output is a
+            // list (the index list's bounds) of Sum{Oob:U64 | Found:T}.
+            Op::GatherTry => {
+                let (idx, haystack) = input.into_pair("GatherTry");
+                let (ib, ivals) = idx.into_list("GatherTry indices");
+                let (hb, hvals) = haystack.into_list("GatherTry haystack");
+                assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
+                let idxs = ivals.into_u64("GatherTry indices");
+                let mut tags = Vec::with_capacity(idxs.len());
+                let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
+                let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
+                let (mut is, mut hs) = (0, 0);
+                for r in 0..ib.len() {
+                    let (ie, he) = (ib[r], hb[r]);
+                    let rowlen = he - hs;
+                    for &x in &idxs[is..ie] {
+                        if (x as usize) < rowlen {
+                            tags.push(1);
+                            abs.push(hs + x as usize);
+                        } else {
+                            tags.push(0);
+                            oob.push(x);
+                        }
+                    }
+                    is = ie;
+                    hs = he;
+                }
+                let sum = Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)]);
+                Value::List(ib, Box::new(sum))
             }
 
             // DESTRUCTURE one list layer: return the per-inner-list ranges (relative to
@@ -326,20 +648,6 @@ impl<L: OpLike> Op<L> {
                 Value::List((1..=n).collect(), Box::new(input))
             }
 
-            // each row's first element — the stratum drop back out of a List. Partial: an empty
-            // row has no head, a data-dependent panic like Gather's bounds check.
-            Op::Head => {
-                let (bounds, vals) = input.into_list("Head");
-                let mut idx = Vec::with_capacity(bounds.len());
-                let mut start = 0;
-                for (r, &end) in bounds.iter().enumerate() {
-                    assert!(start < end, "Head: row {r} is empty");
-                    idx.push(start);
-                    start = end;
-                }
-                gather(&vals, &idx)
-            }
-
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
             Op::Iota => {
@@ -353,6 +661,23 @@ impl<L: OpLike> Op<L> {
                     bounds.push(end);
                 }
                 Value::List(bounds, Box::new(Value::u64(vals)))
+            }
+
+            // forget the payload, keep the row count — the constructor for unit/`None` columns.
+            Op::Unit => Value::Unit(input.len()),
+
+            // branchless blend: a two-source `gather_lanes` reading each row's own position from the
+            // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
+            // identity offset reads row i from row i — the whole "computed both sides, pick per lane".
+            Op::Select => {
+                let mut cols = input.into_prod("Select");
+                assert_eq!(cols.len(), 3, "Select: expected (mask, then, else)");
+                let els = cols.pop().unwrap();
+                let then = cols.pop().unwrap();
+                let mask = cols.pop().unwrap().into_u64("Select mask");
+                let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
+                let off: Vec<usize> = (0..tags.len()).collect();
+                gather_lanes(&[Some(&els), Some(&then)], &tags, &off)
             }
         }
     }
@@ -392,6 +717,18 @@ impl<L: OpLike> Op<L> {
                     List(Box::new(Prod(inners)))
                 }
                 _ => return err("Zip expects a nonempty product of lists"),
+            },
+
+            // total Zip (pair): Sum{ Err: (List<X>, List<Y>) | Ok: List<(X,Y)> }.
+            Op::TryZip => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (List(x), List(y)) => Sum(vec![
+                        Some(Prod(vec![List(x.clone()), List(y.clone())])),
+                        Some(List(Box::new(Prod(vec![(**x).clone(), (**y).clone()])))),
+                    ]),
+                    _ => return err("TryZip expects (List<X>, List<Y>)"),
+                },
+                _ => return err("TryZip expects a pair of lists"),
             },
 
             // every lane must be committed: a ⊥ lane would need a standalone List<⊥>, and ⊥ lives
@@ -467,6 +804,20 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Branch expects (X, U64-tags)"),
             },
 
+            // total Branch: an extra leading Oob:U64 lane, then the n payload lanes (n+1 total, so the
+            // u8 tag bound is n+1).
+            Op::TryBranch(n) => match input {
+                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
+                    if *n + 1 > 256 {
+                        return err(&format!("TryBranch: arity {n}+1 exceeds the u8 tag width"));
+                    }
+                    let mut lanes = vec![Some(Prim(64))];
+                    lanes.extend(std::iter::repeat_n(Some(ts[0].clone()), *n));
+                    Sum(lanes)
+                }
+                _ => return err("TryBranch expects (X, U64-tags)"),
+            },
+
             // only the widths the `prim!` macro generates exist; any other would judge fine and
             // panic at eval — the typer owns the rejection.
             Op::Cast(bits) => match input {
@@ -493,12 +844,41 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Slices expects a pair"),
             },
 
+            // scalar access: (U64, List<T>) -> T — the index is a leaf column, the list stratum drops.
+            Op::Get => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (Prim(64), List(t)) => (**t).clone(),
+                    _ => return err("Get expects (U64, List<T>)"),
+                },
+                _ => return err("Get expects a pair"),
+            },
+
+            // total scalar access: (U64, List<T>) -> Sum{Oob: U64 | Found: T} — Oob carries the index.
+            Op::GetTry => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (Prim(64), List(t)) => Sum(vec![Some(Prim(64)), Some((**t).clone())]),
+                    _ => return err("GetTry expects (U64, List<T>)"),
+                },
+                _ => return err("GetTry expects a pair"),
+            },
+
             Op::Gather => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
                     (List(i), List(t)) if **i == Prim(64) => List(t.clone()),
                     _ => return err("Gather expects (List<U64>, List<T>)"),
                 },
                 _ => return err("Gather expects a pair"),
+            },
+
+            // total vector access: List<Sum{Oob: U64 | Found: T}> — the Oob lane carries the bad index.
+            Op::GatherTry => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (List(i), List(t)) if **i == Prim(64) => {
+                        List(Box::new(Sum(vec![Some(Prim(64)), Some((**t).clone())])))
+                    }
+                    _ => return err("GatherTry expects (List<U64>, List<T>)"),
+                },
+                _ => return err("GatherTry expects a pair"),
             },
 
             Op::Flatten => match input {
@@ -511,14 +891,18 @@ impl<L: OpLike> Op<L> {
 
             Op::Enlist => List(Box::new(input.clone())),
 
-            Op::Head => match input {
-                List(x) => (**x).clone(),
-                _ => return err("Head expects a list"),
-            },
-
             Op::Iota => match input {
                 Prim(64) => List(Box::new(Prim(64))),
                 _ => return err("Iota expects U64"),
+            },
+
+            Op::Unit => Unit, // any shape -> Unit
+
+            // (U64 mask, T, T) -> T. The two branches join (a ⊥ lane adopts its sibling, as in Unwrap);
+            // eval never reads a branch the mask doesn't select, so the join is total.
+            Op::Select => match input {
+                Prod(ts) if ts.len() == 3 && ts[0] == Prim(64) => join(&ts[1], &ts[2])?,
+                _ => return err("Select expects (U64 mask, T, T)"),
             },
 
             // homogeneous up to `⊥`: fold the committed (`Some`) lanes by `join`, so `⊥` lanes adopt the
@@ -555,6 +939,38 @@ impl<L: OpLike> Op<L> {
                 _ => return err("MapList expects a list"),
             },
 
+            // (B, List<A>) -> B. The body, on (B, A), must again yield B (joined ⊥-tolerantly with the
+            // seed shape). Heterogeneous: the accumulator B and element A need not match.
+            Op::Fold(body) => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    List(a) => {
+                        let body_out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
+                        join(&ts[0], &body_out)?
+                    }
+                    _ => return err("Fold expects (B, List<A>)"),
+                },
+                _ => return err("Fold expects a pair"),
+            },
+
+            // (T, List<A>) -> (T, List<R>). The body, on (T, A), must return (T', R) with T' joining the
+            // state T; the result is the final state and the list of emitted R.
+            Op::FoldScan(body) => match input {
+                Prod(ts) if ts.len() == 2 => match &ts[1] {
+                    List(a) => {
+                        let out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
+                        match out {
+                            Prod(os) if os.len() == 2 => {
+                                let state = join(&ts[0], &os[0])?;
+                                Prod(vec![state, List(Box::new(os[1].clone()))])
+                            }
+                            _ => return err("FoldScan body must return (T, R)"),
+                        }
+                    }
+                    _ => return err("FoldScan expects (T, List<A>)"),
+                },
+                _ => return err("FoldScan expects a pair"),
+            },
+
             Op::MapSum(arms) => match input {
                 Sum(ts) => {
                     let mut out = ts.clone();
@@ -583,6 +999,7 @@ impl<L: OpLike> Op<L> {
     pub(crate) fn children(&self) -> Vec<&Graph<L>> {
         match self {
             Op::MapList(b) => vec![b],
+            Op::Fold(b) | Op::FoldScan(b) => vec![b],
             Op::MapSum(arms) => arms.iter().map(|(_, b)| b).collect(),
             _ => Vec::new(),
         }

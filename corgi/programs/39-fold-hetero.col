@@ -1,0 +1,8 @@
+# heterogeneous fold: the accumulator B = (U64, U64) is a DIFFERENT shape than the element A = U64.
+# Folding (sum, count) over [0,1,2,3,4] yields (10, 5) — the generalization of the original (T,[T])->T
+# to (B,[A])->B (the classic fold; needed for e.g. parsing digits into a number, char A into int B).
+# The lambda's (acc, x) pattern binds acc to the pair and x to the leaf; acc.0 / acc.1 project it.
+# n = 5
+# = ([10], [5])
+let seed = (input lit 0, input lit 0) in
+(seed, input iota) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))

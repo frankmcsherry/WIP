@@ -168,6 +168,8 @@ mod discriminate {
             Value::Prod(cols) => sort_prod_blocks(labels, cols),
             Value::Sum(tags, within, variants) => sort_sum_blocks(labels, tags, within, variants),
             Value::List(bounds, vals) => sort_list_blocks(labels, bounds, vals),
+            // unit rows are all equal: stable identity perm, no label refinement.
+            Value::Unit(n) => ((0..*n).collect(), labels.to_vec()),
         }
     }
 

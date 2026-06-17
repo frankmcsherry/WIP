@@ -13,6 +13,9 @@ pub enum Value {
                                   // one lane per variant; a `None` lane is `⊥` — uncommitted, holds no rows
                                   // (no row carries its tag) and adopts a sibling's shape at a merge.
     List(Vec<usize>, Box<Value>), // end-offset per row; flattened values
+    Unit(usize),                  // a length-carrying unit column: `n` rows, no payload. The terminal
+                                  // object as a COLUMN (a fieldless `Prod` has no length witness); the
+                                  // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
 }
 
 /// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
@@ -68,6 +71,56 @@ macro_rules! prim {
             pub(crate) fn gather(&self, idx: &[usize]) -> Prim {
                 match self {
                     $( Prim::$V(v) => Prim::$V(Arc::new(idx.iter().map(|&i| v[i]).collect())), )+
+                }
+            }
+
+            /// lane-wise min (`take_max=false`) or max (`true`) of two same-width columns, KIND-BLIND:
+            /// the leaf is stored order-preserving (unsigned native, signed/float swizzled), so byte
+            /// min/max IS value min/max for every kind — no deswizzle. An order op, hence `cmp`'s, not
+            /// arithmetic's. (The `cmp` analogue of `rel`: same kind-blindness, picks a value not a mask.)
+            /// CONSUMES both operands and writes in place into whichever is uniquely owned (same
+            /// opportunistic reuse as arithmetic's `bin_into`; min/max is a same-width elementwise binary
+            /// like add/sub/mul, so it shares that path); only when both are shared do we allocate.
+            pub(crate) fn lane_pick(self, other: Prim, take_max: bool) -> Prim {
+                match (self, other) {
+                    $( (Prim::$V(mut a), Prim::$V(mut b)) => {
+                        let pick = |x: $t, y: $t| if take_max { x.max(y) } else { x.min(y) };
+                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
+                            for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = pick(*x, y); }
+                            a
+                        } else if let Some(dst) = Arc::get_mut(&mut b) {
+                            for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = pick(x, *y); }
+                            b
+                        } else {
+                            Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| pick(x, y)).collect())
+                        })
+                    } )+
+                    _ => panic!("min/max: prim width mismatch"),
+                }
+            }
+
+            /// XOR the top (sign) bit of every element, at this width — the order-preserving signed
+            /// swizzle (`enc_i64` generalized), an involution. Converts an unsigned column to the
+            /// signed encoding of the same non-negative values and back; the numeric layer's `signed`.
+            pub(crate) fn xor_signbit(&self) -> Prim {
+                match self {
+                    $( Prim::$V(v) => {
+                        let m = !(<$t>::MAX >> 1);
+                        Prim::$V(Arc::new(v.iter().map(|&x| x ^ m).collect()))
+                    } )+
+                }
+            }
+
+            /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives the
+            /// buffer mutably when uniquely owned (the common case), or clones it once if shared. Touches
+            /// only the `active` rows; no allocation in the unique case. The leaf of [`scatter`].
+            pub(crate) fn scatter_into(&mut self, active: &[usize], src: &Prim) {
+                match (self, src) {
+                    $( (Prim::$V(dst), Prim::$V(s)) => {
+                        let dst = Arc::make_mut(dst);
+                        for (p, &r) in active.iter().enumerate() { dst[r] = s[p]; }
+                    } )+
+                    _ => panic!("scatter_into: prim width mismatch"),
                 }
             }
 
@@ -229,6 +282,7 @@ impl Value {
                 ss.iter().map(|o| o.as_ref().map(Value::empty)).collect(),
             ),
             Shape::List(s) => Value::List(Vec::new(), Box::new(Value::empty(s))),
+            Shape::Unit => Value::Unit(0),
         }
     }
 
@@ -239,6 +293,7 @@ impl Value {
             Value::Prod(c) => c.first().map_or(0, |c| c.len()),
             Value::Sum(t, _, _) => t.len(),
             Value::List(b, _) => b.len(),
+            Value::Unit(n) => *n,
         }
     }
 
@@ -313,5 +368,6 @@ pub fn show(v: &Value) -> String {
             format!("Sum tags={:?} [{}]", t.usize_vec(), lanes.join(", "))
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b, show(vals)),
+        Value::Unit(n) => format!("()x{n}"),
     }
 }

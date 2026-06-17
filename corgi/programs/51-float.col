@@ -1,0 +1,10 @@
+# typed FLOAT arithmetic, reached by suffix (`div_f32`, `neg_f32`). Floats enter via `to_f32` (an
+# unsigned int -> the f32 of the same value, total-order encoded); there is no float literal token —
+# a float constant is `lit_uN K to_fN`. Two checks: 6/4 = 3/2 = 1.5 (IEEE division), and -1.0 < +1.0
+# under the TOTAL order (the kind-blind comparator on the swizzled bits). Division is total: x/0 -> inf,
+# never a panic. Float order/equality is total, NOT IEEE (NaN orderable, -0 != +0) — see NOTES.
+# n = 1
+# = [1]
+let half3 = (input lit_u32 3 to_f32, input lit_u32 2 to_f32) div_f32 in
+let half6 = (input lit_u32 6 to_f32, input lit_u32 4 to_f32) div_f32 in
+((half3, half6) eq, (input lit_u32 1 to_f32 neg_f32, input lit_u32 1 to_f32) lt) mul

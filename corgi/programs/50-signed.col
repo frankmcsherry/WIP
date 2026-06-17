@@ -1,0 +1,9 @@
+# typed SIGNED arithmetic, reached by suffix (`sub_i32`, `neg_i32`) over the order-preserving signed
+# encoding. Two algebraic laws: 3 - 7 = -(7 - 3) (signed subtraction goes negative correctly), and
+# double negation is the identity. `lit_i32 N` is a sign-swizzled literal; the kind-blind comparator
+# reads the swizzled bytes, so `eq` works across kinds.
+# n = 1
+# = [1]
+let a = input lit_i32 3 in
+let b = input lit_i32 7 in
+(((a, b) sub_i32, (b, a) sub_i32 neg_i32) eq, (a neg_i32 neg_i32, a) eq) mul

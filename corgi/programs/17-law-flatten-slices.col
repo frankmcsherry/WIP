@@ -1,3 +1,3 @@
 # n = 4
 # = [1]
-let data = input iota map (x -> x iota) in let rt = (let f = data flatten in (f.0, f.1) slices) in (data, rt) eq
+let data = input iota map (x -> x iota) in let rt = (let f = data flatten in (f.0, f.1) slices_uns) in (data, rt) eq

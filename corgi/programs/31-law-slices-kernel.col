@@ -6,7 +6,7 @@
 # = [1]
 let hay = input iota in
 let lohi = hay map (x -> (x shr 1, x)) in
-let fused = (lohi, hay) slices in
+let fused = (lohi, hay) slices_uns in
 let kernel = (hay, lohi) cap_list map (q ->
-    ((q.1.0, (q.1.1, q.1.0) sub iota) cap_list map (r -> (r.0, r.1) add), q.0) gather) in
+    ((q.1.0, (q.1.1, q.1.0) sub iota) cap_list map (r -> (r.0, r.1) add), q.0) gather_uns) in
 (fused, kernel) eq

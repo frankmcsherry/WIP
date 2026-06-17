@@ -1,0 +1,14 @@
+# the List⊗Prod CAPTURE cell: cap_list is the STRENGTH of List — (X, List<Y>) -> List<(X,Y)>, the
+# list-side dual of cap_sum (the Prod-over-Sum distributivity, program 30). Two laws witness it:
+# Conjunct 1 (strip): capturing a context then projecting the payload recovers the list unchanged —
+#   the round-trip identity, exactly cap_sum's strip conjunct.
+# Conjunct 2 (naturality): mapping the payload before capture equals capturing then mapping field 1 —
+#   the strength commutes with the functor action. (Both spellings need cap_list precisely because a
+#   bare `map` body cannot see the outer context; capture is what brings it in.)
+# n = 6
+# = [1]
+let ctx = input in
+let ys = input iota in
+let strip = ((ctx, ys) cap_list map (p -> p.1), ys) eq in
+let natural = ((ctx, ys map (y -> y add_u64 1)) cap_list, (ctx, ys) cap_list map (p -> (p.0, p.1 add_u64 1))) eq in
+(strip, natural) mul

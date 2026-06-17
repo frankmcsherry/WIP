@@ -1,0 +1,6 @@
+# scan: the inclusive prefix scan (B, List<A>) -> List<B> — Fold retaining each step. Seed 0 and `add`
+# give the cumulative sum of [0,1,2,3,4] = [0,1,3,6,10]. Same lockstep eval as fold; one B per A, so
+# the output list has the input's bounds. `scan` then last-element = `fold` (the running total's tail).
+# n = 5
+# = List ends=[5] <[0, 1, 3, 6, 10]>
+(input lit 0, input iota) scan ((a, x) -> (a, x) add)

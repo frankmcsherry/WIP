@@ -1,0 +1,10 @@
+# branch_try agrees with branch when every tag is in range. On a 0/1 mask (tags clamped by `and 1`,
+# so always < 2), the payload lanes of `branch_try 2` (lanes 1,2) carry exactly what `branch 2` puts
+# in lanes 0,1 — the Oob lane stays empty. This is the law a range pass would use to demote
+# branch_try -> branch: when Oob is provably empty, the two agree up to the lane shift.
+# n = 8
+# = [1]
+let xs = input iota in
+let viab = xs map (x -> (x, x and 1) branch 2 unwrap) in
+let viat = xs map (x -> (x, x and 1) branch_try 2 match (0 (o -> o), 1 (a -> a), 2 (b -> b))) in
+(viab, viat) eq

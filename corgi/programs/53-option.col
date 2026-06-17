@@ -1,0 +1,10 @@
+# true Option via the length-carrying Unit leaf: Option<T> = Sum{Some: T | None: Unit}. Each element
+# is classified even -> Some(x), odd -> None: `branch 2` splits on the parity mask (lane 0 = evens,
+# lane 1 = odds), and `map_variant 1 (o -> o unit)` forgets the odd payloads to Unit — the None lane
+# carries no data, just its length (shown as `()x2`). `match` then supplies a default 0 for None and
+# x+100 for Some. The Unit lane is what a fieldless product could not be: a column with a length.
+# n = 6
+# = List ends=[6] <[100, 0, 102, 0, 104, 0]>
+input iota map (x ->
+    (x, x and 1) branch 2 map_variant 1 (o -> o unit)
+    match (0 (some -> some add_u64 100), 1 (none -> none lit 0)))

@@ -20,6 +20,7 @@ pub enum Shape {
     Sum(Vec<Option<Shape>>), // one slot per variant; `None` is `⊥` — an uncommitted (e.g. `Inject`'d-past)
                              // lane, the bottom of the lattice that `join` lets adopt a sibling's shape.
     List(Box<Shape>),
+    Unit, // the length-carrying unit (payload-free); `None` of `Option = Sum{Unit | T}`.
 }
 
 /// the join of two shapes: equal concretes join to themselves, the recursion is structural, and a
@@ -37,6 +38,7 @@ pub fn join(a: &Shape, b: &Shape) -> Result<Shape, String> {
             Sum(xs.iter().zip(ys).map(|(x, y)| join_lane(x, y)).collect::<Result<_, _>>()?)
         }
         (List(x), List(y)) => List(Box::new(join(x, y)?)),
+        (Unit, Unit) => Unit,
         _ => return Err(format!("shapes do not unify: {a} vs {b}")),
     })
 }
@@ -58,6 +60,7 @@ pub fn shape_of_value(v: &Value) -> Shape {
             Shape::Sum(variants.iter().map(|o| o.as_ref().map(shape_of_value)).collect())
         }
         Value::List(_, vals) => Shape::List(Box::new(shape_of_value(vals))),
+        Value::Unit(_) => Shape::Unit,
     }
 }
 
@@ -75,6 +78,7 @@ impl std::fmt::Display for Shape {
                 write!(f, "{{{}}}", inner.join(" | "))
             }
             Shape::List(t) => write!(f, "List<{t}>"),
+            Shape::Unit => write!(f, "()"),
         }
     }
 }

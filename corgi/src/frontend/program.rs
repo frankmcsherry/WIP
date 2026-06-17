@@ -43,11 +43,19 @@ impl Program {
         shape_of(&self.graph, input)
     }
 
-    /// run the program on an input, consuming it — after shape-checking the graph against the input's
-    /// shape, so an ill-typed program is a located `Err` here rather than a panic deep inside an op.
-    /// This is the enforced surface boundary: nothing reaches `eval_graph` without passing the typer.
+    /// run the program on an input, consuming it — after shape-checking the graph and proving its two
+    /// static gates: Class-A bounds (`check_lengths`: `Zip`/`Filter` agreement) and Class-B ranges
+    /// (`check_ranges`: `branch` tag-in-range). An ill-typed or gate-failing program is a located `Err`
+    /// here rather than a panic deep inside an op. NOTE the scope: these gates cover `Zip`/`Filter`/
+    /// `branch` only. An UNCHECKED `*_uns` op (`get_uns`/`gather_uns`/`slices_uns`, incl. `head_uns`
+    /// which lowers to `get_uns 0`) has a data-dependent precondition no gate proves and can still panic
+    /// in `eval` — for the full no-panic guarantee a caller must additionally require `check_total`
+    /// (`run` deliberately does not, so the corpus can exercise the `_uns` tier).
     pub fn run(&self, input: Value) -> Result<Value, String> {
-        shape_of(&self.graph, &shape_of_value(&input))?;
+        let shape = shape_of_value(&input);
+        shape_of(&self.graph, &shape)?;
+        crate::lengths::check_lengths(&self.graph, &shape)?;
+        crate::ranges::check_ranges(&self.graph, &shape)?;
         Ok(eval_graph(&self.graph, input))
     }
 }

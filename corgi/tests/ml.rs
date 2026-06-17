@@ -29,7 +29,7 @@ fn sample() -> Value {
 
 #[test]
 fn sum_scores_with_destructure() {
-    let src = "let (subj, vals) = input.1 transpose in vals reduce_sum";
+    let src = "let (subj, vals) = input.1 transpose in vals reduce_add";
     assert_eq!(run_ml(src, &sample()), "[300, 300, 1500]");
 }
 
@@ -60,9 +60,9 @@ fn juxtaposition_stops_at_let_in() {
 #[test]
 fn let_sharing_beats_fanout_recompute() {
     // same join: `let t = transpose` shares the transpose once; inlining it fans out and recomputes.
-    let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
+    let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices_uns";
     let inlined =
-        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
+        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices_uns";
     let shared_nodes = parse_ml(shared).unwrap().node_count();
     let inlined_nodes = parse_ml(inlined).unwrap().node_count();
     assert!(shared_nodes < inlined_nodes, "shared {shared_nodes} should be < inlined {inlined_nodes}");
@@ -73,12 +73,12 @@ fn workhorse_products_sums_lists() {
     // ONE program that walks the whole data model on the `sample()` record-batch
     //   ( id:U64, scores:List<(subj,val)>, contact:Sum{Email|Phone} ):
     //   input.1 transpose        List<(subj,val)> -> (List<subj>, List<val>)   [list <-> product]
-    //   scores.1 reduce_sum       List<val> -> one U64 per record (sum each row) [list -> scalar]
+    //   scores.1 reduce_add       List<val> -> one U64 per record (sum each row) [list -> scalar]
     //   (input.0, totals) add     pair the id column with the totals, add them   [product + arith]
     //   map_variant 0 (..) unwrap bump the Email variant, then flatten the sum    [sum navigation]
     //   (id_plus, contact)           bundle the two results into a product           [product build]
     let src = "let scores = input.1 transpose in \
-               let totals = scores.1 reduce_sum in \
+               let totals = scores.1 reduce_add in \
                let id_plus = (input.0, totals) add in \
                let contact = input.2 map_variant 0 (e -> e add_u64 1000000) unwrap in \
                (id_plus, contact)";
@@ -138,4 +138,15 @@ fn errors_are_reported() {
 fn string_literal_broadcasts() {
     // a string literal as a stage is a constant List<U8>, broadcast to the value.
     assert_eq!(run_ml("input \"hi\"", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
+}
+
+#[test]
+fn head_sugar_is_total() {
+    // `head` lowers to `get_try 0`, `head_uns` to `get_uns 0`. Cover the total branch the corpus
+    // (which uses only head_uns) misses: a non-empty row yields Found(first), an EMPTY row yields
+    // Oob 0 — no panic. (`input add_u64 1 iota` is [0..n+1); `input iota` at n=0 is the empty row.)
+    assert_eq!(run_ml("input add_u64 1 iota head", &u64(&[3])), "Sum tags=[1] [[], [0]]");
+    assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[0] [[0], []]");
+    // head_uns on a non-empty row extracts the bare element.
+    assert_eq!(run_ml("input add_u64 1 iota head_uns", &u64(&[3])), "[0]");
 }

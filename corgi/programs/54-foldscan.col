@@ -1,0 +1,14 @@
+# foldscan = mapAccumL: a body (T,A)->(T,R) threads a state and emits an output per element, returning
+# (final state, [R]). It unifies fold and scan — fold is the .0 projection with R=Unit, scan is the .1
+# projection emitting (newstate, newstate) — and expresses stateful maps neither does (here a running
+# index: state is a counter, output is the index, so it reproduces iota). Three equivalences in one:
+# as-fold == fold, as-scan == scan, running-index == iota.
+# n = 6
+# = ([1], [1], [1])
+let xs = input iota in
+let as_fold = ((input lit 0, xs) foldscan ((a, x) -> ((a, x) add, x unit))) .0 in
+let as_scan = ((input lit 0, xs) foldscan ((a, x) -> let a2 = (a, x) add in (a2, a2))) .1 in
+let idx     = ((input lit 0, xs) foldscan ((i, x) -> (i add_u64 1, i))) .1 in
+((as_fold, (input lit 0, xs) fold ((a, x) -> (a, x) add)) eq,
+ (as_scan, (input lit 0, xs) scan ((a, x) -> (a, x) add)) eq,
+ (idx, xs) eq)

@@ -1,5 +1,5 @@
 //! A small ML-flavoured expression surface, concatenative-by-juxtaposition: a value is followed by
-//! its operator stages with no separator (`input iota reduce_sum`). `let` boils binding into shared
+//! its operator stages with no separator (`input iota reduce_add`). `let` boils binding into shared
 //! edges (no re-derivation), with product destructuring; lambdas (`x -> …`) are the map/match bodies;
 //! sums are built/eliminated via `inject`/`match`. A stage-chain runs until a token that can't begin a
 //! stage — notably the `let` body's `in`, the one identifier allowed to follow a complete chain.
@@ -10,6 +10,7 @@
 //!   pat    = IDENT | '(' IDENT (',' IDENT)* ')'
 //!   pipe   = proj apply*                               -- juxtaposition; chain ends before `in`
 //!   apply  = 'map' '(' lambda ')'
+//!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
 //!          | 'map_variant' tag '(' lambda ')'
 //!          | 'match' '(' (tag '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
 //!          | 'inject' (NUM NUM | VARIANT)                   -- sum construction (tag arity)
@@ -22,14 +23,14 @@
 //!   proj   = atom ('.' NUM)*
 //!   atom   = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
 //!
-//! e.g.  let (subj, vals) = input.1 transpose in vals reduce_sum
+//! e.g.  let (subj, vals) = input.1 transpose in vals reduce_add
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
 //!       xs inject 0 2                                      -- tag xs into variant 0 of 2
 //!       xs inject Lo                                       -- both numbers off the declaration
 
 use super::{pair_imm, resolve, str_value, takes_num};
-use crate::graph::{Builder, Graph};
+use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::{NumOp, Op};
 use crate::value::Value;
 use std::collections::HashMap;
@@ -138,9 +139,13 @@ enum Apply {
     BinImm(String, u64), // pair op + immediate: `x sub 1` desugars to `(x, x lit 1) sub`
     Str(Vec<u8>),
     Map(Pat, Box<E>),
+    Fold(Pat, Box<E>), // (B, List<A>) folded by a binary body; the lambda's tuple pattern is (acc, x)
+    Scan(Pat, Box<E>), // (B, List<A>) scanned by a binary body; inclusive running accumulator
+    FoldScan(Pat, Box<E>), // (T, List<A>) -> (T, List<R>); body (acc, x) -> (new state, output R)
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, usize),         // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
+    Head(bool), // `head`/`head_uns`: sugar for `(lit 0, list) get_try`/`get_uns` — the first element
 }
 
 enum E {
@@ -308,6 +313,25 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(Apply::Map(x, Box::new(body)))
             }
+            // fold / scan: the value is a pair (seed, list); the lambda destructures (acc, x).
+            "fold" => {
+                self.eat(&Tok::LParen)?;
+                let (x, body) = self.lambda()?;
+                self.eat(&Tok::RParen)?;
+                Ok(Apply::Fold(x, Box::new(body)))
+            }
+            "scan" => {
+                self.eat(&Tok::LParen)?;
+                let (x, body) = self.lambda()?;
+                self.eat(&Tok::RParen)?;
+                Ok(Apply::Scan(x, Box::new(body)))
+            }
+            "foldscan" => {
+                self.eat(&Tok::LParen)?;
+                let (x, body) = self.lambda()?;
+                self.eat(&Tok::RParen)?;
+                Ok(Apply::FoldScan(x, Box::new(body)))
+            }
             "map_variant" => {
                 let (k, _) = self.variant()?;
                 self.eat(&Tok::LParen)?;
@@ -345,6 +369,10 @@ impl P {
                 };
                 Ok(Apply::Inject(tag, arity))
             }
+            // head: first element, sugar for `get 0`. `head` is total (an empty row -> Oob 0), so it
+            // lowers to `get_try`; `head_uns` asserts non-empty and lowers to `get_uns`.
+            "head" => Ok(Apply::Head(true)),
+            "head_uns" => Ok(Apply::Head(false)),
             // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
             // it names a byte, not a count.
             "split" => match self.bump() {
@@ -441,6 +469,15 @@ fn lower_body(pat: &Pat, body: &E) -> Result<Graph<NumOp>, String> {
     Ok(bb.finish(bout))
 }
 
+/// append `Tuple([out, out])` to a body `(T,A)->B`, making it `(T,A)->(B,B)` — the `FoldScan` body
+/// that re-expresses `scan`: the new state and the emitted output are both the running accumulator.
+fn dup_output(mut g: Graph<NumOp>) -> Graph<NumOp> {
+    let out = g.output;
+    let tup = g.nodes.len();
+    g.nodes.push(Node { kind: NodeKind::Tuple, inputs: vec![out, out] });
+    Graph { nodes: g.nodes, output: tup }
+}
+
 fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
     match e {
         E::Var(name) => env.get(name).copied().ok_or_else(|| format!("unbound variable '{name}'")),
@@ -469,6 +506,17 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 }
                 Apply::Str(bytes) => Ok(b.add(Op::Lit(str_value(bytes.clone())), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
+                Apply::Fold(x, body) => Ok(b.add(Op::Fold(Box::new(lower_body(x, body)?)), vec![id])),
+                // scan IS foldscan: a body `(a,x) -> b` becomes `(a,x) -> (b, b)` (state = output), and
+                // the running-accumulator list is field 1 of the result. Measured identical to a
+                // dedicated Scan, so `Op::Scan` is retired in favour of this lowering.
+                Apply::Scan(x, body) => {
+                    let fs = b.add(Op::FoldScan(Box::new(dup_output(lower_body(x, body)?))), vec![id]);
+                    Ok(b.add(Op::Field(1), vec![fs]))
+                }
+                Apply::FoldScan(x, body) => {
+                    Ok(b.add(Op::FoldScan(Box::new(lower_body(x, body)?)), vec![id]))
+                }
                 Apply::MapVariant(k, x, body) => {
                     Ok(b.add(Op::MapSum(vec![(*k, lower_body(x, body)?)]), vec![id]))
                 }
@@ -481,6 +529,12 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     Ok(b.add(Op::Unwrap, vec![ms]))
                 }
                 Apply::Inject(tag, arity) => Ok(b.add(Op::Inject(*tag, *arity), vec![id])),
+                // first element = index 0 of the row: build the (0, list) pair and scalar-`get` it.
+                Apply::Head(total) => {
+                    let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
+                    let pair = b.tuple(vec![zero, id]);
+                    Ok(b.add(if *total { Op::GetTry } else { Op::Get }, vec![pair]))
+                }
             }
         }
     }
