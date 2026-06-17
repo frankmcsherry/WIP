@@ -72,7 +72,7 @@ impl CmpOp {
                 let (a, b) = input.into_pair("min/max");
                 let (pa, pb) = (a.into_prim("min/max lhs"), b.into_prim("min/max rhs"));
                 assert_eq!(pa.len(), pb.len(), "min/max: operands at different strata");
-                Value::Prim(pa.lane_pick(&pb, take_max))
+                Value::Prim(pa.lane_pick(pb, take_max))
             }
 
             CmpOp::Gt(c) => {

@@ -78,10 +78,23 @@ macro_rules! prim {
             /// the leaf is stored order-preserving (unsigned native, signed/float swizzled), so byte
             /// min/max IS value min/max for every kind — no deswizzle. An order op, hence `cmp`'s, not
             /// arithmetic's. (The `cmp` analogue of `rel`: same kind-blindness, picks a value not a mask.)
-            pub(crate) fn lane_pick(&self, other: &Prim, take_max: bool) -> Prim {
+            /// CONSUMES both operands and writes in place into whichever is uniquely owned (same
+            /// opportunistic reuse as arithmetic's `bin_into`; min/max is a same-width elementwise binary
+            /// like add/sub/mul, so it shares that path); only when both are shared do we allocate.
+            pub(crate) fn lane_pick(self, other: Prim, take_max: bool) -> Prim {
                 match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) => Prim::$V(Arc::new(a.iter().zip(b.iter())
-                        .map(|(&x, &y)| if take_max { x.max(y) } else { x.min(y) }).collect())), )+
+                    $( (Prim::$V(mut a), Prim::$V(mut b)) => {
+                        let pick = |x: $t, y: $t| if take_max { x.max(y) } else { x.min(y) };
+                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
+                            for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = pick(*x, y); }
+                            a
+                        } else if let Some(dst) = Arc::get_mut(&mut b) {
+                            for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = pick(x, *y); }
+                            b
+                        } else {
+                            Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| pick(x, y)).collect())
+                        })
+                    } )+
                     _ => panic!("min/max: prim width mismatch"),
                 }
             }
