@@ -25,6 +25,43 @@ fn map_kind(kind: &NodeKind<NumOp>, f: fn(&Graph<NumOp>) -> Graph<NumOp>) -> Nod
     }
 }
 
+/// the outcome of a rewrite rule at one node (see [`rewrite_graph`]); `None` (the common case) rebuilds
+/// the node verbatim.
+enum Rewrite {
+    Redirect(usize),      // this node already exists (an earlier built id) — point consumers there
+    Replace(Node<NumOp>), // emit this node instead of the default `{ kind, inputs }`
+}
+
+/// the shared single-pass rewriter that `peephole`/`cancel_isos`/`fuse_maps` are each just a `rule` of:
+/// walk nodes in order, remap every edge to its already-rebuilt id, recurse each body via `map_kind`,
+/// then consult `rule` (which sees the body-recursed `kind`, the remapped `inputs`, the nodes `built`
+/// so far, and the original `node`). No hit rebuilds verbatim. (`cse`/`dce` carry cross-node state — a
+/// dedup map, a reachability mark — so they stay bespoke.)
+fn rewrite_graph(
+    g: &Graph<NumOp>,
+    recurse: fn(&Graph<NumOp>) -> Graph<NumOp>,
+    rule: impl Fn(&NodeKind<NumOp>, &[usize], &[Node<NumOp>], &Node<NumOp>) -> Option<Rewrite>,
+) -> Graph<NumOp> {
+    let mut remap = vec![0usize; g.nodes.len()];
+    let mut built: Vec<Node<NumOp>> = Vec::new();
+    for (old, node) in g.nodes.iter().enumerate() {
+        let inputs: Vec<usize> = node.inputs.iter().map(|&i| remap[i]).collect();
+        let kind = map_kind(&node.kind, recurse);
+        remap[old] = match rule(&kind, &inputs, &built, node) {
+            Some(Rewrite::Redirect(r)) => r,
+            Some(Rewrite::Replace(n)) => {
+                built.push(n);
+                built.len() - 1
+            }
+            None => {
+                built.push(Node { kind, inputs });
+                built.len() - 1
+            }
+        };
+    }
+    Graph { nodes: built, output: remap[g.output] }
+}
+
 /// hash-consing: fold structurally-identical nodes into one.
 pub fn cse(g: &Graph<NumOp>) -> Graph<NumOp> {
     let mut new_nodes: Vec<Node<NumOp>> = Vec::new();
@@ -72,21 +109,14 @@ pub fn dce(g: &Graph<NumOp>) -> Graph<NumOp> {
 
 /// peephole: `Field(i)` applied to a `Tuple` is just the tuple's i-th input.
 pub fn peephole(g: &Graph<NumOp>) -> Graph<NumOp> {
-    let mut remap = vec![0usize; g.nodes.len()];
-    let mut new_nodes: Vec<Node<NumOp>> = Vec::new();
-    for (old, node) in g.nodes.iter().enumerate() {
-        let inputs: Vec<usize> = node.inputs.iter().map(|&i| remap[i]).collect();
-        if let NodeKind::Op(NumOp::Core(Op::Field(i))) = &node.kind {
-            let src = inputs[0];
-            if matches!(new_nodes[src].kind, NodeKind::Tuple) {
-                remap[old] = new_nodes[src].inputs[*i];
-                continue;
+    rewrite_graph(g, peephole, |kind, inputs, built, _| {
+        if let NodeKind::Op(NumOp::Core(Op::Field(i))) = kind {
+            if matches!(built[inputs[0]].kind, NodeKind::Tuple) {
+                return Some(Rewrite::Redirect(built[inputs[0]].inputs[*i]));
             }
         }
-        remap[old] = new_nodes.len();
-        new_nodes.push(Node { kind: map_kind(&node.kind, peephole), inputs });
-    }
-    Graph { nodes: new_nodes, output: remap[g.output] }
+        None
+    })
 }
 
 /// inline `g1: A -> B` into `g2: B -> C`, returning `g1 ; g2 : A -> C`. `g2`'s `Input` is replaced by
@@ -120,37 +150,20 @@ pub fn fuse_maps(g: &Graph<NumOp>) -> Graph<NumOp> {
         }
     }
     uses[g.output] += 1;
-
-    let mut remap = vec![0usize; g.nodes.len()];
-    let mut new_nodes: Vec<Node<NumOp>> = Vec::new();
-    for (old, node) in g.nodes.iter().enumerate() {
-        let inputs: Vec<usize> = node.inputs.iter().map(|&i| remap[i]).collect();
-        let kind = map_kind(&node.kind, fuse_maps); // fuse the body's own chains first
-        if let NodeKind::Op(NumOp::Core(Op::MapList(b2))) = &kind {
-            // the producer is a MapList used nowhere else → safe to fold the two bodies into one pass.
-            let fused = if uses[node.inputs[0]] == 1 {
-                match &new_nodes[inputs[0]].kind {
-                    NodeKind::Op(NumOp::Core(Op::MapList(b1))) => {
-                        Some((compose(b1, b2), new_nodes[inputs[0]].inputs[0]))
-                    }
-                    _ => None,
+    rewrite_graph(g, fuse_maps, |kind, inputs, built, node| {
+        if let NodeKind::Op(NumOp::Core(Op::MapList(b2))) = kind {
+            // fuse only when the producer is a MapList used NOWHERE else (else fusing duplicates work).
+            if uses[node.inputs[0]] == 1 {
+                if let NodeKind::Op(NumOp::Core(Op::MapList(b1))) = &built[inputs[0]].kind {
+                    return Some(Rewrite::Replace(Node {
+                        kind: NodeKind::Op(NumOp::Core(Op::MapList(Box::new(compose(b1, b2))))),
+                        inputs: vec![built[inputs[0]].inputs[0]],
+                    }));
                 }
-            } else {
-                None
-            };
-            if let Some((body, producer)) = fused {
-                remap[old] = new_nodes.len();
-                new_nodes.push(Node {
-                    kind: NodeKind::Op(NumOp::Core(Op::MapList(Box::new(body)))),
-                    inputs: vec![producer],
-                });
-                continue;
             }
         }
-        remap[old] = new_nodes.len();
-        new_nodes.push(Node { kind, inputs });
-    }
-    Graph { nodes: new_nodes, output: remap[g.output] }
+        None
+    })
 }
 
 /// adjacent structural isos that are exact inverses (`Zip∘Transpose`, `Weave∘Unweave`, and their
@@ -166,23 +179,16 @@ fn is_inverse(outer: &Op<NumOp>, inner: &Op<NumOp>) -> bool {
 
 /// cancel adjacent inverse isos (see [`is_inverse`]). The iso analogue of `peephole`'s Field-of-Tuple.
 pub fn cancel_isos(g: &Graph<NumOp>) -> Graph<NumOp> {
-    let mut remap = vec![0usize; g.nodes.len()];
-    let mut new_nodes: Vec<Node<NumOp>> = Vec::new();
-    for (old, node) in g.nodes.iter().enumerate() {
-        let inputs: Vec<usize> = node.inputs.iter().map(|&i| remap[i]).collect();
-        let kind = map_kind(&node.kind, cancel_isos);
-        if let NodeKind::Op(NumOp::Core(outer)) = &kind {
-            if let NodeKind::Op(NumOp::Core(inner)) = &new_nodes[inputs[0]].kind {
+    rewrite_graph(g, cancel_isos, |kind, inputs, built, _| {
+        if let NodeKind::Op(NumOp::Core(outer)) = kind {
+            if let NodeKind::Op(NumOp::Core(inner)) = &built[inputs[0]].kind {
                 if is_inverse(outer, inner) {
-                    remap[old] = new_nodes[inputs[0]].inputs[0];
-                    continue;
+                    return Some(Rewrite::Redirect(built[inputs[0]].inputs[0]));
                 }
             }
         }
-        remap[old] = new_nodes.len();
-        new_nodes.push(Node { kind, inputs });
-    }
-    Graph { nodes: new_nodes, output: remap[g.output] }
+        None
+    })
 }
 
 /// run the passes together: peephole and iso-cancellation expose dead/foldable structure, map fusion
