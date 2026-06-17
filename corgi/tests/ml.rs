@@ -60,9 +60,9 @@ fn juxtaposition_stops_at_let_in() {
 #[test]
 fn let_sharing_beats_fanout_recompute() {
     // same join: `let t = transpose` shares the transpose once; inlining it fans out and recomputes.
-    let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
+    let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices_uns";
     let inlined =
-        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
+        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices_uns";
     let shared_nodes = parse_ml(shared).unwrap().node_count();
     let inlined_nodes = parse_ml(inlined).unwrap().node_count();
     assert!(shared_nodes < inlined_nodes, "shared {shared_nodes} should be < inlined {inlined_nodes}");

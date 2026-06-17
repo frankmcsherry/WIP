@@ -5,6 +5,6 @@
 # n = 8
 # = [1]
 let xs = input iota in
-let retract = (xs map (x -> x enlist head), xs) eq in
-let minima = (xs map (x -> x add_u64 1 iota) map (r -> r sort head), xs map (x -> x lit 0)) eq in
+let retract = (xs map (x -> x enlist head_uns), xs) eq in
+let minima = (xs map (x -> x add_u64 1 iota) map (r -> r sort head_uns), xs map (x -> x lit 0)) eq in
 (retract, minima) mul

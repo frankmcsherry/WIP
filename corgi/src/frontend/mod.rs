@@ -22,7 +22,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "try_branch")
+    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "branch_try")
 }
 
 /// which op idents are pair-eating binaries that accept an optional immediate: `x sub 1` is sugar
@@ -42,8 +42,10 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cast" => Op::Cast(n()? as u32).into(),
         "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
-        "zip" => Op::Zip.into(),         // Transpose's inverse: parallel lists -> list of products
-        "try_zip" => Op::TryZip.into(),  // total Zip (pair): per-row Sum{Err | Ok}
+        // the three tiers — `foo` (checked: a static pass gates it), `foo_try` (total: an error lane),
+        // `foo_uns` (unchecked: asserts the precondition, may panic — the kernel tier `check_total` flags).
+        "zip" => Op::Zip.into(),         // checked by the length pass (columns share bounds)
+        "zip_try" => Op::TryZip.into(),  // total Zip (pair): per-row Sum{Err | Ok}
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
         // iso-inverses (Zip pairs any two columns; Slices materializes any ranges, incl. Find's),
@@ -54,20 +56,23 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // a verb. (A `try_weave` would only carry an unactionable "inconsistent columns" error.)
         "cap_list" => Op::CapList.into(), // capture: pair a context with every list element
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
-        "branch" => Op::Branch(n()? as usize).into(), // N-way partition by a discriminant column;
+        "branch" => Op::Branch(n()? as usize).into(), // checked by the range pass (tags < n);
                                                       // `branch 2` on a 0/1 mask is the boolean split
-        "try_branch" => Op::TryBranch(n()? as usize).into(), // total Branch: tag>=n -> Oob:U64 lane 0
+        "branch_try" => Op::TryBranch(n()? as usize).into(), // total Branch: tag>=n -> Oob:U64 lane 0
         "filter" => Op::Filter.into(),
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
-        "slices" => Op::Slices.into(),
-        "gather" => Op::Gather.into(), // row-relative point gather (indices, haystack) — PARTIAL
-        "index" => Op::Index.into(),   // total point index -> Sum{Oob:U64 | Found:T} (head = index 0)
+        // the UNCHECKED kernel tier — data-dependent bounds no static pass proves; `check_total` flags
+        // these as outside the guaranteed-total subset. `index` (total) is gather's safe form; `index 0`
+        // is head's; a total `slices_try` (range-index) is the future safe form for `slices_uns`.
+        "slices_uns" => Op::Slices.into(), // (ranges, haystack) -> List<List<T>>  ranges asserted in-bounds
+        "gather_uns" => Op::Gather.into(), // row-relative point gather; indices asserted in-bounds
+        "index" => Op::Index.into(),   // total point index -> Sum{Oob:U64 | Found:T} (gather's safe form)
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
-        "head" => Op::Head.into(), // each row's first element (the stratum drop; empty row panics)
+        "head_uns" => Op::Head.into(), // each row's first element; non-empty asserted (index 0 is safe)
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
         // relational compares: two equal-width leaf columns -> 0/1 mask. `gt`/`ge` are these with

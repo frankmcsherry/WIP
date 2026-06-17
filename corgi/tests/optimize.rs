@@ -39,9 +39,9 @@ fn join_input() -> Value {
 
 // the join with the shared transpose INLINED (fanned out) vs. hand-shared with `let`.
 const INLINED_JOIN: &str =
-    "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
+    "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices_uns";
 const ML_JOIN: &str =
-    "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
+    "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices_uns";
 
 #[test]
 fn cse_collapses_the_fanout_join() {

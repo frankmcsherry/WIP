@@ -24,7 +24,7 @@ let nodes2 = (classid, ks) cap_list map ((table, k) ->
     map_variant Add ((t, k) ->
         let l = k sub 1 and 3 in
         let r = k add 1 and 7 in
-        ((l enlist, t) gather head, (r enlist, t) gather head)))
+        ((l enlist, t) gather_uns head_uns, (r enlist, t) gather_uns head_uns)))
 in
 let canon = nodes2 dedup in
 (canon, (nodes2, canon) find map ((lo, hi) -> lo))
