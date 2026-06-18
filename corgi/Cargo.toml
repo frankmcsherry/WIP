@@ -8,3 +8,11 @@ edition = "2021"
 [[bench]]
 name = "eval"
 harness = false   # plain `fn main()` timing — no framework, no dependency
+
+[[bench]]
+name = "gaps"
+harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see benches/gaps.rs
+
+[[bench]]
+name = "stride"
+harness = false   # stride-detection spike: ragged vs dense sort of uniform-width keys
