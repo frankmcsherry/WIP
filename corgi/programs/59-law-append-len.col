@@ -1,0 +1,6 @@
+# law: len is a monoid homomorphism — len(a ⊕ b) = len a + len b. Appending xs to itself then taking
+# the length equals twice xs's length, so `len` and `append` agree on the list monoid.
+# n = 3
+# = [1]
+let xs = input iota in
+((xs, xs) append len, (xs len, xs len) add) eq

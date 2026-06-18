@@ -34,14 +34,14 @@ fn scrambled(n: usize) -> Vec<u64> {
 
 /// one big list of `n` scrambled values: `List<U64>` with a single row.
 fn one_list(n: usize) -> Value {
-    Value::List(vec![n], Box::new(Value::u64(scrambled(n))))
+    Value::List(vec![n].into(), Box::new(Value::u64(scrambled(n))))
 }
 
 /// a `List<U64>` of `m` rows each `l` wide — `m` independent sub-lists in one column. `ReduceSum`
 /// folds each row separately, so this is `m` list-sums delivered in a single bulk pass.
 fn lists(m: usize, l: usize) -> Value {
-    let bounds = (1..=m).map(|r| r * l).collect();
-    Value::List(bounds, Box::new(Value::u64(scrambled(m * l))))
+    let bounds: Vec<usize> = (1..=m).map(|r| r * l).collect();
+    Value::List(bounds.into(), Box::new(Value::u64(scrambled(m * l))))
 }
 
 fn graph(op: impl Into<NumOp>) -> Graph<NumOp> {
@@ -84,7 +84,7 @@ fn main() {
     let sums = graph(ArithOp::Reduce(corgi::Red::Add));
     report("sum_list/bulk", m * l, bench(&sums, &lists(m, l), reps));
     {
-        let one = Value::List(vec![l], Box::new(Value::u64(scrambled(l))));
+        let one = Value::List(vec![l].into(), Box::new(Value::u64(scrambled(l))));
         let t = Instant::now();
         for _ in 0..m {
             black_box(eval_graph(&sums, black_box(one.clone())));

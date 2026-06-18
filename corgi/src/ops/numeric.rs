@@ -45,8 +45,8 @@ pub fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
 /// are unsigned; `All`/`Any` are the 0/1-mask AND/OR.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Red {
-    Add, // `reduce_add` (sum)
-    Mul, // `reduce_mul` (product)
+    Add, // `fold_add` (sum) / `scan_add` (prefix sum)
+    Mul, // `fold_mul` (product) / `scan_mul`
     Min,
     Max,
     All,
@@ -102,6 +102,10 @@ pub enum ArithOp {
     Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
     And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
     Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
+    Scan(Red),             // List<U64> -> List<U64>  per-row inclusive monoid PREFIX scan. The monoid
+                           // fast path for `scan` with a monoid body: one in-place pass, where the
+                           // general `FoldScan` re-evals the body per element (catastrophic on one long
+                           // row — see perf-gaps.md). `Reduce` is its drop-the-prefix sibling.
 }
 
 // deswizzle the order-preserving signed encoding (XOR the top bit `m`), apply a native wrapping op,
@@ -258,7 +262,7 @@ impl ArithOp {
                 let xs = vals.into_u64("reduce values");
                 let mut out = Vec::with_capacity(bounds.len());
                 let mut start = 0;
-                for end in bounds {
+                for end in bounds.ends() {
                     let s = &xs[start..end]; // empty row -> the monoid identity
                     out.push(match r {
                         Red::Add => s.iter().sum(),
@@ -271,6 +275,36 @@ impl ArithOp {
                     start = end;
                 }
                 Value::u64(out)
+            }
+            ArithOp::Scan(r) => {
+                let (bounds, vals) = input.into_list("scan");
+                let mut xs = vals.into_u64("scan values"); // owned -> inclusive prefix written in place
+                // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
+                // sequential within a row, so this is a single memory pass, not a vectorizable one.
+                macro_rules! prefix {
+                    ($id:expr, $a:ident, $x:ident => $comb:expr) => {{
+                        let mut start = 0;
+                        for end in bounds.ends() {
+                            let mut $a = $id;
+                            for slot in &mut xs[start..end] {
+                                let $x = *slot;
+                                $a = $comb;
+                                *slot = $a;
+                            }
+                            start = end;
+                        }
+                    }};
+                }
+                match r {
+                    // integer Add/Mul wrap (the totality invariant); identities seed each row.
+                    Red::Add => prefix!(0u64, a, x => a.wrapping_add(x)),
+                    Red::Mul => prefix!(1u64, a, x => a.wrapping_mul(x)),
+                    Red::Min => prefix!(u64::MAX, a, x => a.min(x)),
+                    Red::Max => prefix!(0u64, a, x => a.max(x)),
+                    Red::All => prefix!(1u64, a, x => a & (x != 0) as u64), // running "all nonzero so far"
+                    Red::Any => prefix!(0u64, a, x => a | (x != 0) as u64), // running "any nonzero so far"
+                }
+                Value::List(bounds, Box::new(Value::u64(xs)))
             }
         }
     }
@@ -315,6 +349,10 @@ impl ArithOp {
             ArithOp::Reduce(_) => match input {
                 List(t) if **t == Prim(64) => Prim(64),
                 _ => return Err(format!("reduce expects List<U64>, got {input}")),
+            },
+            ArithOp::Scan(_) => match input {
+                List(t) if **t == Prim(64) => List(Box::new(Prim(64))),
+                _ => return Err(format!("scan expects List<U64>, got {input}")),
             },
         })
     }

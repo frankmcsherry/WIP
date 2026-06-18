@@ -40,4 +40,4 @@ pub use total::check_total;
 pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
-pub use value::{show, Value};
+pub use value::{show, Bounds, Value};

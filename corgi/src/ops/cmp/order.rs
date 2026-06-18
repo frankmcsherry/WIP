@@ -3,7 +3,7 @@
 //! reduce to) and `mod discriminate` (the discrimination sort `sort` uses); both re-exported at this level.
 
 use crate::engine::{gather, row_span};
-use crate::value::{Prim, Value};
+use crate::value::{Bounds, Prim, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
@@ -183,7 +183,8 @@ mod discriminate {
 
     /// per-element labels seeding a SEGMENTED sort: each element of outer row `r` gets label `r`, so
     /// `sort_blocks` sorts within each row and rows stay contiguous and in order.
-    pub fn segment_labels(bounds: &[usize]) -> Vec<u64> {
+    pub fn segment_labels(bounds: &Bounds) -> Vec<u64> {
+        let bounds = bounds.to_vec(); // step 1: materialize; step 2 makes this stride-aware
         let mut labels = Vec::with_capacity(bounds.last().copied().unwrap_or(0));
         let mut start = 0;
         for (r, &end) in bounds.iter().enumerate() {
@@ -220,10 +221,11 @@ mod discriminate {
     /// project run starts onto outer rows: `out[r]` is the count of run firsts strictly before
     /// `bounds[r]`, cumulative (both are ascending). This is the new outer-bounds `dedup`/`group`
     /// emit — a run never crosses a row, so each falls under exactly one outer row.
-    pub fn runs_per_row(bounds: &[usize], firsts: &[usize]) -> Vec<usize> {
+    pub fn runs_per_row(bounds: &Bounds, firsts: &[usize]) -> Vec<usize> {
+        let bounds = bounds.to_vec();
         let mut out = Vec::with_capacity(bounds.len());
         let mut g = 0;
-        for &end in bounds {
+        for &end in &bounds {
             while g < firsts.len() && firsts[g] < end { g += 1; }
             out.push(g);
         }
@@ -301,8 +303,23 @@ mod discriminate {
         (perm, new_labels)
     }
 
-    fn sort_list_blocks(labels: &[u64], bounds: &[usize], vals: &Value) -> (Vec<usize>, Vec<u64>) {
+    fn sort_list_blocks(labels: &[u64], bounds: &Bounds, vals: &Value) -> (Vec<usize>, Vec<u64>) {
         let n = labels.len();
+        // STRIDE FAST PATH (the array-language special case): equal-width byte records — a uniform
+        // inner list — packable into a u64 sort as ONE wide leaf, because for equal lengths the
+        // lexicographic byte order IS big-endian numeric order. O(1) stride detection diverts to the
+        // dense leaf radix instead of the length-first + position-by-position structural sort below
+        // (the `stride_sort_matches_offsets` test pins the two to the same result). Records wider than
+        // 8 bytes, or non-byte leaves, fall through to the general path.
+        if let (Some(k), Value::Prim(Prim::U8(bytes))) = (bounds.strided(), vals) {
+            if (1..=8).contains(&k) {
+                let keys: Vec<u64> = (0..n)
+                    .map(|r| (0..k).fold(0u64, |key, p| (key << 8) | bytes[r * k + p] as u64))
+                    .collect();
+                return sort_leaf_blocks(labels, &Prim::U64(std::sync::Arc::new(keys)));
+            }
+        }
+        let bounds = bounds.to_vec();
         // start-offsets (n+1): row i is vals[starts[i]..starts[i+1]).
         let starts: Vec<usize> = std::iter::once(0).chain(bounds.iter().copied()).collect();
         let lengths: Vec<u64> = starts.windows(2).map(|w| (w[1] - w[0]) as u64).collect();
@@ -428,8 +445,8 @@ mod tests {
         );
         // list: length-first, then position-wise first difference over ragged rows
         agree_cmp(
-            &Value::List(vec![2, 2, 5, 6], Box::new(u(&[3, 1, 4, 5, 9, 0]))),
-            &Value::List(vec![2, 3, 6, 7], Box::new(u(&[3, 2, 7, 4, 5, 1, 0]))),
+            &Value::List(vec![2, 2, 5, 6].into(), Box::new(u(&[3, 1, 4, 5, 9, 0]))),
+            &Value::List(vec![2, 3, 6, 7].into(), Box::new(u(&[3, 2, 7, 4, 5, 1, 0]))),
         );
         // nested: a sum in secondary product position (the within-offset remap under a fold)
         agree_cmp(
@@ -438,8 +455,8 @@ mod tests {
         );
         // nested: a sum AS the list element — the position loop gathers sum rows and remaps offsets.
         agree_cmp(
-            &Value::List(vec![2, 4], Box::new(Value::sum(vec![0, 1, 0, 1], vec![u(&[5, 8]), u(&[2, 9])]))),
-            &Value::List(vec![2, 4], Box::new(Value::sum(vec![0, 0, 1, 1], vec![u(&[5, 7]), u(&[2, 9])]))),
+            &Value::List(vec![2, 4].into(), Box::new(Value::sum(vec![0, 1, 0, 1], vec![u(&[5, 8]), u(&[2, 9])]))),
+            &Value::List(vec![2, 4].into(), Box::new(Value::sum(vec![0, 0, 1, 1], vec![u(&[5, 7]), u(&[2, 9])]))),
         );
     }
 
@@ -453,8 +470,8 @@ mod tests {
         let want: Vec<i8> = ia.iter().zip(ib).map(|(&i, &j)| compare2(&a, i, &b, j) as i8).collect();
         assert_eq!(got, want);
 
-        let la = Value::List(vec![2, 2, 5, 6], Box::new(u(&[3, 1, 4, 5, 9, 0])));
-        let lb = Value::List(vec![2, 3, 6, 7], Box::new(u(&[3, 2, 7, 4, 5, 1, 0])));
+        let la = Value::List(vec![2, 2, 5, 6].into(), Box::new(u(&[3, 1, 4, 5, 9, 0])));
+        let lb = Value::List(vec![2, 3, 6, 7].into(), Box::new(u(&[3, 2, 7, 4, 5, 1, 0])));
         let (ja, jb) = (&[3usize, 0, 2, 1], &[3usize, 0, 2, 1]);
         let got = compare_idx(&la, &lb, ja, jb);
         let want: Vec<i8> = ja.iter().zip(jb).map(|(&i, &j)| compare2(&la, i, &lb, j) as i8).collect();
@@ -520,7 +537,7 @@ mod tests {
     #[test]
     fn list_length_first() {
         // rows [3,1,2], [], [5], [9,0] — sorted length-first, then element-wise
-        agree(&Value::List(vec![3, 3, 4, 6], Box::new(u(&[3, 1, 2, 5, 9, 0]))));
+        agree(&Value::List(vec![3, 3, 4, 6].into(), Box::new(u(&[3, 1, 2, 5, 9, 0]))));
     }
 
     #[test]
@@ -533,7 +550,7 @@ mod tests {
     fn list_of_sum_fully_discriminated() {
         // List<Sum> — structural all the way down.
         let inner = Value::sum(vec![1, 0, 0, 1], vec![u(&[5, 8]), u(&[2, 9])]);
-        agree(&Value::List(vec![2, 4], Box::new(inner)));
+        agree(&Value::List(vec![2, 4].into(), Box::new(inner)));
     }
 
     #[test]
@@ -552,7 +569,7 @@ mod tests {
             acc += len as usize;
             bounds.push(acc);
         }
-        agree(&Value::List(bounds, Box::new(u(&vals))));
+        agree(&Value::List(bounds.into(), Box::new(u(&vals))));
     }
 
     #[test]

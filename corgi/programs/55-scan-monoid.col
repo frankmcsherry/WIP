@@ -1,0 +1,5 @@
+# scan_add: the inclusive Add-monoid prefix as a one-pass kernel — cumulative sum of [0..5) = [0,1,3,6,10],
+# identical to program 37's general `scan` with an add body, but without the per-element body re-eval.
+# n = 5
+# = List ends=[5] <[0, 1, 3, 6, 10]>
+input iota scan_add

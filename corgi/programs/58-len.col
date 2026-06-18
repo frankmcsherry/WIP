@@ -1,0 +1,5 @@
+# len: each row's element count, read off the bounds. The inner lists [], [0], [0,1], [0,1,2] have
+# lengths 0,1,2,3 — `len` recovers them without folding over the elements.
+# n = 4
+# = List ends=[4] <[0, 1, 2, 3]>
+input iota map (x -> x iota) map (r -> r len)

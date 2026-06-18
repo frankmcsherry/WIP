@@ -21,7 +21,7 @@ fn strings(rows: &[&str]) -> Value {
         bytes.extend_from_slice(r.as_bytes());
         ends.push(bytes.len());
     }
-    Value::List(ends, Box::new(Value::u8(bytes)))
+    Value::List(ends.into(), Box::new(Value::u8(bytes)))
 }
 
 #[test]

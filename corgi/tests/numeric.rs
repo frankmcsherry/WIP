@@ -40,7 +40,7 @@ fn signed_subtraction_mixes_core_and_arith() {
 fn core_sort_orders_signed_values() {
     // the headline: SortList is a kind-blind CMP op (u64/byte order). Because the layer
     // encoded the integers order-preserving, the sort comes out in *signed* order.
-    let input = Value::List(vec![4], Box::new(i64col(&[5, -3, 10, -8])));
+    let input = Value::List(vec![4].into(), Box::new(i64col(&[5, -3, 10, -8])));
     let mut b = Builder::<NumOp>::default();
     let inp = b.input();
     let out = b.add(NumOp::Cmp(CmpOp::SortList), vec![inp]);

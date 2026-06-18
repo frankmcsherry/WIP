@@ -94,7 +94,7 @@ impl CmpOp {
                 let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
                 // outer bounds: cumulative distinct count per row (runs never cross rows).
                 let nb = runs_per_row(&bounds, &firsts);
-                Value::List(nb, Box::new(gather(&vals, &idx)))
+                Value::List(nb.into(), Box::new(gather(&vals, &idx)))
             }
 
             CmpOp::GroupKey => {
@@ -107,10 +107,10 @@ impl CmpOp {
                 let v_sorted = gather(&v_col, &perm);
                 let (ends, firsts) = run_layout(&klabels);
                 let keys = gather(&k_sorted, &firsts);
-                let inner = Value::List(ends, Box::new(v_sorted));
+                let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
                 let no = runs_per_row(&bounds, &firsts);
-                Value::List(no, Box::new(Value::Prod(vec![keys, inner])))
+                Value::List(no.into(), Box::new(Value::Prod(vec![keys, inner])))
             }
 
             // for each needle element, equal_range it in the matching haystack row (batched binary
@@ -125,7 +125,7 @@ impl CmpOp {
                 let (mut lo, mut hi, mut base) = (vec![0usize; n], vec![0usize; n], vec![0usize; n]);
                 let (mut ns, mut hs) = (0, 0);
                 for r in 0..nb.len() {
-                    let (ne, he) = (nb[r], hb[r]);
+                    let (ne, he) = (nb.end(r), hb.end(r));
                     for k in ns..ne {
                         lo[k] = hs;
                         hi[k] = he;

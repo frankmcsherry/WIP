@@ -117,6 +117,17 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   op; div-by-zero would panic) — the judge rejects it.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
+- **List rows carry a stride-aware `Bounds`.** `Value::List` holds `Bounds { Stride(stride, rows) |
+  Offsets(Vec) }` — the dynamic mirror of `columnar`'s `Strides` (corgi is the *dynamic* columnar: it
+  interprets programs that can't announce types ahead of time, so it can't adopt static `columnar`
+  wholesale — it mirrors the layout and bridges at the serialization edge). Uniform-width rows are
+  detected O(1) (`strided`), and the property PROPAGATES: every op that preserves the partition reuses
+  the `Bounds`, so a uniform list keeps "I'm uniform" through a pipeline rather than re-deriving it.
+  That lets uniform data recover dense / array-language kernels as a special case — `sort` of an
+  equal-width byte list packs each record to a u64 key and radixes once (measured ~7×→~1.3× of the
+  dense leaf sort at 1M/8M; `tests/kernel.rs::stride_sort_matches_offsets` pins the fast path to the
+  structural result). `enlist` emits `Stride(1)`; `eq`/`hash`/`show` are by the partition, so a
+  `Stride` and the equivalent `Offsets` are interchangeable. Array languages are the all-uniform case.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
   sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
   *Reuse policy:* an op that is elementwise AND same-width (`AddU64`/`Shr`/`And`, `bin_into`, `neg_into`,
@@ -141,7 +152,7 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
   the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
-- **Named monoid reductions** (`reduce_sum`/`min`/`max`/`prod`/`all`/`any`) are the one-SIMD-pass fast
+- **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Remaining
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
   identity acc-gather + scatter) for the uniform-length regime where every row is active every round.

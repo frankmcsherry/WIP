@@ -45,7 +45,7 @@ impl TextOp {
                 let mut piece_ends = Vec::new();
                 let mut outer_ends = Vec::with_capacity(ends.len());
                 let mut start = 0;
-                for end in ends {
+                for end in ends.ends() {
                     for &b in &bytes[start..end] {
                         if b == *d {
                             piece_ends.push(out.len());
@@ -57,7 +57,7 @@ impl TextOp {
                     outer_ends.push(piece_ends.len());
                     start = end;
                 }
-                Value::List(outer_ends, Box::new(Value::List(piece_ends, Box::new(Value::u8(out)))))
+                Value::List(outer_ends.into(), Box::new(Value::List(piece_ends.into(), Box::new(Value::u8(out)))))
             }
             TextOp::ParseU64 => {
                 let (ends, vals) = input.into_list("ParseU64");
@@ -66,7 +66,7 @@ impl TextOp {
                 let mut oks = Vec::new();
                 let (mut err_ends, mut err_bytes) = (Vec::new(), Vec::new());
                 let mut start = 0;
-                for end in ends {
+                for end in ends.ends() {
                     let row = &bytes[start..end];
                     match parse_u64(row) {
                         Some(v) => {
@@ -83,7 +83,7 @@ impl TextOp {
                 }
                 Value::sum(
                     tags,
-                    vec![Value::List(err_ends, Box::new(Value::u8(err_bytes))), Value::u64(oks)],
+                    vec![Value::List(err_ends.into(), Box::new(Value::u8(err_bytes))), Value::u64(oks)],
                 )
             }
         }

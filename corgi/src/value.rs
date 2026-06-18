@@ -12,10 +12,100 @@ pub enum Value {
     Sum(Prim, Vec<usize>, Vec<Option<Value>>), // discriminant (u8 leaf) + within-variant offset per row +
                                   // one lane per variant; a `None` lane is `⊥` — uncommitted, holds no rows
                                   // (no row carries its tag) and adopts a sibling's shape at a merge.
-    List(Vec<usize>, Box<Value>), // end-offset per row; flattened values
+    List(Bounds, Box<Value>),     // row partition (see `Bounds`) + flattened values
     Unit(usize),                  // a length-carrying unit column: `n` rows, no payload. The terminal
                                   // object as a COLUMN (a fieldless `Prod` has no length witness); the
                                   // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
+}
+
+/// how a `List`'s flattened `values` partition into rows. `Offsets` is the general end-offset-per-row
+/// form (row `i` is `[ends[i-1]..ends[i])`, `ends[-1] = 0`). `Stride` is the UNIFORM case — `rows` rows
+/// each exactly `stride` wide — a list carries it when its rows happen to be equal width. This is the
+/// dynamic mirror of `columnar`'s `Strides`: detecting uniformity is O(1) (`strided`), so uniform data
+/// recovers dense / array-language kernels for free, and the property PROPAGATES through a pipeline
+/// instead of being re-derived per op. Equality/hash are by the partition, so a `Stride` and the
+/// equivalent `Offsets` are interchangeable.
+#[derive(Clone, Debug)]
+pub enum Bounds {
+    Offsets(Vec<usize>),  // end offset of each row
+    Stride(usize, usize), // (stride, rows): row i spans [i*stride .. (i+1)*stride), total = stride*rows
+}
+
+impl Bounds {
+    /// number of rows.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Bounds::Offsets(v) => v.len(),
+            Bounds::Stride(_, rows) => *rows,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// end offset of row `i` (one past its last element).
+    pub(crate) fn end(&self, i: usize) -> usize {
+        match self {
+            Bounds::Offsets(v) => v[i],
+            Bounds::Stride(k, _) => (i + 1) * k,
+        }
+    }
+    /// total flattened element count.
+    pub(crate) fn total(&self) -> usize {
+        match self {
+            Bounds::Offsets(v) => v.last().copied().unwrap_or(0),
+            Bounds::Stride(k, rows) => k * rows,
+        }
+    }
+    /// row `i`'s `[start, end)` span.
+    pub(crate) fn span(&self, i: usize) -> (usize, usize) {
+        match self {
+            Bounds::Offsets(v) => (if i == 0 { 0 } else { v[i - 1] }, v[i]),
+            Bounds::Stride(k, _) => (i * k, (i + 1) * k),
+        }
+    }
+    /// the uniform stride, if this partition is uniform — the O(1) detection that recovers array kernels.
+    pub fn strided(&self) -> Option<usize> {
+        match self {
+            Bounds::Stride(k, _) => Some(*k),
+            Bounds::Offsets(_) => None,
+        }
+    }
+    /// iterate the per-row end offsets (materialized for `Stride`).
+    pub(crate) fn ends(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |i| self.end(i))
+    }
+    /// materialize the general end-offset form — for ops not yet stride-aware, and for eq/show.
+    pub(crate) fn to_vec(&self) -> Vec<usize> {
+        match self {
+            Bounds::Offsets(v) => v.clone(),
+            Bounds::Stride(..) => self.ends().collect(),
+        }
+    }
+}
+
+impl From<Vec<usize>> for Bounds {
+    fn from(v: Vec<usize>) -> Self {
+        Bounds::Offsets(v)
+    }
+}
+
+// equality/hash are by the PARTITION, so a `Stride` and the equivalent `Offsets` compare and hash equal.
+impl PartialEq for Bounds {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Bounds::Offsets(a), Bounds::Offsets(b)) => a == b,
+            (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => k0 == k1 && n0 == n1,
+            _ => self.len() == other.len() && self.ends().eq(other.ends()),
+        }
+    }
+}
+impl Eq for Bounds {}
+impl std::hash::Hash for Bounds {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for e in self.ends() {
+            e.hash(state);
+        }
+    }
 }
 
 /// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
@@ -288,7 +378,7 @@ impl Value {
                 Prim::U8(Arc::new(Vec::new())),
                 ss.iter().map(|o| o.as_ref().map(Value::empty)).collect(),
             ),
-            Shape::List(s) => Value::List(Vec::new(), Box::new(Value::empty(s))),
+            Shape::List(s) => Value::List(Bounds::Offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
         }
     }
@@ -328,7 +418,7 @@ impl Value {
         }
     }
 
-    pub fn into_list(self, who: &str) -> (Vec<usize>, Value) {
+    pub fn into_list(self, who: &str) -> (Bounds, Value) {
         match self {
             Value::List(bounds, vals) => (bounds, *vals),
             _ => panic!("{who}: expected a list"),
@@ -374,7 +464,7 @@ pub fn show(v: &Value) -> String {
             let lanes: Vec<String> = vs.iter().map(|o| o.as_ref().map_or("⊥".to_string(), show)).collect();
             format!("Sum tags={:?} [{}]", t.usize_vec(), lanes.join(", "))
         }
-        Value::List(b, vals) => format!("List ends={:?} <{}>", b, show(vals)),
+        Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
     }
 }

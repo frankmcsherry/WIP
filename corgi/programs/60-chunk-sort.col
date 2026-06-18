@@ -1,0 +1,6 @@
+# chunk: split a flat byte string into fixed 4-byte records (a Stride(4) inner list — the surface
+# producer of wide strides), then sort them. The sort takes the stride fast path (each 4-byte record
+# packs to a u64 key). "dcba","ABCD" sort to "ABCD","dcba" — uppercase precedes lowercase in ASCII.
+# n = 1
+# = List ends=[2] <List ends=[4, 8] <[65, 66, 67, 68, 100, 99, 98, 97]>>
+input "dcbaABCD" chunk 4 sort

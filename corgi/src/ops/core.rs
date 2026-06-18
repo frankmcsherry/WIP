@@ -7,7 +7,7 @@ use crate::engine::{
 };
 use crate::graph::{eval_graph, shape_of, Graph, OpLike};
 use crate::shape::{join, shape_of_value, Shape};
-use crate::value::Value;
+use crate::value::{Bounds, Value};
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
 /// `gather`, the accumulator update for `Fold`/`Scan`.
@@ -64,7 +64,8 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
 /// `len > t`, so the per-round cost tracks the *active* rows, not all N (the win for ragged lengths —
 /// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
 /// targets: row `r`'s round-`t` element is at flat index `start + t`.
-fn init_active(bounds: &[usize]) -> Vec<(usize, usize, usize)> {
+fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
+    let bounds = bounds.to_vec();
     let mut v = Vec::with_capacity(bounds.len());
     let mut start = 0;
     for (r, &end) in bounds.iter().enumerate() {
@@ -176,6 +177,16 @@ pub enum Op<L> {
                     // row i takes `then` if mask[i] != 0 else `else`. The dual of `Branch(2)`+`Weave` —
                     // Branch avoids computing the unused side, Select avoids the partition; cheap bodies
                     // favour Select. Shape-generic: it IS `gather_lanes([else, then], mask, identity)`.
+
+    // the List monoid + measure (both 1:1 on the SEQ — cardinality stays inside the list).
+    Append,         // (List<X>, List<X>) -> List<X>   row-wise concat: row i = a[i] ++ b[i] (the ⊕ of
+                    // the list monoid, [] its unit). Same-shape elements, joined ⊥-tolerantly as in Zip.
+    Len,            // List<X> -> U64                  each row's element count, read straight off the
+                    // bounds (O(1) — the count the structure already holds, not a fold over the row).
+    Chunk(usize),   // List<X> -> List<List<X>>        partition each row into fixed `k`-wide sub-rows
+                    // (the uniform inverse of Flatten): a pure re-partition — values don't move, the
+                    // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
+                    // chunked record stream feeds the stride fast paths. Each row must divide by `k`.
 }
 
 impl<L: OpLike> Op<L> {
@@ -202,7 +213,7 @@ impl<L: OpLike> Op<L> {
             // products. No data moves — the columns simply become the product's fields.
             Op::Zip => {
                 let cols = input.into_prod("Zip");
-                let mut bounds: Option<Vec<usize>> = None;
+                let mut bounds: Option<Bounds> = None;
                 let mut inner = Vec::with_capacity(cols.len());
                 for c in cols {
                     let (b, v) = c.into_list("Zip column");
@@ -230,7 +241,7 @@ impl<L: OpLike> Op<L> {
                 let (mut sx, mut sy) = (0, 0);
                 let (mut oka, mut exa, mut eya) = (0, 0, 0);
                 for r in 0..bx.len() {
-                    let (ex, ey) = (bx[r], by[r]);
+                    let (ex, ey) = (bx.end(r), by.end(r));
                     let (lenx, leny) = (ex - sx, ey - sy);
                     if lenx == leny {
                         tags.push(1); // Ok
@@ -257,12 +268,12 @@ impl<L: OpLike> Op<L> {
                     sy = ey;
                 }
                 let ok = Value::List(
-                    ok_outer,
+                    ok_outer.into(),
                     Box::new(Value::Prod(vec![gather(&vx, &ok_x), gather(&vy, &ok_y)])),
                 );
                 let err = Value::Prod(vec![
-                    Value::List(ex_outer, Box::new(gather(&vx, &ex_idx))),
-                    Value::List(ey_outer, Box::new(gather(&vy, &ey_idx))),
+                    Value::List(ex_outer.into(), Box::new(gather(&vx, &ex_idx))),
+                    Value::List(ey_outer.into(), Box::new(gather(&vy, &ey_idx))),
                 ]);
                 Value::sum(tags, vec![err, ok]) // lane 0 = Err, lane 1 = Ok
             }
@@ -276,7 +287,7 @@ impl<L: OpLike> Op<L> {
                 let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
                 let mut counts = vec![0usize; lanes.len()];
                 let mut start = 0;
-                for &end in &bounds {
+                for end in bounds.ends() {
                     for &t in &tags[start..end] {
                         counts[t] += 1;
                     }
@@ -290,7 +301,7 @@ impl<L: OpLike> Op<L> {
                 let mut out = vec![tag_list];
                 for (o, lb) in lanes.into_iter().zip(lane_bounds) {
                     let lane = o.expect("Unweave: ⊥ lane (judge rejects these)");
-                    out.push(Value::List(lb, Box::new(lane)));
+                    out.push(Value::List(lb.into(), Box::new(lane)));
                 }
                 Value::Prod(out)
             }
@@ -313,13 +324,13 @@ impl<L: OpLike> Op<L> {
                 }
                 let mut counts = vec![0usize; lanes.len()];
                 let mut start = 0;
-                for (r, &end) in tb.iter().enumerate() {
+                for (r, end) in tb.ends().enumerate() {
                     for &t in &tags[start..end] {
                         assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
                         counts[t as usize] += 1;
                     }
                     for (t, (lb, &c)) in lane_bounds.iter().zip(&counts).enumerate() {
-                        assert_eq!(lb[r], c, "Weave: row {r} lane {t} length/tag-count mismatch");
+                        assert_eq!(lb.end(r), c, "Weave: row {r} lane {t} length/tag-count mismatch");
                     }
                     start = end;
                 }
@@ -365,7 +376,56 @@ impl<L: OpLike> Op<L> {
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
                 let m = mv.into_u64("Filter mask");
                 let (idx, nb) = filter_mask(&bounds, &m);
-                Value::List(nb, Box::new(gather(&vals, &idx)))
+                Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+            }
+
+            // row-wise append: row r's output is a's row r elements followed by b's. A multi-source
+            // gather over the two value columns ([a, b]) reuses the engine's `gather_lanes`, so it
+            // works for any element shape X (leaf / product / list / sum).
+            Op::Append => {
+                let (a, b) = input.into_pair("Append");
+                let (ab, av) = a.into_list("Append lhs");
+                let (bb, bv) = b.into_list("Append rhs");
+                // both are SEQ columns, hence equal row count by the product invariant (defensive).
+                assert_eq!(ab.len(), bb.len(), "Append: row count mismatch");
+                let cap = av.len() + bv.len();
+                let mut nb = Vec::with_capacity(ab.len());
+                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+                let (mut acc, mut sa, mut sb) = (0usize, 0usize, 0usize);
+                for r in 0..ab.len() {
+                    let (ea, eb) = (ab.end(r), bb.end(r));
+                    for p in sa..ea { tags.push(0); off.push(p); } // a's row-r elements ...
+                    for p in sb..eb { tags.push(1); off.push(p); } // ... then b's
+                    acc += (ea - sa) + (eb - sb);
+                    nb.push(acc);
+                    sa = ea;
+                    sb = eb;
+                }
+                Value::List(nb.into(), Box::new(gather_lanes(&[Some(&av), Some(&bv)], &tags, &off)))
+            }
+
+            // each row's length, read off the bounds in one pass (no per-element work).
+            Op::Len => {
+                let (bounds, _vals) = input.into_list("Len");
+                let mut prev = 0;
+                let lens = bounds.ends().map(|e| { let l = (e - prev) as u64; prev = e; l }).collect();
+                Value::u64(lens)
+            }
+
+            // re-partition each row into k-wide sub-rows. Pure: the values never move — only the bounds
+            // change, the new inner being a `Stride(k)` (the surface producer of wide strides).
+            Op::Chunk(k) => {
+                let (bounds, vals) = input.into_list("Chunk");
+                let mut outer = Vec::with_capacity(bounds.len());
+                let (mut total, mut prev) = (0usize, 0usize);
+                for end in bounds.ends() {
+                    let len = end - prev;
+                    assert!(len % k == 0, "Chunk: row length {len} not divisible by {k}");
+                    total += len / k;
+                    outer.push(total);
+                    prev = end;
+                }
+                Value::List(outer.into(), Box::new(Value::List(Bounds::Stride(*k, total), Box::new(vals))))
             }
 
             // N-way partition: the discriminant `tags` routes each row of `data` to its variant. The
@@ -519,7 +579,7 @@ impl<L: OpLike> Op<L> {
                 let (lo_c, hi_c) = (lo.into_u64("Slices lo"), hi.into_u64("Slices hi"));
                 assert_eq!(lb.len(), hb.len(), "Slices: row count");
                 let (idx, inner_bounds) = expand_ranges(&lb, &lo_c, &hi_c, &hb);
-                let inner = Value::List(inner_bounds, Box::new(gather(&hvals, &idx)));
+                let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
                 Value::List(lb, Box::new(inner))
             }
 
@@ -533,7 +593,7 @@ impl<L: OpLike> Op<L> {
                 assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
                 let mut abs = Vec::with_capacity(idxs.len());
                 let mut hs = 0;
-                for (r, &he) in hb.iter().enumerate() {
+                for (r, he) in hb.ends().enumerate() {
                     let x = idxs[r];
                     assert!((x as usize) < he - hs, "Get: index {x} out of row {r}'s bounds");
                     abs.push(hs + x as usize);
@@ -554,7 +614,7 @@ impl<L: OpLike> Op<L> {
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
                 let mut hs = 0;
-                for (r, &he) in hb.iter().enumerate() {
+                for (r, he) in hb.ends().enumerate() {
                     let x = idxs[r];
                     if (x as usize) < he - hs {
                         tags.push(1);
@@ -594,7 +654,7 @@ impl<L: OpLike> Op<L> {
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
                 let (mut is, mut hs) = (0, 0);
                 for r in 0..ib.len() {
-                    let (ie, he) = (ib[r], hb[r]);
+                    let (ie, he) = (ib.end(r), hb.end(r));
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
@@ -620,16 +680,16 @@ impl<L: OpLike> Op<L> {
                 let (ob, inner) = input.into_list("Flatten");
                 let (ib, vals) = inner.into_list("Flatten inner");
                 let new_ob: Vec<usize> =
-                    ob.iter().map(|&e| if e == 0 { 0 } else { ib[e - 1] }).collect();
+                    ob.ends().map(|e| if e == 0 { 0 } else { ib.end(e - 1) }).collect();
                 let mut lo_c = Vec::with_capacity(ib.len());
                 let mut hi_c = Vec::with_capacity(ib.len());
                 let mut prev = 0;
-                for &e in &ob {
-                    let base = if prev == 0 { 0 } else { ib[prev - 1] }; // top row's flat start
+                for e in ob.ends() {
+                    let base = if prev == 0 { 0 } else { ib.end(prev - 1) }; // top row's flat start
                     for kk in prev..e {
-                        let g_lo = if kk == 0 { 0 } else { ib[kk - 1] };
+                        let g_lo = if kk == 0 { 0 } else { ib.end(kk - 1) };
                         lo_c.push((g_lo - base) as u64);
-                        hi_c.push((ib[kk] - base) as u64);
+                        hi_c.push((ib.end(kk) - base) as u64);
                     }
                     prev = e;
                 }
@@ -637,7 +697,7 @@ impl<L: OpLike> Op<L> {
                     ob,
                     Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])),
                 );
-                let flat = Value::List(new_ob, Box::new(vals));
+                let flat = Value::List(new_ob.into(), Box::new(vals));
                 Value::Prod(vec![ranges, flat])
             }
 
@@ -645,7 +705,7 @@ impl<L: OpLike> Op<L> {
             // unchanged; bounds become [1,2,..,n]. `Flatten` of an `Enlist` is identity.
             Op::Enlist => {
                 let n = input.len();
-                Value::List((1..=n).collect(), Box::new(input))
+                Value::List(Bounds::Stride(1, n), Box::new(input)) // uniform width 1 — a stride, not offsets
             }
 
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
@@ -660,7 +720,7 @@ impl<L: OpLike> Op<L> {
                     end += n as usize;
                     bounds.push(end);
                 }
-                Value::List(bounds, Box::new(Value::u64(vals)))
+                Value::List(bounds.into(), Box::new(Value::u64(vals)))
             }
 
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
@@ -695,6 +755,28 @@ impl<L: OpLike> Op<L> {
             Op::Field(i) => match input {
                 Prod(ts) if *i < ts.len() => ts[*i].clone(),
                 _ => return err(&format!("Field({i}) expects a product with > {i} fields")),
+            },
+
+            // (List<X>, List<X>) -> List<X>: elements must JOIN (a ⊥ lane adopts its sibling, as in Zip).
+            Op::Append => match input {
+                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
+                    (List(x), List(y)) => List(Box::new(join(x, y).map_err(|e| format!("Append: {e}"))?)),
+                    _ => return err("Append expects (List<X>, List<X>)"),
+                },
+                _ => return err("Append expects a pair of lists"),
+            },
+
+            // List<X> -> U64, kind-blind: the element shape is irrelevant, only that it is a list.
+            Op::Len => match input {
+                List(_) => Prim(64),
+                _ => return err("Len expects a list"),
+            },
+
+            // List<X> -> List<List<X>>; `k` must be positive (re-partition into k-wide rows).
+            Op::Chunk(k) => match input {
+                List(inner) if *k > 0 => List(Box::new(List(inner.clone()))),
+                List(_) => return err("Chunk width must be positive"),
+                _ => return err("Chunk expects a list"),
             },
 
             Op::Transpose => match input {
@@ -1015,12 +1097,14 @@ impl<L: OpLike> Op<L> {
             Op::Get => Some("get_uns"),
             Op::Gather => Some("gather_uns"),
             Op::Slices => Some("slices_uns"),
+            // chunk asserts each row divides by `k` — a data-dependent precondition no gate proves yet.
+            Op::Chunk(_) => Some("chunk"),
             // total (run to a value), gated (lengths/ranges prove the precondition), or pure structural:
             Op::Field(_) | Op::Lit(_) | Op::Transpose | Op::Zip | Op::TryZip | Op::Unweave
             | Op::Weave | Op::CapList | Op::CapSum | Op::Cast(_) | Op::Filter | Op::Branch(_)
             | Op::TryBranch(_) | Op::Unwrap | Op::Inject(_, _) | Op::MapList(_) | Op::Fold(_)
             | Op::FoldScan(_) | Op::MapSum(_) | Op::GetTry | Op::GatherTry | Op::Flatten
-            | Op::Enlist | Op::Iota | Op::Unit | Op::Select => None,
+            | Op::Enlist | Op::Iota | Op::Unit | Op::Select | Op::Append | Op::Len => None,
         }
     }
 }

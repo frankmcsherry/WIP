@@ -16,13 +16,13 @@ use crate::value::Value;
 /// a string literal as a `List<U8>` value (one list of its UTF-8 bytes). `"…"` lowers to `Op::Lit`
 /// of this, broadcasting it to the input's length like any constant.
 pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
-    Value::List(vec![bytes.len()], Box::new(Value::u8(bytes)))
+    Value::List(vec![bytes.len()].into(), Box::new(Value::u8(bytes)))
 }
 
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "branch_try")
+    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "branch_try" | "chunk")
         || name.starts_with("lit_") // typed literals `lit_<k><w> N`
 }
 
@@ -123,6 +123,9 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "gather_try" => Op::GatherTry.into(), // (idxs, haystack) -> [Sum{Oob | Found}]  total vector access
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
+        "append" => Op::Append.into(), // (List<X>, List<X>) -> List<X>  row-wise concat (the list-monoid ⊕)
+        "len" => Op::Len.into(),       // List<X> -> U64  per-row element count, read off the bounds
+        "chunk" => Op::Chunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records (Stride producer)
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
@@ -149,13 +152,21 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "add_u64" => ArithOp::AddU64(n()?).into(),
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
-        // named monoid reductions, each `reduce_<binop>` (reduce_add = sum, reduce_mul = product):
-        "reduce_add" => ArithOp::Reduce(Red::Add).into(),
-        "reduce_mul" => ArithOp::Reduce(Red::Mul).into(),
-        "reduce_min" => ArithOp::Reduce(Red::Min).into(),
-        "reduce_max" => ArithOp::Reduce(Red::Max).into(),
-        "reduce_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)
-        "reduce_any" => ArithOp::Reduce(Red::Any).into(), // 1 iff any element nonzero (mask OR)
+        // named monoid reductions, each `fold_<binop>` (fold_add = sum, fold_mul = product):
+        "fold_add" => ArithOp::Reduce(Red::Add).into(),
+        "fold_mul" => ArithOp::Reduce(Red::Mul).into(),
+        "fold_min" => ArithOp::Reduce(Red::Min).into(),
+        "fold_max" => ArithOp::Reduce(Red::Max).into(),
+        "fold_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)
+        "fold_any" => ArithOp::Reduce(Red::Any).into(), // 1 iff any element nonzero (mask OR)
+        // the inclusive-prefix monoid scans — `scan_<binop>`, the one-pass fast paths for `scan` with a
+        // monoid body (the `fold_*` siblings that KEEP each prefix instead of dropping to the total).
+        "scan_add" => ArithOp::Scan(Red::Add).into(),
+        "scan_mul" => ArithOp::Scan(Red::Mul).into(),
+        "scan_min" => ArithOp::Scan(Red::Min).into(),
+        "scan_max" => ArithOp::Scan(Red::Max).into(), // the running maximum
+        "scan_all" => ArithOp::Scan(Red::All).into(),
+        "scan_any" => ArithOp::Scan(Red::Any).into(),
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
         "parse_u64" => TextOp::ParseU64.into(),

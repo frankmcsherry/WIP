@@ -1,0 +1,5 @@
+# append: the list-monoid ⊕ — row-wise concat of two lists. Appending [0,1,2] to itself gives the
+# six-element [0,1,2,0,1,2] in one row (a's elements then b's, per row).
+# n = 3
+# = List ends=[6] <[0, 1, 2, 0, 1, 2]>
+let xs = input iota in (xs, xs) append

@@ -1,0 +1,9 @@
+# law: the monoid scan kernels equal the general `scan` with the matching body, element for element.
+# `scan_add` vs an additive scan and `scan_max` vs a max-body scan, each compared by structural `eq`
+# over the two List<U64> rows. Witnesses that the kernels are pure fast paths, not a new semantics —
+# the prefix counterpart of the reduce-monoid laws.
+# n = 7
+# = ([1], [1])
+let xs = input iota in
+((xs scan_add, (xs lit 0, xs) scan ((a, x) -> (a, x) add)) eq,
+ (xs scan_max, (xs lit 0, xs) scan ((a, x) -> (a, x) max)) eq)

@@ -3,12 +3,12 @@
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
 use crate::shape::shape_of_value;
-use crate::value::{Prim, Value};
+use crate::value::{Bounds, Prim, Value};
 
 pub(crate) use generators::*;
 
-pub(crate) fn row_span(b: &[usize], i: usize) -> (usize, usize) {
-    (if i == 0 { 0 } else { b[i - 1] }, b[i])
+pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
+    b.span(i)
 }
 
 /// lift a single-row constant to a column of length `n` (its stratum): `n` copies of `row`'s row 0. Total
@@ -29,11 +29,11 @@ mod generators {
 
     /// the mask family: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
     /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`.
-    pub(crate) fn filter_mask(bounds: &[usize], mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut nb = Vec::with_capacity(bounds.len());
         let mut start = 0;
-        for &end in bounds {
+        for end in bounds.ends() {
             for (off, &b) in mask[start..end].iter().enumerate() {
                 if b != 0 {
                     idx.push(start + off);
@@ -48,8 +48,8 @@ mod generators {
     /// the capture family: expand a list's `bounds` to the owner row of each element — `[2,3,6]` →
     /// `[0,0,1,2,2,2]`. Pairs with `gather` to replicate the context side of `CapList`. (The inverse of
     /// `bounds`: position → segment.)
-    pub(crate) fn owner_ids(bounds: &[usize]) -> Vec<usize> {
-        let mut idx = Vec::with_capacity(bounds.last().copied().unwrap_or(0));
+    pub(crate) fn owner_ids(bounds: &Bounds) -> Vec<usize> {
+        let mut idx = Vec::with_capacity(bounds.total());
         for i in 0..bounds.len() {
             let (s, e) = row_span(bounds, i);
             idx.extend(std::iter::repeat_n(i, e - s));
@@ -60,11 +60,11 @@ mod generators {
     /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
     /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
     /// of `expand_ranges` below. An index outside its row's span is a (data-dependent) panic.
-    pub(crate) fn resolve_indices(outer: &[usize], idx: &[u64], hay: &[usize]) -> Vec<usize> {
+    pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: &Bounds) -> Vec<usize> {
         let mut abs = Vec::with_capacity(idx.len());
         let (mut os, mut hs) = (0, 0);
         for r in 0..outer.len() {
-            let (oe, he) = (outer[r], hay[r]);
+            let (oe, he) = (outer.end(r), hay.end(r));
             for &x in &idx[os..oe] {
                 let p = hs + x as usize;
                 assert!(p < he, "Gather: index {x} out of row {r}'s bounds");
@@ -79,13 +79,13 @@ mod generators {
     /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row
     /// (rows spanned by `hay`). Emits the absolute haystack positions each pair names and the per-pair inner
     /// bounds. Pairs with `gather` to realise `Slices` — the materialising inverse of `Flatten`.
-    pub(crate) fn expand_ranges(outer: &[usize], lo: &[u64], hi: &[u64], hay: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn expand_ranges(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Bounds) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut inner = Vec::new();
         let mut acc = 0;
         let (mut os, mut hs) = (0, 0);
         for r in 0..outer.len() {
-            let (oe, he) = (outer[r], hay[r]);
+            let (oe, he) = (outer.end(r), hay.end(r));
             for k in os..oe {
                 let (a, b) = (hs + lo[k] as usize, hs + hi[k] as usize);
                 idx.extend(a..b);
@@ -115,7 +115,7 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
                 acc += e - s;
                 nb.push(acc);
             }
-            Value::List(nb, Box::new(gather(vals, &elem)))
+            Value::List(nb.into(), Box::new(gather(vals, &elem)))
         }
         Value::Sum(tags, within, variants) => {
             // `within` is the carried within-variant offset — read, not recomputed. Each selected row
@@ -172,10 +172,10 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
         ),
         Value::List(..) => {
             // each output row is a source row's span; expand to element-level (source, pos) pairs.
-            let lists: Vec<(&[usize], &Value)> = filled
+            let lists: Vec<(&Bounds, &Value)> = filled
                 .iter()
                 .map(|v| match v {
-                    Value::List(b, vv) => (b.as_slice(), &**vv),
+                    Value::List(b, vv) => (b, &**vv),
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
@@ -192,7 +192,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 nb.push(acc);
             }
             let vals: Vec<Option<&Value>> = lists.iter().map(|l| Some(l.1)).collect();
-            Value::List(nb, Box::new(gather_lanes(&vals, &etags, &eoff)))
+            Value::List(nb.into(), Box::new(gather_lanes(&vals, &etags, &eoff)))
         }
         Value::Sum(..) => {
             // pick each output row's tagged payload: build the output tag column, then per output-tag
@@ -270,14 +270,14 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             for p in parts {
                 match p {
                     Value::List(b, vals) => {
-                        nb.extend(b.iter().map(|&x| base + x));
-                        base += b.last().copied().unwrap_or(0);
+                        nb.extend(b.ends().map(|x| base + x));
+                        base += b.total();
                         vp.push((**vals).clone());
                     }
                     _ => panic!("concat: shape mismatch"),
                 }
             }
-            Value::List(nb, Box::new(concat(&vp)))
+            Value::List(nb.into(), Box::new(concat(&vp)))
         }
         Value::Sum(_, _, v0) => {
             let mut tag_parts: Vec<&Prim> = Vec::new();
@@ -350,8 +350,8 @@ mod tests {
         check(
             &tags,
             vec![
-                Value::List(vec![2, 3, 6], Box::new(u(&[1, 2, 3, 4, 5, 6]))),
-                Value::List(vec![1, 3], Box::new(u(&[7, 8, 9]))),
+                Value::List(vec![2, 3, 6].into(), Box::new(u(&[1, 2, 3, 4, 5, 6]))),
+                Value::List(vec![1, 3].into(), Box::new(u(&[7, 8, 9]))),
             ],
         );
         // sum payload (nested tags + within-offset remap)

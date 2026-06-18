@@ -20,7 +20,7 @@ fn sample() -> Value {
     Value::Prod(vec![
         u64(&[10, 20, 30]),
         Value::List(
-            vec![2, 3, 6],
+            vec![2, 3, 6].into(),
             Box::new(Value::Prod(vec![u64(&[1, 2, 3, 4, 5, 6]), u64(&[100, 200, 300, 400, 500, 600])])),
         ),
         Value::sum(vec![0, 1, 0], vec![u64(&[1111, 3333]), u64(&[2222])]),
@@ -29,7 +29,7 @@ fn sample() -> Value {
 
 #[test]
 fn sum_scores_with_destructure() {
-    let src = "let (subj, vals) = input.1 transpose in vals reduce_add";
+    let src = "let (subj, vals) = input.1 transpose in vals fold_add";
     assert_eq!(run_ml(src, &sample()), "[300, 300, 1500]");
 }
 
@@ -73,12 +73,12 @@ fn workhorse_products_sums_lists() {
     // ONE program that walks the whole data model on the `sample()` record-batch
     //   ( id:U64, scores:List<(subj,val)>, contact:Sum{Email|Phone} ):
     //   input.1 transpose        List<(subj,val)> -> (List<subj>, List<val>)   [list <-> product]
-    //   scores.1 reduce_add       List<val> -> one U64 per record (sum each row) [list -> scalar]
+    //   scores.1 fold_add       List<val> -> one U64 per record (sum each row) [list -> scalar]
     //   (input.0, totals) add     pair the id column with the totals, add them   [product + arith]
     //   map_variant 0 (..) unwrap bump the Email variant, then flatten the sum    [sum navigation]
     //   (id_plus, contact)           bundle the two results into a product           [product build]
     let src = "let scores = input.1 transpose in \
-               let totals = scores.1 reduce_add in \
+               let totals = scores.1 fold_add in \
                let id_plus = (input.0, totals) add in \
                let contact = input.2 map_variant 0 (e -> e add_u64 1000000) unwrap in \
                (id_plus, contact)";

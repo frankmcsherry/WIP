@@ -20,7 +20,7 @@ fn sample() -> Value {
     Value::Prod(vec![
         u64(&[10, 20, 30]),
         Value::List(
-            vec![2, 3, 6],
+            vec![2, 3, 6].into(),
             Box::new(Value::Prod(vec![u64(&[1, 2, 3, 4, 5, 6]), u64(&[100, 200, 300, 400, 500, 600])])),
         ),
         Value::sum(vec![0, 1, 0], vec![u64(&[1111, 3333]), u64(&[2222])]),
@@ -30,10 +30,10 @@ fn sample() -> Value {
 fn join_input() -> Value {
     Value::Prod(vec![
         Value::List(
-            vec![6],
+            vec![6].into(),
             Box::new(Value::Prod(vec![u64(&[1, 1, 2, 3, 3, 3]), u64(&[10, 11, 20, 30, 31, 32])])),
         ),
-        Value::List(vec![4], Box::new(u64(&[2, 3, 5, 1]))),
+        Value::List(vec![4].into(), Box::new(u64(&[2, 3, 5, 1]))),
     ])
 }
 
@@ -76,7 +76,7 @@ type Case = (&'static str, fn() -> Value);
 #[test]
 fn optimize_preserves_eval_everywhere() {
     let cases: &[Case] = &[
-        ("input.1 transpose field 1 reduce_add", sample),
+        ("input.1 transpose field 1 fold_add", sample),
         ("(input.0, input.1 transpose field 1) cap_list map (p -> p add)", sample),
         ("input.2 map_variant 1 (h -> h add_u64 1000000) unwrap", sample),
         // map fusion: a three-deep MapList chain must collapse without changing the result.

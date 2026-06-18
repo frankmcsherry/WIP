@@ -1,5 +1,5 @@
 //! A small ML-flavoured expression surface, concatenative-by-juxtaposition: a value is followed by
-//! its operator stages with no separator (`input iota reduce_add`). `let` boils binding into shared
+//! its operator stages with no separator (`input iota fold_add`). `let` boils binding into shared
 //! edges (no re-derivation), with product destructuring; lambdas (`x -> …`) are the map/match bodies;
 //! sums are built/eliminated via `inject`/`match`. A stage-chain runs until a token that can't begin a
 //! stage — notably the `let` body's `in`, the one identifier allowed to follow a complete chain.
@@ -23,7 +23,7 @@
 //!   proj   = atom ('.' NUM)*
 //!   atom   = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
 //!
-//! e.g.  let (subj, vals) = input.1 transpose in vals reduce_add
+//! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
 //!       xs inject 0 2                                      -- tag xs into variant 0 of 2
