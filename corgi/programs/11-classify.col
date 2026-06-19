@@ -1,4 +1,4 @@
 # n = 5
-# = List ends=[5] <[0, 1, 2, 103, 104]>
+# = Sum tags=[0] [List ends=[5] <[0, 1, 2, 103, 104]>, ()x0]
 enum Size = Lo | Hi in
 input iota map (x -> (x, x gt 2) branch Size map_variant Hi (h -> h add_u64 100) unwrap)

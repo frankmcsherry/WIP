@@ -4,8 +4,8 @@
 # eight nodes reach the root in two compositions. The algorithm IS index manipulation;
 # no node payloads ever move.
 # n = 8
-# = (List ends=[8] <[0, 0, 0, 0, 1, 1, 1, 1]>, List ends=[8] <[0, 0, 0, 0, 0, 0, 0, 0]>)
+# = Sum tags=[0] [(List ends=[8] <[0, 0, 0, 0, 1, 1, 1, 1]>, List ends=[8] <[0, 0, 0, 0, 0, 0, 0, 0]>), ()x0]
 let p = input iota map (x -> x shr 1) in
-let pp = (p, p) gather_uns in
-let p4 = (pp, pp) gather_uns in
+let pp = (p, p) gather in
+let p4 = (pp, pp) gather in
 (pp, p4)

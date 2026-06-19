@@ -3,7 +3,7 @@
 //! self-contained: it GENERATES its own data with `iota`, seeded only by the size in its `# n =`
 //! header. Run with `cargo run --example tour`.
 
-use corgi::{shape_of_value, show, Program, Value};
+use corgi::{eval_try, show, EffectValues, Program, Value};
 use std::path::Path;
 
 /// parse a `.col` file into (seed `n`, program). `#` lines are headers; the rest is the program.
@@ -38,10 +38,13 @@ fn main() {
         let (n, prog) = parse_col(&std::fs::read_to_string(&path).unwrap());
         let p = Program::compile_ml(&prog).expect("parse error");
         let seed = Value::u64(vec![n]);
-        let ty = p.shape(&shape_of_value(&seed)).expect("type error");
+        let total = if p.is_total() { "total" } else { "partial" };
+        let out = match p.run_effect(seed) {
+            EffectValues::Pure(v) => show(&v),
+            EffectValues::Fail(fv) => show(&eval_try(fv)),
+        };
         println!("• {desc}  (n = {n})");
         println!("    {prog}");
-        println!("    : {ty}");
-        println!("    = {}\n", show(&p.run(seed).expect("shape error")));
+        println!("    [{total}]  = {out}\n");
     }
 }

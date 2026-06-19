@@ -1,19 +1,21 @@
 //! ML front-end tests: same demos through `let` and juxtaposed stages, plus a check that `let`
 //! sharing produces fewer nodes than the same join written with the shared subexpression inlined.
 
-use corgi::{parse_ml, shape_of_value, show, Program, Value};
+use corgi::{eval_try, parse_ml, show, EffectValues, Program, Value};
 
 fn u64(xs: &[u64]) -> Value {
     Value::u64(xs.to_vec())
 }
 
+/// run through the effect layer and render: a total program shows its pure value; a partial program
+/// (an un-`TRY`'d `FailOp`) shows its result TRY'd to a `Sum{T | Unit}`.
 fn run_ml(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
     p.check();
-    let out = p.run(arg.clone()).expect("shape error");
-    let inferred = p.shape(&shape_of_value(arg)).expect("type error");
-    assert_eq!(inferred, shape_of_value(&out), "typer disagrees with evaluator");
-    show(&out)
+    match p.run_effect(arg.clone()) {
+        EffectValues::Pure(v) => show(&v),
+        EffectValues::Fail(fv) => show(&eval_try(fv)),
+    }
 }
 
 fn sample() -> Value {
@@ -60,9 +62,9 @@ fn juxtaposition_stops_at_let_in() {
 #[test]
 fn let_sharing_beats_fanout_recompute() {
     // same join: `let t = transpose` shares the transpose once; inlining it fans out and recomputes.
-    let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices_uns";
+    let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
     let inlined =
-        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices_uns";
+        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
     let shared_nodes = parse_ml(shared).unwrap().node_count();
     let inlined_nodes = parse_ml(inlined).unwrap().node_count();
     assert!(shared_nodes < inlined_nodes, "shared {shared_nodes} should be < inlined {inlined_nodes}");
@@ -106,7 +108,12 @@ fn branch_by_enum_and_named_match_arms() {
     let src = "enum Size = Lo | Hi in \
                let (subj, vals) = input.1 transpose in \
                vals map (v -> (v, v gt 300) branch Size match (Lo (l -> l), Hi (h -> h add 1)))";
-    assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[100, 200, 300, 401, 501, 601]>");
+    // `branch` is a FailOp now (demux Sum{Lo|Hi} with Oob in the err-mask), so the result is a Fail
+    // column shown TRY'd; the match arms still align (the demux re-tags Lo=0, Hi=1) — Hi (>300) gets +1.
+    assert_eq!(
+        run_ml(src, &sample()),
+        "Sum tags=[0, 0, 0] [List ends=[2, 3, 6] <[100, 200, 300, 401, 501, 601]>, ()x0]"
+    );
 }
 
 #[test]
@@ -141,12 +148,10 @@ fn string_literal_broadcasts() {
 }
 
 #[test]
-fn head_sugar_is_total() {
-    // `head` lowers to `get_try 0`, `head_uns` to `get_uns 0`. Cover the total branch the corpus
-    // (which uses only head_uns) misses: a non-empty row yields Found(first), an EMPTY row yields
-    // Oob 0 — no panic. (`input add_u64 1 iota` is [0..n+1); `input iota` at n=0 is the empty row.)
-    assert_eq!(run_ml("input add_u64 1 iota head", &u64(&[3])), "Sum tags=[1] [[], [0]]");
-    assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[0] [[0], []]");
-    // head_uns on a non-empty row extracts the bare element.
-    assert_eq!(run_ml("input add_u64 1 iota head_uns", &u64(&[3])), "[0]");
+fn head_sugar_is_a_failop() {
+    // `head` is the get FailOp: a non-empty row -> Found(first), an EMPTY row -> Oob — both carried in
+    // the err-mask, shown TRY'd as Sum{T | Unit}. No panic, no total/unchecked split. (`input add_u64 1
+    // iota` is [0..n+1); `input iota` at n=0 is the empty row.)
+    assert_eq!(run_ml("input add_u64 1 iota head", &u64(&[3])), "Sum tags=[0] [[0], ()x0]");
+    assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[1] [[], ()x1]");
 }

@@ -2,7 +2,7 @@
 # transpose undoes zip on parallel lists. Both are pure rewraps of the columnar layout —
 # the law is that the wrapping is lossless.
 # n = 8
-# = [1]
+# = Sum tags=[0] [[1], ()x0]
 let xs = input iota in
 let pairs = xs map (x -> (x, (x, x) mul)) in
 let cols = pairs transpose in

@@ -15,7 +15,9 @@
 //! eye; 8 K rows (64 KB) is a control that proves dispatch is amortized — NOT a target. Run:
 //! `cargo bench --bench gaps`.
 
-use corgi::{eval_graph, parse_ml, ArithOp, Builder, Graph, NumOp, Value};
+use corgi::{
+    effect_eval_graph, eval_graph, parse_ml, ArithOp, Builder, EffectValues, Graph, NumOp, Op, Value,
+};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,20 @@ fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
         let a = arg.clone();
         let t = Instant::now();
         black_box(eval_graph(g, black_box(a)));
+        best = best.min(t.elapsed());
+    }
+    best
+}
+
+/// best-of-`reps` wall time for one whole-graph EFFECT eval — the total path: a `FailOp` (gather here)
+/// does the vectorized bounds check and produces a `Fail` column, rather than panicking or returning
+/// the raw value. Same Arc-clone-outside-the-timer discipline as `corgi_t`.
+fn corgi_effect_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
+    let mut best = Duration::MAX;
+    for _ in 0..reps {
+        let a = arg.clone();
+        let t = Instant::now();
+        black_box(effect_eval_graph(g, black_box(EffectValues::Pure(a))));
         best = best.min(t.elapsed());
     }
     best
@@ -79,6 +95,18 @@ fn row_chain(task: &str, n: usize, ck: Duration, rk: Duration, r1: Duration) {
         ns_per(r1, n),
         ck.as_secs_f64() / rk.as_secs_f64(),
         rk.as_secs_f64() / r1.as_secs_f64(),
+    );
+}
+
+/// the safety comparison: ns/row for corgi's TOTAL gather (vectorized check + gather) and corgi-raw
+/// (no check), against three Rust ceilings — `get_unchecked` (no safety), indexed `h[i[k]]` (panicking
+/// per-element bounds check), and `.get()` collected to `Option<Vec>` (the total Rust analog, which
+/// discovers failure SEQUENTIALLY and short-circuits on the first miss).
+#[allow(clippy::too_many_arguments)]
+fn row_safety(task: &str, n: usize, cs: Duration, cr: Duration, ru: Duration, ri: Duration, ro: Duration) {
+    println!(
+        "{task:<12} n={n:>8}  corgi-safe {:>6.2}  corgi-raw {:>6.2}  | rust-unsafe {:>6.2}  rust-idx {:>6.2}  rust-opt {:>6.2}  ns/row",
+        ns_per(cs, n), ns_per(cr, n), ns_per(ru, n), ns_per(ri, n), ns_per(ro, n),
     );
 }
 
@@ -485,6 +513,130 @@ fn family_g(m: usize, reps: u32) {
 
 // ----- driver ------------------------------------------------------------
 
+/// time corgi (safe `effect_eval_graph` + raw `eval_graph`) and the three Rust ceilings for `gather`
+/// with an `arith` applied to each gathered value — the SAME arith in corgi's `map` body and in every
+/// Rust closure, so the comparison is honest. `unsafe` = `get_unchecked`; `idx` = panicking `h[i[k]]`;
+/// `opt` = `.get()` mapped through `arith`, collected to `Option<Vec>` (the total Rust path).
+fn bench_gather(label: &str, n: usize, reps: u32, idx: &[u64], hay: &[u64], g: &Graph<NumOp>, arith: fn(u64) -> u64) {
+    let arg = Value::Prod(vec![
+        Value::List(vec![n].into(), Box::new(Value::u64(idx.to_vec()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(hay.to_vec()))),
+    ]);
+    let cs = corgi_effect_t(g, &arg, reps);
+    let cr = corgi_t(g, &arg, reps);
+    // all three Rust variants are iterator-collect (allocate + write ONCE, no zero-init pass), so only
+    // the safety mechanism differs: unchecked load, panicking index, or `.get()`->Option.
+    let ru = rust_t(reps, || {
+        let (i, h) = (black_box(idx), black_box(hay));
+        black_box(i.iter().map(|&x| arith(unsafe { *h.get_unchecked(x as usize) })).collect::<Vec<u64>>());
+    });
+    let ri = rust_t(reps, || {
+        let (i, h) = (black_box(idx), black_box(hay));
+        black_box(i.iter().map(|&x| arith(h[x as usize])).collect::<Vec<u64>>());
+    });
+    let ro = rust_t(reps, || {
+        let (i, h) = (black_box(idx), black_box(hay));
+        black_box(i.iter().map(|&x| h.get(x as usize).map(|&v| arith(v))).collect::<Option<Vec<u64>>>());
+    });
+    row_safety(label, n, cs, cr, ru, ri, ro);
+}
+
+/// the safety bench: corgi's TOTAL gather (a FailOp — one vectorized "all in range" sweep, then the
+/// gather) vs the Rust ceilings, with NO downstream op and with a 1- and 3-op arith chain mapped over
+/// the gathered values. The chain tests whether corgi amortizes its ONE check across the compute while
+/// Rust's total `.get()` path re-pays the `Option` per element. RANDOM (scrambled) and SEQUENTIAL
+/// patterns; all indices are in range, so the check never actually fires.
+fn family_safety(n: usize, reps: u32) {
+    let hay: Vec<u64> = (0..n as u64).collect();
+    let idx_rand: Vec<u64> = scrambled(n).iter().map(|&x| x % n as u64).collect();
+    let idx_seq: Vec<u64> = (0..n as u64).collect();
+    let g_plain = compile("input gather");
+    let g_add = compile("input gather map (v -> v add_u64 7)");
+    let g_chain = compile("input gather map (v -> v add_u64 7 shr 1 and 255)");
+    let cases: [(&str, &Graph<NumOp>, fn(u64) -> u64); 3] = [
+        ("gather", &g_plain, |v| v),
+        ("gath+add", &g_add, |v| v.wrapping_add(7)),
+        ("gath+chn3", &g_chain, |v| (v.wrapping_add(7) >> 1) & 255),
+    ];
+    for (label, g, arith) in cases {
+        bench_gather(&format!("{label}_rand"), n, reps, &idx_rand, &hay, g, arith);
+        bench_gather(&format!("{label}_seq"), n, reps, &idx_seq, &hay, g, arith);
+    }
+}
+
+/// the pointer-CHASE bench: `r` independent chains, each `d` deep, through a random successor array of
+/// `n` slots. corgi advances ALL chains in lockstep (one gather per step = `r` INDEPENDENT loads ->
+/// MLP); the naive Rust chase walks each chain to the bottom first (dependent loads -> one outstanding
+/// load, no MLP). A Rust LOCKSTEP control (loop-interchanged: step-outer, chain-inner) shows the gap
+/// closes once Rust also exposes the independent loads. `get_unchecked` on BOTH Rust sides, so this
+/// isolates memory-level parallelism — safety is factored out entirely.
+fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
+    let h: Vec<u64> = scrambled(n).iter().map(|&x| x % n as u64).collect(); // random successor
+    let start: Vec<u64> = (0..r).map(|i| ((i * (n / r)) % n) as u64).collect(); // spread-out chain heads
+
+    // corgi: d chained gathers, each advancing the r positions one step (lockstep by construction).
+    let mut b = Builder::<NumOp>::default();
+    let inp = b.input();
+    let hf = b.add(NumOp::Core(Op::Field(1)), vec![inp]);
+    let mut cur = b.add(NumOp::Core(Op::Field(0)), vec![inp]);
+    for _ in 0..d {
+        let pair = b.tuple(vec![cur, hf]);
+        cur = b.add(NumOp::Core(Op::Gather), vec![pair]);
+    }
+    let g = b.finish(cur);
+    let arg = Value::Prod(vec![
+        Value::List(vec![r].into(), Box::new(Value::u64(start.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(h.clone()))),
+    ]);
+    let craw = corgi_t(&g, &arg, reps);
+    let csafe = corgi_effect_t(&g, &arg, reps);
+
+    // Rust naive chase: chain-outer, step-inner — each chain's loads are dependent (a = h[a]), serial.
+    let naive = rust_t(reps, || {
+        let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
+        let mut out = vec![0u64; r];
+        for ri in 0..r {
+            let mut a = s[ri];
+            for _ in 0..d {
+                a = unsafe { *hh.get_unchecked(a as usize) };
+            }
+            out[ri] = a;
+        }
+        black_box(out);
+    });
+    // Rust lockstep, IN PLACE: step-outer, chain-inner — each step's r loads independent -> MLP.
+    let lock = rust_t(reps, || {
+        let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
+        let mut pos: Vec<u64> = s.to_vec();
+        for _ in 0..d {
+            for p in pos.iter_mut() {
+                *p = unsafe { *hh.get_unchecked(*p as usize) };
+            }
+        }
+        black_box(pos);
+    });
+    // Rust lockstep, ALLOCATING a fresh column each step (like corgi's gather, which can't yet write in
+    // place) — isolates the per-step allocation cost from corgi's remaining dispatch/double-pass tax.
+    let lock_alloc = rust_t(reps, || {
+        let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
+        let mut pos: Vec<u64> = s.to_vec();
+        for _ in 0..d {
+            pos = pos.iter().map(|&p| unsafe { *hh.get_unchecked(p as usize) }).collect();
+        }
+        black_box(pos);
+    });
+
+    let tot = r * d; // total chase steps (loads)
+    println!(
+        "chase r={r} d={d} n={n} ({} MB)  corgi-raw {:>5.2}  corgi-safe {:>5.2}  | naive {:>5.2}  lock-inplace {:>5.2}  lock-alloc {:>5.2}  ns/step  (naive/lock {:>4.1}x, alloc-tax {:>4.1}x, corgi/lock-alloc {:>4.1}x)",
+        n * 8 / (1 << 20),
+        ns_per(craw, tot), ns_per(csafe, tot), ns_per(naive, tot), ns_per(lock, tot), ns_per(lock_alloc, tot),
+        naive.as_secs_f64() / lock.as_secs_f64(),
+        lock_alloc.as_secs_f64() / lock.as_secs_f64(),
+        craw.as_secs_f64() / lock_alloc.as_secs_f64(),
+    );
+}
+
 fn main() {
     // (n, reps). 8 K = L1 control; 1 M = L2/SLC design center; 8 M = DRAM eye.
     let core: [(usize, u32); 3] = [(1 << 13, 2000), (1 << 20, 50), (1 << 23, 10)];
@@ -512,5 +664,23 @@ fn main() {
         println!("\n==== m = {m} elements — text ========================================", );
         println!("-- G text --");
         family_g(m, reps);
+    }
+    // H safety: is corgi's TOTAL gather (vectorized check) as cheap as unsafe, and cheaper than Rust's
+    // scalar safety? Run at L1 / L2 / DRAM (sequential gather wants the L1 point; random wants DRAM).
+    for (n, reps) in [(1usize << 13, 2000u32), (1 << 20, 50), (1 << 23, 10)] {
+        println!("\n==== n = {n}  ({} MB/col) — H safety: total gather vs Rust =========", n * 8 / (1 << 20));
+        family_safety(n, reps);
+    }
+    // I pointer-chase: corgi lockstep gather (MLP) vs Rust naive chase (serial) vs Rust lockstep. 1k
+    // chains x 1k deep, through an L2-sized and a DRAM-sized random successor array.
+    println!("\n==== I pointer-chase: MLP from lockstep vs serial dependent chase ==========");
+    for (n, reps) in [(1usize << 20, 30u32), (1 << 23, 12)] {
+        family_chase(1024, 1024, n, reps);
+    }
+    // I-sweep: fixed depth (=node count), widen the chains. If corgi's gap to lock-alloc is
+    // unamortized per-node dispatch, `corgi/lock-alloc` should fall as `r` (work per node) grows.
+    println!("\n-- I-sweep: fixed d=256 nodes, widening r (work/node) — dispatch amortization --");
+    for (r, reps) in [(1024usize, 200u32), (1 << 14, 40), (1 << 18, 12)] {
+        family_chase(r, 256, 1 << 22, reps);
     }
 }

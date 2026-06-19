@@ -3,7 +3,7 @@
 # sum column, and keep lane 1. The fused op earns its keep as one mask-driven pass; this law
 # says it adds no expressive power (it was the last reduction awaiting zip).
 # n = 8
-# = [1]
+# = Sum tags=[0] [[1], ()x0]
 let data = input iota in
 let mask = data map (x -> x and 1) in
 let fused = (data, mask) filter in

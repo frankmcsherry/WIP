@@ -21,22 +21,18 @@
 //! [`ops`] (the vocabulary; `ops::cmp` carries its own `compare_idx`/structural-order
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
 
+pub(crate) mod effect;
 pub(crate) mod engine;
 pub(crate) mod frontend;
 pub(crate) mod graph;
-pub(crate) mod lengths;
 pub(crate) mod ops;
 pub(crate) mod optimize;
-pub(crate) mod ranges;
 pub(crate) mod shape;
-pub(crate) mod total;
 pub(crate) mod value;
 
+pub use effect::{effect_eval_graph, eval_try, is_total, EffectValues, FailValues};
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
-pub use lengths::check_lengths;
-pub use ranges::check_ranges;
-pub use total::check_total;
 pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
