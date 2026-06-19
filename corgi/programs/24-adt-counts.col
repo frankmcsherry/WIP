@@ -3,7 +3,7 @@
 # (tag first, then payload — lists length-first), dedup to the distinct values, then `find`
 # each distinct value's run in the sorted column: hi - lo is its multiplicity.
 # n = 10
-# = (List ends=[4] <Sum tags=[0, 0, 1, 1] [[0, 2], List ends=[1, 4] <[0, 0, 1, 2]>]>, List ends=[4] <[3, 2, 3, 2]>)
+# = Sum tags=[0] [(List ends=[4] <Sum tags=[0, 0, 1, 1] [[0, 2], List ends=[1, 4] <[0, 0, 1, 2]>]>, List ends=[4] <[3, 2, 3, 2]>), ()x0]
 enum Parity = Even | Odd in
 let sums = input iota map (x ->
     (x, x and 1) branch Parity

@@ -4,7 +4,7 @@
 # Conjunct 2: an arm can now SEE the context — adding a captured x+100 in the even lane agrees
 # with the direct arithmetic x + (1 - parity) * (x + 100).
 # n = 8
-# = [1]
+# = Sum tags=[0] [[1], ()x0]
 let xs = input iota in
 let sums = xs map (x -> (x, x and 1) branch 2) in
 let strip = xs map (x ->

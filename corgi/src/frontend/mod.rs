@@ -22,7 +22,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "branch_try" | "chunk")
+    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "chunk")
         || name.starts_with("lit_") // typed literals `lit_<k><w> N`
 }
 
@@ -88,10 +88,10 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cast" => Op::Cast(n()? as u32).into(),
         "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
-        // the three tiers — `foo` (checked: a static pass gates it), `foo_try` (total: an error lane),
-        // `foo_uns` (unchecked: asserts the precondition, may panic — the kernel tier `check_total` flags).
-        "zip" => Op::Zip.into(),         // checked by the length pass (columns share bounds)
-        "zip_try" => Op::TryZip.into(),  // total Zip (pair): per-row Sum{Err | Ok}
+        // One name per fallible method — each routes through the effect layer as a FailOp; the old
+        // `_try`/`_uns` tier split is retired (totality is `is_total`, not a name). The lone survivor,
+        // `gather_try`, is kept only as the DISTINCT per-element gather (below), never as an alias.
+        "zip" => Op::TryZip.into(),      // the zip FailOp: per-row Sum{Err | Ok} (length agreement)
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
         // iso-inverses (Zip pairs any two columns; Slices materializes any ranges, incl. Find's),
@@ -102,25 +102,23 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // a verb. (A `try_weave` would only carry an unactionable "inconsistent columns" error.)
         "cap_list" => Op::CapList.into(), // capture: pair a context with every list element
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
-        "branch" => Op::Branch(n()? as usize).into(), // checked by the range pass (tags < n);
-                                                      // `branch 2` on a 0/1 mask is the boolean split
-        "branch_try" => Op::TryBranch(n()? as usize).into(), // total Branch: tag>=n -> Oob:U64 lane 0
+        "branch" => Op::TryBranch(n()? as usize).into(), // the branch FailOp: tag>=n -> Oob (err-mask),
+                                                         // else the demux Sum{X×n}; `branch 2` is the split
         "filter" => Op::Filter.into(),
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
-        // point access — `get` is scalar (one index per row), `gather` is its vector form (a list of
-        // indices). Each follows the uniform tier rubric: plain `Foo` is the CHECKED form (a proven
-        // bound; reserved even where unbuilt), `Foo_try` the TOTAL form (an Oob lane), `Foo_uns` the
-        // unchecked kernel `check_total` flags. `get`/`gather` (plain) are RESERVED for a future checked
-        // access (a bound proven `< len`, or sourced from `find`). `head` is sugar for `get_try 0` (see
-        // ml.rs) — an empty row is `Oob 0`, so a total head needs no separate non-emptiness proof.
-        "slices_uns" => Op::Slices.into(), // (ranges, haystack) -> List<List<T>>  ranges asserted in-bounds
-        "get_uns" => Op::Get.into(),       // (idx, haystack) -> T          scalar; index asserted in-bounds
-        "get_try" => Op::GetTry.into(),    // (idx, haystack) -> Sum{Oob | Found}    total scalar access
-        "gather_uns" => Op::Gather.into(), // (idxs, haystack) -> [T]       vector; indices asserted in-bounds
-        "gather_try" => Op::GatherTry.into(), // (idxs, haystack) -> [Sum{Oob | Found}]  total vector access
+        // point access — `get` (scalar, one index per row) and `gather` (vector, a list of indices) are
+        // the per-row FailOps: an out-of-range index folds into the err-mask. `gather_try` is the DISTINCT
+        // per-element gather (`List<Sum{Oob | Found}>`), reifying each element's miss as DATA rather than a
+        // per-row effect — kept as its own verb. `head` is sugar for `get 0` (see ml.rs): an empty row is
+        // `Oob`, so a total head needs no separate non-emptiness proof.
+        "slices" => Op::Slices.into(),        // the slices FailOp: per-row range-in-bounds check
+        "get" => Op::GetTry.into(),           // the get FailOp: (idx, haystack) -> per-row Found/Oob
+        "gather" => Op::Gather.into(),        // the gather FailOp: per-row all-or-nothing
+        "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Oob | Found}>
+        "try" => Op::Try.into(), // handle a fallible stage: reveal its Fail as a pure Sum{T | Unit}
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
         "append" => Op::Append.into(), // (List<X>, List<X>) -> List<X>  row-wise concat (the list-monoid ⊕)

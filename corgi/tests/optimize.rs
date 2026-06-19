@@ -3,7 +3,8 @@
 //! `Field` of a `Tuple`).
 
 use corgi::{
-    cancel_isos, cse, dce, fuse_maps, optimize, parse_ml, peephole, show, Graph, NumOp, Program, Value,
+    cancel_isos, cse, dce, eval_try, fuse_maps, optimize, parse_ml, peephole, show, Builder,
+    EffectValues, Graph, NumOp, Op, Program, Value,
 };
 
 fn u64(xs: &[u64]) -> Value {
@@ -13,7 +14,10 @@ fn u64(xs: &[u64]) -> Value {
 fn eval_str(g: &Graph<NumOp>, arg: &Value) -> String {
     let p = Program::from_graph(g.clone());
     p.check();
-    show(&p.run(arg.clone()).expect("shape error"))
+    match p.run_effect(arg.clone()) {
+        EffectValues::Pure(v) => show(&v),
+        EffectValues::Fail(fv) => show(&eval_try(fv)),
+    }
 }
 
 fn sample() -> Value {
@@ -39,9 +43,9 @@ fn join_input() -> Value {
 
 // the join with the shared transpose INLINED (fanned out) vs. hand-shared with `let`.
 const INLINED_JOIN: &str =
-    "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices_uns";
+    "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
 const ML_JOIN: &str =
-    "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices_uns";
+    "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
 
 #[test]
 fn cse_collapses_the_fanout_join() {
@@ -104,8 +108,15 @@ fn fuse_maps_collapses_adjacent_passes() {
 
 #[test]
 fn cancel_isos_drops_inverse_pairs() {
-    // Transpose then Zip is the identity on List<(X,Y)>; cancellation removes both, leaving the input.
-    let g = parse_ml("input.1 transpose zip").unwrap();
+    // Transpose then (PURE) Zip is the identity on List<(X,Y)>; cancellation removes both. Built with
+    // `Op::Zip` directly: the SURFACE `zip` is now the `TryZip` FailOp (fallible — not a pure inverse,
+    // so it can't cancel without optimizer demotion), while the optimizer still targets the pure op.
+    let mut b: Builder<NumOp> = Builder::default();
+    let inp = b.input();
+    let f1 = b.add(NumOp::Core(Op::Field(1)), vec![inp]);
+    let t = b.add(NumOp::Core(Op::Transpose), vec![f1]);
+    let z = b.add(NumOp::Core(Op::Zip), vec![t]);
+    let g = b.finish(z);
     let opt = dce(&cancel_isos(&g));
     assert!(opt.node_count() < g.node_count(), "Zip∘Transpose should cancel");
     assert_eq!(eval_str(&opt, &sample()), eval_str(&g, &sample()));

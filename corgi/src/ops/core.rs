@@ -17,7 +17,7 @@ use crate::value::{Bounds, Value};
 /// allocation, no copying of the unchanged rows. VARIABLE-WIDTH `acc` (containing a `List`/`Sum`,
 /// whose rows differ in size) can't be slot-overwritten, so it falls back to the rebuild via
 /// two-source `gather_lanes` (correct, the prior behaviour; an uncommon accumulator shape).
-fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
+pub(crate) fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
     if fixed_width(&acc) {
         scatter_fixed(&mut acc, active, &new);
         acc
@@ -64,7 +64,7 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
 /// `len > t`, so the per-round cost tracks the *active* rows, not all N (the win for ragged lengths —
 /// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
 /// targets: row `r`'s round-`t` element is at flat index `start + t`.
-fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
+pub(crate) fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
     let bounds = bounds.to_vec();
     let mut v = Vec::with_capacity(bounds.len());
     let mut start = 0;
@@ -158,8 +158,6 @@ pub enum Op<L> {
     // sugar for `Get 0` (an empty row is `Oob 0`, so a TOTAL head needs no non-emptiness proof).
     // Each comes in a `_uns` (assert in-bounds, panic) and a `_try` (total, Oob lane) tier; the plain
     // checked tier (`get`/`gather`, a proven bound) is reserved for later.
-    Get,            // (idx:U64, haystack:List<T>) -> T  scalar point access — one index per row into
-                    // that row's list. PARTIAL (panics out of bounds): the unchecked fast path.
     GetTry,         // (idx:U64, haystack:List<T>) -> Sum{Oob:U64 | Found:T}  TOTAL scalar access: an
                     // out-of-bounds index lands in Oob carrying the bad index, in-bounds in Found
                     // (the ParseU64 discipline — failure is a committed lane, never a panic).
@@ -187,6 +185,10 @@ pub enum Op<L> {
                     // (the uniform inverse of Flatten): a pure re-partition — values don't move, the
                     // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
                     // chunked record stream feeds the stride fast paths. Each row must divide by `k`.
+    Try,            // the TRY marker: identity to the pure engine, but the effect layer reads it as
+                    // "handle here" — it reveals a `Fail` column as a pure `Sum{T | Unit}` to match
+                    // (`eval_try`), the one transition that takes a column from the `Fail` regime to
+                    // `Pure`. Inert (no-op) on an already-pure value.
 }
 
 impl<L: OpLike> Op<L> {
@@ -583,25 +585,6 @@ impl<L: OpLike> Op<L> {
                 Value::List(lb, Box::new(inner))
             }
 
-            // scalar point access: one index per row into that row's haystack list. Output is a
-            // bare T column (the list stratum is DROPPED — this is the eliminator). Partial: an
-            // out-of-bounds index is a data-dependent panic, like Gather's bounds check.
-            Op::Get => {
-                let (idx, haystack) = input.into_pair("Get");
-                let idxs = idx.into_u64("Get index");
-                let (hb, hvals) = haystack.into_list("Get haystack");
-                assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
-                let mut abs = Vec::with_capacity(idxs.len());
-                let mut hs = 0;
-                for (r, he) in hb.ends().enumerate() {
-                    let x = idxs[r];
-                    assert!((x as usize) < he - hs, "Get: index {x} out of row {r}'s bounds");
-                    abs.push(hs + x as usize);
-                    hs = he;
-                }
-                gather(&hvals, &abs)
-            }
-
             // total scalar access: each index either names its row's element (Found) or is out of
             // bounds (Oob, carrying the bad index). The empty-row case is just Oob 0 — which is why
             // `head = GetTry 0` is total with no non-emptiness proof. Output is a bare Sum column.
@@ -725,6 +708,9 @@ impl<L: OpLike> Op<L> {
 
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
             Op::Unit => Value::Unit(input.len()),
+
+            // TRY is identity to the pure engine; the effect layer (`eval_try`) gives it its meaning.
+            Op::Try => input,
 
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the
             // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
@@ -927,14 +913,6 @@ impl<L: OpLike> Op<L> {
             },
 
             // scalar access: (U64, List<T>) -> T — the index is a leaf column, the list stratum drops.
-            Op::Get => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (Prim(64), List(t)) => (**t).clone(),
-                    _ => return err("Get expects (U64, List<T>)"),
-                },
-                _ => return err("Get expects a pair"),
-            },
-
             // total scalar access: (U64, List<T>) -> Sum{Oob: U64 | Found: T} — Oob carries the index.
             Op::GetTry => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
@@ -979,6 +957,8 @@ impl<L: OpLike> Op<L> {
             },
 
             Op::Unit => Unit, // any shape -> Unit
+
+            Op::Try => input.clone(), // pure-level identity (the effect layer reshapes Fail -> Sum)
 
             // (U64 mask, T, T) -> T. The two branches join (a ⊥ lane adopts its sibling, as in Unwrap);
             // eval never reads a branch the mask doesn't select, so the join is total.
@@ -1084,27 +1064,6 @@ impl<L: OpLike> Op<L> {
             Op::Fold(b) | Op::FoldScan(b) => vec![b],
             Op::MapSum(arms) => arms.iter().map(|(_, b)| b).collect(),
             _ => Vec::new(),
-        }
-    }
-
-    /// the surface name of the UNCHECKED tier, for the ops whose in-bounds precondition no static gate
-    /// proves (`check_total` reports these); `None` for every total/gated/structural op. The match is
-    /// EXHAUSTIVE on purpose: a new `Op` must classify itself here, so the totality guarantee can't
-    /// silently regress (the old `_ => {}` in `check_total` let a new partial op pass as total).
-    pub(crate) fn unchecked_site(&self) -> Option<&'static str> {
-        match self {
-            // data-dependent bounds, no static proof — the `_uns` kernels (`head_uns` lowers to `Get`):
-            Op::Get => Some("get_uns"),
-            Op::Gather => Some("gather_uns"),
-            Op::Slices => Some("slices_uns"),
-            // chunk asserts each row divides by `k` — a data-dependent precondition no gate proves yet.
-            Op::Chunk(_) => Some("chunk"),
-            // total (run to a value), gated (lengths/ranges prove the precondition), or pure structural:
-            Op::Field(_) | Op::Lit(_) | Op::Transpose | Op::Zip | Op::TryZip | Op::Unweave
-            | Op::Weave | Op::CapList | Op::CapSum | Op::Cast(_) | Op::Filter | Op::Branch(_)
-            | Op::TryBranch(_) | Op::Unwrap | Op::Inject(_, _) | Op::MapList(_) | Op::Fold(_)
-            | Op::FoldScan(_) | Op::MapSum(_) | Op::GetTry | Op::GatherTry | Op::Flatten
-            | Op::Enlist | Op::Iota | Op::Unit | Op::Select | Op::Append | Op::Len => None,
         }
     }
 }

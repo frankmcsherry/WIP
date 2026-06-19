@@ -145,7 +145,7 @@ enum Apply {
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, usize),         // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
-    Head(bool), // `head`/`head_uns`: sugar for `(lit 0, list) get_try`/`get_uns` — the first element
+    Head, // `head`: sugar for `(lit 0, list) get` — the first element (the get FailOp; empty row -> Oob)
 }
 
 enum E {
@@ -369,10 +369,8 @@ impl P {
                 };
                 Ok(Apply::Inject(tag, arity))
             }
-            // head: first element, sugar for `get 0`. `head` is total (an empty row -> Oob 0), so it
-            // lowers to `get_try`; `head_uns` asserts non-empty and lowers to `get_uns`.
-            "head" => Ok(Apply::Head(true)),
-            "head_uns" => Ok(Apply::Head(false)),
+            // head: first element, sugar for `get 0` — total (an empty row -> Oob, carried in the err-mask).
+            "head" => Ok(Apply::Head),
             // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
             // it names a byte, not a count.
             "split" => match self.bump() {
@@ -530,10 +528,12 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 }
                 Apply::Inject(tag, arity) => Ok(b.add(Op::Inject(*tag, *arity), vec![id])),
                 // first element = index 0 of the row: build the (0, list) pair and scalar-`get` it.
-                Apply::Head(total) => {
+                Apply::Head => {
+                    // `head` lowers to `get` (GetTry) — the get FailOp; an empty row is an Oob carried
+                    // in the err-mask, observed by a downstream TRY, not a panic.
                     let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
-                    Ok(b.add(if *total { Op::GetTry } else { Op::Get }, vec![pair]))
+                    Ok(b.add(Op::GetTry, vec![pair]))
                 }
             }
         }

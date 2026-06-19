@@ -1,4 +1,4 @@
 # n = 8
-# = List ends=[8] <[0, 1, 2, 3, 104, 105, 106, 107]>
+# = Sum tags=[0] [List ends=[8] <[0, 1, 2, 3, 104, 105, 106, 107]>, ()x0]
 enum Size = Lo | Hi in
 input iota map (x -> (x, x gt 3) branch Size match (Lo (lo -> lo), Hi (hi -> hi add_u64 100)))

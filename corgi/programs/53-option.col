@@ -4,7 +4,7 @@
 # carries no data, just its length (shown as `()x2`). `match` then supplies a default 0 for None and
 # x+100 for Some. The Unit lane is what a fieldless product could not be: a column with a length.
 # n = 6
-# = List ends=[6] <[100, 0, 102, 0, 104, 0]>
+# = Sum tags=[0] [List ends=[6] <[100, 0, 102, 0, 104, 0]>, ()x0]
 input iota map (x ->
     (x, x and 1) branch 2 map_variant 1 (o -> o unit)
     match (0 (some -> some add_u64 100), 1 (none -> none lit 0)))

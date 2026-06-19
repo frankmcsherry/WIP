@@ -7,9 +7,10 @@
 //! `Program` is not ML-specific: `compile_ml` is one constructor; `from_graph` wraps any `Graph`.
 
 use super::parse_ml;
-use crate::graph::{eval_graph, shape_of, Graph};
+use crate::effect::{effect_eval_graph, is_total, EffectValues};
+use crate::graph::{shape_of, Graph};
 use crate::ops::NumOp;
-use crate::shape::{shape_of_value, Shape};
+use crate::shape::Shape;
 use crate::value::Value;
 
 pub struct Program {
@@ -43,19 +44,32 @@ impl Program {
         shape_of(&self.graph, input)
     }
 
-    /// run the program on an input, consuming it — after shape-checking the graph and proving its two
-    /// static gates: Class-A bounds (`check_lengths`: `Zip`/`Filter` agreement) and Class-B ranges
-    /// (`check_ranges`: `branch` tag-in-range). An ill-typed or gate-failing program is a located `Err`
-    /// here rather than a panic deep inside an op. NOTE the scope: these gates cover `Zip`/`Filter`/
-    /// `branch` only. An UNCHECKED `*_uns` op (`get_uns`/`gather_uns`/`slices_uns`, incl. `head_uns`
-    /// which lowers to `get_uns 0`) has a data-dependent precondition no gate proves and can still panic
-    /// in `eval` — for the full no-panic guarantee a caller must additionally require `check_total`
-    /// (`run` deliberately does not, so the corpus can exercise the `_uns` tier).
+    /// run a TOTAL program to its bare value — a convenience over [`Program::run_effect`] for programs
+    /// with no un-`TRY`'d `FailOp` (the output is `Pure`). A partial program is an `Err` here: there is
+    /// no single bare `Value` for a `Fail` column, so use [`Program::run_effect`] (or add a `TRY`).
+    /// (The old static length/range gates are gone — partiality is carried by the effect layer, not
+    /// rejected up front; their proofs would return only as opt-in optimizer demotion, not run-path.)
     pub fn run(&self, input: Value) -> Result<Value, String> {
-        let shape = shape_of_value(&input);
-        shape_of(&self.graph, &shape)?;
-        crate::lengths::check_lengths(&self.graph, &shape)?;
-        crate::ranges::check_ranges(&self.graph, &shape)?;
-        Ok(eval_graph(&self.graph, input))
+        match self.run_effect(input) {
+            EffectValues::Pure(v) => Ok(v),
+            EffectValues::Fail(_) => {
+                Err("partial program (an un-TRY'd FailOp); use run_effect or add a TRY".into())
+            }
+        }
+    }
+
+    /// run over the EFFECT layer: the input is pure, the output is `Pure` or `Fail` (a per-row
+    /// Ok/Error column). A `Fail` output is the honest result of a partial program, not an error —
+    /// totality is the separate, syntactic [`Program::is_total`] query, and `TRY` (`eval_try`) is how
+    /// a program turns a `Fail` back into matchable `Pure` data. This is the total successor to `run`:
+    /// it needs no static length/range gate, because partiality is carried, not rejected.
+    pub fn run_effect(&self, input: Value) -> EffectValues {
+        effect_eval_graph(&self.graph, EffectValues::Pure(input))
+    }
+
+    /// is this program total — does its output column type `Pure` (every `FailOp` discharged by a
+    /// `TRY`)? The syntactic totality query, read off the op tags (the effect-typer).
+    pub fn is_total(&self) -> bool {
+        is_total(&self.graph)
     }
 }
