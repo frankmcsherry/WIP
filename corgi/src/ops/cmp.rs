@@ -5,7 +5,7 @@
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
 //! The structural-order engine these ops reduce to is the private [`order`] submodule.
 
-mod order;
+pub(crate) mod order;
 
 use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};

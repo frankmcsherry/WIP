@@ -9,6 +9,17 @@ use std::cmp::Ordering;
 pub(crate) use compare::*;
 pub(crate) use discriminate::*;
 
+/// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
+/// scalar form of [`compare_idx`]; exposed (via `crate::arrange`) for using corgi columns as a
+/// differential-dataflow arrangement substrate.
+pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
+    match compare_idx(a, b, &[i], &[j])[0] {
+        s if s < 0 => Ordering::Less,
+        0 => Ordering::Equal,
+        _ => Ordering::Greater,
+    }
+}
+
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
     //! leaf value, then Prod field-by-field, List LENGTH-FIRST (shorter first; equal lengths element-wise),
@@ -106,6 +117,10 @@ mod compare {
                 }
                 ord
             }
+
+            // Unit rows carry no payload — always equal. (Added for `crate::arrange`: a unit-valued
+            // column, e.g. `distinct`'s output, must be a sortable arrangement payload.)
+            (Value::Unit(_), Value::Unit(_)) => vec![0i8; ia.len()],
 
             _ => panic!("compare_idx: shape mismatch"),
         }
