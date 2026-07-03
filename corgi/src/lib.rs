@@ -91,6 +91,39 @@ pub mod arrange {
         crate::ops::cmp::order::compare_idx(a, b, ia, ib)
     }
 
+    /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given
+    /// per-row `labels` marking segments (non-decreasing — segment `s` is the maximal run of rows
+    /// sharing a label), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
+    /// label block by corgi structural order (stable, so ties keep input order), and `refined_labels`
+    /// further splits each block by equal value (two rows share a refined label iff they shared a
+    /// `labels` value AND are structurally equal). `sort_perm(v)` is exactly the single-block case
+    /// `sort_blocks(&[0; n], v).0`.
+    ///
+    /// This is the load-bearing segmented primitive for the dd backend: within a segment `[lo, hi)`
+    /// (a run of one input label, read via [`run_layout`]), `perm[lo]` is the segment's structural
+    /// ARGMIN (its minimum row's original position) and `perm[lo..hi]` is the segment's sorted order —
+    /// so argmin/argmax/first-per-segment and per-segment sorted order fall out while keeping the row
+    /// positions the caller indexed by.
+    pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
+        crate::ops::cmp::order::sort_blocks(labels, v)
+    }
+
+    /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
+    /// This is the seed for a segmented [`sort_blocks`] that sorts within each list row while keeping
+    /// the rows contiguous and in outer-row order. `Offsets` and the equivalent `Stride` produce the
+    /// same labels (labels depend only on the partition, not its encoding).
+    pub fn segment_labels(bounds: &Bounds) -> Vec<u64> {
+        crate::ops::cmp::order::segment_labels(bounds)
+    }
+
+    /// The run structure of a non-decreasing `labels` vector (e.g. either side of [`sort_blocks`]):
+    /// `(ends, firsts)`, where `ends[i]` is the exclusive end and `firsts[i]` the first index of the
+    /// `i`th maximal equal-label run. Reads segment/group boundaries back out — segment `i` occupies
+    /// `firsts[i]..ends[i]`, and `firsts` are the per-segment representative positions.
+    pub fn run_layout(labels: &[u64]) -> (Vec<usize>, Vec<usize>) {
+        crate::ops::cmp::order::run_layout(labels)
+    }
+
     // --- structural per-row content hash ---------------------------------------------------------
     //
     // A deterministic, position-independent u64 per row. The finalizer is splitmix64 and the
@@ -293,6 +326,78 @@ pub mod arrange {
             for (k, &p) in perm.iter().enumerate() {
                 assert_eq!(permuted[k], base[p]);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod order_tests {
+        use super::{gather, run_layout, segment_labels, sort_blocks};
+        use crate::value::{Bounds, Value};
+
+        #[test]
+        fn sort_blocks_segmented_stable_argmin() {
+            // two segments (labels [0,0,0, 1,1,1]) over rows; segment 0 has duplicate 3s (stability),
+            // segment 1 has duplicate 5s. Segments must stay contiguous, sort within, argmin at start.
+            let labels = vec![0u64, 0, 0, 1, 1, 1];
+            let v = Value::u64(vec![3, 1, 3, 5, 2, 5]);
+            let (perm, _refined) = sort_blocks(&labels, &v);
+
+            // segment 0 occupies output [0,3), segment 1 [3,6); each perm entry stays in its segment's
+            // index range (rows contiguous, in segment order).
+            for &p in &perm[0..3] {
+                assert!(p < 3, "segment 0 pulled a row from segment 1");
+            }
+            for &p in &perm[3..6] {
+                assert!((3..6).contains(&p), "segment 1 pulled a row from segment 0");
+            }
+
+            // sorted WITHIN each segment.
+            let sorted = gather(&v, &perm).into_u64("sorted");
+            assert_eq!(&sorted[0..3], &[1, 3, 3]);
+            assert_eq!(&sorted[3..6], &[2, 5, 5]);
+
+            // perm[segment_start] is the segment's argmin (original position of its minimum).
+            assert_eq!(perm[0], 1); // min of [3,1,3] is at index 1
+            assert_eq!(perm[3], 4); // min of [5,2,5] is at index 4
+
+            // stability: the two equal 3s (indices 0 and 2) keep input order.
+            assert_eq!(&perm[1..3], &[0, 2]);
+        }
+
+        #[test]
+        fn segment_labels_offsets_and_stride_agree() {
+            // Offsets([2,4,6]) and the equivalent Stride(2,3) describe the same 3-row partition
+            // (rows of width 2), so per-element segment labels are identical.
+            let off = Bounds::Offsets(vec![2, 4, 6]);
+            let stride = Bounds::Stride(2, 3);
+            assert_eq!(segment_labels(&off), vec![0, 0, 1, 1, 2, 2]);
+            assert_eq!(segment_labels(&off), segment_labels(&stride));
+        }
+
+        #[test]
+        fn run_layout_simple() {
+            // labels [0,0,1,2,2] → 3 runs: [0,2), [2,3), [3,5).
+            let (ends, firsts) = run_layout(&[0, 0, 1, 2, 2]);
+            assert_eq!(ends, vec![2, 3, 5]);
+            assert_eq!(firsts, vec![0, 2, 3]);
+        }
+
+        #[test]
+        fn roundtrip_matches_sortlist_op() {
+            // build List<u64> with ragged rows, segmented-sort it via the arrange surface, and check
+            // it reproduces exactly what the ML `sort` op (CmpOp::SortList) produces on the same list.
+            let bounds = Bounds::Offsets(vec![3, 3, 6]); // rows [3,1,2], [], [5,0,4]
+            let vals = Value::u64(vec![3, 1, 2, 5, 0, 4]);
+            let list = Value::List(bounds.clone(), Box::new(vals.clone()));
+
+            // arrange surface: seed segment labels from bounds, segmented-sort, gather by perm.
+            let labels = segment_labels(&bounds);
+            let (perm, _refined) = sort_blocks(&labels, &vals);
+            let ours = Value::List(bounds.clone(), Box::new(gather(&vals, &perm)));
+
+            // the ML op.
+            let theirs = crate::ops::cmp::CmpOp::SortList.eval(list);
+            assert_eq!(ours, theirs);
         }
     }
 }
