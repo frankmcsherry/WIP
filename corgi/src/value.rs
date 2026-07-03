@@ -273,6 +273,18 @@ macro_rules! prim {
                 }
             }
 
+            /// stable per-element hash: each element WIDENED to u64 (zero-extend) and mixed (splitmix64
+            /// finalizer). The leaf of [`crate::hash::hash`]; reads the stored bytes only, so it is
+            /// KIND-BLIND and — for the raw/unsigned reading — WIDTH-BLIND: `u8` 5 and `u64` 5 both
+            /// hash `mix64(5)`, since the widen collapses them (so a narrowing/widening for storage is
+            /// id-preserving). Signed/float store a WIDTH-DEPENDENT order-preserving encoding, so
+            /// cross-width identity is NOT promised for those kinds; see [`crate::hash`].
+            pub(crate) fn hashes(&self) -> Vec<u64> {
+                match self {
+                    $( Prim::$V(v) => v.iter().map(|&x| crate::hash::mix64(x as u64)).collect(), )+
+                }
+            }
+
             /// structural order of paired records: `out[k]` = sign of `self[ia[k]]` vs `other[ib[k]]`
             /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and scalar
             /// on NEON; the dense column-vs-column compare is [`Prim::rel`].

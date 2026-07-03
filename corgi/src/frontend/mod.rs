@@ -127,6 +127,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
+        "hash" => Op::Hash.into(), // X -> U64  stable structural content hash (the boundary id fn)
         // relational compares: two equal-width leaf columns -> 0/1 mask. `gt`/`ge` are these with
         // the operands swapped, and the column-vs-constant `gt N` is the separate sugar above.
         "eq" => CmpOp::Rel(Pred::Eq).into(),

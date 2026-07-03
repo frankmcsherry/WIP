@@ -151,6 +151,8 @@ pub enum Op<L> {
     // ---- fused forms & producers -------------------------------------------------------------
     Lit(Value),     // a constant element, filled to the input's length (anchored)
     Cast(u32),      // leaf -> leaf  re-width to N bits (low bytes / zero-pad), kind-blind
+    Hash,           // X -> U64   stable content hash of each row: structural, kind-blind, one pass
+                    // (the boundary id function — see [`crate::hash`]). TOTAL over any shape.
     Filter,         // (List<X>, List<U64-mask>) -> List<X>  keep mask-nonzero elements in one
                     // pass (the kernel expansion is zip; map(branch); unweave; field — see the law)
     // point access — fetch a haystack element by index. The atom is the SCALAR `Get` (one O(1)
@@ -370,6 +372,9 @@ impl<L: OpLike> Op<L> {
                 Value::Prim(p) => Value::Prim(p.cast(*bits)),
                 _ => panic!("Cast: expected a leaf"),
             },
+
+            // stable structural hash: one U64 per row, kind-blind over any shape (see `crate::hash`).
+            Op::Hash => crate::hash::hash(&input),
 
             Op::Filter => {
                 let (data, mask) = input.into_pair("Filter");
@@ -893,6 +898,9 @@ impl<L: OpLike> Op<L> {
                 Prim(_) => return err(&format!("Cast: unsupported width {bits}")),
                 _ => return err("Cast expects a leaf"),
             },
+
+            // any shape -> U64: structural and kind-blind, so the element shape is irrelevant.
+            Op::Hash => Prim(64),
 
             Op::Filter => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
