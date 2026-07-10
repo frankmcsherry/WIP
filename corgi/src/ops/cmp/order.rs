@@ -20,6 +20,119 @@ pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
     }
 }
 
+/// One report from [`survey`]: a maximal range drawn from one side of the interleaving, or a
+/// single matched pair present in both. The bidirectional generalization of `find_ranges`' report.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Run {
+    /// Rows `a[lo..hi)` come next in merged order, all strictly less than the current head of `b`
+    /// (exclusive to `a` over this range).
+    A(usize, usize),
+    /// Rows `b[lo..hi)` come next in merged order, all strictly less than the current head of `a`
+    /// (exclusive to `b` over this range).
+    B(usize, usize),
+    /// A single matched pair: row `a[ia]` and row `b[ib]` are structurally equal.
+    Both(usize, usize),
+}
+
+/// Galloping search over the structurally-sorted column `xs`: advance `*idx` (bounded by `hi`)
+/// while row `*idx` of `xs` compares strictly less than row `pj` of `piv`. On return `*idx` is the
+/// first position whose row is `>= piv[pj]` (or `hi`). Exponential probe + binary refine, so it
+/// costs `O(log gap)` `compare_at`s rather than one per row — the whole point of the survey.
+fn gallop_lt(xs: &Value, idx: &mut usize, hi: usize, piv: &Value, pj: usize) {
+    let lt = |k: usize| compare_at(xs, k, piv, pj) == Ordering::Less;
+    // nothing to do unless the row at the cursor is itself still below the pivot.
+    if *idx < hi && lt(*idx) {
+        let mut step = 1;
+        while *idx + step < hi && lt(*idx + step) {
+            *idx += step;
+            step <<= 1;
+        }
+        // binary refine over the last (overshot) doubling.
+        step >>= 1;
+        while step > 0 {
+            if *idx + step < hi && lt(*idx + step) {
+                *idx += step;
+            }
+            step >>= 1;
+        }
+        // `*idx` sits on the last row `< piv`; step past it to the first row `>= piv`.
+        *idx += 1;
+    }
+}
+
+/// Survey the mutual interleaving of two structurally-sorted columns `a` and `b`: a zig-zag gallop
+/// that returns the merge as a sequence of [`Run`]s — maximal ranges exclusive to one side and the
+/// single matched pairs present in both — instead of a per-pair two-pointer. The bidirectional
+/// generalization of `find_ranges` (the one-directional needle-into-haystack gallop).
+///
+/// The caller bulk-`gather`s each `A`/`B` range and consolidates only at the `Both` pairs, so the
+/// merge crosses the corgi/Rust boundary once per *range* rather than once per *row*. This owns no
+/// times/diffs: it reports only positions, and the caller drives its own lattice logic off the runs.
+///
+/// Guarantees: the `A` ranges plus every `Both`'s `ia` cover `0..a.len()` in order with no gap or
+/// overlap (`b` likewise via `hi`/`ib`); expanding the runs to their rows yields a non-decreasing
+/// structural sequence; every `Both(ia, ib)` has `compare_at(a, ia, b, ib) == Equal`. Equal
+/// duplicates within one side after the match fall through as follow-on `A`/`B` runs (as in DD's
+/// `trie_merger::survey`, the reference this ports).
+pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
+    let (na, nb) = (a.len(), b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut out = Vec::new();
+    while i < na && j < nb {
+        match compare_at(a, i, b, j) {
+            Ordering::Less => {
+                let start = i;
+                i += 1;
+                gallop_lt(a, &mut i, na, b, j); // a[start..i) all < b[j]
+                out.push(Run::A(start, i));
+            }
+            Ordering::Equal => {
+                out.push(Run::Both(i, j));
+                i += 1;
+                j += 1;
+            }
+            Ordering::Greater => {
+                let start = j;
+                j += 1;
+                gallop_lt(b, &mut j, nb, a, i); // b[start..j) all < a[i]
+                out.push(Run::B(start, j));
+            }
+        }
+    }
+    // one side exhausted: the remainder of the other is a single trailing run.
+    if i < na {
+        out.push(Run::A(i, na));
+    }
+    if j < nb {
+        out.push(Run::B(j, nb));
+    }
+    out
+}
+
+/// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
+/// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
+/// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
+/// single-column analogue of the equal-key boundaries a [`survey`] reveals across two runs, and the
+/// `Value`-column counterpart of [`run_layout`]'s `ends` (which reads a precomputed labels vector).
+pub fn group_bounds(keys: &Value) -> Vec<usize> {
+    let n = keys.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k.
+    let ia: Vec<usize> = (0..n - 1).collect();
+    let ib: Vec<usize> = (1..n).collect();
+    let signs = compare_idx(keys, keys, &ia, &ib);
+    let mut ends = Vec::new();
+    for (k, &s) in signs.iter().enumerate() {
+        if s != 0 {
+            ends.push(k + 1);
+        }
+    }
+    ends.push(n);
+    ends
+}
+
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
     //! leaf value, then Prod field-by-field, List LENGTH-FIRST (shorter first; equal lengths element-wise),
