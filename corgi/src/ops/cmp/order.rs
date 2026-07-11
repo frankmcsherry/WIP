@@ -133,29 +133,6 @@ pub fn group_bounds(keys: &Value) -> Vec<usize> {
     ends
 }
 
-/// Order rows by a leading `u64` discriminant `key` (a hash or value-id column) radix-first, then
-/// refine `key`-equal rows by `v`'s structural order — the "hash as a leading `CValue` column"
-/// arrangement order. Returns `(perm, labels)`: `perm` sorts the rows into `(key, structural(v))`
-/// order, and `labels[k]` is the group of output row `k` — two output rows share a label iff they
-/// share a `key` AND are structurally equal in `v`. Positions-returning; owns no times.
-///
-/// `key` is prepended as a genuine `u64` leaf column, so the discrimination sort radixes it in one
-/// counting pass (high all-zero bytes skipped) and descends into `v` only within each `key`-equal
-/// block — with a 64-bit hash those blocks are almost all singletons, so the structural refinement
-/// is near-free. This is the blessed alternative to sorting a side `Vec<u64>` and gather-permuting
-/// every column (which regresses to a full sort + a per-column gather).
-///
-/// The pure-`key` order (no structural refinement) is just a leaf sort of `Value::u64(key)`; the
-/// refined `labels` here are the value-id / group seed a hash-ordered `present` scans in order (no
-/// re-sort) and that [`group_bounds`] / [`run_layout`] read.
-pub fn hash_order(key: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-    let n = v.len();
-    debug_assert_eq!(key.len(), n);
-    // the leading discriminant as a real CValue leaf → `sort_prod_blocks` radixes it, then refines.
-    let keyed = Value::Prod(vec![Value::u64(key.to_vec()), v.clone()]);
-    sort_blocks(&vec![0u64; n], &keyed)
-}
-
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
     //! leaf value, then Prod field-by-field, List LENGTH-FIRST (shorter first; equal lengths element-wise),

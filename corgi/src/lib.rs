@@ -145,21 +145,6 @@ pub mod arrange {
         crate::ops::cmp::order::group_bounds(keys)
     }
 
-    /// Order rows by a leading `u64` discriminant `key` (a hash or value-id column) radix-first,
-    /// then refine `key`-equal rows by `v`'s structural order — hashing corgi columns as a
-    /// hash-ordered arrangement natively. Returns `(perm, labels)`: `perm` sorts into
-    /// `(key, structural(v))` order, and two output rows share a `labels` group iff they share a
-    /// `key` AND are structurally equal in `v`.
-    ///
-    /// `key` (e.g. [`hash_rows`]' output) is prepended as a real `u64` `CValue` leaf, so the
-    /// discrimination sort radixes it in one counting pass and descends into `v` only within
-    /// `key`-equal blocks — the blessed alternative to sorting a side `Vec<u64>` and gather-permuting
-    /// every column. The `labels` are the value-id / group seed a hash-ordered `present` scans in
-    /// order (no re-sort); pair with [`group_bounds`] / [`run_layout`] to read the group boundaries.
-    pub fn hash_order(key: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-        crate::ops::cmp::order::hash_order(key, v)
-    }
-
     // --- structural per-row content hash ---------------------------------------------------------
     //
     // A deterministic, position-independent u64 per row. The finalizer is splitmix64 and the
@@ -368,8 +353,7 @@ pub mod arrange {
     #[cfg(test)]
     mod order_tests {
         use super::{
-            compare_at, gather, group_bounds, hash_order, run_layout, segment_labels, sort_blocks,
-            survey, Run,
+            compare_at, gather, group_bounds, run_layout, segment_labels, sort_blocks, survey, Run,
         };
         use crate::value::{Bounds, Value};
         use std::cmp::Ordering;
@@ -624,85 +608,6 @@ pub mod arrange {
             let keys = Value::u64(vec![10, 10, 20, 20, 20, 30]);
             let labels = vec![0u64, 0, 1, 1, 1, 2];
             assert_eq!(group_bounds(&keys), run_layout(&labels).0);
-        }
-
-        // --- hash_order (radix-leading discriminant) --------------------------------------------
-
-        /// Verify every guarantee [`hash_order`] promises: `perm` is a permutation ordered by
-        /// `(key, structural(v))`, and `labels` groups exactly the rows equal in both.
-        fn check_hash_order(key: &[u64], v: &Value) {
-            let n = v.len();
-            let (perm, labels) = hash_order(key, v);
-            assert_eq!(perm.len(), n);
-            assert_eq!(labels.len(), n);
-
-            // perm is a genuine permutation of 0..n.
-            let mut seen = perm.clone();
-            seen.sort_unstable();
-            assert_eq!(seen, (0..n).collect::<Vec<_>>(), "perm is not a permutation");
-
-            // ordered by (key, structural v); labels non-decreasing and grouping exactly the ties.
-            let sorted_v = gather(v, &perm);
-            assert!(labels.windows(2).all(|w| w[0] <= w[1]), "labels not non-decreasing");
-            for k in 1..n {
-                let (p0, p1) = (perm[k - 1], perm[k]);
-                let struct_eq = compare_at(&sorted_v, k - 1, &sorted_v, k) == Ordering::Equal;
-                let ord = if key[p0] != key[p1] {
-                    key[p0].cmp(&key[p1]) // key is primary
-                } else {
-                    compare_at(&sorted_v, k - 1, &sorted_v, k) // then structural
-                };
-                assert_ne!(ord, Ordering::Greater, "not in (key, structural) order at {k}");
-                // two rows share a label iff same key AND structurally equal.
-                let same_group = key[p0] == key[p1] && struct_eq;
-                assert_eq!(labels[k - 1] == labels[k], same_group, "label/group mismatch at {k}");
-            }
-        }
-
-        #[test]
-        fn hash_order_radix_leads_then_refines() {
-            // v's own leading field (9,9,1,1) DISAGREES with the hash order, so a correct result must
-            // be hash-primary, not structural-primary.
-            let v = Value::Prod(vec![
-                Value::u64(vec![9, 9, 1, 1]),
-                Value::u32(vec![0, 1, 0, 1]),
-            ]);
-            let key = vec![7u64, 9, 5, 5]; // hash order: rows {2,3} (5), {0} (7), {1} (9)
-            let (perm, labels) = hash_order(&key, &v);
-            // hash-5 block {2,3} refines by structural v: (1,0) < (1,1) → row 2 before row 3.
-            assert_eq!(perm, vec![2, 3, 0, 1]);
-            assert_eq!(labels, vec![0, 1, 2, 3]); // all four rows distinct in (key, v)
-            check_hash_order(&key, &v);
-        }
-
-        #[test]
-        fn hash_order_labels_are_collision_aware() {
-            // all rows collide on the hash → a single radix block, refined purely by structural v.
-            let v = Value::u64(vec![5, 5, 8]);
-            let key = vec![42u64, 42, 42];
-            let (perm, labels) = hash_order(&key, &v);
-            assert_eq!(gather(&v, &perm).into_u64("sv"), vec![5, 5, 8]);
-            assert_eq!(labels[0], labels[1]); // the two structurally-equal 5s are one group
-            assert_ne!(labels[1], labels[2]); // the 8 splits off, despite the shared hash
-            check_hash_order(&key, &v);
-        }
-
-        #[test]
-        fn hash_order_at_scale() {
-            // deterministic LCG (no rng dep): a small key space forces many hash collisions, so the
-            // structural refinement within radix blocks is genuinely exercised.
-            let n = 1000usize;
-            let (mut sk, mut sv) = (11u64, 22u64);
-            let mut keys = Vec::with_capacity(n);
-            let mut vals = Vec::with_capacity(n);
-            for _ in 0..n {
-                sk = sk.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                sv = sv.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                keys.push((sk >> 40) % 50); // ~20 rows per hash bucket
-                vals.push((sv >> 40) % 30);
-            }
-            let v = Value::Prod(vec![Value::u64(vals.clone()), Value::u32(keys.iter().map(|&k| k as u32).collect())]);
-            check_hash_order(&keys, &v);
         }
     }
 }
