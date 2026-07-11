@@ -248,14 +248,36 @@ mod compare {
                 compare_idx(&ca[0], &cb[0], ia, ib)
             }
 
-            // product = lexicographic: fold the fields (same pairs), each refining prior ties — keep
-            // the first field that broke the tie (the first nonzero sign).
+            // product = lexicographic: field 0 over all pairs, then each later field over the
+            // SURVIVING TIES only — when an early field discriminates most pairs (the common
+            // case), later fields cost proportionally to the ties, not to m.
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
-                let mut ord = vec![0i8; m];
-                for (x, y) in ca.iter().zip(cb) {
-                    for (o, c) in ord.iter_mut().zip(compare_idx(x, y, ia, ib)) {
-                        if *o == 0 { *o = c; }
+                let mut ord = compare_idx(&ca[0], &cb[0], ia, ib);
+                if ca.len() > 1 {
+                    let mut tie_k: Vec<usize> = (0..m).filter(|&k| ord[k] == 0).collect();
+                    let mut tia: Vec<usize> = tie_k.iter().map(|&k| ia[k]).collect();
+                    let mut tib: Vec<usize> = tie_k.iter().map(|&k| ib[k]).collect();
+                    for (x, y) in ca[1..].iter().zip(&cb[1..]) {
+                        if tie_k.is_empty() {
+                            break;
+                        }
+                        let sub = compare_idx(x, y, &tia, &tib);
+                        let mut w = 0usize;
+                        for t in 0..tie_k.len() {
+                            let k = tie_k[t];
+                            if sub[t] != 0 {
+                                ord[k] = sub[t];
+                            } else {
+                                tie_k[w] = k;
+                                tia[w] = tia[t];
+                                tib[w] = tib[t];
+                                w += 1;
+                            }
+                        }
+                        tie_k.truncate(w);
+                        tia.truncate(w);
+                        tib.truncate(w);
                     }
                 }
                 ord
