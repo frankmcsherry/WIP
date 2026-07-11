@@ -217,26 +217,28 @@ fn batched_bound(
     hi: &mut [usize],
     go_right: impl Fn(i8) -> bool,
 ) {
-    loop {
-        // live needles and their probe midpoints; the active list doubles as the needle indices
-        // (needle element k lives at index k in `nvals`).
-        let (mut active, mut mids) = (Vec::new(), Vec::new());
-        for (k, (&l, &h)) in lo.iter().zip(hi.iter()).enumerate() {
-            if l < h {
-                active.push(k);
-                mids.push((l + h) / 2);
-            }
-        }
-        if active.is_empty() {
-            break;
-        }
+    // The live needle set only shrinks: seed it once and compact in place each round, so a
+    // round's work tracks the ACTIVE needles, not all of them (the full rescan per round was
+    // ~8% of a join-heavy profile). `active` doubles as the needle indices into `nvals`.
+    let mut active: Vec<usize> = (0..lo.len()).filter(|&k| lo[k] < hi[k]).collect();
+    let mut mids: Vec<usize> = Vec::with_capacity(active.len());
+    while !active.is_empty() {
+        mids.clear();
+        mids.extend(active.iter().map(|&k| (lo[k] + hi[k]) / 2));
         let ord = compare_idx(hvals, nvals, &mids, &active);
-        for (t, &k) in active.iter().enumerate() {
+        let mut w = 0usize;
+        for t in 0..active.len() {
+            let k = active[t];
             if go_right(ord[t]) {
                 lo[k] = mids[t] + 1;
             } else {
                 hi[k] = mids[t];
             }
+            if lo[k] < hi[k] {
+                active[w] = k;
+                w += 1;
+            }
         }
+        active.truncate(w);
     }
 }
