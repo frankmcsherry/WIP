@@ -124,7 +124,7 @@ pub mod arrange {
         crate::ops::cmp::order::run_layout(labels)
     }
 
-    pub use crate::ops::cmp::order::Run;
+    pub use crate::ops::cmp::order::{GroupRun, Run};
 
     /// Survey the mutual interleaving of two structurally-sorted columns `a` and `b` as a sequence
     /// of [`Run`]s — maximal ranges exclusive to one side, single matched pairs common to both — in
@@ -135,6 +135,15 @@ pub mod arrange {
     /// consolidation off the returned runs. See [`Run`] for the coverage/sortedness guarantees.
     pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
         crate::ops::cmp::order::survey(a, b)
+    }
+
+    /// [`survey`] at GROUP granularity: a match is reported as the maximal equal class on BOTH
+    /// sides ([`GroupRun::Both`] carries both ranges), so a caller with out-of-band per-row
+    /// payloads (times, diffs) can merge and consolidate the whole class in one place. This is
+    /// the group-range `Both` a time-carrying merge needs for correct cross-side consolidation
+    /// when the same row recurs with different payloads on each side.
+    pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
+        crate::ops::cmp::order::survey_groups(a, b)
     }
 
     /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`:
