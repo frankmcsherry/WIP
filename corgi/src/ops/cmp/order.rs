@@ -162,6 +162,11 @@ mod compare {
             // leaf: read all pairs at their two indices in one width-dispatched pass.
             (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(ia, ib, pb),
 
+            // single-field product: the field's order IS the order — skip the fold + tie vec.
+            (Value::Prod(ca), Value::Prod(cb)) if ca.len() == 1 && cb.len() == 1 => {
+                compare_idx(&ca[0], &cb[0], ia, ib)
+            }
+
             // product = lexicographic: fold the fields (same pairs), each refining prior ties — keep
             // the first field that broke the tie (the first nonzero sign).
             (Value::Prod(ca), Value::Prod(cb)) => {
