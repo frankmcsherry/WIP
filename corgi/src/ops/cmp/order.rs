@@ -366,23 +366,40 @@ mod discriminate {
     }
 
     fn sort_leaf_blocks(labels: &[u64], p: &Prim) -> (Vec<usize>, Vec<u64>) {
-        let mut perm = Vec::with_capacity(p.len());
-        let mut new_labels = Vec::with_capacity(p.len());
-        let mut next = 0u64;
+        // Per-block: stable byte-radix (or tiny-block insertion sort) IN PLACE over the perm
+        // slice, with one shared scratch — a refinement pass produces millions of tiny blocks,
+        // and per-block allocations (index collect + sort output + adjacent-compare vec) were
+        // ~17% self of a join-heavy profile. The adjacent compare runs ONCE over the whole
+        // column afterwards (one width dispatch), with block boundaries forcing label breaks.
+        let n = p.len();
+        let mut perm: Vec<usize> = Vec::with_capacity(n);
+        let mut ends: Vec<usize> = Vec::new();
+        let mut tmp: Vec<usize> = Vec::new();
         for (lo, hi) in find_blocks(labels) {
-            // stable byte-radix within the block (one comparator gone); a single `cmp_idx` over the
-            // adjacent pairs feeds the O(n) run-label scan — one width-dispatch, not one per element.
-            // Radix is stable, so the recursion stays stable — group keeps V-within-key order.
-            let sorted = p.sort_block(&(lo..hi).collect::<Vec<usize>>());
-            let adj = p.cmp_idx(&sorted[1..], &sorted[..sorted.len() - 1], p);
-            for (k, &i) in sorted.iter().enumerate() {
-                if k > 0 && adj[k - 1] != 0 {
-                    next += 1;
+            let start = perm.len();
+            perm.extend(lo..hi);
+            if hi - lo > 1 {
+                p.sort_block_scratch(&mut perm[start..], &mut tmp);
+            }
+            ends.push(perm.len());
+        }
+        let mut new_labels = Vec::with_capacity(n);
+        if n > 0 {
+            let adj = if n > 1 { p.cmp_idx(&perm[1..], &perm[..n - 1], p) } else { Vec::new() };
+            let mut next = 0u64;
+            let mut b = 0usize;
+            for k in 0..n {
+                if k > 0 {
+                    let boundary = ends[b] == k;
+                    if boundary {
+                        b += 1;
+                    }
+                    if boundary || adj[k - 1] != 0 {
+                        next += 1;
+                    }
                 }
                 new_labels.push(next);
-                perm.push(i);
             }
-            next += 1;
         }
         (perm, new_labels)
     }
