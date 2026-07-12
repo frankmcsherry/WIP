@@ -504,6 +504,23 @@ impl<L: OpLike> Op<L> {
             Op::Fold(body) => {
                 let (seed, list) = input.into_pair("Fold");
                 let (bounds, vals) = list.into_list("Fold list");
+                // Strided fast path: every row has length k, so every row is active in every
+                // round — no worklist, no per-round accumulator gather/scatter (the whole
+                // accumulator IS the active set); one strided element gather per round.
+                if let Some(k) = bounds.strided() {
+                    let n = bounds.len();
+                    let mut acc = seed;
+                    let mut elem: Vec<usize> = Vec::with_capacity(n);
+                    for t in 0..k {
+                        elem.clear();
+                        elem.extend((0..n).map(|r| r * k + t));
+                        let elt = gather(&vals, &elem);
+                        let updated = eval_graph(body, Value::Prod(vec![acc, elt]));
+                        assert_eq!(updated.len(), n, "Fold body changed the row count");
+                        acc = updated;
+                    }
+                    return acc;
+                }
                 let mut acc = seed;
                 let mut active = init_active(&bounds);
                 let mut t = 0;
@@ -527,6 +544,37 @@ impl<L: OpLike> Op<L> {
                 let (seed, list) = input.into_pair("FoldScan");
                 let (bounds, vals) = list.into_list("FoldScan list");
                 let total = vals.len();
+                // Strided fast path — as in `Fold`: no worklist, no scatter; round t's outputs
+                // land at positions r*k + t, chunk t, slot r.
+                if let Some(k) = bounds.strided() {
+                    let n = bounds.len();
+                    let mut acc = seed;
+                    let mut chunks: Vec<Value> = Vec::with_capacity(k);
+                    let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                    let mut elem: Vec<usize> = Vec::with_capacity(n);
+                    for t in 0..k {
+                        elem.clear();
+                        elem.extend((0..n).map(|r| r * k + t));
+                        let elt = gather(&vals, &elem);
+                        let (new_state, r) =
+                            eval_graph(body, Value::Prod(vec![acc, elt])).into_pair("FoldScan body");
+                        assert_eq!(new_state.len(), n, "FoldScan body changed the row count");
+                        for (slot, &pos) in elem.iter().enumerate() {
+                            tags[pos] = t;
+                            off[pos] = slot;
+                        }
+                        acc = new_state;
+                        chunks.push(r);
+                    }
+                    let out_vals = if chunks.is_empty() {
+                        let z = eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]));
+                        z.into_pair("FoldScan body").1
+                    } else {
+                        let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+                        gather_lanes(&refs, &tags, &off)
+                    };
+                    return Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))]);
+                }
                 let mut acc = seed;
                 let mut chunks: Vec<Value> = Vec::new();
                 let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);

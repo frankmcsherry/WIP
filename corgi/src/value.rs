@@ -85,6 +85,18 @@ impl Bounds {
 
 impl From<Vec<usize>> for Bounds {
     fn from(v: Vec<usize>) -> Self {
+        // One O(n) uniformity check at construction: a uniform partition becomes a `Stride`,
+        // so `strided()` recovers the array kernels downstream at every `.into()` site for
+        // free. Equality/hash are by the partition, so this is representation-invisible.
+        if let Some(&last) = v.last() {
+            let n = v.len();
+            if last % n == 0 {
+                let k = last / n;
+                if v.iter().enumerate().all(|(i, &e)| e == (i + 1) * k) {
+                    return Bounds::Stride(k, n);
+                }
+            }
+        }
         Bounds::Offsets(v)
     }
 }
