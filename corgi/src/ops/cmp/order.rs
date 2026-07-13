@@ -162,14 +162,41 @@ mod compare {
             // leaf: read all pairs at their two indices in one width-dispatched pass.
             (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(ia, ib, pb),
 
-            // product = lexicographic: fold the fields (same pairs), each refining prior ties — keep
-            // the first field that broke the tie (the first nonzero sign).
+            // single-field product: the field's order IS the order — skip the fold + tie vec.
+            (Value::Prod(ca), Value::Prod(cb)) if ca.len() == 1 && cb.len() == 1 => {
+                compare_idx(&ca[0], &cb[0], ia, ib)
+            }
+
+            // product = lexicographic: field 0 over all pairs, then each later field over the
+            // SURVIVING TIES only — when an early field discriminates most pairs (the common
+            // case), later fields cost proportionally to the ties, not to m.
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
-                let mut ord = vec![0i8; m];
-                for (x, y) in ca.iter().zip(cb) {
-                    for (o, c) in ord.iter_mut().zip(compare_idx(x, y, ia, ib)) {
-                        if *o == 0 { *o = c; }
+                let mut ord = compare_idx(&ca[0], &cb[0], ia, ib);
+                if ca.len() > 1 {
+                    let mut tie_k: Vec<usize> = (0..m).filter(|&k| ord[k] == 0).collect();
+                    let mut tia: Vec<usize> = tie_k.iter().map(|&k| ia[k]).collect();
+                    let mut tib: Vec<usize> = tie_k.iter().map(|&k| ib[k]).collect();
+                    for (x, y) in ca[1..].iter().zip(&cb[1..]) {
+                        if tie_k.is_empty() {
+                            break;
+                        }
+                        let sub = compare_idx(x, y, &tia, &tib);
+                        let mut w = 0usize;
+                        for t in 0..tie_k.len() {
+                            let k = tie_k[t];
+                            if sub[t] != 0 {
+                                ord[k] = sub[t];
+                            } else {
+                                tie_k[w] = k;
+                                tia[w] = tia[t];
+                                tib[w] = tib[t];
+                                w += 1;
+                            }
+                        }
+                        tie_k.truncate(w);
+                        tia.truncate(w);
+                        tib.truncate(w);
                     }
                 }
                 ord
@@ -361,23 +388,40 @@ mod discriminate {
     }
 
     fn sort_leaf_blocks(labels: &[u64], p: &Prim) -> (Vec<usize>, Vec<u64>) {
-        let mut perm = Vec::with_capacity(p.len());
-        let mut new_labels = Vec::with_capacity(p.len());
-        let mut next = 0u64;
+        // Per-block: stable byte-radix (or tiny-block insertion sort) IN PLACE over the perm
+        // slice, with one shared scratch — a refinement pass produces millions of tiny blocks,
+        // and per-block allocations (index collect + sort output + adjacent-compare vec) were
+        // ~17% self of a join-heavy profile. The adjacent compare runs ONCE over the whole
+        // column afterwards (one width dispatch), with block boundaries forcing label breaks.
+        let n = p.len();
+        let mut perm: Vec<usize> = Vec::with_capacity(n);
+        let mut ends: Vec<usize> = Vec::new();
+        let mut tmp: Vec<usize> = Vec::new();
         for (lo, hi) in find_blocks(labels) {
-            // stable byte-radix within the block (one comparator gone); a single `cmp_idx` over the
-            // adjacent pairs feeds the O(n) run-label scan — one width-dispatch, not one per element.
-            // Radix is stable, so the recursion stays stable — group keeps V-within-key order.
-            let sorted = p.sort_block(&(lo..hi).collect::<Vec<usize>>());
-            let adj = p.cmp_idx(&sorted[1..], &sorted[..sorted.len() - 1], p);
-            for (k, &i) in sorted.iter().enumerate() {
-                if k > 0 && adj[k - 1] != 0 {
-                    next += 1;
+            let start = perm.len();
+            perm.extend(lo..hi);
+            if hi - lo > 1 {
+                p.sort_block_scratch(&mut perm[start..], &mut tmp);
+            }
+            ends.push(perm.len());
+        }
+        let mut new_labels = Vec::with_capacity(n);
+        if n > 0 {
+            let adj = if n > 1 { p.cmp_idx(&perm[1..], &perm[..n - 1], p) } else { Vec::new() };
+            let mut next = 0u64;
+            let mut b = 0usize;
+            for k in 0..n {
+                if k > 0 {
+                    let boundary = ends[b] == k;
+                    if boundary {
+                        b += 1;
+                    }
+                    if boundary || adj[k - 1] != 0 {
+                        next += 1;
+                    }
                 }
                 new_labels.push(next);
-                perm.push(i);
             }
-            next += 1;
         }
         (perm, new_labels)
     }
