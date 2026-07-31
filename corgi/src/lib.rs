@@ -90,6 +90,20 @@ pub mod arrange {
         (lo, hi)
     }
 
+    /// Borrow a column's `u64` leaf, if it is one — peeling single-field products, which
+    /// order identically to the field they wrap.
+    ///
+    /// The zero-copy read. Without it every leaf inspection from outside corgi has to
+    /// `gather(..).into_u64(..)` or clone, because a shared column's `Arc` cannot be
+    /// unwrapped: callers pay a full column copy to look at values they only read.
+    pub fn leaf_slice(v: &Value) -> Option<&[u64]> {
+        match v {
+            Value::Prim(crate::value::Prim::U64(xs)) => Some(&xs[..]),
+            Value::Prod(fs) if fs.len() == 1 => leaf_slice(&fs[0]),
+            _ => None,
+        }
+    }
+
     /// Select/reorder rows of a single columnar `Value` by index.
     pub fn gather(v: &Value, idx: &[usize]) -> Value { crate::engine::gather(v, idx) }
     /// Multi-source gather: output row `i` = row `off[i]` of source `srcs[tags[i]]` (all same shape).
