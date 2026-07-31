@@ -54,6 +54,31 @@ pub mod arrange {
     /// O(|needles| · log|haystack|) — the multi-record replacement for a per-pair merge-join /
     /// semijoin scan.
     pub fn find_ranges(needles: &Value, haystack: &Value) -> (Vec<usize>, Vec<usize>) {
+        // Fast path: both sides one `U64` leaf — integer keys and hashes, i.e. the
+        // overwhelmingly common probe. A native binary search per needle, with no
+        // structural dispatch: the generic path below re-inspects the column's shape at
+        // every comparison step of every probe, which profiling of an incremental
+        // differential round attributed 21% of its time to.
+        // NB single-field products peel: `Prod([X])` orders exactly as `X`, and callers
+        // routinely wrap a scalar key in a 1-tuple, so matching only a bare leaf would
+        // silently miss the common case.
+        fn as_u64_leaf(v: &Value) -> Option<&[u64]> {
+            match v {
+                Value::Prim(crate::value::Prim::U64(xs)) => Some(&xs[..]),
+                Value::Prod(fs) if fs.len() == 1 => as_u64_leaf(&fs[0]),
+                _ => None,
+            }
+        }
+        if let (Some(ns), Some(hs)) = (as_u64_leaf(needles), as_u64_leaf(haystack)) {
+            let (mut lo, mut hi) = (Vec::with_capacity(ns.len()), Vec::with_capacity(ns.len()));
+            for n in ns.iter() {
+                let l = hs.partition_point(|x| x < n);
+                let h = l + hs[l..].partition_point(|x| x == n);
+                lo.push(l);
+                hi.push(h);
+            }
+            return (lo, hi);
+        }
         let (n, h) = (needles.len(), haystack.len());
         let needle_list = Value::List(Bounds::Offsets(vec![n]), Box::new(needles.clone()));
         let hay_list = Value::List(Bounds::Offsets(vec![h]), Box::new(haystack.clone()));
@@ -609,5 +634,50 @@ pub mod arrange {
             let labels = vec![0u64, 0, 1, 1, 1, 2];
             assert_eq!(group_bounds(&keys), run_layout(&labels).0);
         }
+    }
+}
+
+#[cfg(test)]
+mod find_ranges_fast_path {
+    use crate::Value;
+
+    /// The `U64` fast path in `arrange::find_ranges` must agree with the generic
+    /// structural path exactly, including absent needles (`lo == hi`), duplicate runs,
+    /// unsorted needles, and empty inputs.
+    #[test]
+    fn agrees_with_generic() {
+        // Generic path, forced by wrapping the leaves in a 1-field product (same order,
+        // same equal-classes, but not the `Prim::U64`/`Prim::U64` pattern).
+        fn generic(needles: &[u64], hay: &[u64]) -> (Vec<usize>, Vec<usize>) {
+            // Two fields: not peelable to a leaf, so this takes the structural path.
+            let n = Value::Prod(vec![Value::u64(needles.to_vec()), Value::u64(vec![0; needles.len()])]);
+            let h = Value::Prod(vec![Value::u64(hay.to_vec()), Value::u64(vec![0; hay.len()])]);
+            crate::arrange::find_ranges(&n, &h)
+        }
+        fn fast(needles: &[u64], hay: &[u64]) -> (Vec<usize>, Vec<usize>) {
+            crate::arrange::find_ranges(&Value::u64(needles.to_vec()), &Value::u64(hay.to_vec()))
+        }
+
+        let mut state = 0x243f6a8885a308d3u64;
+        let mut rng = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+        for case in 0..200 {
+            // Small value range so duplicates and absences are common.
+            let hlen = (rng() % 24) as usize;
+            let mut hay: Vec<u64> = (0..hlen).map(|_| rng() % 8).collect();
+            hay.sort();
+            let nlen = (rng() % 8) as usize;
+            let needles: Vec<u64> = (0..nlen).map(|_| rng() % 10).collect(); // unsorted, may miss
+            assert_eq!(fast(&needles, &hay), generic(&needles, &hay), "case {case}: needles={needles:?} hay={hay:?}");
+        }
+        // Degenerate shapes.
+        assert_eq!(fast(&[], &[1, 2]), generic(&[], &[1, 2]));
+        assert_eq!(fast(&[1, 2], &[]), generic(&[1, 2], &[]));
+        assert_eq!(fast(&[u64::MAX], &[0, u64::MAX]), generic(&[u64::MAX], &[0, u64::MAX]));
+        // The 1-tuple wrapping DDIR actually uses must reach the fast path and agree.
+        let wrap = |xs: &[u64]| Value::Prod(vec![Value::u64(xs.to_vec())]);
+        assert_eq!(
+            crate::arrange::find_ranges(&wrap(&[1, 5, 9]), &wrap(&[1, 1, 5, 7])),
+            generic(&[1, 5, 9], &[1, 1, 5, 7]),
+        );
     }
 }
