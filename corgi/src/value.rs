@@ -85,6 +85,18 @@ impl Bounds {
 
 impl From<Vec<usize>> for Bounds {
     fn from(v: Vec<usize>) -> Self {
+        // One O(n) uniformity check at construction: a uniform partition becomes a `Stride`,
+        // so `strided()` recovers the array kernels downstream at every `.into()` site for
+        // free. Equality/hash are by the partition, so this is representation-invisible.
+        if let Some(&last) = v.last() {
+            let n = v.len();
+            if last % n == 0 {
+                let k = last / n;
+                if v.iter().enumerate().all(|(i, &e)| e == (i + 1) * k) {
+                    return Bounds::Stride(k, n);
+                }
+            }
+        }
         Bounds::Offsets(v)
     }
 }
@@ -235,40 +247,71 @@ macro_rules! prim {
                 }
             }
 
-            /// stable LSD byte-radix: `indices` reordered by leaf value. A counting sort
-            /// per *significant* byte (high all-zero bytes skipped), so narrow values and
-            /// narrow widths are cheap — a `u8` column is one counting pass.
-            pub(crate) fn sort_block(&self, indices: &[usize]) -> Vec<usize> {
+            /// stable LSD byte-radix over a mutable index slice, IN PLACE (`tmp` is caller
+            /// scratch, resized as needed and reusable across calls — a refinement pass calls
+            /// this once per block, and per-block allocations dominated a join-heavy profile).
+            /// A counting sort per *significant* byte (high all-zero bytes skipped); blocks of
+            /// <= 16 take a stable insertion sort instead — the radix set-up dwarfs tiny
+            /// blocks, the common case once a prior pass has split the column into groups.
+            pub(crate) fn sort_block_scratch(&self, idx: &mut [usize], tmp: &mut Vec<usize>) {
                 match self {
                     $( Prim::$V(v) => {
-                        let mut cur = indices.to_vec();
-                        if cur.len() <= 1 {
-                            return cur;
+                        let n = idx.len();
+                        if n <= 1 {
+                            return;
                         }
-                        let max = cur.iter().map(|&i| v[i]).max().unwrap_or(0);
+                        if n <= 16 {
+                            for k in 1..n {
+                                let mut j = k;
+                                while j > 0 && v[idx[j - 1]] > v[idx[j]] {
+                                    idx.swap(j - 1, j);
+                                    j -= 1;
+                                }
+                            }
+                            return;
+                        }
+                        let max = idx.iter().map(|&i| v[i]).max().unwrap_or(0);
                         let bits = std::mem::size_of::<$t>() * 8;
                         let nbytes = (bits - max.leading_zeros() as usize).div_ceil(8);
-                        let mut tmp = vec![0usize; cur.len()];
+                        if tmp.len() < n {
+                            tmp.resize(n, 0);
+                        }
+                        let mut src_is_idx = true;
                         for byte in 0..nbytes {
                             let shift = (byte * 8) as u32;
                             let mut counts = [0usize; 256];
-                            for &i in &cur {
-                                counts[((v[i] >> shift) & 0xff) as usize] += 1;
+                            {
+                                let src: &[usize] = if src_is_idx { &idx[..] } else { &tmp[..n] };
+                                for &i in src {
+                                    counts[((v[i] >> shift) & 0xff) as usize] += 1;
+                                }
                             }
                             let mut start = 0;
                             for c in counts.iter_mut() {
-                                let n = *c;
+                                let cnt = *c;
                                 *c = start;
-                                start += n;
+                                start += cnt;
                             }
-                            for &i in &cur {
-                                let b = ((v[i] >> shift) & 0xff) as usize;
-                                tmp[counts[b]] = i;
-                                counts[b] += 1;
+                            if src_is_idx {
+                                for k in 0..n {
+                                    let i = idx[k];
+                                    let b = ((v[i] >> shift) & 0xff) as usize;
+                                    tmp[counts[b]] = i;
+                                    counts[b] += 1;
+                                }
+                            } else {
+                                for k in 0..n {
+                                    let i = tmp[k];
+                                    let b = ((v[i] >> shift) & 0xff) as usize;
+                                    idx[counts[b]] = i;
+                                    counts[b] += 1;
+                                }
                             }
-                            std::mem::swap(&mut cur, &mut tmp);
+                            src_is_idx = !src_is_idx;
                         }
-                        cur
+                        if !src_is_idx {
+                            idx.copy_from_slice(&tmp[..n]);
+                        }
                     } )+
                 }
             }

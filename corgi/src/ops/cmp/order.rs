@@ -9,6 +9,130 @@ use std::cmp::Ordering;
 pub(crate) use compare::*;
 pub(crate) use discriminate::*;
 
+/// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
+/// scalar form of [`compare_idx`]; exposed (via `crate::arrange`) for using corgi columns as a
+/// differential-dataflow arrangement substrate.
+pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
+    match compare_idx(a, b, &[i], &[j])[0] {
+        s if s < 0 => Ordering::Less,
+        0 => Ordering::Equal,
+        _ => Ordering::Greater,
+    }
+}
+
+/// One report from [`survey`]: a maximal range drawn from one side of the interleaving, or a
+/// single matched pair present in both. The bidirectional generalization of `find_ranges`' report.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Run {
+    /// Rows `a[lo..hi)` come next in merged order, all strictly less than the current head of `b`
+    /// (exclusive to `a` over this range).
+    A(usize, usize),
+    /// Rows `b[lo..hi)` come next in merged order, all strictly less than the current head of `a`
+    /// (exclusive to `b` over this range).
+    B(usize, usize),
+    /// A single matched pair: row `a[ia]` and row `b[ib]` are structurally equal.
+    Both(usize, usize),
+}
+
+/// Galloping search over the structurally-sorted column `xs`: advance `*idx` (bounded by `hi`)
+/// while row `*idx` of `xs` compares strictly less than row `pj` of `piv`. On return `*idx` is the
+/// first position whose row is `>= piv[pj]` (or `hi`). Exponential probe + binary refine, so it
+/// costs `O(log gap)` `compare_at`s rather than one per row — the whole point of the survey.
+fn gallop_lt(xs: &Value, idx: &mut usize, hi: usize, piv: &Value, pj: usize) {
+    let lt = |k: usize| compare_at(xs, k, piv, pj) == Ordering::Less;
+    // nothing to do unless the row at the cursor is itself still below the pivot.
+    if *idx < hi && lt(*idx) {
+        let mut step = 1;
+        while *idx + step < hi && lt(*idx + step) {
+            *idx += step;
+            step <<= 1;
+        }
+        // binary refine over the last (overshot) doubling.
+        step >>= 1;
+        while step > 0 {
+            if *idx + step < hi && lt(*idx + step) {
+                *idx += step;
+            }
+            step >>= 1;
+        }
+        // `*idx` sits on the last row `< piv`; step past it to the first row `>= piv`.
+        *idx += 1;
+    }
+}
+
+/// Survey the mutual interleaving of two structurally-sorted columns `a` and `b`: a zig-zag gallop
+/// that returns the merge as a sequence of [`Run`]s — maximal ranges exclusive to one side and the
+/// single matched pairs present in both — instead of a per-pair two-pointer. The bidirectional
+/// generalization of `find_ranges` (the one-directional needle-into-haystack gallop).
+///
+/// The caller bulk-`gather`s each `A`/`B` range and consolidates only at the `Both` pairs, so the
+/// merge crosses the corgi/Rust boundary once per *range* rather than once per *row*. This owns no
+/// times/diffs: it reports only positions, and the caller drives its own lattice logic off the runs.
+///
+/// Guarantees: the `A` ranges plus every `Both`'s `ia` cover `0..a.len()` in order with no gap or
+/// overlap (`b` likewise via `hi`/`ib`); expanding the runs to their rows yields a non-decreasing
+/// structural sequence; every `Both(ia, ib)` has `compare_at(a, ia, b, ib) == Equal`. Equal
+/// duplicates within one side after the match fall through as follow-on `A`/`B` runs (as in DD's
+/// `trie_merger::survey`, the reference this ports).
+pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
+    let (na, nb) = (a.len(), b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut out = Vec::new();
+    while i < na && j < nb {
+        match compare_at(a, i, b, j) {
+            Ordering::Less => {
+                let start = i;
+                i += 1;
+                gallop_lt(a, &mut i, na, b, j); // a[start..i) all < b[j]
+                out.push(Run::A(start, i));
+            }
+            Ordering::Equal => {
+                out.push(Run::Both(i, j));
+                i += 1;
+                j += 1;
+            }
+            Ordering::Greater => {
+                let start = j;
+                j += 1;
+                gallop_lt(b, &mut j, nb, a, i); // b[start..j) all < a[i]
+                out.push(Run::B(start, j));
+            }
+        }
+    }
+    // one side exhausted: the remainder of the other is a single trailing run.
+    if i < na {
+        out.push(Run::A(i, na));
+    }
+    if j < nb {
+        out.push(Run::B(j, nb));
+    }
+    out
+}
+
+/// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
+/// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
+/// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
+/// single-column analogue of the equal-key boundaries a [`survey`] reveals across two runs, and the
+/// `Value`-column counterpart of [`run_layout`]'s `ends` (which reads a precomputed labels vector).
+pub fn group_bounds(keys: &Value) -> Vec<usize> {
+    let n = keys.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k.
+    let ia: Vec<usize> = (0..n - 1).collect();
+    let ib: Vec<usize> = (1..n).collect();
+    let signs = compare_idx(keys, keys, &ia, &ib);
+    let mut ends = Vec::new();
+    for (k, &s) in signs.iter().enumerate() {
+        if s != 0 {
+            ends.push(k + 1);
+        }
+    }
+    ends.push(n);
+    ends
+}
+
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
     //! leaf value, then Prod field-by-field, List LENGTH-FIRST (shorter first; equal lengths element-wise),
@@ -38,14 +162,41 @@ mod compare {
             // leaf: read all pairs at their two indices in one width-dispatched pass.
             (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(ia, ib, pb),
 
-            // product = lexicographic: fold the fields (same pairs), each refining prior ties — keep
-            // the first field that broke the tie (the first nonzero sign).
+            // single-field product: the field's order IS the order — skip the fold + tie vec.
+            (Value::Prod(ca), Value::Prod(cb)) if ca.len() == 1 && cb.len() == 1 => {
+                compare_idx(&ca[0], &cb[0], ia, ib)
+            }
+
+            // product = lexicographic: field 0 over all pairs, then each later field over the
+            // SURVIVING TIES only — when an early field discriminates most pairs (the common
+            // case), later fields cost proportionally to the ties, not to m.
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
-                let mut ord = vec![0i8; m];
-                for (x, y) in ca.iter().zip(cb) {
-                    for (o, c) in ord.iter_mut().zip(compare_idx(x, y, ia, ib)) {
-                        if *o == 0 { *o = c; }
+                let mut ord = compare_idx(&ca[0], &cb[0], ia, ib);
+                if ca.len() > 1 {
+                    let mut tie_k: Vec<usize> = (0..m).filter(|&k| ord[k] == 0).collect();
+                    let mut tia: Vec<usize> = tie_k.iter().map(|&k| ia[k]).collect();
+                    let mut tib: Vec<usize> = tie_k.iter().map(|&k| ib[k]).collect();
+                    for (x, y) in ca[1..].iter().zip(&cb[1..]) {
+                        if tie_k.is_empty() {
+                            break;
+                        }
+                        let sub = compare_idx(x, y, &tia, &tib);
+                        let mut w = 0usize;
+                        for t in 0..tie_k.len() {
+                            let k = tie_k[t];
+                            if sub[t] != 0 {
+                                ord[k] = sub[t];
+                            } else {
+                                tie_k[w] = k;
+                                tia[w] = tia[t];
+                                tib[w] = tib[t];
+                                w += 1;
+                            }
+                        }
+                        tie_k.truncate(w);
+                        tia.truncate(w);
+                        tib.truncate(w);
                     }
                 }
                 ord
@@ -106,6 +257,10 @@ mod compare {
                 }
                 ord
             }
+
+            // Unit rows carry no payload — always equal. (Added for `crate::arrange`: a unit-valued
+            // column, e.g. `distinct`'s output, must be a sortable arrangement payload.)
+            (Value::Unit(_), Value::Unit(_)) => vec![0i8; ia.len()],
 
             _ => panic!("compare_idx: shape mismatch"),
         }
@@ -233,23 +388,40 @@ mod discriminate {
     }
 
     fn sort_leaf_blocks(labels: &[u64], p: &Prim) -> (Vec<usize>, Vec<u64>) {
-        let mut perm = Vec::with_capacity(p.len());
-        let mut new_labels = Vec::with_capacity(p.len());
-        let mut next = 0u64;
+        // Per-block: stable byte-radix (or tiny-block insertion sort) IN PLACE over the perm
+        // slice, with one shared scratch — a refinement pass produces millions of tiny blocks,
+        // and per-block allocations (index collect + sort output + adjacent-compare vec) were
+        // ~17% self of a join-heavy profile. The adjacent compare runs ONCE over the whole
+        // column afterwards (one width dispatch), with block boundaries forcing label breaks.
+        let n = p.len();
+        let mut perm: Vec<usize> = Vec::with_capacity(n);
+        let mut ends: Vec<usize> = Vec::new();
+        let mut tmp: Vec<usize> = Vec::new();
         for (lo, hi) in find_blocks(labels) {
-            // stable byte-radix within the block (one comparator gone); a single `cmp_idx` over the
-            // adjacent pairs feeds the O(n) run-label scan — one width-dispatch, not one per element.
-            // Radix is stable, so the recursion stays stable — group keeps V-within-key order.
-            let sorted = p.sort_block(&(lo..hi).collect::<Vec<usize>>());
-            let adj = p.cmp_idx(&sorted[1..], &sorted[..sorted.len() - 1], p);
-            for (k, &i) in sorted.iter().enumerate() {
-                if k > 0 && adj[k - 1] != 0 {
-                    next += 1;
+            let start = perm.len();
+            perm.extend(lo..hi);
+            if hi - lo > 1 {
+                p.sort_block_scratch(&mut perm[start..], &mut tmp);
+            }
+            ends.push(perm.len());
+        }
+        let mut new_labels = Vec::with_capacity(n);
+        if n > 0 {
+            let adj = if n > 1 { p.cmp_idx(&perm[1..], &perm[..n - 1], p) } else { Vec::new() };
+            let mut next = 0u64;
+            let mut b = 0usize;
+            for k in 0..n {
+                if k > 0 {
+                    let boundary = ends[b] == k;
+                    if boundary {
+                        b += 1;
+                    }
+                    if boundary || adj[k - 1] != 0 {
+                        next += 1;
+                    }
                 }
                 new_labels.push(next);
-                perm.push(i);
             }
-            next += 1;
         }
         (perm, new_labels)
     }

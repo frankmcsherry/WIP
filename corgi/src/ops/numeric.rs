@@ -265,8 +265,11 @@ impl ArithOp {
                 for end in bounds.ends() {
                     let s = &xs[start..end]; // empty row -> the monoid identity
                     out.push(match r {
-                        Red::Add => s.iter().sum(),
-                        Red::Mul => s.iter().product(),
+                        // Wrapping, to match the Scan sibling (prefix!) and the Kind::U BinOp add — so
+                        // reducing raw two's-complement diffs (a negative diff is a large u64) yields
+                        // the correct i64 sum instead of a checked-overflow panic in debug.
+                        Red::Add => s.iter().fold(0u64, |a, &x| a.wrapping_add(x)),
+                        Red::Mul => s.iter().fold(1u64, |a, &x| a.wrapping_mul(x)),
                         Red::Min => s.iter().copied().min().unwrap_or(u64::MAX),
                         Red::Max => s.iter().copied().max().unwrap_or(0),
                         Red::All => s.iter().all(|&x| x != 0) as u64,
