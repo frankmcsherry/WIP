@@ -209,11 +209,17 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
             let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
             let out_tag_vec = out_tags.usize_vec();
-            let arity = sums[0].2.len();
+            // The output commits every lane ANY source commits, so the arity is the max over
+            // sources — not source 0's. Sources are independently inferred and may disagree on
+            // arity (a column holding only tag 0 infers one lane, one holding only tag 1 infers
+            // two); a source that stops short is ⊥ from there on, which is the same rule the
+            // `None` lanes below already follow. Taking source 0's arity instead drops lanes the
+            // gathered tag column still names, and `sum_from_prim` then indexes past its lanes.
+            let arity = sums.iter().map(|sm| sm.2.len()).max().unwrap_or(0);
             let out_vars: Vec<Option<Value>> = (0..arity)
                 .map(|s| {
                     // out lane `s` is ⊥ only if no source committed it.
-                    if sums.iter().all(|sm| sm.2[s].is_none()) {
+                    if sums.iter().all(|sm| sm.2.get(s).map_or(true, Option::is_none)) {
                         return None;
                     }
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
@@ -224,7 +230,8 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                             s_o.push(sums[t].1[o]); // carried offset = position in the source's variant s
                         }
                     }
-                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| sm.2[s].as_ref()).collect();
+                    let vsrcs: Vec<Option<&Value>> =
+                        sums.iter().map(|sm| sm.2.get(s).and_then(Option::as_ref)).collect();
                     Some(gather_lanes(&vsrcs, &s_t, &s_o))
                 })
                 .collect();
@@ -331,6 +338,33 @@ mod tests {
         let off: Vec<usize> = tags.iter().map(|&t| { let p = cur[t]; cur[t] += 1; p }).collect();
         let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
         assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
+    }
+
+    /// Sources may disagree on `Sum` arity: a column holding only tag 0 commits one lane, one
+    /// holding only tag 1 commits two. The gather must commit every lane ANY source does — taking
+    /// source 0's arity drops lanes the output tag column still names, and `sum_from_prim` then
+    /// indexes past its own lanes ("index out of bounds: the len is 1 but the index is 1").
+    #[test]
+    fn gather_lanes_sums_of_differing_arity() {
+        // src 0: tag 0 only  -> Sum([Some])         (arity 1)
+        // src 1: tag 1 only  -> Sum([None, Some])   (arity 2)
+        let a = Value::sum_opt(vec![0, 0], vec![Some(u(&[10, 11]))]);
+        let b = Value::sum_opt(vec![1, 1], vec![None, Some(u(&[20, 21]))]);
+        let (tags, off) = (vec![0usize, 1, 0, 1], vec![0usize, 0, 1, 1]);
+        let out = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
+        // The result commits both lanes, and reads back as the interleaving.
+        match &out {
+            Value::Sum(t, _, lanes) => {
+                assert_eq!(lanes.len(), 2, "output must commit both lanes");
+                assert_eq!(t.usize_vec(), vec![0, 1, 0, 1]);
+                assert_eq!(lanes[0], Some(u(&[10, 11])));
+                assert_eq!(lanes[1], Some(u(&[20, 21])));
+            }
+            other => panic!("expected a Sum, got {other:?}"),
+        }
+        // ...and the shorter source in either position.
+        let flipped = gather_lanes(&[Some(&b), Some(&a)], &tags, &off);
+        assert_eq!(flipped.len(), 4);
     }
 
     #[test]
