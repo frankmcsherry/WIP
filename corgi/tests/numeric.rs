@@ -136,3 +136,68 @@ fn no_float_literal_token() {
     assert!(parse_ml("input lit_i16 3").is_ok());
     assert!(parse_ml("input lit_u32 3 to_f32").is_ok());
 }
+
+/// `Rem` on the unsigned row, including the total `x % 0 = x`. The zero divisor is
+/// deliberately defined rather than rejected: a caller that already knows the modulus is
+/// positive (DDIR's `hash(bound, ..)` guards `bound > 0`) should not pay for a branch, and
+/// "no reduction" is the only reading of a zero modulus that keeps the op total.
+#[test]
+fn unsigned_rem_is_total_at_a_zero_divisor() {
+    let input = Value::Prod(vec![u64(&[17, 100, 7, 42]), u64(&[5, 97, 7, 0])]);
+    let mut b = Builder::<NumOp>::default();
+    let inp = b.input();
+    let x = b.add(NumOp::Core(Op::Field(0)), vec![inp]);
+    let y = b.add(NumOp::Core(Op::Field(1)), vec![inp]);
+    let pair = b.tuple(vec![x, y]);
+    let out = b.add(NumOp::Arith(ArithOp::Bin(BinOp::Rem, Kind::U, 64)), vec![pair]);
+    let g = b.finish(out);
+    g.check();
+    assert_eq!(shape_of(&g, &shape_of_value(&input)).unwrap(), Shape::Prim(64));
+    assert_eq!(eval_graph(&g, input).into_u64("rem"), vec![2, 3, 0, 42]);
+}
+
+/// `Rem` on the signed row: the sign follows the DIVIDEND (Rust's `%`), the operands are
+/// read through the order-preserving encoding, and `i64::MIN % -1` does not overflow.
+#[test]
+fn signed_rem_follows_the_dividend() {
+    let input = Value::Prod(vec![i64col(&[-17, 17, -17, i64::MIN]), i64col(&[5, -5, -5, -1])]);
+    let mut b = Builder::<NumOp>::default();
+    let inp = b.input();
+    let x = b.add(NumOp::Core(Op::Field(0)), vec![inp]);
+    let y = b.add(NumOp::Core(Op::Field(1)), vec![inp]);
+    let pair = b.tuple(vec![x, y]);
+    let out = b.add(NumOp::Arith(ArithOp::Bin(BinOp::Rem, Kind::I, 64)), vec![pair]);
+    let g = b.finish(out);
+    g.check();
+    assert_eq!(dec_col(eval_graph(&g, input)), vec![-2, 2, -2, 0]);
+}
+
+/// The signed zero divisor is the encoded zero, not the raw-bit zero — a `Kind::I` lane
+/// stores 0 as the flipped sign bit, so a naive `y == 0` test would miss it and divide.
+#[test]
+fn signed_rem_is_total_at_a_zero_divisor() {
+    let input = Value::Prod(vec![i64col(&[-17, 9]), i64col(&[0, 0])]);
+    let mut b = Builder::<NumOp>::default();
+    let inp = b.input();
+    let x = b.add(NumOp::Core(Op::Field(0)), vec![inp]);
+    let y = b.add(NumOp::Core(Op::Field(1)), vec![inp]);
+    let pair = b.tuple(vec![x, y]);
+    let out = b.add(NumOp::Arith(ArithOp::Bin(BinOp::Rem, Kind::I, 64)), vec![pair]);
+    let g = b.finish(out);
+    g.check();
+    assert_eq!(dec_col(eval_graph(&g, input)), vec![-17, 9]);
+}
+
+/// The judge rejects a float `Rem` (integer-only), the mirror of its integer-`Div` rejection.
+#[test]
+fn float_rem_is_rejected() {
+    let mut b = Builder::<NumOp>::default();
+    let inp = b.input();
+    let x = b.add(NumOp::Core(Op::Field(0)), vec![inp]);
+    let y = b.add(NumOp::Core(Op::Field(1)), vec![inp]);
+    let pair = b.tuple(vec![x, y]);
+    let out = b.add(NumOp::Arith(ArithOp::Bin(BinOp::Rem, Kind::F, 64)), vec![pair]);
+    let g = b.finish(out);
+    let shape = Shape::Prod(vec![Shape::Prim(64), Shape::Prim(64)]);
+    assert!(shape_of(&g, &shape).is_err(), "float Rem must not type");
+}
