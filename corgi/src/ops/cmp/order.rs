@@ -109,6 +109,87 @@ pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
     out
 }
 
+/// One report from [`survey_groups`]: a maximal range exclusive to one side, or a matched
+/// GROUP — the maximal equal class on BOTH sides. Unlike [`Run::Both`] (a single positional
+/// pair), a group `Both` hands the caller every row of the equal class from each side at once,
+/// so out-of-band per-row payloads (times, diffs) can be merged and consolidated for the whole
+/// class in one place — the composition the pairwise `Both` cannot support (unequal per-side
+/// duplicate counts leak the excess into exclusive runs, splitting the class).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GroupRun {
+    /// Rows `a[lo..hi)` come next in merged order, strictly less than every unconsumed row of `b`.
+    A(usize, usize),
+    /// Rows `b[lo..hi)` come next in merged order, strictly less than every unconsumed row of `a`.
+    B(usize, usize),
+    /// Equal class: rows `a[alo..ahi)` and rows `b[blo..bhi)` are all structurally equal.
+    Both(usize, usize, usize, usize),
+}
+
+/// Gallop `idx` past the contiguous run of rows equal to `piv[pj]` (the column is sorted, so the
+/// equal class is contiguous and everything after it is greater). Same doubling/refine shape as
+/// [`gallop_lt`].
+fn gallop_eq(xs: &Value, idx: &mut usize, hi: usize, piv: &Value, pj: usize) {
+    let eq = |k: usize| compare_at(xs, k, piv, pj) == Ordering::Equal;
+    if *idx < hi && eq(*idx) {
+        let mut step = 1;
+        while *idx + step < hi && eq(*idx + step) {
+            *idx += step;
+            step <<= 1;
+        }
+        step >>= 1;
+        while step > 0 {
+            if *idx + step < hi && eq(*idx + step) {
+                *idx += step;
+            }
+            step >>= 1;
+        }
+        *idx += 1;
+    }
+}
+
+/// [`survey`] at GROUP granularity: the same zig-zag gallop, but a match reports the maximal
+/// equal class on both sides as one [`GroupRun::Both`] (galloping each side past its own
+/// duplicates) instead of a positional pair. Guarantees: the runs' `a`-parts (A ranges and
+/// Both `alo..ahi`) cover `0..a.len()` in order without gap or overlap (likewise `b`);
+/// expanding runs yields a non-decreasing structural sequence; every row in a `Both`'s two
+/// ranges is structurally equal to every other.
+pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
+    let (na, nb) = (a.len(), b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut out = Vec::new();
+    while i < na && j < nb {
+        match compare_at(a, i, b, j) {
+            Ordering::Less => {
+                let start = i;
+                i += 1;
+                gallop_lt(a, &mut i, na, b, j);
+                out.push(GroupRun::A(start, i));
+            }
+            Ordering::Greater => {
+                let start = j;
+                j += 1;
+                gallop_lt(b, &mut j, nb, a, i);
+                out.push(GroupRun::B(start, j));
+            }
+            Ordering::Equal => {
+                let (sa, sb) = (i, j);
+                i += 1;
+                gallop_eq(a, &mut i, na, b, sb);
+                j += 1;
+                gallop_eq(b, &mut j, nb, a, sa);
+                out.push(GroupRun::Both(sa, i, sb, j));
+            }
+        }
+    }
+    if i < na {
+        out.push(GroupRun::A(i, na));
+    }
+    if j < nb {
+        out.push(GroupRun::B(j, nb));
+    }
+    out
+}
+
 /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
 /// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
 /// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
@@ -535,6 +616,66 @@ mod discriminate {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn survey_groups_oracle() {
+        use super::{survey_groups, GroupRun};
+        use crate::Value;
+        fn xs(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
+        for seed in 1u64..40 {
+            let mut st = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let space = 1 + (xs(&mut st) % 12);
+            let (na, nb) = ((xs(&mut st) % 40) as usize, (xs(&mut st) % 40) as usize);
+            let mut av: Vec<u64> = (0..na).map(|_| xs(&mut st) % space).collect();
+            let mut bv: Vec<u64> = (0..nb).map(|_| xs(&mut st) % space).collect();
+            av.sort_unstable();
+            bv.sort_unstable();
+            let a = Value::u64(av.clone());
+            let b = Value::u64(bv.clone());
+            let runs = survey_groups(&a, &b);
+            // Coverage in order, no gap/overlap; Both groups maximal and equal.
+            let (mut ca, mut cb) = (0usize, 0usize);
+            let mut merged: Vec<u64> = Vec::new();
+            for r in &runs {
+                match *r {
+                    GroupRun::A(lo, hi) => {
+                        assert_eq!(lo, ca);
+                        assert!(hi > lo);
+                        merged.extend(&av[lo..hi]);
+                        ca = hi;
+                    }
+                    GroupRun::B(lo, hi) => {
+                        assert_eq!(lo, cb);
+                        assert!(hi > lo);
+                        merged.extend(&bv[lo..hi]);
+                        cb = hi;
+                    }
+                    GroupRun::Both(alo, ahi, blo, bhi) => {
+                        assert_eq!((alo, blo), (ca, cb));
+                        assert!(ahi > alo && bhi > blo);
+                        let v = av[alo];
+                        assert!(av[alo..ahi].iter().all(|&x| x == v));
+                        assert!(bv[blo..bhi].iter().all(|&x| x == v));
+                        // maximal: neighbors differ
+                        assert!(ahi == na || av[ahi] != v);
+                        assert!(bhi == nb || bv[bhi] != v);
+                        assert!(alo == 0 || av[alo - 1] != v);
+                        assert!(blo == 0 || bv[blo - 1] != v);
+                        merged.extend(av[alo..ahi].iter());
+                        merged.extend(bv[blo..bhi].iter());
+                        ca = ahi;
+                        cb = bhi;
+                    }
+                }
+            }
+            assert_eq!((ca, cb), (na, nb), "full coverage");
+            let mut expect = av.clone();
+            expect.extend(&bv);
+            expect.sort_unstable();
+            merged.sort_unstable(); // Both emits a-then-b; order within class is caller's business
+            assert_eq!(merged, expect, "seed {seed}");
+        }
+    }
+
     use super::*;
 
     fn u(xs: &[u64]) -> Value {

@@ -163,7 +163,7 @@ pub mod arrange {
         crate::ops::cmp::order::run_layout(labels)
     }
 
-    pub use crate::ops::cmp::order::Run;
+    pub use crate::ops::cmp::order::{GroupRun, Run};
 
     /// Survey the mutual interleaving of two structurally-sorted columns `a` and `b` as a sequence
     /// of [`Run`]s — maximal ranges exclusive to one side, single matched pairs common to both — in
@@ -174,6 +174,15 @@ pub mod arrange {
     /// consolidation off the returned runs. See [`Run`] for the coverage/sortedness guarantees.
     pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
         crate::ops::cmp::order::survey(a, b)
+    }
+
+    /// [`survey`] at GROUP granularity: a match is reported as the maximal equal class on BOTH
+    /// sides ([`GroupRun::Both`] carries both ranges), so a caller with out-of-band per-row
+    /// payloads (times, diffs) can merge and consolidate the whole class in one place. This is
+    /// the group-range `Both` a time-carrying merge needs for correct cross-side consolidation
+    /// when the same row recurs with different payloads on each side.
+    pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
+        crate::ops::cmp::order::survey_groups(a, b)
     }
 
     /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`:
@@ -392,7 +401,8 @@ pub mod arrange {
     #[cfg(test)]
     mod order_tests {
         use super::{
-            compare_at, gather, group_bounds, run_layout, segment_labels, sort_blocks, survey, Run,
+            compare_at, gather, group_bounds, run_layout, segment_labels, sort_blocks, survey,
+            survey_groups, GroupRun, Run,
         };
         use crate::value::{Bounds, Value};
         use std::cmp::Ordering;
@@ -633,6 +643,61 @@ pub mod arrange {
             check_survey(&mk(1, 500, 300), &mk(2, 500, 300)); // dense overlap, many Both + dups
             check_survey(&mk(3, 800, 5000), &mk(4, 200, 5000)); // sparse, lopsided sizes
             check_survey(&mk(5, 1, 10), &mk(6, 1000, 10)); // single-element vs large
+        }
+
+        /// [`survey_groups`] over the shape a time-carrying merge actually surveys: a
+        /// `Prod([keys, vals])` with UNEQUAL per-side duplicate counts for the same row. That is
+        /// the case the pairwise [`survey`] cannot express — its `Both` is one positional pair, so
+        /// a class of 3-on-`a` against 2-on-`b` leaks its excess into an exclusive run and splits
+        /// the class across reports. Checks the two guarantees a merge leans on: the `a`-parts and
+        /// `b`-parts each cover their side in order without gap or overlap, and every `Both` is the
+        /// MAXIMAL equal class on both sides (so the caller sees each class exactly once).
+        #[test]
+        fn survey_groups_prod_unequal_duplicate_counts() {
+            // Rows are (key, val) pairs; `a` and `b` repeat shared rows different numbers of times.
+            let mk = |rows: &[(u64, u64)]| {
+                Value::Prod(vec![
+                    Value::u64(rows.iter().map(|r| r.0).collect()),
+                    Value::u64(rows.iter().map(|r| r.1).collect()),
+                ])
+            };
+            let arows: &[(u64, u64)] = &[(1, 0), (2, 7), (2, 7), (2, 7), (4, 1), (9, 9)];
+            let brows: &[(u64, u64)] = &[(0, 5), (2, 7), (2, 7), (3, 3), (9, 9), (9, 9)];
+            let (a, b) = (mk(arows), mk(brows));
+            let runs = survey_groups(&a, &b);
+
+            let (mut ca, mut cb) = (0usize, 0usize);
+            for r in &runs {
+                match *r {
+                    GroupRun::A(lo, hi) => {
+                        assert_eq!(lo, ca, "a coverage in order");
+                        assert!(hi > lo);
+                        ca = hi;
+                    }
+                    GroupRun::B(lo, hi) => {
+                        assert_eq!(lo, cb, "b coverage in order");
+                        assert!(hi > lo);
+                        cb = hi;
+                    }
+                    GroupRun::Both(alo, ahi, blo, bhi) => {
+                        assert_eq!((alo, blo), (ca, cb), "both sides advance together");
+                        // The whole class, on both sides, and nothing outside it.
+                        assert!((alo..ahi).all(|k| compare_at(&a, k, &b, blo) == Ordering::Equal));
+                        assert!((blo..bhi).all(|k| compare_at(&b, k, &a, alo) == Ordering::Equal));
+                        assert!(ahi == arows.len() || arows[ahi] != arows[alo], "maximal in a");
+                        assert!(bhi == brows.len() || brows[bhi] != brows[blo], "maximal in b");
+                        ca = ahi;
+                        cb = bhi;
+                    }
+                }
+            }
+            assert_eq!((ca, cb), (arows.len(), brows.len()), "full coverage of both sides");
+
+            // The (2,7) class is 3-on-a against 2-on-b, and the (9,9) class 1-against-2: each is
+            // ONE report carrying both full ranges, which is exactly what the pairwise survey
+            // cannot do.
+            assert!(runs.contains(&GroupRun::Both(1, 4, 1, 3)), "{runs:?}");
+            assert!(runs.contains(&GroupRun::Both(5, 6, 4, 6)), "{runs:?}");
         }
 
         #[test]
