@@ -1,5 +1,13 @@
 # Corgi performance gaps — pre-DPS baseline
 
+> **Status:** The measurements below are retained as a historical pre-DPS baseline. The executable
+> matrix in `benches/gaps.rs` now uses the effect-aware A–I workload families and the R arrangement
+> family; this report has not yet been refreshed against that definition or current `master`.
+
+To exercise the definition without producing reportable measurements, run
+`cargo bench --bench gaps -- --smoke`. Reportable runs can select one or more families with
+`cargo bench --bench gaps -- --family A` or `--family C,R`; omitting the selector runs all families.
+
 The throughput companion to `expressivity-gaps.md`.
 That audit asks what the surface cannot say; this one asks where the engine leaves throughput on the floor, measured against an honest hand-written-Rust ceiling, before destination-passing style is built.
 

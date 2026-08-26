@@ -8,7 +8,10 @@
 //! Method (after collie's bake-off harness): inline Rust ceilings in THIS binary, same input data,
 //! best-of-`reps` timing (min rejects scheduler/turbo noise), `black_box` on input and output so LLVM
 //! can't elide the work, deterministic LCG-scrambled inputs (no rng dep). Inputs are built once and
-//! handed to `eval` by Arc-clone inside the loop (outside the timer) — a real pipeline's column flow.
+//! handed to effect-aware `eval` by Arc-clone inside the loop (outside the timer) — a real pipeline's
+//! column flow. `--smoke` runs every family with tiny inputs; `--family A` (repeatable, or a comma-
+//! separated list) selects families A-I or R (arrangement). Examples:
+//! `cargo bench --bench gaps -- --smoke`; `cargo bench --bench gaps -- --family C,R`.
 //!
 //! Sizing targets the M4 mini (128 KB L1D, ~16 MB L2/cluster, ~8 MB SLC; no conventional L3): the
 //! design center is the 1 M-row (8 MB/col) L2/SLC point; 8 M rows (64 MB/col) is the DRAM-streaming
@@ -16,35 +19,44 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{
-    effect_eval_graph, eval_graph, parse_ml, ArithOp, Builder, EffectValues, Graph, NumOp, Op, Value,
+    arrange, effect_eval_graph, eval_graph, parse_ml, ArithOp, Builder, EffectValues, Graph, NumOp,
+    Op, Value,
 };
+use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 // ----- harness -----------------------------------------------------------
 
-/// best-of-`reps` wall time for one whole-graph `eval`. The arg is cloned (Arc bump) outside the timer,
-/// matching a pipeline that hands an owned column to each op.
+/// best-of-`reps` wall time for one whole-graph effect-aware `eval`. Surface graphs must use this path:
+/// `filter`, `gather`, `slices`, `branch`, etc. are FailOps in the current vocabulary. The arg is
+/// cloned (Arc bump) outside the timer, matching a pipeline that hands an owned column to each op.
 fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
         let t = Instant::now();
-        black_box(eval_graph(g, black_box(a)));
-        best = best.min(t.elapsed());
+        let out = black_box(effect_eval_graph(g, black_box(EffectValues::Pure(a))));
+        let failed = matches!(&out, EffectValues::Fail(f) if f.err.iter().any(|&failed| failed));
+        black_box(out); // include output destruction in the timer, as rust_t's closures do
+        let elapsed = t.elapsed();
+        assert!(
+            !failed,
+            "benchmark input unexpectedly exercised a FailOp error lane"
+        );
+        best = best.min(elapsed);
     }
     best
 }
 
-/// best-of-`reps` wall time for one whole-graph EFFECT eval — the total path: a `FailOp` (gather here)
-/// does the vectorized bounds check and produces a `Fail` column, rather than panicking or returning
-/// the raw value. Same Arc-clone-outside-the-timer discipline as `corgi_t`.
-fn corgi_effect_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
+/// Raw kernel timing, used only by the H safety and I pointer-chase controls to isolate the cost of
+/// the effect check from the underlying gather. This is not the normal surface execution path.
+fn corgi_raw_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
         let t = Instant::now();
-        black_box(effect_eval_graph(g, black_box(EffectValues::Pure(a))));
+        black_box(eval_graph(g, black_box(a)));
         best = best.min(t.elapsed());
     }
     best
@@ -66,20 +78,21 @@ fn ns_per(d: Duration, n: usize) -> f64 {
     d.as_nanos() as f64 / n as f64
 }
 
-/// GB/s over the *input* footprint (`n` u64s) — a single comparable bandwidth number across engine and
-/// ceiling; the 8 MB→64 MB drop in this figure is the bandwidth-bound vs compute-bound tell.
-fn gbs(d: Duration, n: usize) -> f64 {
+/// Eight-byte-equivalent throughput per reported work item. This is exact input GB/s for the common
+/// one-U64-per-item rows; for byte text and multi-column arrangement kernels it is a normalization,
+/// not an estimate of physical memory traffic.
+fn u64eq_gbs(d: Duration, n: usize) -> f64 {
     (n as f64 * 8.0) / d.as_secs_f64() / 1e9
 }
 
-/// one corgi-vs-ceiling row: ns/row for each, the input-GB/s for corgi, the slowdown, and the named
-/// mechanism the slowdown is attributed to (the decompose-before-reporting discipline).
+/// one corgi-vs-ceiling row: ns/row for each, normalized throughput for corgi, the slowdown, and the
+/// named mechanism the slowdown is attributed to (the decompose-before-reporting discipline).
 fn row(task: &str, n: usize, c: Duration, r: Duration, mech: &str) {
     println!(
-        "{task:<22} n={n:>8}  corgi {:>6.2} ns  rust {:>6.2} ns  {:>5.1} GB/s  {:>5.2}x   {mech}",
+        "{task:<22} n={n:>8}  corgi {:>7.3} ns  rust {:>7.3} ns  {:>5.1} u64eq GB/s  {:>6.3}x   {mech}",
         ns_per(c, n),
         ns_per(r, n),
-        gbs(c, n),
+        u64eq_gbs(c, n),
         c.as_secs_f64() / r.as_secs_f64(),
     );
 }
@@ -103,7 +116,15 @@ fn row_chain(task: &str, n: usize, ck: Duration, rk: Duration, r1: Duration) {
 /// per-element bounds check), and `.get()` collected to `Option<Vec>` (the total Rust analog, which
 /// discovers failure SEQUENTIALLY and short-circuits on the first miss).
 #[allow(clippy::too_many_arguments)]
-fn row_safety(task: &str, n: usize, cs: Duration, cr: Duration, ru: Duration, ri: Duration, ro: Duration) {
+fn row_safety(
+    task: &str,
+    n: usize,
+    cs: Duration,
+    cr: Duration,
+    ru: Duration,
+    ri: Duration,
+    ro: Duration,
+) {
     println!(
         "{task:<12} n={n:>8}  corgi-safe {:>6.2}  corgi-raw {:>6.2}  | rust-unsafe {:>6.2}  rust-idx {:>6.2}  rust-opt {:>6.2}  ns/row",
         ns_per(cs, n), ns_per(cr, n), ns_per(ru, n), ns_per(ri, n), ns_per(ro, n),
@@ -115,7 +136,13 @@ fn row_safety(task: &str, n: usize, cs: Duration, cr: Duration, ru: Duration, ri
 /// deterministic non-sorted column via an LCG step (no rng dep). Masked to 32 bits so the byte-radix
 /// sort runs four passes, not eight, and so group/dedup keys have a realistic distinct count.
 fn scrambled(n: usize) -> Vec<u64> {
-    (0..n as u64).map(|i| i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 32).collect()
+    (0..n as u64)
+        .map(|i| {
+            i.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+                >> 32
+        })
+        .collect()
 }
 
 fn leaf(n: usize) -> Value {
@@ -131,7 +158,10 @@ fn one_list(n: usize) -> Value {
 /// a SORTED big `List<U64>` (one `n`-wide row of `0..n`) — the equi-join feeds find/slices a haystack
 /// already in key order, so the measurement isolates the join primitives from a sort cost.
 fn sorted_list(n: usize) -> Value {
-    Value::List(vec![n].into(), Box::new(Value::u64((0..n as u64).collect())))
+    Value::List(
+        vec![n].into(),
+        Box::new(Value::u64((0..n as u64).collect())),
+    )
 }
 
 fn compile(src: &str) -> Graph<NumOp> {
@@ -142,7 +172,10 @@ fn compile(src: &str) -> Graph<NumOp> {
 /// size at the call site, so a small distinct count makes dedup/find do real grouping work).
 fn word5(mut v: u64) -> [u8; 5] {
     let mut w = [0u8; 5];
-    for c in w.iter_mut() { *c = b'a' + (v % 26) as u8; v /= 26; }
+    for c in w.iter_mut() {
+        *c = b'a' + (v % 26) as u8;
+        v /= 26;
+    }
     w
 }
 
@@ -153,10 +186,15 @@ fn words_text(m: usize, vocab: u64) -> (Value, Vec<u8>) {
     let src = scrambled(m);
     let mut bytes = Vec::with_capacity(m * 6);
     for (i, &v) in src.iter().enumerate() {
-        if i > 0 { bytes.push(b' '); }
+        if i > 0 {
+            bytes.push(b' ');
+        }
         bytes.extend_from_slice(&word5(v % vocab));
     }
-    (Value::List(vec![bytes.len()].into(), Box::new(Value::u8(bytes.clone()))), bytes)
+    (
+        Value::List(vec![bytes.len()].into(), Box::new(Value::u8(bytes.clone()))),
+        bytes,
+    )
 }
 
 /// a comma-separated CSV of `m` small integers, returned BOTH as a one-row `List<U8>` and as the raw
@@ -166,10 +204,15 @@ fn csv_text(m: usize) -> (Value, Vec<u8>) {
     let nums = scrambled(m);
     let mut bytes = Vec::with_capacity(m * 6);
     for (i, &v) in nums.iter().enumerate() {
-        if i > 0 { bytes.push(b','); }
+        if i > 0 {
+            bytes.push(b',');
+        }
         bytes.extend_from_slice((v % 100_000).to_string().as_bytes());
     }
-    (Value::List(vec![bytes.len()].into(), Box::new(Value::u8(bytes.clone()))), bytes)
+    (
+        Value::List(vec![bytes.len()].into(), Box::new(Value::u8(bytes.clone()))),
+        bytes,
+    )
 }
 
 /// a chain of `k` in-place `AddU64` passes — each link its own pass over memory (interior links mutate
@@ -206,7 +249,9 @@ fn family_a(n: usize, reps: u32) {
         let s = black_box(&src);
         let mut v: Vec<u64> = s.to_vec();
         for _ in 0..8 {
-            for x in v.iter_mut() { *x = x.wrapping_add(7); }
+            for x in v.iter_mut() {
+                *x = x.wrapping_add(7);
+            }
         }
         black_box(v);
     });
@@ -222,14 +267,24 @@ fn family_a(n: usize, reps: u32) {
     let rk = rust_t(reps, || {
         let s = black_box(&src);
         let mut v: Vec<u64> = s.iter().map(|&x| x.wrapping_add(5)).collect();
-        for x in v.iter_mut() { *x = x.wrapping_mul(3); }
-        for x in v.iter_mut() { *x = x.wrapping_sub(2); }
-        for x in v.iter_mut() { *x >>= 1; }
+        for x in v.iter_mut() {
+            *x = x.wrapping_mul(3);
+        }
+        for x in v.iter_mut() {
+            *x = x.wrapping_sub(2);
+        }
+        for x in v.iter_mut() {
+            *x >>= 1;
+        }
         black_box(v);
     });
     let r1 = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().map(|&x| (x.wrapping_add(5).wrapping_mul(3).wrapping_sub(2)) >> 1).collect::<Vec<u64>>());
+        black_box(
+            s.iter()
+                .map(|&x| (x.wrapping_add(5).wrapping_mul(3).wrapping_sub(2)) >> 1)
+                .collect::<Vec<u64>>(),
+        );
     });
     row_chain("A3 mixed_chain", n, ck, rk, r1);
 
@@ -239,7 +294,10 @@ fn family_a(n: usize, reps: u32) {
     let ck = corgi_t(&g, &li, reps);
     let r1 = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().fold(0u64, |a, &x| a.wrapping_add(x.wrapping_mul(2))));
+        black_box(
+            s.iter()
+                .fold(0u64, |a, &x| a.wrapping_add(x.wrapping_mul(2))),
+        );
     });
     let rk = rust_t(reps, || {
         let s = black_box(&src);
@@ -261,23 +319,49 @@ fn family_b(n: usize, reps: u32) {
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let mut out = Vec::with_capacity(s.len());
-        for &x in s { if x > t { out.push(x); } }
+        for &x in s {
+            if x > t {
+                out.push(x);
+            }
+        }
         black_box(out);
     });
-    row("B1 filter_values", n, c, r, "mask pass + scalar filter_mask vs predicated push");
+    row(
+        "B1 filter_values",
+        n,
+        c,
+        r,
+        "mask pass + scalar filter_mask vs predicated push",
+    );
 
     // B2 select/blend — min(x+7, 3x) via cmp + branchless select. corgi: add,mul,cmp,select passes.
-    let g = compile("input map (x -> let a = x add_u64 7 in let b = x mul 3 in ((a, b) lt, a, b) select)");
+    let g = compile(
+        "input map (x -> let a = x add_u64 7 in let b = x mul 3 in ((a, b) lt, a, b) select)",
+    );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().map(|&x| {
-            let a = x.wrapping_add(7);
-            let b = x.wrapping_mul(3);
-            if a < b { a } else { b }
-        }).collect::<Vec<u64>>());
+        black_box(
+            s.iter()
+                .map(|&x| {
+                    let a = x.wrapping_add(7);
+                    let b = x.wrapping_mul(3);
+                    if a < b {
+                        a
+                    } else {
+                        b
+                    }
+                })
+                .collect::<Vec<u64>>(),
+        );
     });
-    row("B2 cmp_select", n, c, r, "4 passes (add,mul,cmp,select) vs 1 fused");
+    row(
+        "B2 cmp_select",
+        n,
+        c,
+        r,
+        "4 passes (add,mul,cmp,select) vs 1 fused",
+    );
 }
 
 /// C — aggregation. Monoid reductions are one SIMD pass (at ceiling); group/scan/fold are the interesting cases.
@@ -304,15 +388,25 @@ fn family_c(n: usize, reps: u32) {
     row("C2 fold_max", n, c, r, "1 SIMD pass");
 
     // C3 group_by + sum — 256 buckets (key = x & 255). corgi: sort-based group; rust: sort-by-key + segment sum.
-    let g = compile("let g = input map (x -> (x and 255, x)) group in g map ((k, vs) -> (k, vs fold_add))");
+    let g = compile(
+        "let g = input map (x -> (x and 255, x)) group in g map ((k, vs) -> (k, vs fold_add))",
+    );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let mut acc = [0u64; 256];
-        for &x in s { acc[(x & 255) as usize] = acc[(x & 255) as usize].wrapping_add(x); }
+        for &x in s {
+            acc[(x & 255) as usize] = acc[(x & 255) as usize].wrapping_add(x);
+        }
         black_box(acc);
     });
-    row("C3 group_by_sum", n, c, r, "sort-based group vs direct bucket accum");
+    row(
+        "C3 group_by_sum",
+        n,
+        c,
+        r,
+        "sort-based group vs direct bucket accum",
+    );
 
     // C4 scan — inclusive prefix sum. Sequential within the row; rust is a tight cumsum loop.
     let g = compile("let xs = input in (xs lit 0, xs) scan ((a, x) -> (a, x) add)");
@@ -320,9 +414,22 @@ fn family_c(n: usize, reps: u32) {
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let mut acc = 0u64;
-        black_box(s.iter().map(|&x| { acc = acc.wrapping_add(x); acc }).collect::<Vec<u64>>());
+        black_box(
+            s.iter()
+                .map(|&x| {
+                    acc = acc.wrapping_add(x);
+                    acc
+                })
+                .collect::<Vec<u64>>(),
+        );
     });
-    row("C4 scan_prefix", n, c, r, "lockstep foldscan vs cumsum loop");
+    row(
+        "C4 scan_prefix",
+        n,
+        c,
+        r,
+        "lockstep foldscan vs cumsum loop",
+    );
 
     // C4k scan_add — the monoid PREFIX kernel: one in-place pass, the fast path the general scan above
     // should lower to. Same cumsum, vs the same Rust loop — the measured close of the C4 gap.
@@ -331,9 +438,22 @@ fn family_c(n: usize, reps: u32) {
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let mut acc = 0u64;
-        black_box(s.iter().map(|&x| { acc = acc.wrapping_add(x); acc }).collect::<Vec<u64>>());
+        black_box(
+            s.iter()
+                .map(|&x| {
+                    acc = acc.wrapping_add(x);
+                    acc
+                })
+                .collect::<Vec<u64>>(),
+        );
     });
-    row("C4k scan_add(kernel)", n, c, r, "monoid prefix kernel, one in-place pass");
+    row(
+        "C4k scan_add(kernel)",
+        n,
+        c,
+        r,
+        "monoid prefix kernel, one in-place pass",
+    );
 
     // C5 fold (sum, count) — heterogeneous accumulator, non-monoid shape.
     let g = compile("let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))");
@@ -342,10 +462,19 @@ fn family_c(n: usize, reps: u32) {
         let s = black_box(&src);
         let mut sum = 0u64;
         let mut cnt = 0u64;
-        for &x in s { sum = sum.wrapping_add(x); cnt += 1; }
+        for &x in s {
+            sum = sum.wrapping_add(x);
+            cnt += 1;
+        }
         black_box((sum, cnt));
     });
-    row("C5 fold_sum_count", n, c, r, "lockstep fold vs single accum loop");
+    row(
+        "C5 fold_sum_count",
+        n,
+        c,
+        r,
+        "lockstep fold vs single accum loop",
+    );
 }
 
 /// D — sort / order. The lone compute-bound corner; the structural comparator is the distinctive piece.
@@ -385,7 +514,7 @@ fn family_e(n: usize, reps: u32) {
     let g = compile(
         "let bn = input in let build = bn map (x -> (x shr 8, x)) in \
          let probes = bn map (x -> x shr 8) dedup in let t = build transpose in \
-         let r = (probes, t.0) find in (r, t.1) slices_uns",
+         let r = (probes, t.0) find in (r, t.1) slices",
     );
     let sl = sorted_list(n);
     let c = corgi_t(&g, &sl, reps);
@@ -401,16 +530,26 @@ fn family_e(n: usize, reps: u32) {
         let mut j = 0usize;
         for &p in &probes {
             let start = j;
-            while j < keys.len() && keys[j] == p { j += 1; }
+            while j < keys.len() && keys[j] == p {
+                j += 1;
+            }
             flat.extend_from_slice(&vals[start..j]);
             bounds.push(flat.len());
         }
         black_box((flat, bounds));
     });
-    row("E1 join_find_slices", n, c, r, "find (per-probe search)+slices vs two-pointer merge, both materializing");
+    row(
+        "E1 join_find_slices",
+        n,
+        c,
+        r,
+        "find (per-probe search)+slices vs two-pointer merge, both materializing",
+    );
 
     // E2 gather — random permutation. corgi: `resolve_indices` (scalar, +bounds assert) then `Prim::gather`.
-    let g = compile(&format!("let h = input in (h map (e -> e and {mask}), h) gather_uns"));
+    let g = compile(&format!(
+        "let h = input in (h map (e -> e and {mask}), h) gather"
+    ));
     let li = one_list(n);
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -418,12 +557,18 @@ fn family_e(n: usize, reps: u32) {
         let idx: Vec<usize> = s.iter().map(|&e| (e & mask) as usize).collect();
         black_box(idx.iter().map(|&i| s[i]).collect::<Vec<u64>>());
     });
-    row("E2 gather", n, c, r, "resolve_indices (scalar) + gather vs map+gather");
+    row(
+        "E2 gather",
+        n,
+        c,
+        r,
+        "resolve_indices (scalar) + gather vs map+gather",
+    );
 
     // E3 gather-chain (pointer jump) — two composed gathers; the index-composition rewrite target.
     let g = compile(&format!(
-        "let p = input map (e -> e and {mask}) in let pp = (p, p) gather_uns in \
-         let p4 = (pp, pp) gather_uns in (pp, p4)"
+        "let p = input map (e -> e and {mask}) in let pp = (p, p) gather in \
+         let p4 = (pp, pp) gather in (pp, p4)"
     ));
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -433,7 +578,13 @@ fn family_e(n: usize, reps: u32) {
         let p4: Vec<usize> = pp.iter().map(|&i| pp[i]).collect();
         black_box((pp, p4));
     });
-    row("E3 gather_chain", n, c, r, "2 gathers vs 2 gathers (index-rewrite headroom on top)");
+    row(
+        "E3 gather_chain",
+        n,
+        c,
+        r,
+        "2 gathers vs 2 gathers (index-rewrite headroom on top)",
+    );
 }
 
 /// F — sum-type / variant. The differentiator: data-parallel `branch`/`match` keep each lane dense
@@ -443,13 +594,31 @@ fn family_f(n: usize, reps: u32) {
     let src = scrambled(n);
 
     // F1 branch+match — parity dispatch (50/50, unpredictable). corgi: mask+partition+per-lane+recombine.
-    let g = compile("input map (x -> (x, x and 1) branch 2 match (0 (e -> e add_u64 3), 1 (o -> o add_u64 7)))");
+    let g = compile(
+        "input map (x -> (x, x and 1) branch 2 match (0 (e -> e add_u64 3), 1 (o -> o add_u64 7)))",
+    );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().map(|&x| if x & 1 == 0 { x.wrapping_add(3) } else { x.wrapping_add(7) }).collect::<Vec<u64>>());
+        black_box(
+            s.iter()
+                .map(|&x| {
+                    if x & 1 == 0 {
+                        x.wrapping_add(3)
+                    } else {
+                        x.wrapping_add(7)
+                    }
+                })
+                .collect::<Vec<u64>>(),
+        );
     });
-    row("F1 branch_match", n, c, r, "columnar partition+recombine vs scalar branchy map");
+    row(
+        "F1 branch_match",
+        n,
+        c,
+        r,
+        "columnar partition+recombine vs scalar branchy map",
+    );
 
     // F2 shred — build a Sum column then `unweave` it to SoA, vs a hand partition-by-tag.
     let g = compile("let xs = input in xs map (x -> (x, x and 1) branch 2) unweave");
@@ -459,11 +628,21 @@ fn family_f(n: usize, reps: u32) {
         let (mut e, mut o, mut tags) = (Vec::new(), Vec::new(), Vec::with_capacity(s.len()));
         for &x in s {
             tags.push((x & 1) as u8);
-            if x & 1 == 0 { e.push(x); } else { o.push(x); }
+            if x & 1 == 0 {
+                e.push(x);
+            } else {
+                o.push(x);
+            }
         }
         black_box((e, o, tags));
     });
-    row("F2 unweave_shred", n, c, r, "branch(build sum)+unweave vs one-pass partition");
+    row(
+        "F2 unweave_shred",
+        n,
+        c,
+        r,
+        "branch(build sum)+unweave vs one-pass partition",
+    );
 }
 
 /// G — text. split + the relational uniq-c idiom, and a parse+aggregate. Sized by element COUNT (`m`).
@@ -484,13 +663,21 @@ fn family_g(m: usize, reps: u32) {
         let (mut i, mut run) = (0usize, 0usize);
         while i < v.len() {
             run = 1;
-            while i + run < v.len() && v[i + run] == v[i] { run += 1; }
+            while i + run < v.len() && v[i + run] == v[i] {
+                run += 1;
+            }
             counts.push(run as u64);
             i += run;
         }
         black_box((v, counts, run));
     });
-    row("G1 word_count", m, c, r, "split+sort+dedup+find vs split+sort+run-count (same algo)");
+    row(
+        "G1 word_count",
+        m,
+        c,
+        r,
+        "split+sort+dedup+find vs split+sort+run-count (same algo)",
+    );
 
     // G2 csv-sum: split, parse_u64 (total), default Err->0, unwrap, reduce. Ceiling does the SAME work:
     // one pass over the bytes, atoi at each comma, accumulate (no pre-parsed shortcut).
@@ -503,12 +690,198 @@ fn family_g(m: usize, reps: u32) {
         let bytes = black_box(&csv_bytes);
         let (mut sum, mut cur) = (0u64, 0u64);
         for &b in bytes {
-            if b == b',' { sum = sum.wrapping_add(cur); cur = 0; }
-            else { cur = cur.wrapping_mul(10).wrapping_add((b - b'0') as u64); }
+            if b == b',' {
+                sum = sum.wrapping_add(cur);
+                cur = 0;
+            } else {
+                cur = cur.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+            }
         }
         black_box(sum.wrapping_add(cur));
     });
-    row("G2 csv_sum", m, c, r, "split+parse_u64(Sum)+reduce vs split+atoi+sum");
+    row(
+        "G2 csv_sum",
+        m,
+        c,
+        r,
+        "split+parse_u64(Sum)+reduce vs split+atoi+sum",
+    );
+}
+
+/// R — arrangement substrate. These are representative kernels called directly by a
+/// differential-dataflow backend: stable argsort, batched compare/probe, run survey, and two-source
+/// gather. The ceilings return the same materialized products (permutations/ranges/runs/columns).
+fn family_arrange(n: usize, reps: u32) {
+    let src = scrambled(n);
+    let col = Value::u64(src.clone());
+
+    let c = rust_t(reps, || {
+        black_box(arrange::sort_perm(black_box(&col)));
+    });
+    let r = rust_t(reps, || {
+        let s = black_box(&src);
+        let mut perm: Vec<usize> = (0..s.len()).collect();
+        // Cache each key once while `perm` is still in input order. Plain `sort_by_key` would reload
+        // the large key column at every comparison and is not an honest argsort ceiling at DRAM scale.
+        perm.sort_by_cached_key(|&i| s[i]); // stable, matching sort_perm's contract
+        black_box(perm);
+    });
+    row(
+        "R1 arrange_sort_perm",
+        n,
+        c,
+        r,
+        "stable radix argsort vs stable cached-key Rust sort",
+    );
+
+    let mut sorted = src.clone();
+    sorted.sort_unstable();
+    let sorted_col = Value::u64(sorted.clone());
+    let ia: Vec<usize> = (0..n.saturating_sub(1)).collect();
+    let ib: Vec<usize> = (1..n).collect();
+    let c = rust_t(reps, || {
+        black_box(arrange::compare_idx(
+            black_box(&sorted_col),
+            &sorted_col,
+            &ia,
+            &ib,
+        ));
+    });
+    let r = rust_t(reps, || {
+        black_box(
+            black_box(&sorted)
+                .windows(2)
+                .map(|w| w[0].cmp(&w[1]) as i8)
+                .collect::<Vec<i8>>(),
+        );
+    });
+    row(
+        "R2 arrange_compare",
+        ia.len().max(1),
+        c,
+        r,
+        "batched adjacent compare vs direct leaf compare",
+    );
+
+    // Four copies of each key exercise both lower and upper bounds. Probe 1/16 as many rows as the
+    // haystack, representative of an incremental lookup into an existing arrangement.
+    let hay: Vec<u64> = (0..n as u64).map(|x| x >> 2).collect();
+    let q = (n / 16).max(1);
+    let needles: Vec<u64> = scrambled(q)
+        .into_iter()
+        .map(|x| x % (n as u64).div_ceil(4))
+        .collect();
+    let (needle_col, hay_col) = (Value::u64(needles.clone()), Value::u64(hay.clone()));
+    let c = rust_t(reps, || {
+        black_box(arrange::find_ranges(
+            black_box(&needle_col),
+            black_box(&hay_col),
+        ));
+    });
+    let r = rust_t(reps, || {
+        let (ns, hs) = (black_box(&needles), black_box(&hay));
+        let mut lo = Vec::with_capacity(ns.len());
+        let mut hi = Vec::with_capacity(ns.len());
+        for x in ns {
+            let l = hs.partition_point(|y| y < x);
+            lo.push(l);
+            hi.push(l + hs[l..].partition_point(|y| y == x));
+        }
+        black_box((lo, hi));
+    });
+    row(
+        "R3 arrange_find",
+        q,
+        c,
+        r,
+        "u64 fast path vs the same two partition points",
+    );
+
+    // Sorted inputs alternate in 256-row blocks: enough runs to exercise the survey boundary while
+    // preserving the range compression it was designed for. There are no equal keys in this case.
+    const BLOCK: usize = 256;
+    let blocked = |phase: usize| -> Vec<u64> {
+        (0..n)
+            .map(|i| (((i / BLOCK) * 2 + phase) * BLOCK + i % BLOCK) as u64)
+            .collect()
+    };
+    let (av, bv) = (blocked(0), blocked(1));
+    let (ac, bc) = (Value::u64(av.clone()), Value::u64(bv.clone()));
+    let c = rust_t(reps, || {
+        black_box(arrange::survey(black_box(&ac), black_box(&bc)));
+    });
+    let r = rust_t(reps, || {
+        let (a, b) = (black_box(&av), black_box(&bv));
+        let (mut i, mut j) = (0usize, 0usize);
+        let mut runs = Vec::new();
+        while i < a.len() && j < b.len() {
+            if a[i] < b[j] {
+                let start = i;
+                while i < a.len() && a[i] < b[j] {
+                    i += 1;
+                }
+                runs.push(arrange::Run::A(start, i));
+            } else if b[j] < a[i] {
+                let start = j;
+                while j < b.len() && b[j] < a[i] {
+                    j += 1;
+                }
+                runs.push(arrange::Run::B(start, j));
+            } else {
+                runs.push(arrange::Run::Both(i, j));
+                i += 1;
+                j += 1;
+            }
+        }
+        if i < a.len() {
+            runs.push(arrange::Run::A(i, a.len()));
+        }
+        if j < b.len() {
+            runs.push(arrange::Run::B(j, b.len()));
+        }
+        black_box(runs);
+    });
+    row(
+        "R4 arrange_survey",
+        n * 2,
+        c,
+        r,
+        "256-row galloping runs vs two-pointer run survey",
+    );
+
+    let left: Vec<u64> = (0..n.div_ceil(2) as u64).map(|x| x * 2).collect();
+    let right: Vec<u64> = (0..(n / 2) as u64).map(|x| x * 2 + 1).collect();
+    let tags: Vec<usize> = (0..n).map(|i| i & 1).collect();
+    let offsets: Vec<usize> = (0..n).map(|i| i >> 1).collect();
+    let (left_col, right_col) = (Value::u64(left.clone()), Value::u64(right.clone()));
+    let c = rust_t(reps, || {
+        black_box(arrange::gather_lanes(
+            &[Some(black_box(&left_col)), Some(black_box(&right_col))],
+            black_box(&tags),
+            black_box(&offsets),
+        ));
+    });
+    let r = rust_t(reps, || {
+        let (l, rr, ts, os) = (
+            black_box(&left),
+            black_box(&right),
+            black_box(&tags),
+            black_box(&offsets),
+        );
+        black_box(
+            ts.iter()
+                .zip(os)
+                .map(|(&tag, &off)| if tag == 0 { l[off] } else { rr[off] })
+                .collect::<Vec<u64>>(),
+        );
+    });
+    row(
+        "R5 arrange_gather2",
+        n,
+        c,
+        r,
+        "two-source column gather vs direct two-slice gather",
+    );
 }
 
 // ----- driver ------------------------------------------------------------
@@ -517,26 +890,46 @@ fn family_g(m: usize, reps: u32) {
 /// with an `arith` applied to each gathered value — the SAME arith in corgi's `map` body and in every
 /// Rust closure, so the comparison is honest. `unsafe` = `get_unchecked`; `idx` = panicking `h[i[k]]`;
 /// `opt` = `.get()` mapped through `arith`, collected to `Option<Vec>` (the total Rust path).
-fn bench_gather(label: &str, n: usize, reps: u32, idx: &[u64], hay: &[u64], g: &Graph<NumOp>, arith: fn(u64) -> u64) {
+fn bench_gather(
+    label: &str,
+    n: usize,
+    reps: u32,
+    idx: &[u64],
+    hay: &[u64],
+    g: &Graph<NumOp>,
+    arith: fn(u64) -> u64,
+) {
     let arg = Value::Prod(vec![
         Value::List(vec![n].into(), Box::new(Value::u64(idx.to_vec()))),
         Value::List(vec![n].into(), Box::new(Value::u64(hay.to_vec()))),
     ]);
-    let cs = corgi_effect_t(g, &arg, reps);
-    let cr = corgi_t(g, &arg, reps);
+    let cs = corgi_t(g, &arg, reps);
+    let cr = corgi_raw_t(g, &arg, reps);
     // all three Rust variants are iterator-collect (allocate + write ONCE, no zero-init pass), so only
     // the safety mechanism differs: unchecked load, panicking index, or `.get()`->Option.
     let ru = rust_t(reps, || {
         let (i, h) = (black_box(idx), black_box(hay));
-        black_box(i.iter().map(|&x| arith(unsafe { *h.get_unchecked(x as usize) })).collect::<Vec<u64>>());
+        black_box(
+            i.iter()
+                .map(|&x| arith(unsafe { *h.get_unchecked(x as usize) }))
+                .collect::<Vec<u64>>(),
+        );
     });
     let ri = rust_t(reps, || {
         let (i, h) = (black_box(idx), black_box(hay));
-        black_box(i.iter().map(|&x| arith(h[x as usize])).collect::<Vec<u64>>());
+        black_box(
+            i.iter()
+                .map(|&x| arith(h[x as usize]))
+                .collect::<Vec<u64>>(),
+        );
     });
     let ro = rust_t(reps, || {
         let (i, h) = (black_box(idx), black_box(hay));
-        black_box(i.iter().map(|&x| h.get(x as usize).map(|&v| arith(v))).collect::<Option<Vec<u64>>>());
+        black_box(
+            i.iter()
+                .map(|&x| h.get(x as usize).map(|&v| arith(v)))
+                .collect::<Option<Vec<u64>>>(),
+        );
     });
     row_safety(label, n, cs, cr, ru, ri, ro);
 }
@@ -553,13 +946,18 @@ fn family_safety(n: usize, reps: u32) {
     let g_plain = compile("input gather");
     let g_add = compile("input gather map (v -> v add_u64 7)");
     let g_chain = compile("input gather map (v -> v add_u64 7 shr 1 and 255)");
-    let cases: [(&str, &Graph<NumOp>, fn(u64) -> u64); 3] = [
+    type GatherCase<'a> = (&'a str, &'a Graph<NumOp>, fn(u64) -> u64);
+    let cases: [GatherCase<'_>; 3] = [
         ("gather", &g_plain, |v| v),
         ("gath+add", &g_add, |v| v.wrapping_add(7)),
         ("gath+chn3", &g_chain, |v| (v.wrapping_add(7) >> 1) & 255),
     ];
+    // Run every random control before a sequential identity candidate. If an identity fast path is
+    // present, its missing output allocation cannot change state for the following random control.
     for (label, g, arith) in cases {
         bench_gather(&format!("{label}_rand"), n, reps, &idx_rand, &hay, g, arith);
+    }
+    for (label, g, arith) in cases {
         bench_gather(&format!("{label}_seq"), n, reps, &idx_seq, &hay, g, arith);
     }
 }
@@ -588,8 +986,8 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
         Value::List(vec![r].into(), Box::new(Value::u64(start.clone()))),
         Value::List(vec![n].into(), Box::new(Value::u64(h.clone()))),
     ]);
-    let craw = corgi_t(&g, &arg, reps);
-    let csafe = corgi_effect_t(&g, &arg, reps);
+    let craw = corgi_raw_t(&g, &arg, reps);
+    let csafe = corgi_t(&g, &arg, reps);
 
     // Rust naive chase: chain-outer, step-inner — each chain's loads are dependent (a = h[a]), serial.
     let naive = rust_t(reps, || {
@@ -621,7 +1019,10 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
         let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
         let mut pos: Vec<u64> = s.to_vec();
         for _ in 0..d {
-            pos = pos.iter().map(|&p| unsafe { *hh.get_unchecked(p as usize) }).collect();
+            pos = pos
+                .iter()
+                .map(|&p| unsafe { *hh.get_unchecked(p as usize) })
+                .collect();
         }
         black_box(pos);
     });
@@ -637,50 +1038,195 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
     );
 }
 
+#[derive(Debug)]
+struct Config {
+    smoke: bool,
+    families: Vec<String>,
+}
+
+impl Config {
+    fn parse() -> Result<Self, String> {
+        let mut smoke = false;
+        let mut families = Vec::new();
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                // Cargo appends this libtest-style marker even though this benchmark opts out of
+                // the harness. It carries no information for our plain `main` driver.
+                "--bench" => {}
+                "--smoke" => smoke = true,
+                "--family" | "--families" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("{arg} requires A-I or R"))?;
+                    if value == "--bench" {
+                        return Err(format!("{arg} requires A-I or R"));
+                    }
+                    for family in value.split(',') {
+                        let family = family.trim().to_ascii_uppercase();
+                        if !matches!(
+                            family.as_str(),
+                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "R"
+                        ) {
+                            return Err(format!("unknown family {family:?}; expected A-I or R"));
+                        }
+                        if !families.contains(&family) {
+                            families.push(family);
+                        }
+                    }
+                }
+                "-h" | "--help" => {
+                    println!(
+                        "gaps [--smoke] [--family A-I,R] \
+                         (repeatable; comma-separated values accepted)\n\
+                         H=safety, I=pointer-chase, R=arrangement"
+                    );
+                    std::process::exit(0);
+                }
+                _ => return Err(format!("unknown argument {arg:?}; use --help")),
+            }
+        }
+        Ok(Self { smoke, families })
+    }
+
+    fn runs(&self, family: &str) -> bool {
+        self.families.is_empty() || self.families.iter().any(|f| f == family)
+    }
+}
+
 fn main() {
+    let cfg = Config::parse().unwrap_or_else(|e| {
+        eprintln!("gaps: {e}");
+        std::process::exit(2);
+    });
+    if cfg.smoke {
+        println!("==== smoke mode: tiny inputs, coverage only (not reportable) ====");
+    }
+
     // (n, reps). 8 K = L1 control; 1 M = L2/SLC design center; 8 M = DRAM eye.
-    let core: [(usize, u32); 3] = [(1 << 13, 2000), (1 << 20, 50), (1 << 23, 10)];
+    let core: Vec<(usize, u32)> = if cfg.smoke {
+        vec![(1 << 8, 1)]
+    } else {
+        vec![(1 << 13, 2000), (1 << 20, 50), (1 << 23, 10)]
+    };
     for (n, reps) in core {
-        println!("\n==== n = {n}  ({} MB/col) ============================================", n * 8 / (1 << 20));
-        println!("-- A pointwise --");
-        family_a(n, reps);
-        println!("-- B selection --");
-        family_b(n, reps);
-        println!("-- C aggregation --");
-        family_c(n, reps);
-        println!("-- D order --");
-        family_d(n, reps);
+        if !(cfg.runs("A") || cfg.runs("B") || cfg.runs("C") || cfg.runs("D")) {
+            break;
+        }
+        println!(
+            "\n==== n = {n}  ({} MB/col) ============================================",
+            n * 8 / (1 << 20)
+        );
+        if cfg.runs("A") {
+            println!("-- A pointwise --");
+            family_a(n, reps);
+        }
+        if cfg.runs("B") {
+            println!("-- B selection --");
+            family_b(n, reps);
+        }
+        if cfg.runs("C") {
+            println!("-- C aggregation --");
+            family_c(n, reps);
+        }
+        if cfg.runs("D") {
+            println!("-- D order --");
+            family_d(n, reps);
+        }
     }
+
     // E/F at the L2/SLC and DRAM points only (skip the L1 control — these are not single-pass ops).
-    for (n, reps) in [(1usize << 20, 30u32), (1 << 23, 8)] {
-        println!("\n==== n = {n}  ({} MB/col) — relational / sum-type ====================", n * 8 / (1 << 20));
-        println!("-- E relational / index generators --");
-        family_e(n, reps);
-        println!("-- F sum-type --");
-        family_f(n, reps);
+    let ef = if cfg.smoke {
+        vec![(1usize << 8, 1u32)]
+    } else {
+        vec![(1 << 20, 30), (1 << 23, 8)]
+    };
+    for (n, reps) in ef {
+        if !(cfg.runs("E") || cfg.runs("F")) {
+            break;
+        }
+        println!(
+            "\n==== n = {n}  ({} MB/col) — relational / sum-type ====================",
+            n * 8 / (1 << 20)
+        );
+        if cfg.runs("E") {
+            println!("-- E relational / index generators --");
+            family_e(n, reps);
+        }
+        if cfg.runs("F") {
+            println!("-- F sum-type --");
+            family_f(n, reps);
+        }
     }
+
     // G sized by element (word/field) count: ~1 M and ~4 M elements.
-    for (m, reps) in [(1usize << 20, 15u32), (1 << 22, 6)] {
-        println!("\n==== m = {m} elements — text ========================================", );
-        println!("-- G text --");
-        family_g(m, reps);
+    let text = if cfg.smoke {
+        vec![(1usize << 8, 1u32)]
+    } else {
+        vec![(1 << 20, 15), (1 << 22, 6)]
+    };
+    for (m, reps) in text {
+        if !cfg.runs("G") {
+            break;
+        }
+        println!("\n==== m = {m} elements — text ========================================");
+        if cfg.runs("G") {
+            println!("-- G text --");
+            family_g(m, reps);
+        }
     }
+
     // H safety: is corgi's TOTAL gather (vectorized check) as cheap as unsafe, and cheaper than Rust's
     // scalar safety? Run at L1 / L2 / DRAM (sequential gather wants the L1 point; random wants DRAM).
-    for (n, reps) in [(1usize << 13, 2000u32), (1 << 20, 50), (1 << 23, 10)] {
-        println!("\n==== n = {n}  ({} MB/col) — H safety: total gather vs Rust =========", n * 8 / (1 << 20));
-        family_safety(n, reps);
+    let safety = if cfg.smoke {
+        vec![(1usize << 8, 1u32)]
+    } else {
+        vec![(1 << 13, 2000), (1 << 20, 50), (1 << 23, 10)]
+    };
+    for (n, reps) in safety {
+        if !cfg.runs("H") {
+            break;
+        }
+        println!(
+            "\n==== n = {n}  ({} MB/col) — H safety: total gather vs Rust =========",
+            n * 8 / (1 << 20)
+        );
+        if cfg.runs("H") {
+            family_safety(n, reps);
+        }
     }
+
     // I pointer-chase: corgi lockstep gather (MLP) vs Rust naive chase (serial) vs Rust lockstep. 1k
     // chains x 1k deep, through an L2-sized and a DRAM-sized random successor array.
-    println!("\n==== I pointer-chase: MLP from lockstep vs serial dependent chase ==========");
-    for (n, reps) in [(1usize << 20, 30u32), (1 << 23, 12)] {
-        family_chase(1024, 1024, n, reps);
+    if cfg.runs("I") {
+        println!("\n==== I pointer-chase: MLP from lockstep vs serial dependent chase ==========");
+        if cfg.smoke {
+            family_chase(16, 8, 1 << 8, 1);
+        } else {
+            for (n, reps) in [(1usize << 20, 30u32), (1 << 23, 12)] {
+                family_chase(1024, 1024, n, reps);
+            }
+            // I-sweep: fixed depth (=node count), widen the chains. If corgi's gap to lock-alloc is
+            // unamortized per-node dispatch, `corgi/lock-alloc` should fall as `r` (work per node) grows.
+            println!("\n-- I-sweep: fixed d=256 nodes, widening r (work/node) — dispatch amortization --");
+            for (r, reps) in [(1024usize, 200u32), (1 << 14, 40), (1 << 18, 12)] {
+                family_chase(r, 256, 1 << 22, reps);
+            }
+        }
     }
-    // I-sweep: fixed depth (=node count), widen the chains. If corgi's gap to lock-alloc is
-    // unamortized per-node dispatch, `corgi/lock-alloc` should fall as `r` (work per node) grows.
-    println!("\n-- I-sweep: fixed d=256 nodes, widening r (work/node) — dispatch amortization --");
-    for (r, reps) in [(1024usize, 200u32), (1 << 14, 40), (1 << 18, 12)] {
-        family_chase(r, 256, 1 << 22, reps);
+
+    // R is separate from A-I because it measures the public arrangement substrate directly rather
+    // than a surface-language workload. Use both design-center and DRAM inputs in reportable mode.
+    if cfg.runs("R") {
+        println!("\n==== R arrangement kernels ================================================");
+        let arrangement = if cfg.smoke {
+            vec![(1usize << 8, 1u32)]
+        } else {
+            vec![(1 << 20, 30), (1 << 23, 8)]
+        };
+        for (n, reps) in arrangement {
+            println!("-- n = {n} ({} MB/leaf) --", n * 8 / (1 << 20));
+            family_arrange(n, reps);
+        }
     }
 }
