@@ -78,20 +78,21 @@ fn ns_per(d: Duration, n: usize) -> f64 {
     d.as_nanos() as f64 / n as f64
 }
 
-/// GB/s over the *input* footprint (`n` u64s) — a single comparable bandwidth number across engine and
-/// ceiling; the 8 MB→64 MB drop in this figure is the bandwidth-bound vs compute-bound tell.
-fn gbs(d: Duration, n: usize) -> f64 {
+/// Eight-byte-equivalent throughput per reported work item. This is exact input GB/s for the common
+/// one-U64-per-item rows; for byte text and multi-column arrangement kernels it is a normalization,
+/// not an estimate of physical memory traffic.
+fn u64eq_gbs(d: Duration, n: usize) -> f64 {
     (n as f64 * 8.0) / d.as_secs_f64() / 1e9
 }
 
-/// one corgi-vs-ceiling row: ns/row for each, the input-GB/s for corgi, the slowdown, and the named
-/// mechanism the slowdown is attributed to (the decompose-before-reporting discipline).
+/// one corgi-vs-ceiling row: ns/row for each, normalized throughput for corgi, the slowdown, and the
+/// named mechanism the slowdown is attributed to (the decompose-before-reporting discipline).
 fn row(task: &str, n: usize, c: Duration, r: Duration, mech: &str) {
     println!(
-        "{task:<22} n={n:>8}  corgi {:>7.3} ns  rust {:>7.3} ns  {:>5.1} GB/s  {:>6.3}x   {mech}",
+        "{task:<22} n={n:>8}  corgi {:>7.3} ns  rust {:>7.3} ns  {:>5.1} u64eq GB/s  {:>6.3}x   {mech}",
         ns_per(c, n),
         ns_per(r, n),
-        gbs(c, n),
+        u64eq_gbs(c, n),
         c.as_secs_f64() / r.as_secs_f64(),
     );
 }
@@ -720,7 +721,9 @@ fn family_arrange(n: usize, reps: u32) {
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let mut perm: Vec<usize> = (0..s.len()).collect();
-        perm.sort_by_key(|&i| s[i]); // stable, matching sort_perm's contract
+        // Cache each key once while `perm` is still in input order. Plain `sort_by_key` would reload
+        // the large key column at every comparison and is not an honest argsort ceiling at DRAM scale.
+        perm.sort_by_cached_key(|&i| s[i]); // stable, matching sort_perm's contract
         black_box(perm);
     });
     row(
@@ -728,7 +731,7 @@ fn family_arrange(n: usize, reps: u32) {
         n,
         c,
         r,
-        "stable radix argsort vs stable Rust index sort",
+        "stable radix argsort vs stable cached-key Rust sort",
     );
 
     let mut sorted = src.clone();
@@ -949,8 +952,8 @@ fn family_safety(n: usize, reps: u32) {
         ("gath+add", &g_add, |v| v.wrapping_add(7)),
         ("gath+chn3", &g_chain, |v| (v.wrapping_add(7) >> 1) & 255),
     ];
-    // Run every random control before an identity candidate. A successful identity gather allocates
-    // no output, which otherwise changes allocator/cache state for the following random case.
+    // Run every random control before a sequential identity candidate. If an identity fast path is
+    // present, its missing output allocation cannot change state for the following random control.
     for (label, g, arith) in cases {
         bench_gather(&format!("{label}_rand"), n, reps, &idx_rand, &hay, g, arith);
     }
@@ -1056,6 +1059,9 @@ impl Config {
                     let value = args
                         .next()
                         .ok_or_else(|| format!("{arg} requires A-I or R"))?;
+                    if value == "--bench" {
+                        return Err(format!("{arg} requires A-I or R"));
+                    }
                     for family in value.split(',') {
                         let family = family.trim().to_ascii_uppercase();
                         if !matches!(
@@ -1072,7 +1078,8 @@ impl Config {
                 "-h" | "--help" => {
                     println!(
                         "gaps [--smoke] [--family A-I,R] \
-                         (repeatable; comma-separated values accepted)"
+                         (repeatable; comma-separated values accepted)\n\
+                         H=safety, I=pointer-chase, R=arrangement"
                     );
                     std::process::exit(0);
                 }
