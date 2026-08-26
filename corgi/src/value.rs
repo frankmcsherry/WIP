@@ -177,17 +177,24 @@ macro_rules! prim {
             }
 
             /// A U64 index column is also correctly typed storage for a U64 gather result. Rewrite
-            /// that owned buffer in place; other haystack widths allocate their native vector.
+            /// that owned buffer in place; other haystack widths allocate their native vector. The
+            /// raw caller deliberately materializes even an identity gather rather than adding an
+            /// identity-detection scan to its single indexing pass.
             pub(crate) fn gather_u64_owned(&self, mut idx: Vec<u64>) -> Prim {
                 if let Prim::U64(v) = self {
                     for x in idx.iter_mut() {
-                        *x = v[*x as usize];
+                        let i = *x;
+                        *x = *v.get(i as usize).unwrap_or_else(|| {
+                            panic!("Gather: index {i} out of row 0's bounds")
+                        });
                     }
                     Prim::U64(Arc::new(idx))
                 } else {
                     match self {
                         $( Prim::$V(v) => Prim::$V(Arc::new(
-                            idx.iter().map(|&i| v[i as usize]).collect()
+                            idx.iter().map(|&i| *v.get(i as usize).unwrap_or_else(|| {
+                                panic!("Gather: index {i} out of row 0's bounds")
+                            })).collect()
                         )), )+
                     }
                 }
@@ -201,6 +208,9 @@ macro_rules! prim {
                 mut idx: Vec<u64>,
                 rowlen: usize,
             ) -> Option<Prim> {
+                // A List invariant guarantees the flattened one-row leaf has exactly `rowlen`
+                // elements. Identity reuse and checked indexing both rely on that correspondence.
+                debug_assert_eq!(self.len(), rowlen, "gather: bounds/leaf length mismatch");
                 let identity = idx.len() == rowlen
                     && (rowlen == 0
                         || (idx[0] == 0
