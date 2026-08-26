@@ -65,6 +65,7 @@ fn typed_arith(name: &str, arg: Option<u64>) -> Option<NumOp> {
         "sub" => bin(BinOp::Sub),
         "mul" => bin(BinOp::Mul),
         "div" => bin(BinOp::Div),
+        "rem" => bin(BinOp::Rem),
         "neg" => Some(ArithOp::Neg(k, w).into()),
         // min/max take no kind/width suffix — they're kind-blind and width-inferred (`min`/`max`).
         _ => None,
@@ -138,6 +139,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "add" => ArithOp::Bin(BinOp::Add, Kind::U, 64).into(),
         "sub" => ArithOp::Bin(BinOp::Sub, Kind::U, 64).into(),
         "mul" => ArithOp::Bin(BinOp::Mul, Kind::U, 64).into(),
+        "rem" => ArithOp::Bin(BinOp::Rem, Kind::U, 64).into(),
         "min" => CmpOp::Min.into(), // kind-blind lane min/max — order ops, in `cmp` not the arith grid
         "max" => CmpOp::Max.into(),
         "neg" => ArithOp::Neg(Kind::U, 64).into(),

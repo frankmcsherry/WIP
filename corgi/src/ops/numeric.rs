@@ -59,6 +59,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div, // FLOAT-ONLY (integer div deferred: no NEON op, div-by-zero would panic). x/0 -> ±inf, 0/0 -> NaN.
+    Rem, // INTEGER-ONLY (the float remainder has no caller). `x % 0 = x`: a total definition, so the
+         // lane body needs no branch out and callers that guard the divisor pay nothing. It is the
+         // "no reduction" reading of a zero modulus, which is what DDIR's `hash(0, ..)` means.
     // NB: lane-wise min/max are NOT here — they're kind-blind order ops (byte min/max on the
     // order-preserving leaf needs no deswizzle), so they live in `cmp` as `CmpOp::Min`/`Max`.
 }
@@ -160,6 +163,12 @@ macro_rules! grid {
                     (Kind::I, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
                     (Kind::I, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
                     (Kind::I, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
+                    (Kind::U, BinOp::Rem) => bin_into(av, bv, |x: $u, y: $u| if y == 0 { x } else { x % y }),
+                    // `wrapping_rem` for the MIN % -1 overflow; the zero divisor is the total `x % 0 = x`.
+                    (Kind::I, BinOp::Rem) => bin_into(av, bv, |x: $u, y: $u| {
+                        let m = !(<$u>::MAX >> 1);
+                        if (y ^ m) as $i == 0 { x } else { swiz!($u, $i, x, y, wrapping_rem) }
+                    }),
                     // integer division is deferred; the judge rejects it, so this is never reached.
                     (Kind::U, BinOp::Div) | (Kind::I, BinOp::Div) => {
                         unreachable!("integer Div is rejected by judge")
@@ -214,6 +223,7 @@ fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
     macro_rules! f { ($V:ident, $dec:ident, $enc:ident, $av:ident, $bv:ident) => {
         Prim::$V(bin_into($av, $bv, |x, y| { let (x, y) = ($dec(x), $dec(y)); $enc(match op {
             BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
+            BinOp::Rem => unreachable!("float Rem is rejected by judge"),
         })}))
     }}
     match (a, b) {
@@ -322,6 +332,9 @@ impl ArithOp {
                 }
                 if matches!(op, BinOp::Div) && !matches!(kind, Kind::F) {
                     return Err("integer div is deferred — div is float-only (use div_f32/div_f64)".into());
+                }
+                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
+                    return Err("rem is integer-only".into());
                 }
                 match input {
                     Prod(ts) if ts.len() == 2 && ts[0] == Prim(*w) && ts[1] == Prim(*w) => Prim(*w),
