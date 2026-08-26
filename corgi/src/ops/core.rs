@@ -671,7 +671,15 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("Gather indices");
                 let (hb, hvals) = haystack.into_list("Gather haystack");
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
-                let abs = resolve_indices(&ib, &ivals.into_u64("Gather indices"), &hb);
+                let idxs = ivals.into_u64("Gather indices");
+                if ib.len() == 1 && hb.len() == 1 {
+                    if let Value::Prim(p) = &hvals {
+                        // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
+                        // indexing in the gather supplies that check without a separate scan.
+                        return Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs))));
+                    }
+                }
+                let abs = resolve_indices(&ib, &idxs, &hb);
                 Value::List(ib, Box::new(gather(&hvals, &abs)))
             }
 
