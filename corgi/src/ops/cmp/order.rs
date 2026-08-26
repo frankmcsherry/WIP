@@ -34,12 +34,9 @@ pub enum Run {
     Both(usize, usize),
 }
 
-/// Galloping search over the structurally-sorted column `xs`: advance `*idx` (bounded by `hi`)
-/// while row `*idx` of `xs` compares strictly less than row `pj` of `piv`. On return `*idx` is the
-/// first position whose row is `>= piv[pj]` (or `hi`). Exponential probe + binary refine, so it
-/// costs `O(log gap)` `compare_at`s rather than one per row — the whole point of the survey.
-fn gallop_lt(xs: &Value, idx: &mut usize, hi: usize, piv: &Value, pj: usize) {
-    let lt = |k: usize| compare_at(xs, k, piv, pj) == Ordering::Less;
+/// Advance `idx` while the supplied sorted-position predicate remains true. Exponential probe plus
+/// binary refinement costs `O(log gap)` comparisons rather than one per row.
+fn gallop_lt_by(idx: &mut usize, hi: usize, lt: impl Fn(usize) -> bool) {
     // nothing to do unless the row at the cursor is itself still below the pivot.
     if *idx < hi && lt(*idx) {
         let mut step = 1;
@@ -60,10 +57,11 @@ fn gallop_lt(xs: &Value, idx: &mut usize, hi: usize, piv: &Value, pj: usize) {
     }
 }
 
-/// Survey the mutual interleaving of two structurally-sorted columns `a` and `b`: a zig-zag gallop
-/// that returns the merge as a sequence of [`Run`]s — maximal ranges exclusive to one side and the
-/// single matched pairs present in both — instead of a per-pair two-pointer. The bidirectional
-/// generalization of `find_ranges` (the one-directional needle-into-haystack gallop).
+/// Shared zig-zag gallop over two sorted domains with a caller-supplied comparison.
+///
+/// Surveying mutual interleaving returns a sequence of [`Run`]s — maximal ranges exclusive to one
+/// side and the single matched pairs present in both — instead of a per-pair two-pointer. The
+/// bidirectional generalization of `find_ranges` (the one-directional needle-into-haystack gallop).
 ///
 /// The caller bulk-`gather`s each `A`/`B` range and consolidates only at the `Both` pairs, so the
 /// merge crosses the corgi/Rust boundary once per *range* rather than once per *row*. This owns no
@@ -74,16 +72,19 @@ fn gallop_lt(xs: &Value, idx: &mut usize, hi: usize, piv: &Value, pj: usize) {
 /// structural sequence; every `Both(ia, ib)` has `compare_at(a, ia, b, ib) == Equal`. Equal
 /// duplicates within one side after the match fall through as follow-on `A`/`B` runs (as in DD's
 /// `trie_merger::survey`, the reference this ports).
-pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
-    let (na, nb) = (a.len(), b.len());
+fn survey_by(
+    na: usize,
+    nb: usize,
+    compare: impl Fn(usize, usize) -> Ordering,
+) -> Vec<Run> {
     let (mut i, mut j) = (0usize, 0usize);
     let mut out = Vec::new();
     while i < na && j < nb {
-        match compare_at(a, i, b, j) {
+        match compare(i, j) {
             Ordering::Less => {
                 let start = i;
                 i += 1;
-                gallop_lt(a, &mut i, na, b, j); // a[start..i) all < b[j]
+                gallop_lt_by(&mut i, na, |k| compare(k, j) == Ordering::Less);
                 out.push(Run::A(start, i));
             }
             Ordering::Equal => {
@@ -94,7 +95,7 @@ pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
             Ordering::Greater => {
                 let start = j;
                 j += 1;
-                gallop_lt(b, &mut j, nb, a, i); // b[start..j) all < a[i]
+                gallop_lt_by(&mut j, nb, |k| compare(i, k) == Ordering::Greater);
                 out.push(Run::B(start, j));
             }
         }
@@ -107,6 +108,25 @@ pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
         out.push(Run::B(j, nb));
     }
     out
+}
+
+/// Survey two structurally-sorted columns, hoisting primitive-width dispatch out of the gallop.
+pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
+    match (a, b) {
+        (Value::Prim(Prim::U8(a)), Value::Prim(Prim::U8(b))) => {
+            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+        }
+        (Value::Prim(Prim::U16(a)), Value::Prim(Prim::U16(b))) => {
+            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+        }
+        (Value::Prim(Prim::U32(a)), Value::Prim(Prim::U32(b))) => {
+            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+        }
+        (Value::Prim(Prim::U64(a)), Value::Prim(Prim::U64(b))) => {
+            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+        }
+        _ => survey_by(a.len(), b.len(), |i, j| compare_at(a, i, b, j)),
+    }
 }
 
 /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
@@ -629,6 +649,23 @@ mod tests {
         agree_cmp(
             &Value::List(vec![2, 4].into(), Box::new(Value::sum(vec![0, 1, 0, 1], vec![u(&[5, 8]), u(&[2, 9])]))),
             &Value::List(vec![2, 4].into(), Box::new(Value::sum(vec![0, 0, 1, 1], vec![u(&[5, 7]), u(&[2, 9])]))),
+        );
+    }
+
+    #[test]
+    fn primitive_survey_dispatch_matches_the_structural_comparator() {
+        fn agree(a: Value, b: Value) {
+            let fallback = survey_by(a.len(), b.len(), |i, j| compare_at(&a, i, &b, j));
+            assert_eq!(survey(&a, &b), fallback);
+        }
+
+        agree(Value::u8(vec![1, 3, 5]), Value::u8(vec![2, 3, 6]));
+        agree(Value::u16(vec![1, 4, 9]), Value::u16(vec![0, 4, 10]));
+        agree(Value::u32(vec![2, 7, 11]), Value::u32(vec![1, 7, 12]));
+        agree(Value::u64(vec![1, 2, 8]), Value::u64(vec![2, 3, 9]));
+        agree(
+            Value::Prod(vec![Value::u64(vec![1, 2]), Value::u8(vec![4, 0])]),
+            Value::Prod(vec![Value::u64(vec![1, 3]), Value::u8(vec![5, 0])]),
         );
     }
 
