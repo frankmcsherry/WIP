@@ -391,4 +391,117 @@ mod test {
         let v = Value::u64((0..10_000u64).collect());
         assert_eq!(length_in_bytes(&v), 24 + 8 * 10_000);
     }
+
+    /// A splitmix64 stream — deterministic, seedable, no dependency. Enough randomness to shake
+    /// out shapes a hand-written corpus does not think of.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            crate::hash::mix64(self.0)
+        }
+        /// A value in `[0, n)`.
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// A well-formed `Value` of exactly `rows` rows, nested up to `depth` levels.
+    ///
+    /// Well-formed matters more than random here: a `Prod`'s fields agree on length, a `Sum`'s
+    /// offsets are the running per-lane counts its tags imply, and a `List`'s bounds total its
+    /// values' length. Generating malformed columns would test the codec against inputs the rest
+    /// of corgi cannot produce.
+    fn random_value(rng: &mut Rng, rows: usize, depth: usize) -> Value {
+        // At depth 0 only leaves, so recursion always terminates.
+        let arms = if depth == 0 { 2 } else { 5 };
+        match rng.below(arms) {
+            0 => match rng.below(4) {
+                0 => Value::u8((0..rows).map(|_| rng.next() as u8).collect()),
+                1 => Value::u16((0..rows).map(|_| rng.next() as u16).collect()),
+                2 => Value::u32((0..rows).map(|_| rng.next() as u32).collect()),
+                _ => Value::u64((0..rows).map(|_| rng.next()).collect()),
+            },
+            1 => Value::Unit(rows),
+            2 => {
+                let fields = 1 + rng.below(3);
+                Value::Prod((0..fields).map(|_| random_value(rng, rows, depth - 1)).collect())
+            }
+            3 => {
+                // Lists: sometimes uniform (so `Stride` is exercised), sometimes ragged.
+                let (bounds, total) = if rng.below(2) == 0 {
+                    let stride = rng.below(3);
+                    (Bounds::Stride(stride, rows), stride * rows)
+                } else {
+                    let mut ends = Vec::with_capacity(rows);
+                    let mut acc = 0;
+                    for _ in 0..rows {
+                        acc += rng.below(3);
+                        ends.push(acc);
+                    }
+                    (Bounds::Offsets(ends), acc)
+                };
+                Value::List(bounds, Box::new(random_value(rng, total, depth - 1)))
+            }
+            _ => {
+                // Sums: pick a tag per row, count per lane, and leave some lanes uncommitted (`⊥`).
+                let lanes = 1 + rng.below(3);
+                let tags: Vec<usize> = (0..rows).map(|_| rng.below(lanes)).collect();
+                let mut counts = vec![0usize; lanes];
+                let offsets: Vec<usize> = tags
+                    .iter()
+                    .map(|&t| {
+                        counts[t] += 1;
+                        counts[t] - 1
+                    })
+                    .collect();
+                let variants = counts
+                    .iter()
+                    .map(|&n| if n == 0 { None } else { Some(random_value(rng, n, depth - 1)) })
+                    .collect();
+                Value::Sum(Prim::U8(std::sync::Arc::new(tags.iter().map(|&t| t as u8).collect())), offsets, variants)
+            }
+        }
+    }
+
+    /// The general property, over shapes nobody wrote down: whatever the encoder was handed comes
+    /// back, its promised length is its actual length, and the encoding stays word-aligned.
+    #[test]
+    fn round_trips_random_shapes() {
+        let mut rng = Rng(0x5EED);
+        for i in 0..400 {
+            let rows = i % 7; // includes 0 — empty columns at every nesting depth
+            let v = random_value(&mut rng, rows, 3);
+            round_trip(&v);
+        }
+    }
+
+    /// Row identity survives too, for the same random shapes: the decoded column hashes
+    /// row-for-row like the original, which is what a distribution boundary depends on.
+    #[test]
+    fn random_shapes_preserve_row_hashes() {
+        let mut rng = Rng(0xC0FFEE);
+        for i in 0..400 {
+            let v = random_value(&mut rng, 1 + i % 9, 3);
+            let mut buf = Vec::new();
+            write_to(&v, &mut buf).unwrap();
+            let (back, _) = read_from(&buf).unwrap();
+            assert_eq!(crate::arrange::hash_rows(&back), crate::arrange::hash_rows(&v), "{v:?}");
+        }
+    }
+
+    /// Truncating a random shape is an error, never a panic or an out-of-bounds read.
+    #[test]
+    fn random_shapes_reject_truncation() {
+        let mut rng = Rng(0xBADCAFE);
+        for i in 0..100 {
+            let v = random_value(&mut rng, 1 + i % 5, 3);
+            let mut buf = Vec::new();
+            write_to(&v, &mut buf).unwrap();
+            for cut in (0..buf.len()).step_by(8) {
+                assert!(read_from(&buf[..cut]).is_err(), "decoding {cut} of {} bytes should fail: {v:?}", buf.len());
+            }
+        }
+    }
 }
