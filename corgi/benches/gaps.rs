@@ -37,14 +37,13 @@ fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
         let a = arg.clone();
         let t = Instant::now();
         let out = black_box(effect_eval_graph(g, black_box(EffectValues::Pure(a))));
+        let failed = matches!(&out, EffectValues::Fail(f) if f.err.iter().any(|&failed| failed));
+        black_box(out); // include output destruction in the timer, as rust_t's closures do
         let elapsed = t.elapsed();
-        if let EffectValues::Fail(f) = &out {
-            assert!(
-                !f.err.iter().any(|&failed| failed),
-                "benchmark input unexpectedly exercised a FailOp error lane"
-            );
-        }
-        black_box(out);
+        assert!(
+            !failed,
+            "benchmark input unexpectedly exercised a FailOp error lane"
+        );
         best = best.min(elapsed);
     }
     best
@@ -950,8 +949,12 @@ fn family_safety(n: usize, reps: u32) {
         ("gath+add", &g_add, |v| v.wrapping_add(7)),
         ("gath+chn3", &g_chain, |v| (v.wrapping_add(7) >> 1) & 255),
     ];
+    // Run every random control before an identity candidate. A successful identity gather allocates
+    // no output, which otherwise changes allocator/cache state for the following random case.
     for (label, g, arith) in cases {
         bench_gather(&format!("{label}_rand"), n, reps, &idx_rand, &hay, g, arith);
+    }
+    for (label, g, arith) in cases {
         bench_gather(&format!("{label}_seq"), n, reps, &idx_seq, &hay, g, arith);
     }
 }
