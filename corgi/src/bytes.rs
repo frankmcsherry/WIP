@@ -95,13 +95,108 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
 
 /// Deserialize a `Value` from the front of `bytes`, returning it and the number of bytes read.
 ///
-/// `bytes` must be the output of [`write_to`] (possibly with trailing content, which is left
-/// unread). Malformed input is reported rather than panicking, so a decoder can attribute a
-/// corrupt or truncated message instead of dying inside the recursion.
+/// `bytes` is normally the output of [`write_to`] (trailing content is left unread), but it does
+/// not have to be: these bytes came off a wire, so **any** byte string must produce a `Value` or an
+/// `Err`, never a panic, an abort, or an unbounded allocation. What that guarantee covers:
+///
+/// * **Framing.** Every read is bounds-checked; every length is checked against the bytes that
+///   remain before it is believed, so no size arithmetic can wrap and no reservation can exceed
+///   what the buffer could possibly hold.
+/// * **Depth.** The recursion is capped ([`MAX_DEPTH`]). A short message of nested headers cannot
+///   exhaust the stack.
+/// * **Structure.** The returned `Value` satisfies the invariants the rest of corgi indexes by: a
+///   `Prod`'s fields agree on length, a `Sum`'s tags name committed lanes and its offsets land
+///   inside them, a `List`'s bounds are non-decreasing and stay within its values. So a decoded
+///   column can be hashed, compared, gathered and sorted like any other.
+///
+/// What it does *not* cover, both by design:
+///
+/// * **Corruption that stays within those bounds.** A flipped bit in a leaf payload, or an offset
+///   that still points somewhere valid, decodes to a well-formed `Value` holding the wrong data.
+///   Detecting that is a checksum's job, one layer up.
+/// * **Declared row counts.** The payload-free constructors name rows without spending bytes on
+///   them: `Unit(n)` is sixteen bytes whatever `n` is, and a `Stride(k, rows)` is twenty-four. So a
+///   short message can denote an enormous column, and `Value::len` does not reveal it — the `Unit`
+///   may be nested inside a `Sum` lane or under a `List` whose own row count is small. Use
+///   [`declared_rows`] before doing per-row work on bytes from a peer you do not trust.
+///
+///   This is not an artifact of the codec. A `Unit` is O(1) in memory too, and per-row work on one
+///   is O(n) whether it arrived over a wire or was built in process; the codec only makes it
+///   reachable from outside. The right place to close it is the layer that knows how many rows the
+///   message is *supposed* to have — for the DDIR container that is the time column, and its
+///   decoder checks all four columns agree.
 pub fn read_from(bytes: &[u8]) -> Result<(Value, usize), String> {
-    let mut r = Reader { bytes, at: 0 };
+    let mut r = Reader { bytes, at: 0, depth: 0 };
     let v = read_value(&mut r)?;
     Ok((v, r.at))
+}
+
+/// How deep the decoder will follow nested headers before giving up.
+///
+/// Each level costs 16 wire bytes, so without a cap a 16 MB message of one-field `Prod` headers
+/// walks a million frames deep and takes the process down with a stack overflow — which is not
+/// something a caller can catch.
+///
+/// 128 is chosen from both ends. Real corgi shapes are a handful of levels, so it is an order of
+/// magnitude beyond anything a program produces. And it is measured against the other end: a cap of
+/// 512 overflows a 2 MB thread stack in a debug build, which is what `cargo test` gives a test
+/// thread, so this sits a factor of four under the cliff. Raising it needs that measurement redone.
+///
+/// The cap is not what limits how deep a corgi shape may be, incidentally. `write_to`,
+/// `Value::len`, `shape_of_value`, `hash_rows` and `PartialEq` all recurse over the same structure
+/// with comparable frames, so a value deep enough to hit this was already a stack risk everywhere
+/// else in corgi.
+pub const MAX_DEPTH: usize = 128;
+
+/// The largest row count declared anywhere in `v`, saturating.
+///
+/// `Value::len` reports the top column's rows, which is the wrong question for bytes off a wire:
+/// the expensive column may be nested. `Sum(tags=[0], lanes=[Unit(2^61)])` has `len() == 1`, and
+/// hashing it allocates 2^61 words. This walks the whole structure and reports the worst declared
+/// count, so a consumer can refuse a message that claims more rows than it is willing to
+/// materialize — the check [`read_from`] deliberately does not make on the caller's behalf, since
+/// only the caller knows how many rows are plausible.
+///
+/// Cost is O(nodes), not O(rows) — it reads declarations, never payloads.
+pub fn declared_rows(v: &Value) -> u64 {
+    match v {
+        Value::Prim(p) => prim_len(p) as u64,
+        Value::Prod(cols) => cols.iter().map(declared_rows).max().unwrap_or(0),
+        Value::Sum(tags, offsets, lanes) => (prim_len(tags).max(offsets.len()) as u64)
+            .max(lanes.iter().flatten().map(declared_rows).max().unwrap_or(0)),
+        Value::List(bounds, values) => (bounds_rows(bounds) as u64)
+            .max(bounds_total(bounds))
+            .max(declared_rows(values)),
+        Value::Unit(n) => *n as u64,
+    }
+}
+
+/// A partition's row count, without touching its values.
+fn bounds_rows(bounds: &Bounds) -> usize {
+    match bounds {
+        Bounds::Offsets(v) => v.len(),
+        Bounds::Stride(_, rows) => *rows,
+    }
+}
+
+/// A partition's flattened element count, saturating — `Bounds::total` multiplies, and this is
+/// reachable from outside on values the checks have not seen.
+fn bounds_total(bounds: &Bounds) -> u64 {
+    match bounds {
+        Bounds::Offsets(v) => v.last().copied().unwrap_or(0) as u64,
+        Bounds::Stride(k, rows) => (*k as u64).saturating_mul(*rows as u64),
+    }
+}
+
+/// A leaf's element count. (`Prim::len` is crate-private and this module is the only outside-facing
+/// reader of it.)
+fn prim_len(p: &Prim) -> usize {
+    match p {
+        Prim::U8(v) => v.len(),
+        Prim::U16(v) => v.len(),
+        Prim::U32(v) => v.len(),
+        Prim::U64(v) => v.len(),
+    }
 }
 
 // --- encoding helpers ---------------------------------------------------------------------------
@@ -191,88 +286,216 @@ fn write_bounds<W: std::io::Write>(bounds: &Bounds, writer: &mut W) -> std::io::
 
 // --- decoding -----------------------------------------------------------------------------------
 
-/// A cursor over the encoded bytes. Every read is bounds-checked and reported as an error, so a
-/// truncated or corrupt message cannot walk off the buffer or panic mid-recursion.
+/// A cursor over the encoded bytes.
+///
+/// Two rules make the decoder total. **Nothing is sized before it is bounded**: a count read off
+/// the wire is checked against the bytes that remain before it is multiplied, reserved, or looped
+/// over, so no arithmetic wraps and no reservation exceeds what the buffer could hold. And the
+/// recursion carries its own `depth`, so a header chain cannot outrun the stack.
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    depth: usize,
 }
 
 impl<'a> Reader<'a> {
+    /// Bytes not yet consumed — the ceiling on any length this message can legitimately claim.
+    #[inline]
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.at
+    }
+
     /// Read one 64-bit little-endian word.
     fn word(&mut self) -> Result<u64, String> {
-        let end = self.at + 8;
-        if end > self.bytes.len() {
-            return Err(format!("corgi::bytes: truncated at {} (need 8, have {})", self.at, self.bytes.len() - self.at));
+        if self.remaining() < 8 {
+            return Err(format!("corgi::bytes: truncated at {} (need 8, have {})", self.at, self.remaining()));
         }
-        let x = u64::from_le_bytes(self.bytes[self.at..end].try_into().unwrap());
-        self.at = end;
+        let x = u64::from_le_bytes(self.bytes[self.at..self.at + 8].try_into().unwrap());
+        self.at += 8;
         Ok(x)
     }
+
+    /// Read a length word, rejecting anything the remaining bytes could not encode.
+    ///
+    /// `per` is the smallest number of bytes one element can occupy. Checking here rather than at
+    /// the point of use is what keeps every later `n * width` and `with_capacity(n)` honest: a
+    /// wire-supplied `u64::MAX` never reaches them to wrap or to reserve.
+    fn count(&mut self, per: usize, what: &str) -> Result<usize, String> {
+        let n = self.word()?;
+        let max = (self.remaining() / per) as u64;
+        if n > max {
+            return Err(format!("corgi::bytes: {what} claims {n} but only {max} fit in the remaining {} bytes", self.remaining()));
+        }
+        Ok(n as usize)
+    }
+
     /// Take `n` payload bytes and advance past their word padding.
     fn payload(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.at + n;
-        if end > self.bytes.len() {
-            return Err(format!("corgi::bytes: truncated payload at {} (need {}, have {})", self.at, n, self.bytes.len() - self.at));
+        if n > self.remaining() {
+            return Err(format!("corgi::bytes: truncated payload at {} (need {}, have {})", self.at, n, self.remaining()));
         }
-        let slice = &self.bytes[self.at..end];
-        self.at += pad8(n);
-        if self.at > self.bytes.len() {
-            return Err(format!("corgi::bytes: truncated padding at {}", end));
+        let slice = &self.bytes[self.at..self.at + n];
+        let padded = pad8(n);
+        if padded > self.remaining() {
+            return Err(format!("corgi::bytes: truncated padding at {}", self.at + n));
         }
+        self.at += padded;
         Ok(slice)
     }
-    /// Read `n` words as a `Vec<usize>` — the offset/bounds vectors.
+
+    /// Read `n` words as a `Vec<usize>` — the offset/bounds vectors. `n` has already been bounded
+    /// by [`count`](Self::count), so the reservation cannot exceed the buffer.
     fn words(&mut self, n: usize) -> Result<Vec<usize>, String> {
         let mut out = Vec::with_capacity(n);
-        for _ in 0..n { out.push(self.word()? as usize); }
+        for _ in 0..n {
+            out.push(self.word()? as usize);
+        }
         Ok(out)
     }
+
+    /// Run `f` one level deeper, refusing to go past [`MAX_DEPTH`].
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(format!("corgi::bytes: nesting deeper than {MAX_DEPTH} at byte {}", self.at));
+        }
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
+    }
 }
+
+/// The smallest encoding of a whole `Value` is `Unit`: a tag word and a count word.
+const MIN_VALUE_BYTES: usize = 16;
 
 fn read_value(r: &mut Reader) -> Result<Value, String> {
     match r.word()? {
         0 => Ok(Value::Prim(read_prim(r)?)),
         1 => {
-            let n = r.word()? as usize;
+            let n = r.count(MIN_VALUE_BYTES, "product fields")?;
             let mut cols = Vec::with_capacity(n);
-            for _ in 0..n { cols.push(read_value(r)?); }
+            for _ in 0..n {
+                cols.push(r.nested(read_value)?);
+            }
+            // `Value::len` reads field 0, so fields that disagree on length would make the column
+            // silently lie about how many rows it holds.
+            if let Some(first) = cols.first() {
+                let rows = first.len();
+                if let Some(bad) = cols.iter().position(|c| c.len() != rows) {
+                    return Err(format!("corgi::bytes: product field {bad} has {} rows, field 0 has {rows}", cols[bad].len()));
+                }
+            }
             Ok(Value::Prod(cols))
         }
         2 => {
             let tags = read_prim(r)?;
-            let n_offsets = r.word()? as usize;
+            // A lane marker is one word, so that is the floor per lane.
+            let n_offsets = r.count(8, "sum offsets")?;
             let offsets = r.words(n_offsets)?;
-            let n_lanes = r.word()? as usize;
+            let n_lanes = r.count(8, "sum lanes")?;
             let mut lanes = Vec::with_capacity(n_lanes);
             for _ in 0..n_lanes {
                 lanes.push(match r.word()? {
                     0 => None,
-                    1 => Some(read_value(r)?),
+                    1 => Some(r.nested(read_value)?),
                     other => return Err(format!("corgi::bytes: bad lane marker {other}")),
                 });
             }
+            check_sum(&tags, &offsets, &lanes)?;
             Ok(Value::Sum(tags, offsets, lanes))
         }
         3 => {
             let bounds = read_bounds(r)?;
-            Ok(Value::List(bounds, Box::new(read_value(r)?)))
+            let values = r.nested(read_value)?;
+            check_list(&bounds, &values)?;
+            Ok(Value::List(bounds, Box::new(values)))
         }
         4 => Ok(Value::Unit(r.word()? as usize)),
         other => Err(format!("corgi::bytes: bad value tag {other}")),
     }
 }
 
+/// The `Sum` invariants every reader indexes by: a u8 discriminant naming a committed lane, and a
+/// carried offset that lands inside it. Without these, `hash_rows` and the comparators index out
+/// of bounds on a column the decoder handed them.
+fn check_sum(tags: &Prim, offsets: &[usize], lanes: &[Option<Value>]) -> Result<(), String> {
+    // `Value::sum_opt` stores the discriminant as a u8 and asserts the arity fits it; a wider
+    // discriminant off the wire would be a shape corgi cannot construct.
+    if !matches!(tags, Prim::U8(_)) {
+        return Err("corgi::bytes: sum discriminant must be a u8 leaf".into());
+    }
+    if lanes.len() > 256 {
+        return Err(format!("corgi::bytes: {} sum lanes exceeds the u8 tag width", lanes.len()));
+    }
+    let tag_vec = match tags {
+        Prim::U8(v) => v,
+        _ => unreachable!("checked above"),
+    };
+    if offsets.len() != tag_vec.len() {
+        return Err(format!("corgi::bytes: {} sum offsets for {} tags", offsets.len(), tag_vec.len()));
+    }
+    // A `⊥` lane holds no rows, so a tag naming one is a contradiction, not just a bad index.
+    let lane_rows: Vec<Option<usize>> = lanes.iter().map(|l| l.as_ref().map(Value::len)).collect();
+    for (row, (&t, &o)) in tag_vec.iter().zip(offsets).enumerate() {
+        match lane_rows.get(t as usize) {
+            None => return Err(format!("corgi::bytes: row {row} has tag {t} but there are {} lanes", lanes.len())),
+            Some(None) => return Err(format!("corgi::bytes: row {row} carries the tag of uncommitted lane {t}")),
+            Some(Some(rows)) if o >= *rows => {
+                return Err(format!("corgi::bytes: row {row} offset {o} is outside lane {t} ({rows} rows)"));
+            }
+            Some(Some(_)) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The `List` invariant: the partition has to stay inside the values it partitions, and it has to
+/// be non-decreasing, or `Bounds::span` yields a reversed range and panics on the slice.
+fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
+    let rows = values.len();
+    match bounds {
+        Bounds::Offsets(ends) => {
+            let mut prev = 0;
+            for (i, &e) in ends.iter().enumerate() {
+                if e < prev {
+                    return Err(format!("corgi::bytes: list bound {i} = {e} is below its predecessor {prev}"));
+                }
+                prev = e;
+            }
+            if prev > rows {
+                return Err(format!("corgi::bytes: list bounds reach {prev} over {rows} values"));
+            }
+        }
+        Bounds::Stride(k, n) => {
+            let total = k.checked_mul(*n).ok_or_else(|| format!("corgi::bytes: list stride {k} x {n} rows overflows"))?;
+            if total > rows {
+                return Err(format!("corgi::bytes: list stride {k} x {n} rows reaches {total} over {rows} values"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     use std::sync::Arc;
     let bits = r.word()?;
-    let len = r.word()? as usize;
-    Ok(match bits {
-        8 => Prim::U8(Arc::new(r.payload(len)?.to_vec())),
-        16 => Prim::U16(Arc::new(read_le(r.payload(2 * len)?, u16::from_le_bytes))),
-        32 => Prim::U32(Arc::new(read_le(r.payload(4 * len)?, u32::from_le_bytes))),
-        64 => Prim::U64(Arc::new(read_le(r.payload(8 * len)?, u64::from_le_bytes))),
+    // Bound the element count by the width BEFORE multiplying: a wire-supplied length near
+    // `u64::MAX` would otherwise wrap `len * width` — to something small in release (a corrupt
+    // header decoding "successfully" to an empty leaf, desyncing the frame) or to something huge
+    // that walks off the buffer.
+    let payload = match bits {
+        8 => r.count(1, "u8 leaf")?,
+        16 => 2 * r.count(2, "u16 leaf")?,
+        32 => 4 * r.count(4, "u32 leaf")?,
+        64 => 8 * r.count(8, "u64 leaf")?,
         other => return Err(format!("corgi::bytes: bad leaf width {other}")),
+    };
+    let bytes = r.payload(payload)?;
+    Ok(match bits {
+        8 => Prim::U8(Arc::new(bytes.to_vec())),
+        16 => Prim::U16(Arc::new(read_le(bytes, u16::from_le_bytes))),
+        32 => Prim::U32(Arc::new(read_le(bytes, u32::from_le_bytes))),
+        _ => Prim::U64(Arc::new(read_le(bytes, u64::from_le_bytes))),
     })
 }
 
@@ -284,7 +507,7 @@ fn read_le<T, const N: usize>(bytes: &[u8], from_le: fn([u8; N]) -> T) -> Vec<T>
 fn read_bounds(r: &mut Reader) -> Result<Bounds, String> {
     match r.word()? {
         0 => {
-            let n = r.word()? as usize;
+            let n = r.count(8, "list bounds")?;
             // `Bounds::Offsets` directly, NOT `Bounds::from`: the encoder recorded which form the
             // sender held, and normalizing here would silently rewrite it. (The two compare equal
             // when they describe the same partition, so this is fidelity, not correctness.)
@@ -488,6 +711,231 @@ mod test {
             write_to(&v, &mut buf).unwrap();
             let (back, _) = read_from(&buf).unwrap();
             assert_eq!(crate::arrange::hash_rows(&back), crate::arrange::hash_rows(&v), "{v:?}");
+        }
+    }
+
+    // --- adversarial input ----------------------------------------------------------------------
+    //
+    // Truncation is the easy malformed-input family: it shortens the buffer, so the bounds checks
+    // catch it. The interesting families corrupt a length or a tag IN PLACE, leaving the buffer
+    // exactly as long as the decoder expects — which is where wrapped arithmetic, wire-sized
+    // reservations, unbounded recursion, and structurally impossible columns live.
+    //
+    // Several of these depend on the build profile (a debug overflow panic is a release wrap), so
+    // run them both ways: `cargo test` and `cargo test --release`.
+
+    /// Word values chosen to break size arithmetic: zero and small tags, the wrap-to-large
+    /// maximum, the wrap-to-small `2^63` (doubling it is 0), and a value big enough to make any
+    /// reservation fatal if it were believed.
+    const NASTY: [u64; 8] = [0, 1, 2, 5, u64::MAX, 1 << 63, 1 << 61, 1 << 32];
+
+    /// Use a decoded value the way a consumer would. This is the real assertion of the adversarial
+    /// tests: not just that `read_from` returned, but that what it returned can be indexed,
+    /// hashed and shaped without panicking — which is what "the decode validates structure" means.
+    fn exercise(v: &Value) {
+        let _ = crate::shape_of_value(v);
+        let _ = v.len();
+        // The payload-free constructors declare rows without spending bytes, so a mutated header
+        // can legitimately name an enormous column — documented, and `declared_rows` is exactly
+        // the guard a consumer is told to apply. Using it here is the test asserting that the
+        // advice works: `Value::len` alone would not see a `Unit` nested in a `Sum` lane.
+        if declared_rows(v) <= 10_000 {
+            let _ = crate::arrange::hash_rows(v);
+        }
+    }
+
+    /// Corrupt one word of a valid encoding, leaving the length alone, and the decoder must still
+    /// return — `Err`, or an `Ok` whose value is safe to use. This is the family the truncation
+    /// test cannot reach.
+    #[test]
+    fn mutated_headers_never_panic() {
+        let mut rng = Rng(0xD15EA5E);
+        let mut values = corpus();
+        values.extend((0..40).map(|i| random_value(&mut rng, 1 + i % 5, 3)));
+        for v in &values {
+            let mut buf = Vec::new();
+            write_to(v, &mut buf).unwrap();
+            for word in 0..buf.len() / 8 {
+                let original: [u8; 8] = buf[word * 8..word * 8 + 8].try_into().unwrap();
+                for nasty in NASTY {
+                    buf[word * 8..word * 8 + 8].copy_from_slice(&nasty.to_le_bytes());
+                    if let Ok((decoded, read)) = read_from(&buf) {
+                        assert!(read <= buf.len(), "reported {read} bytes read of {}", buf.len());
+                        exercise(&decoded);
+                    }
+                }
+                buf[word * 8..word * 8 + 8].copy_from_slice(&original);
+            }
+        }
+    }
+
+    /// A length near `u64::MAX` must be rejected on its face, not multiplied by a leaf width
+    /// first. In debug that multiply panics; in release it wraps — to something small, which
+    /// would decode "successfully" to an empty leaf and desync the frame for a framing consumer,
+    /// or to something huge, which would walk off the buffer.
+    #[test]
+    fn leaf_lengths_are_bounded_before_they_are_scaled() {
+        for bits in [8u64, 16, 32, 64] {
+            for len in [u64::MAX, 1 << 63, 1 << 61, 1 << 32, 1000] {
+                // tag = Prim, then the width and the claimed element count, and nothing after.
+                let mut buf = Vec::new();
+                for w in [0, bits, len] {
+                    buf.extend_from_slice(&w.to_le_bytes());
+                }
+                assert!(
+                    read_from(&buf).is_err(),
+                    "a {bits}-bit leaf claiming {len} elements with no payload must be rejected"
+                );
+            }
+        }
+    }
+
+    /// Field, lane and bound counts are reservations, so they must be bounded by what the
+    /// remaining bytes could encode before they reach `Vec::with_capacity` — otherwise a
+    /// sixteen-byte message asks for a multi-gigabyte allocation.
+    #[test]
+    fn wire_counts_do_not_become_reservations() {
+        // (value tag, the words that precede the count, description)
+        let cases: [(u64, &[u64], &str); 3] = [
+            (1, &[], "product fields"),
+            (3, &[0], "list bounds"),   // List, Offsets form, then the bound count
+            (4, &[], "unit rows"),      // Unit's count is not a reservation; it must still not panic
+        ];
+        for (tag, prefix, what) in cases {
+            for n in [u64::MAX, 1 << 61, 1 << 40, 1 << 30] {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&tag.to_le_bytes());
+                for w in prefix {
+                    buf.extend_from_slice(&w.to_le_bytes());
+                }
+                buf.extend_from_slice(&n.to_le_bytes());
+                // A `Unit` legitimately declares rows in no bytes; everything else must be refused.
+                let result = read_from(&buf);
+                if tag == 4 {
+                    assert!(result.is_ok(), "{what}: a unit row count is not a reservation");
+                } else {
+                    assert!(result.is_err(), "{what}: {n} must be refused, not reserved");
+                }
+            }
+        }
+    }
+
+    /// A chain of nested headers costs sixteen bytes a level, so without a cap a small message
+    /// walks the decoder off the stack — an abort the caller cannot catch, not an `Err`.
+    #[test]
+    fn nesting_is_capped() {
+        // One-field products all the way down: `Prod, 1, Prod, 1, ...`. Deep enough that without
+        // the cap this is the reported failure — a stack overflow and a process abort, not an
+        // `Err` — so reverting the cap fails this test the way the bug actually behaves.
+        let levels = 100_000;
+        let mut buf = Vec::with_capacity(16 * levels + 16);
+        for _ in 0..levels {
+            buf.extend_from_slice(&1u64.to_le_bytes());
+            buf.extend_from_slice(&1u64.to_le_bytes());
+        }
+        buf.extend_from_slice(&4u64.to_le_bytes()); // a Unit at the bottom
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let err = read_from(&buf).expect_err("nesting past the cap must be an error");
+        assert!(err.contains("nesting"), "unexpected error: {err}");
+
+        // And the cap is generous rather than tight: a shape well inside it still decodes.
+        let mut deep = Value::Unit(3);
+        for _ in 0..MAX_DEPTH / 2 {
+            deep = Value::Prod(vec![deep]);
+        }
+        round_trip(&deep);
+    }
+
+    /// The structural invariants the rest of corgi indexes by. Each of these is a byte string the
+    /// framing accepts and the structure must not: without the checks, the first two panic inside
+    /// `hash_rows` on a column `read_from` handed back as valid.
+    #[test]
+    fn structurally_impossible_columns_are_refused() {
+        /// Encode `v`, overwrite word `word` with `to`, and return the bytes — same length as a
+        /// valid message, so only the structure is wrong.
+        fn patched(v: &Value, word: usize, to: u64) -> Vec<u8> {
+            let mut buf = Vec::new();
+            write_to(v, &mut buf).unwrap();
+            buf[word * 8..word * 8 + 8].copy_from_slice(&to.to_le_bytes());
+            buf
+        }
+
+        // A sum whose tag names a lane that is not there. Words: [Sum][bits][len][tags payload]…
+        // and the payload word carries the single u8 discriminant in its low byte.
+        let bad_tag = patched(
+            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Some(Value::u64(vec![7]))]),
+            3,
+            5,
+        );
+        assert!(read_from(&bad_tag).is_err(), "a tag naming a missing lane must be refused");
+
+        // A sum whose carried offset points past the end of the lane it names.
+        let bad_offset = patched(
+            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Some(Value::u64(vec![7]))]),
+            5, // [Sum][bits][len][tags][n_offsets][offsets[0]]
+            9,
+        );
+        assert!(read_from(&bad_offset).is_err(), "an offset outside its lane must be refused");
+
+        // A list whose partition reaches past its values. Words: [List][form][n][ends[0]]…
+        let over_reach = patched(&Value::List(Bounds::Offsets(vec![2]), Box::new(Value::u64(vec![1, 2]))), 3, 10);
+        assert!(read_from(&over_reach).is_err(), "bounds reaching past the values must be refused");
+
+        // The `Stride` form of the same thing: three rows of two over a two-element leaf.
+        let over_stride = patched(&Value::List(Bounds::Stride(2, 1), Box::new(Value::u64(vec![1, 2]))), 3, 3);
+        assert!(read_from(&over_stride).is_err(), "a stride reaching past the values must be refused");
+
+        // A product whose fields disagree on length — `Value::len` reads field 0, so the column
+        // would silently lie about how many rows it holds. Words:
+        // [Prod][2] [Prim][64][2][payload×2] [Prim][64][2][payload×2], so field 1's count is word 9.
+        let ragged = patched(&Value::Prod(vec![Value::u64(vec![1, 2]), Value::u64(vec![3, 4])]), 9, 1);
+        assert!(read_from(&ragged).is_err(), "a product with ragged fields must be refused");
+
+        // A sum discriminant at a width corgi cannot construct (`sum_opt` stores u8 and asserts
+        // the arity fits it), which would otherwise let a tag column carry more than 256 lanes.
+        let wide_tags = patched(
+            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Some(Value::u64(vec![7]))]),
+            1,
+            64,
+        );
+        assert!(read_from(&wide_tags).is_err(), "a non-u8 sum discriminant must be refused");
+    }
+
+    /// `declared_rows` has to see what `Value::len` cannot, or the advice attached to it is
+    /// useless: the expensive column is the nested one.
+    #[test]
+    fn declared_rows_sees_through_nesting() {
+        let huge = 1usize << 40;
+
+        // A one-row sum whose lane names a trillion rows.
+        let hidden_in_a_lane = Value::Sum(
+            Prim::U8(std::sync::Arc::new(vec![0])),
+            vec![0],
+            vec![Some(Value::Unit(huge))],
+        );
+        assert_eq!(hidden_in_a_lane.len(), 1);
+        assert_eq!(declared_rows(&hidden_in_a_lane), huge as u64);
+
+        // A one-row list whose values do.
+        let hidden_under_a_list = Value::List(Bounds::Offsets(vec![huge]), Box::new(Value::Unit(huge)));
+        assert_eq!(hidden_under_a_list.len(), 1);
+        assert_eq!(declared_rows(&hidden_under_a_list), huge as u64);
+
+        // A stride multiplies rather than storing, so its total is where the size hides.
+        let hidden_in_a_stride = Value::List(Bounds::Stride(huge, 2), Box::new(Value::Unit(2 * huge)));
+        assert_eq!(hidden_in_a_stride.len(), 2);
+        assert_eq!(declared_rows(&hidden_in_a_stride), 2 * huge as u64);
+
+        // And it does not overflow on a stride that would.
+        let overflowing = Value::List(Bounds::Stride(usize::MAX, usize::MAX), Box::new(Value::Unit(0)));
+        assert_eq!(declared_rows(&overflowing), u64::MAX);
+
+        // On ordinary columns it agrees with `len`.
+        for v in corpus() {
+            if matches!(v, Value::List(..)) {
+                continue; // a list's values are legitimately longer than its rows
+            }
+            assert!(declared_rows(&v) >= v.len() as u64, "{v:?}");
         }
     }
 
