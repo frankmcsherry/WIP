@@ -138,14 +138,29 @@ pub fn read_from(bytes: &[u8]) -> Result<(Value, usize), String> {
 /// something a caller can catch.
 ///
 /// 128 is chosen from both ends. Real corgi shapes are a handful of levels, so it is an order of
-/// magnitude beyond anything a program produces. And it is measured against the other end: a cap of
-/// 512 overflows a 2 MB thread stack in a debug build, which is what `cargo test` gives a test
-/// thread, so this sits a factor of four under the cliff. Raising it needs that measurement redone.
+/// magnitude past anything a program produces. And it is measured, not guessed — every traversal of
+/// a `Value` in corgi recurses, and each has its own cliff. Depth at which a one-field `Prod` chain
+/// stops surviving, on the 2 MB stack `cargo test` gives a test thread:
 ///
-/// The cap is not what limits how deep a corgi shape may be, incidentally. `write_to`,
-/// `Value::len`, `shape_of_value`, `hash_rows` and `PartialEq` all recurse over the same structure
-/// with comparable frames, so a value deep enough to hit this was already a stack risk everywhere
-/// else in corgi.
+/// ```text
+///                     release   debug
+///   read_from            3660     479     <- this decoder
+///   hash_rows            4880    1164
+///   shape_of_value      10983    1688
+///   write_to            21966    3760
+///   Drop / len          32949    8780
+/// ```
+///
+/// So the cap is not really protecting the decoder — it is protecting everything the decoder hands
+/// a value to, and `hash_rows` is the one that gives out first. 128 sits a factor of four under the
+/// lowest number in that table. Raising it means redoing the measurement, on whichever traversal is
+/// weakest at the time.
+///
+/// This is also the answer to "why not make the decode iterative and drop the cap?". An explicit
+/// stack would move `read_from` off the bottom of that table, but only as far as the next row: the
+/// derived `Drop` recurses, and so do `len`, `shape_of_value`, `hash_rows` and `PartialEq`. Lifting
+/// the ceiling means making all of them iterative, which is a corgi-wide change with its own
+/// payoff (arbitrarily deep shapes) — not something a codec can do on its own.
 pub const MAX_DEPTH: usize = 128;
 
 /// The largest row count declared anywhere in `v`, saturating.
