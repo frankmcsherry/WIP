@@ -176,6 +176,61 @@ macro_rules! prim {
                 }
             }
 
+            /// A U64 index column is also correctly typed storage for a U64 gather result. Rewrite
+            /// that owned buffer in place; other haystack widths allocate their native vector. The
+            /// raw caller deliberately materializes even an identity gather rather than adding an
+            /// identity-detection scan to its single indexing pass.
+            pub(crate) fn gather_u64_owned(&self, mut idx: Vec<u64>) -> Prim {
+                if let Prim::U64(v) = self {
+                    for x in idx.iter_mut() {
+                        let i = *x;
+                        *x = *v.get(i as usize).unwrap_or_else(|| {
+                            panic!("Gather: index {i} out of row 0's bounds")
+                        });
+                    }
+                    Prim::U64(Arc::new(idx))
+                } else {
+                    match self {
+                        $( Prim::$V(v) => Prim::$V(Arc::new(
+                            idx.iter().map(|&i| *v.get(i as usize).unwrap_or_else(|| {
+                                panic!("Gather: index {i} out of row 0's bounds")
+                            })).collect()
+                        )), )+
+                    }
+                }
+            }
+
+            /// Validate one row of indices and gather it. Exact identity indices reuse the
+            /// haystack leaf; U64 gathers otherwise validate and rewrite the owned index buffer in
+            /// one pass, while other widths retain an all-or-nothing validation pass.
+            pub(crate) fn gather_u64_checked_owned(
+                &self,
+                mut idx: Vec<u64>,
+                rowlen: usize,
+            ) -> Option<Prim> {
+                // A List invariant guarantees the flattened one-row leaf has exactly `rowlen`
+                // elements. Identity reuse and checked indexing both rely on that correspondence.
+                debug_assert_eq!(self.len(), rowlen, "gather: bounds/leaf length mismatch");
+                let identity = idx.len() == rowlen
+                    && (rowlen == 0
+                        || (idx[0] == 0
+                            && idx.iter().enumerate().all(|(i, &x)| x == i as u64)));
+                if identity {
+                    return Some(self.clone());
+                }
+                if let Prim::U64(v) = self {
+                    for x in idx.iter_mut() {
+                        if *x >= rowlen as u64 {
+                            return None;
+                        }
+                        *x = v[*x as usize];
+                    }
+                    return Some(Prim::U64(Arc::new(idx)));
+                }
+                (!idx.iter().any(|&x| x >= rowlen as u64))
+                    .then(|| self.gather_u64_owned(idx))
+            }
+
             /// lane-wise min (`take_max=false`) or max (`true`) of two same-width columns, KIND-BLIND:
             /// the leaf is stored order-preserving (unsigned native, signed/float swizzled), so byte
             /// min/max IS value min/max for every kind — no deswizzle. An order op, hence `cmp`'s, not

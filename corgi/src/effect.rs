@@ -21,7 +21,7 @@ use crate::engine::gather;
 use crate::graph::{Graph, NodeKind, OpLike};
 use crate::ops::core::{init_active, scatter};
 use crate::ops::{NumOp, Op};
-use crate::value::Value;
+use crate::value::{Bounds, Value};
 
 /// a fallible column: per original row, Ok or Error, with the Ok rows' values packed in row order
 /// (`None` = no Ok rows). `Error` carries no payload (the failing-node breadcrumb is deferred).
@@ -83,6 +83,20 @@ fn gather_rows(input: Value) -> FailValues {
     let (ib, ivals) = idx.into_list("gather indices");
     let (hb, hvals) = haystack.into_list("gather haystack");
     let idxs = ivals.into_u64("gather indices");
+    if ib.len() == 1 && hb.len() == 1 {
+        if let Value::Prim(p) = &hvals {
+            // Match the slow path's Bounds construction: consume an Offsets buffer to recover its
+            // uniform Stride representation without allocating another vector.
+            let ib = match ib {
+                Bounds::Offsets(ends) => ends.into(),
+                bounds => bounds,
+            };
+            let gathered = p.gather_u64_checked_owned(idxs, hb.end(0));
+            let failed = gathered.is_none();
+            let ok = gathered.map(|p| Value::List(ib, Box::new(Value::Prim(p))));
+            return FailValues { err: vec![failed], ok };
+        }
+    }
     let mut err = Vec::with_capacity(ib.len());
     let mut abs = Vec::new(); // absolute haystack positions for the Ok rows' elements
     let mut bounds = Vec::new(); // cumulative element count per Ok row (the Ok list's bounds)
@@ -597,6 +611,7 @@ mod tests {
     use super::*;
     use crate::graph::Builder;
     use crate::ops::ArithOp;
+    use crate::value::{Bounds, Prim};
 
     #[test]
     fn get_then_lifted_add() {
@@ -653,6 +668,91 @@ mod tests {
             }
             EffectValues::Pure(_) => panic!("gather is a FailOp"),
         }
+    }
+
+    #[test]
+    fn one_row_identity_gather_reuses_the_haystack_leaf() {
+        let hay = std::sync::Arc::new(vec![10, 20, 30]);
+        let input = || {
+            Value::Prod(vec![
+                Value::List(vec![3].into(), Box::new(Value::u64(vec![0, 1, 2]))),
+                Value::List(
+                    vec![3].into(),
+                    Box::new(Value::Prim(Prim::U64(hay.clone()))),
+                ),
+            ])
+        };
+
+        match effect_eval(&NumOp::Core(Op::Gather), EffectValues::Pure(input())) {
+            EffectValues::Fail(FailValues { err, ok: Some(ok) }) => {
+                assert_eq!(err, vec![false]);
+                let (_, vals) = ok.into_list("identity gather result");
+                let Prim::U64(out) = vals.into_prim("identity gather result") else {
+                    panic!("expected U64 identity gather result");
+                };
+                assert!(std::sync::Arc::ptr_eq(&out, &hay));
+            }
+            _ => panic!("gather is a successful FailOp"),
+        }
+    }
+
+    #[test]
+    fn one_row_u64_gather_discards_a_partially_rewritten_failure() {
+        let hay = std::sync::Arc::new(vec![10, 20, 30]);
+        let input = Value::Prod(vec![
+            Value::List(vec![3].into(), Box::new(Value::u64(vec![1, 3, 0]))),
+            Value::List(
+                vec![3].into(),
+                Box::new(Value::Prim(Prim::U64(hay.clone()))),
+            ),
+        ]);
+
+        match effect_eval(&NumOp::Core(Op::Gather), EffectValues::Pure(input)) {
+            EffectValues::Fail(FailValues { err, ok }) => {
+                assert_eq!(err, vec![true]);
+                assert!(ok.is_none());
+            }
+            _ => panic!("invalid gather must produce a failed row"),
+        }
+        assert_eq!(hay.as_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn one_row_nonidentity_u64_gather_returns_values_and_normalizes_bounds() {
+        let hay = std::sync::Arc::new(vec![10, 20, 30]);
+        let input = Value::Prod(vec![
+            Value::List(
+                Bounds::Offsets(vec![3]),
+                Box::new(Value::u64(vec![2, 0, 1])),
+            ),
+            Value::List(
+                vec![3].into(),
+                Box::new(Value::Prim(Prim::U64(hay.clone()))),
+            ),
+        ]);
+
+        match effect_eval(&NumOp::Core(Op::Gather), EffectValues::Pure(input)) {
+            EffectValues::Fail(FailValues { err, ok: Some(ok) }) => {
+                assert_eq!(err, vec![false]);
+                let (bounds, vals) = ok.into_list("nonidentity gather result");
+                assert_eq!(bounds.strided(), Some(3));
+                let Prim::U64(out) = vals.into_prim("nonidentity gather result") else {
+                    panic!("expected U64 nonidentity gather result");
+                };
+                assert_eq!(out.as_slice(), &[30, 10, 20]);
+                assert!(!std::sync::Arc::ptr_eq(&out, &hay));
+            }
+            _ => panic!("gather is a successful FailOp"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Gather: index 3 out of row 0's bounds")]
+    fn raw_one_row_primitive_gather_still_panics_on_an_invalid_index() {
+        NumOp::Core(Op::Gather).eval(Value::Prod(vec![
+            Value::List(vec![2].into(), Box::new(Value::u64(vec![0, 3]))),
+            Value::List(vec![2].into(), Box::new(Value::u64(vec![10, 20]))),
+        ]));
     }
 
     #[test]
