@@ -9,7 +9,7 @@ pub(crate) mod order;
 
 use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
-use crate::shape::{join, Shape};
+use crate::shape::{same, Shape};
 use crate::value::Value;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
@@ -152,12 +152,10 @@ impl CmpOp {
         use Shape::*;
         let err = |what: &str| Err(format!("{what}, got {input}"));
         Ok(match self {
-            // operands must JOIN (not equal), mirroring Find: a ⊥-laned operand (e.g. an
-            // inject'd probe) compares against a committed one; eval never reads a ⊥ lane
-            // (a row's tag only names a committed lane), so the comparator is total here.
+            // the two operands must share one shape, as for Find.
             CmpOp::Rel(_) => match input {
                 Prod(ts) if ts.len() == 2 => {
-                    join(&ts[0], &ts[1]).map_err(|e| format!("Rel: {e}"))?;
+                    same(&ts[0], &ts[1]).map_err(|e| format!("Rel: {e}"))?;
                     Prim(64)
                 }
                 _ => return err("Rel expects a pair of unifiable shapes"),
@@ -189,12 +187,9 @@ impl CmpOp {
             },
             CmpOp::Find => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    // needle/haystack elements must JOIN, not equal: a ⊥ lane (e.g. an inject'd
-                    // probe) adopts the committed sibling's shape, as in `Unwrap`. Eval is total
-                    // over joined operands — a row's tag only ever names a committed lane, so
-                    // `compare_idx` never reads a ⊥ lane.
+                    // needle and haystack elements must share one shape.
                     (List(a), List(b)) => {
-                        join(a, b).map_err(|e| format!("Find: {e}"))?;
+                        same(a, b).map_err(|e| format!("Find: {e}"))?;
                         List(Box::new(Prod(vec![Prim(64), Prim(64)])))
                     }
                     _ => return err("Find expects (List<X>, List<X>)"),

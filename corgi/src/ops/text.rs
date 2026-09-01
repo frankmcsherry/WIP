@@ -96,7 +96,7 @@ impl TextOp {
         }
         Ok(match self {
             TextOp::Split(_) => List(Box::new(input.clone())),
-            TextOp::ParseU64 => Sum(vec![Some(input.clone()), Some(Prim(64))]),
+            TextOp::ParseU64 => Sum(vec![input.clone(), Prim(64)]),
         })
     }
 }

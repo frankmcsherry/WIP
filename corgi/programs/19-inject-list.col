@@ -1,4 +1,4 @@
 # n = 5
-# = Sum tags=[0] [[5], ⊥]
-enum Either = This | That in
+# = Sum tags=[0] [[5], []]
+enum Either = This u64 | That u64 in
 input inject This

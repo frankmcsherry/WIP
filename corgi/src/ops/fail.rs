@@ -42,16 +42,15 @@ pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
         }
     }
     debug_assert_eq!(ok.len(), n_ok, "fail: Ok lane length disagrees with the mask");
-    Value::Sum(Prim::U8(Arc::new(tags)), off, vec![Some(ok), Some(Value::Unit(n_err))])
+    Value::Sum(Prim::U8(Arc::new(tags)), off, vec![ok, Value::Unit(n_err)])
 }
 
 /// destructure a `Fail<T>` into its error mask and packed Ok lane.
 pub(crate) fn into_fail(v: Value, who: &str) -> (Vec<bool>, Value) {
     match v {
-        Value::Sum(Prim::U8(tags), _off, mut lanes) if lanes.len() == 2 => {
+        Value::Sum(Prim::U8(tags), _off, lanes) if lanes.len() == 2 => {
             let err = tags.iter().map(|&t| t != 0).collect();
-            let ok = lanes[0].take().unwrap_or_else(|| panic!("{who}: Fail with a ⊥ Ok lane"));
-            (err, ok)
+            (err, lanes.into_iter().next().unwrap())
         }
         _ => panic!("{who}: expected a Fail (Sum{{T | Unit}})"),
     }
@@ -59,16 +58,13 @@ pub(crate) fn into_fail(v: Value, who: &str) -> (Vec<bool>, Value) {
 
 /// the shape of `Fail<T>`.
 pub(crate) fn fail_shape(t: Shape) -> Shape {
-    Shape::Sum(vec![Some(t), Some(Shape::Unit)])
+    Shape::Sum(vec![t, Shape::Unit])
 }
 
-/// the payload shape of a `Fail<T>` (a two-lane sum whose Err lane is `Unit` or uncommitted).
+/// the payload shape of a `Fail<T>` (a two-lane sum whose Err lane is `Unit`).
 pub(crate) fn unfail(s: &Shape, who: &str) -> Result<Shape, String> {
     match s {
-        Shape::Sum(ls) if ls.len() == 2 && matches!(ls[1], Some(Shape::Unit) | None) => match &ls[0] {
-            Some(t) => Ok(t.clone()),
-            None => Err(format!("{who}: Fail with a ⊥ Ok lane, got {s}")),
-        },
+        Shape::Sum(ls) if ls.len() == 2 && ls[1] == Shape::Unit => Ok(ls[0].clone()),
         _ => Err(format!("{who}: expected a Fail (Sum{{T | Unit}}), got {s}")),
     }
 }
@@ -95,7 +91,7 @@ fn ranks(err: &[bool], keep: &[usize]) -> Vec<usize> {
 /// `X -> Fail<X>`: every row Ok.
 pub(crate) fn lift(v: Value) -> Value {
     let n = v.len();
-    Value::Sum(Prim::U8(Arc::new(vec![0u8; n])), (0..n).collect(), vec![Some(v), Some(Value::Unit(0))])
+    Value::Sum(Prim::U8(Arc::new(vec![0u8; n])), (0..n).collect(), vec![v, Value::Unit(0)])
 }
 
 /// `Fail<Fail<T>> -> Fail<T>`: a row is Ok iff Ok at both levels; the inner Ok lane passes through.
@@ -162,17 +158,12 @@ pub(crate) fn hoist_list(input: Value) -> Value {
 pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Value {
     let (tags, off, lanes) = input.into_sum("HoistSum");
     let mut errs: Vec<Option<Vec<bool>>> = vec![None; lanes.len()];
-    let mut new_lanes: Vec<Option<Value>> = Vec::with_capacity(lanes.len());
+    let mut new_lanes: Vec<Value> = Vec::with_capacity(lanes.len());
     for (k, lane) in lanes.into_iter().enumerate() {
         if fallible.contains(&k) {
-            match lane {
-                Some(l) => {
-                    let (e, ok) = into_fail(l, "HoistSum lane");
-                    errs[k] = Some(e);
-                    new_lanes.push(Some(ok));
-                }
-                None => new_lanes.push(None), // a ⊥ lane holds no rows — nothing can err
-            }
+            let (e, ok) = into_fail(lane, "HoistSum lane");
+            errs[k] = Some(e);
+            new_lanes.push(ok);
         } else {
             new_lanes.push(lane);
         }
@@ -180,7 +171,7 @@ pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Value {
     let err: Vec<bool> =
         tags.iter().zip(&off).map(|(&t, &o)| errs[t].as_ref().is_some_and(|e| e[o])).collect();
     let ok_tags: Vec<usize> = tags.iter().zip(&err).filter(|(_, &e)| !e).map(|(&t, _)| t).collect();
-    fail(&err, Value::sum_opt(ok_tags, new_lanes))
+    fail(&err, Value::sum(ok_tags, new_lanes))
 }
 
 // --- the total per-row producers -----------------------------------------------------------------
@@ -342,7 +333,7 @@ pub(crate) fn try_branch(n: usize, input: Value) -> Value {
             err.push(true);
         }
     }
-    let variants = groups.iter().map(|idx| Some(gather(&data, idx))).collect();
+    let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
     fail(&err, Value::Sum(Prim::U8(Arc::new(ok_tags)), ok_off, variants))
 }
 
@@ -396,10 +387,7 @@ pub(crate) fn judge<L: OpLike>(op: &super::core::Op<L>, input: &Shape) -> Option
                 let mut out = ls.clone();
                 for &k in fallible {
                     let Some(lane) = ls.get(k) else { return err(&format!("HoistSum: no lane {k}")) };
-                    out[k] = match lane {
-                        Some(s) => Some(unfail(s, "HoistSum lane")?),
-                        None => None,
-                    };
+                    out[k] = unfail(lane, "HoistSum lane")?;
                 }
                 Ok(fail_shape(Sum(out)))
             })(),
@@ -445,7 +433,7 @@ pub(crate) fn judge<L: OpLike>(op: &super::core::Op<L>, input: &Shape) -> Option
                 if *n > 256 {
                     err(&format!("TryBranch: arity {n} exceeds the u8 tag width"))
                 } else {
-                    Ok(fail_shape(Sum(vec![Some(ts[0].clone()); *n])))
+                    Ok(fail_shape(Sum(vec![ts[0].clone(); *n])))
                 }
             }
             _ => err("TryBranch expects (X, U64-tags)"),

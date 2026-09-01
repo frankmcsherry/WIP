@@ -200,8 +200,7 @@ NEON-vectorized; `sort_list` is the lone compute-bound op.
 Then the kernel-matrix session: `Op<L>` reorganized as (intro/elim/map/capture) × (Prod/Sum/List)
 with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (index-as-value) and
 `Head` (the stratum drop) added; the three iso pairs completed (`Zip`, `Unweave`/`Weave`);
-`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` now judge by `join` (⊥-laned probes
-unify with committed operands); the judge rejects what eval can't represent (`Cast` widths, sum
+`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` judge by shape equality; the judge rejects what eval can't represent (`Cast` widths, sum
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
 
@@ -277,11 +276,15 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **JSONL / Extern** — `split`/`parse_u64` landed as the `text` bucket (typed, not `Op::Extern`); `parse_json` remains open and still wants `Extern` or recursion (μ-types below).
 - **Named declarations — enum half DONE; struct half deliberately skipped.**
   `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
-  Use sites: `inject V` (both numbers off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
+  Use sites: `inject V` (the tag AND the whole sum's lane shapes off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
+  Payload shapes: `enum Node = Lit u64 | Add (u64, u64) | Str List(u8) | Wrap Other in …` — a variant may omit its shape unless the
+  enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
+  naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
+  is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
   Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1` ≡ `(x, x lit 1) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are untouched).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
-  Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; programs/10 deliberately keeps the numeric `inject 1 3` so both spellings stay exercised.
+  Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).
 
 - **Kind-checking numeric front-end** — where `i32` / `f32` live; type-checks kinds, inserts
   swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).

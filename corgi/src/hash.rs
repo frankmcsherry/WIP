@@ -30,7 +30,7 @@
 //! widening is a later change to the accumulator type here, never a registry.
 //!
 //! NB: the fold reads only lanes some row's tag NAMES, so two `Sum`s that differ only in an
-//! unreferenced/⊥ lane's shape hash equal — every row's OBSERVABLE value is identical, so sharing an
+//! unreferenced (empty) lane's shape hash equal — every row's OBSERVABLE value is identical, so sharing an
 //! id is correct (and more stable than derived `PartialEq`, which would call them distinct).
 
 use crate::value::Value;
@@ -80,19 +80,12 @@ pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
             acc
         }
 
-        // sum = tag first, then the payload read from the row's committed lane at its carried
-        // within-variant offset. ⊥ lanes carry no rows, so they are never hashed.
+        // sum = tag first, then the payload read from the row's lane at its carried within-variant
+        // offset.
         Value::Sum(tags, offset, variants) => {
             let tags = tags.usize_vec();
-            let lanes: Vec<Option<Vec<u64>>> =
-                variants.iter().map(|o| o.as_ref().map(hash_cols)).collect();
-            tags.iter()
-                .zip(offset)
-                .map(|(&t, &o)| {
-                    let payload = lanes[t].as_ref().expect("hash: row tag names a ⊥ lane")[o];
-                    combine(combine(SUM, t as u64), payload)
-                })
-                .collect()
+            let lanes: Vec<Vec<u64>> = variants.iter().map(hash_cols).collect();
+            tags.iter().zip(offset).map(|(&t, &o)| combine(combine(SUM, t as u64), lanes[t][o])).collect()
         }
 
         // list = length first, then each element in order, folded by SPAN — so a `Stride` and the

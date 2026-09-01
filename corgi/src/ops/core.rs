@@ -6,7 +6,7 @@ use crate::engine::{
     expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
 };
 use crate::graph::{eval_graph, shape_of, Graph, OpLike};
-use crate::shape::{join, shape_of_value, Shape};
+use crate::shape::{same, shape_of_value, Shape};
 use crate::value::{Bounds, Prim, Value};
 use std::sync::Arc;
 
@@ -98,15 +98,16 @@ pub enum Op<L> {
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
                     //        PARTIAL: panics on tag >= n. The clean kernel; surface-usable once a
                     //        range pass proves tags < n (else write TryBranch).
-    Inject(usize, usize), // intro: X -> Sum{tag: X, ⊥..} — the constant-tag Branch; the other
-                    //        lanes are ⊥ (empty, shape uncommitted, pinned later by `join`).
-    Unwrap,         // elim:  homogeneous (up to ⊥) Sum -> payload
+    Inject(usize, Vec<Shape>), // intro: X -> Sum{..} — the constant-tag Branch: the input fills lane
+                    //        `tag` of the declared sum shape (whose lane `tag` must be X); the other
+                    //        lanes are empty columns of their declared shapes.
+    Unwrap,         // elim:  homogeneous Sum -> payload
     MapSum(Vec<(usize, Graph<L>)>), // map: closed bodies on chosen variants; unlisted variants
                     // pass through. The Vec breaks the type recursion, so no Box. A variadic
                     // match — disjoint indices keep the arms independent (the optimizer relies
                     // on this; `judge` rejects duplicates).
     CapSum,         // capture: (X, Sum{A | B | ..}) -> Sum{(X,A) | (X,B) | ..} — distribute a
-                    // context into each lane (⊥ lanes stay ⊥); lets a `match` arm see an outer
+                    // context into each lane; lets a `match` arm see an outer
                     // value (closure capture, made explicit).
     // LIST — witness: the bounds column.
     Enlist,         // intro: X -> List<X>  each element its own length-1 list (list-monad unit)
@@ -137,8 +138,7 @@ pub enum Op<L> {
                     // Flatten's inverse and the range form of Gather.
     Unweave,        // List<Sum{A|B|..}> -> (tags:List<U64>, List<A>, List<B>, ..)  destructure a
                     // sum column: the tag list plus each lane re-sliced per outer row. Lanes are
-                    // already stored packed in row order, so only bounds are computed; ⊥ lanes
-                    // are rejected (a standalone List<⊥> has no shape).
+                    // already stored packed in row order, so only bounds are computed.
     Weave,          // (tags:List<U64>, List<A>, List<B>, ..) -> List<Sum{A|B|..}>  Unweave's
                     // inverse: interleave the lanes per the tags. Per-row tag counts must match
                     // each lane's row length (asserted); the lanes' flat storage is the Sum's.
@@ -171,7 +171,7 @@ pub enum Op<L> {
 
     // the List monoid + measure (both 1:1 on the SEQ — cardinality stays inside the list).
     Append,         // (List<X>, List<X>) -> List<X>   row-wise concat: row i = a[i] ++ b[i] (the ⊕ of
-                    // the list monoid, [] its unit). Same-shape elements, joined ⊥-tolerantly as in Zip.
+                    // the list monoid, [] its unit). Same-shape elements, as in Zip.
     Len,            // List<X> -> U64                  each row's element count, read straight off the
                     // bounds (O(1) — the count the structure already holds, not a fold over the row).
     Chunk(usize),   // List<X> -> List<List<X>>        partition each row into fixed `k`-wide sub-rows
@@ -262,8 +262,7 @@ impl<L: OpLike> Op<L> {
                 let tag_list =
                     Value::List(bounds, Box::new(Value::u64(tags.iter().map(|&t| t as u64).collect())));
                 let mut out = vec![tag_list];
-                for (o, lb) in lanes.into_iter().zip(lane_bounds) {
-                    let lane = o.expect("Unweave: ⊥ lane (judge rejects these)");
+                for (lane, lb) in lanes.into_iter().zip(lane_bounds) {
                     out.push(Value::List(lb.into(), Box::new(lane)));
                 }
                 Value::Prod(out)
@@ -323,7 +322,7 @@ impl<L: OpLike> Op<L> {
                 let new = lanes
                     .into_iter()
                     .zip(&per)
-                    .map(|(o, rows)| o.map(|lane| Value::Prod(vec![gather(&x, rows), lane])))
+                    .map(|(lane, rows)| Value::Prod(vec![gather(&x, rows), lane]))
                     .collect();
                 // the tag and offset columns are unchanged: each lane keeps its rows, now paired.
                 Value::Sum(tags, offset, new)
@@ -416,7 +415,7 @@ impl<L: OpLike> Op<L> {
                     off.push(groups[t].len());
                     groups[t].push(i);
                 }
-                let variants = groups.iter().map(|idx| Some(gather(&data, idx))).collect();
+                let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
                 Value::Sum(Prim::U8(Arc::new(tag8)), off, variants)
             }
 
@@ -424,17 +423,18 @@ impl<L: OpLike> Op<L> {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
                 let (tags, offset, variants) = input.into_sum("Unwrap");
-                let refs: Vec<Option<&Value>> = variants.iter().map(|o| o.as_ref()).collect();
+                let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
                 gather_lanes(&refs, &tags, &offset)
             }
 
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
-            // payload column fills that lane, the others are zero-row. The unary dual of `tuple`.
-            Op::Inject(tag, arity) => {
+            // payload column fills that lane, the others are zero-row columns of their declared
+            // shapes. The unary dual of `tuple`.
+            Op::Inject(tag, shapes) => {
                 let n = input.len();
-                assert!(*arity <= 256, "Inject: arity {arity} exceeds the u8 tag width");
-                let mut variants = vec![None; *arity];
-                variants[*tag] = Some(input);
+                assert!(shapes.len() <= 256, "Inject: arity {} exceeds the u8 tag width", shapes.len());
+                let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
+                variants[*tag] = input;
                 // a constant tag run: the within-variant offset is the row index.
                 Value::Sum(Prim::U8(Arc::new(vec![*tag as u8; n])), (0..n).collect(), variants)
             }
@@ -561,14 +561,12 @@ impl<L: OpLike> Op<L> {
                 // row count), so move them through rather than decode + recompute them.
                 let Value::Sum(tags, offset, mut variants) = input else { panic!("MapSum: expected a sum") };
                 for (k, body) in arms {
-                    // take the lane so the body's `Input` owns it (refcount 1 ⇒ in-place). A ⊥ lane
-                    // (`None`) has no rows and a deferred shape, so the body can't run on it — leave it
-                    // ⊥ (the judge defers its type the same way).
-                    let Some(lane) = variants[*k].take() else { continue };
+                    // take the lane so the body's `Input` owns it (refcount 1 ⇒ in-place).
+                    let lane = std::mem::replace(&mut variants[*k], Value::Unit(0));
                     let lane_len = lane.len();
                     let res = eval_graph(body, lane);
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
-                    variants[*k] = Some(res);
+                    variants[*k] = res;
                 }
                 Value::Sum(tags, offset, variants)
             }
@@ -734,10 +732,10 @@ impl<L: OpLike> Op<L> {
                 _ => return err(&format!("Field({i}) expects a product with > {i} fields")),
             },
 
-            // (List<X>, List<X>) -> List<X>: elements must JOIN (a ⊥ lane adopts its sibling, as in Zip).
+            // (List<X>, List<X>) -> List<X>: the two element shapes must agree.
             Op::Append => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(x), List(y)) => List(Box::new(join(x, y).map_err(|e| format!("Append: {e}"))?)),
+                    (List(x), List(y)) => List(Box::new(same(x, y).map_err(|e| format!("Append: {e}"))?)),
                     _ => return err("Append expects (List<X>, List<X>)"),
                 },
                 _ => return err("Append expects a pair of lists"),
@@ -778,18 +776,11 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Zip expects a nonempty product of lists"),
             },
 
-            // every lane must be committed: a ⊥ lane would need a standalone List<⊥>, and ⊥ lives
-            // only inside Sum shapes. (Merge the sum first if a lane is uncommitted.)
             Op::Unweave => match input {
                 List(inner) => match inner.as_ref() {
                     Sum(ls) => {
                         let mut out = vec![List(Box::new(Prim(64)))];
-                        for (k, o) in ls.iter().enumerate() {
-                            match o {
-                                Some(s) => out.push(List(Box::new(s.clone()))),
-                                None => return err(&format!("Unweave: lane {k} is ⊥ (uncommitted)")),
-                            }
-                        }
+                        out.extend(ls.iter().map(|s| List(Box::new(s.clone()))));
                         Prod(out)
                     }
                     _ => return err("Unweave expects List<Sum>"),
@@ -810,7 +801,7 @@ impl<L: OpLike> Op<L> {
                     let lanes = ts[1..]
                         .iter()
                         .map(|t| match t {
-                            List(x) => Ok(Some((**x).clone())),
+                            List(x) => Ok((**x).clone()),
                             _ => Err(format!("Weave expects lane lists, got {input}")),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -827,14 +818,10 @@ impl<L: OpLike> Op<L> {
                 _ => return err("CapList expects a pair"),
             },
 
-            // the context shape distributes into each committed lane; a ⊥ lane stays ⊥ (no rows,
-            // nothing to pair — the same deferral as MapSum's).
+            // the context shape distributes into each lane.
             Op::CapSum => match input {
                 Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    Sum(ls) => Sum(ls
-                        .iter()
-                        .map(|o| o.as_ref().map(|l| Prod(vec![ts[0].clone(), l.clone()])))
-                        .collect()),
+                    Sum(ls) => Sum(ls.iter().map(|l| Prod(vec![ts[0].clone(), l.clone()])).collect()),
                     _ => return err("CapSum expects (X, Sum)"),
                 },
                 _ => return err("CapSum expects a pair"),
@@ -846,7 +833,7 @@ impl<L: OpLike> Op<L> {
                     if *n > 256 {
                         return err(&format!("Branch: arity {n} exceeds the u8 tag width"));
                     }
-                    Sum(vec![Some(ts[0].clone()); *n])
+                    Sum(vec![ts[0].clone(); *n])
                 }
                 _ => return err("Branch expects (X, U64-tags)"),
             },
@@ -892,7 +879,7 @@ impl<L: OpLike> Op<L> {
             Op::GatherTry => match input {
                 Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
                     (List(i), List(t)) if **i == Prim(64) => {
-                        List(Box::new(Sum(vec![Some(Prim(64)), Some((**t).clone())])))
+                        List(Box::new(Sum(vec![Prim(64), (**t).clone()])))
                     }
                     _ => return err("GatherTry expects (List<U64>, List<T>)"),
                 },
@@ -922,40 +909,35 @@ impl<L: OpLike> Op<L> {
             Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_)
             | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::judge handles the failure family"),
 
-            // (U64 mask, T, T) -> T. The two branches join (a ⊥ lane adopts its sibling, as in Unwrap);
-            // eval never reads a branch the mask doesn't select, so the join is total.
+            // (U64 mask, T, T) -> T: the two branches must share a shape.
             Op::Select => match input {
-                Prod(ts) if ts.len() == 3 && ts[0] == Prim(64) => join(&ts[1], &ts[2])?,
+                Prod(ts) if ts.len() == 3 && ts[0] == Prim(64) => same(&ts[1], &ts[2])?,
                 _ => return err("Select expects (U64 mask, T, T)"),
             },
 
-            // homogeneous up to `⊥`: fold the committed (`Some`) lanes by `join`, so `⊥` lanes adopt the
-            // concrete payload and a genuine clash of two concrete payloads is the type error.
+            // homogeneous: every lane must carry the same shape, which is the payload's.
             Op::Unwrap => match input {
                 Sum(ts) => {
-                    let mut present = ts.iter().flatten();
-                    let first = present
-                        .next()
-                        .ok_or_else(|| format!("Unwrap: sum has no committed variant, got {input}"))?
-                        .clone();
-                    present.try_fold(first, |a, t| join(&a, t))?
+                    let first = ts.first().ok_or_else(|| format!("Unwrap: empty sum, got {input}"))?.clone();
+                    ts.iter().try_fold(first, |a, t| same(&a, t)).map_err(|e| format!("Unwrap: {e}"))?
                 }
                 _ => return err("Unwrap expects a sum"),
             },
 
-            // sum intro: the input lands in variant `tag`; the other `arity - 1` lanes are `⊥` (`None`,
-            // shape uncommitted) and adopt their type wherever the sum is later merged.
-            Op::Inject(tag, arity) => {
-                if *tag >= *arity {
-                    return err(&format!("Inject: tag {tag} out of range for arity {arity}"));
+            // sum intro: the input lands in variant `tag` of the declared sum, whose lane `tag` must be
+            // the input's shape; the other lanes are the declared (empty) ones.
+            Op::Inject(tag, shapes) => {
+                if *tag >= shapes.len() {
+                    return err(&format!("Inject: tag {tag} out of range for arity {}", shapes.len()));
                 }
-                // u8 tag width, as in Branch/Weave — eval's `Value::sum_opt` asserts the same bound.
-                if *arity > 256 {
-                    return err(&format!("Inject: arity {arity} exceeds the u8 tag width"));
+                // u8 tag width, as in Branch/Weave — eval asserts the same bound.
+                if shapes.len() > 256 {
+                    return err(&format!("Inject: arity {} exceeds the u8 tag width", shapes.len()));
                 }
-                let mut variants = vec![None; *arity];
-                variants[*tag] = Some(input.clone());
-                Sum(variants)
+                if shapes[*tag] != *input {
+                    return err(&format!("Inject: lane {tag} is declared {}", shapes[*tag]));
+                }
+                Sum(shapes.clone())
             }
 
             Op::MapList(body) => match input {
@@ -963,28 +945,28 @@ impl<L: OpLike> Op<L> {
                 _ => return err("MapList expects a list"),
             },
 
-            // (B, List<A>) -> B. The body, on (B, A), must again yield B (joined ⊥-tolerantly with the
-            // seed shape). Heterogeneous: the accumulator B and element A need not match.
+            // (B, List<A>) -> B. The body, on (B, A), must again yield B (the seed's shape).
+            // Heterogeneous: the accumulator B and element A need not match.
             Op::Fold(body) => match input {
                 Prod(ts) if ts.len() == 2 => match &ts[1] {
                     List(a) => {
                         let body_out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
-                        join(&ts[0], &body_out)?
+                        same(&ts[0], &body_out).map_err(|e| format!("Fold: {e}"))?
                     }
                     _ => return err("Fold expects (B, List<A>)"),
                 },
                 _ => return err("Fold expects a pair"),
             },
 
-            // (T, List<A>) -> (T, List<R>). The body, on (T, A), must return (T', R) with T' joining the
-            // state T; the result is the final state and the list of emitted R.
+            // (T, List<A>) -> (T, List<R>). The body, on (T, A), must return (T, R) — the state shape
+            // is preserved; the result is the final state and the list of emitted R.
             Op::FoldScan(body) => match input {
                 Prod(ts) if ts.len() == 2 => match &ts[1] {
                     List(a) => {
                         let out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
                         match out {
                             Prod(os) if os.len() == 2 => {
-                                let state = join(&ts[0], &os[0])?;
+                                let state = same(&ts[0], &os[0]).map_err(|e| format!("FoldScan: {e}"))?;
                                 Prod(vec![state, List(Box::new(os[1].clone()))])
                             }
                             _ => return err("FoldScan body must return (T, R)"),
@@ -1006,11 +988,7 @@ impl<L: OpLike> Op<L> {
                         if arms[..i].iter().any(|(j, _)| j == k) {
                             return err(&format!("MapSum: duplicate variant {k}"));
                         }
-                        // a ⊥ (`None`) lane can't be shaped through the body — defer it (stays ⊥).
-                        out[*k] = match &ts[*k] {
-                            Some(s) => Some(shape_of(body, s)?),
-                            None => None,
-                        };
+                        out[*k] = shape_of(body, &ts[*k])?;
                     }
                     Sum(out)
                 }
