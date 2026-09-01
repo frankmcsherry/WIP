@@ -2,7 +2,7 @@
 //! is a single `T0 -> T1` on one element, lifted 1:1 across the column; all
 //! cardinality change lives *inside* a `List`.
 
-use crate::shape::Shape;
+use crate::shape::{shape_of_value, Shape};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -500,60 +500,64 @@ impl Value {
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
-// input accessors: destructure a `Value` to the shape an op expects (`judge` already proved
-// it, so a mismatch is a panic). `into_*` consume `self` and move the buffers out.
+/// a `Sum` taken apart: (tags as usize, within-variant offsets, lanes).
+pub type SumParts = (Vec<usize>, Vec<usize>, Vec<Value>);
+
+// input accessors: destructure a `Value` to the shape an op expects; a mismatch is the shape ERROR
+// the typer reports (an op's eval is `shape_of` when run on zero rows). `into_*` consume `self` and
+// move the buffers out.
 impl Value {
-    pub fn into_pair(self, who: &str) -> (Value, Value) {
+    pub fn into_pair(self, who: &str) -> Result<(Value, Value), String> {
         match self {
             Value::Prod(mut cols) if cols.len() == 2 => {
                 let b = cols.pop().unwrap();
                 let a = cols.pop().unwrap();
-                (a, b)
+                Ok((a, b))
             }
-            _ => panic!("{who}: expected a pair"),
+            other => Err(format!("{who}: expected a pair, got {}", shape_of_value(&other))),
         }
     }
 
-    pub fn into_prod(self, who: &str) -> Vec<Value> {
+    pub fn into_prod(self, who: &str) -> Result<Vec<Value>, String> {
         match self {
-            Value::Prod(cols) => cols,
-            _ => panic!("{who}: expected a product"),
+            Value::Prod(cols) => Ok(cols),
+            other => Err(format!("{who}: expected a product, got {}", shape_of_value(&other))),
         }
     }
 
-    pub fn into_list(self, who: &str) -> (Bounds, Value) {
+    pub fn into_list(self, who: &str) -> Result<(Bounds, Value), String> {
         match self {
-            Value::List(bounds, vals) => (bounds, *vals),
-            _ => panic!("{who}: expected a list"),
+            Value::List(bounds, vals) => Ok((bounds, *vals)),
+            other => Err(format!("{who}: expected a list, got {}", shape_of_value(&other))),
         }
     }
 
-    pub fn into_sum(self, who: &str) -> (Vec<usize>, Vec<usize>, Vec<Value>) {
+    pub fn into_sum(self, who: &str) -> Result<SumParts, String> {
         match self {
-            Value::Sum(tags, offset, variants) => (tags.usize_vec(), offset, variants),
-            _ => panic!("{who}: expected a sum"),
+            Value::Sum(tags, offset, variants) => Ok((tags.usize_vec(), offset, variants)),
+            other => Err(format!("{who}: expected a sum, got {}", shape_of_value(&other))),
         }
     }
 
-    pub fn into_u64(self, who: &str) -> Vec<u64> {
+    pub fn into_u64(self, who: &str) -> Result<Vec<u64>, String> {
         match self {
             // move the buffer out if this is the last holder, else clone (shared leaf).
-            Value::Prim(Prim::U64(xs)) => Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone()),
-            _ => panic!("{who}: expected U64"),
+            Value::Prim(Prim::U64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
+            other => Err(format!("{who}: expected U64, got {}", shape_of_value(&other))),
         }
     }
 
-    pub fn into_u8(self, who: &str) -> Vec<u8> {
+    pub fn into_u8(self, who: &str) -> Result<Vec<u8>, String> {
         match self {
-            Value::Prim(Prim::U8(xs)) => Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone()),
-            _ => panic!("{who}: expected U8"),
+            Value::Prim(Prim::U8(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
+            other => Err(format!("{who}: expected U8, got {}", shape_of_value(&other))),
         }
     }
 
-    pub fn into_prim(self, who: &str) -> Prim {
+    pub fn into_prim(self, who: &str) -> Result<Prim, String> {
         match self {
-            Value::Prim(p) => p,
-            _ => panic!("{who}: expected a leaf"),
+            Value::Prim(p) => Ok(p),
+            other => Err(format!("{who}: expected a leaf, got {}", shape_of_value(&other))),
         }
     }
 }

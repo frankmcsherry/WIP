@@ -5,7 +5,7 @@
 use crate::engine::{
     expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
 };
-use crate::graph::{eval_graph, shape_of, Graph, OpLike};
+use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
 use crate::value::{Bounds, Prim, Value};
 use std::sync::Arc;
@@ -105,7 +105,7 @@ pub enum Op<L> {
     MapSum(Vec<(usize, Graph<L>)>), // map: closed bodies on chosen variants; unlisted variants
                     // pass through. The Vec breaks the type recursion, so no Box. A variadic
                     // match — disjoint indices keep the arms independent (the optimizer relies
-                    // on this; `judge` rejects duplicates).
+                    // on this; `eval` rejects duplicates).
     CapSum,         // capture: (X, Sum{A | B | ..}) -> Sum{(X,A) | (X,B) | ..} — distribute a
                     // context into each lane; lets a `match` arm see an outer
                     // value (closure capture, made explicit).
@@ -182,7 +182,7 @@ pub enum Op<L> {
     // ---- the failure family (see `ops::fail`) — partiality as data: `Fail<T> = Sum{Ok:T | Err:Unit}`.
     // The `Try*` ops are the TOTAL per-row forms of the partial kernels above (a row that would trip
     // the kernel's assert lands in Err); `Lift`/`Squash`/`Hoist*` are the plumbing `effect::lower_effects`
-    // inserts so pure programs run on the Ok lane. All ordinary ops: one eval, one judge.
+    // inserts so pure programs run on the Ok lane. All ordinary ops, with one eval each.
     TryGet,         // (idx:U64, haystack:List<T>) -> Fail<T>
     TryGather,      // (idx:List<U64>, haystack:List<T>) -> Fail<List<T>>   per row all-or-nothing
     TrySlices,      // (List<(lo,hi)>, List<T>) -> Fail<List<List<T>>>      every range in bounds
@@ -200,23 +200,28 @@ pub enum Op<L> {
 }
 
 impl<L: OpLike> Op<L> {
-    pub(crate) fn eval(&self, input: Value) -> Value {
+    /// run the op on a column. `Err` is a SHAPE error — the operand is not what the op consumes —
+    /// which is what makes this the typer when run on zero rows (see `graph::shape_of`). Row-count
+    /// and data-dependent violations remain asserts: those are the partial kernels' contract.
+    pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
         // the failure family lives in `ops::fail`; everything else is below.
-        let input = match super::fail::eval(self, input) {
-            Ok(out) => return out,
-            Err(input) => input,
-        };
-        match self {
+        if super::fail::is_family(self) {
+            return super::fail::eval(self, input);
+        }
+        Ok(match self {
             Op::Lit(v) => fill(v, input.len()),
 
             Op::Field(i) => {
-                let mut cols = input.into_prod("Field");
+                let mut cols = input.into_prod("Field")?;
+                if *i >= cols.len() {
+                    return Err(format!("Field({i}) expects a product with > {i} fields, got {}", Shape::Prod(cols.iter().map(shape_of_value).collect())));
+                }
                 cols.swap_remove(*i)
             }
 
             Op::Transpose => {
-                let (bounds, vals) = input.into_list("Transpose");
-                let cols = vals.into_prod("Transpose values");
+                let (bounds, vals) = input.into_list("Transpose")?;
+                let cols = vals.into_prod("Transpose values")?;
                 Value::Prod(
                     cols.into_iter()
                         .map(|c| Value::List(bounds.clone(), Box::new(c)))
@@ -227,26 +232,27 @@ impl<L: OpLike> Op<L> {
             // Transpose's inverse: parallel lists with identical bounds rewrap as one list of
             // products. No data moves — the columns simply become the product's fields.
             Op::Zip => {
-                let cols = input.into_prod("Zip");
+                let cols = input.into_prod("Zip")?;
                 let mut bounds: Option<Bounds> = None;
                 let mut inner = Vec::with_capacity(cols.len());
                 for c in cols {
-                    let (b, v) = c.into_list("Zip column");
+                    let (b, v) = c.into_list("Zip column")?;
                     match &bounds {
                         None => bounds = Some(b),
                         Some(prev) => assert_eq!(prev, &b, "Zip: column bounds differ"),
                     }
                     inner.push(v);
                 }
-                Value::List(bounds.expect("Zip: empty product"), Box::new(Value::Prod(inner)))
+                let bounds = bounds.ok_or("Zip expects a nonempty product of lists")?;
+                Value::List(bounds, Box::new(Value::Prod(inner)))
             }
 
             // destructure a sum column: the tag list plus each lane re-sliced per outer row. A
             // lane's elements are stored packed in row order, so each lane keeps its values and
             // only gains bounds (per-row cumulative tag counts) — no data moves but the tag widen.
             Op::Unweave => {
-                let (bounds, vals) = input.into_list("Unweave");
-                let (tags, _offset, lanes) = vals.into_sum("Unweave");
+                let (bounds, vals) = input.into_list("Unweave")?;
+                let (tags, _offset, lanes) = vals.into_sum("Unweave")?;
                 let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
                 let mut counts = vec![0usize; lanes.len()];
                 let mut start = 0;
@@ -272,14 +278,17 @@ impl<L: OpLike> Op<L> {
             // storage IS the Sum's lane storage, so after validating per-row tag counts against
             // each lane's row lengths, the Sum is built without moving lane data.
             Op::Weave => {
-                let mut cols = input.into_prod("Weave");
+                let mut cols = input.into_prod("Weave")?;
                 let rest = cols.split_off(1);
-                let (tb, tv) = cols.pop().expect("Weave: empty product").into_list("Weave tags");
-                let tags = tv.into_u64("Weave tags");
+                if rest.is_empty() || rest.len() > 256 {
+                    return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
+                }
+                let (tb, tv) = cols.pop().ok_or("Weave expects (List<U64> tags, List<A>, ..)")?.into_list("Weave tags")?;
+                let tags = tv.into_u64("Weave tags")?;
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
-                    let (b, v) = l.into_list("Weave lane");
+                    let (b, v) = l.into_list("Weave lane")?;
                     assert_eq!(b.len(), tb.len(), "Weave: lane/tags row count");
                     lane_bounds.push(b);
                     lanes.push(v);
@@ -301,8 +310,8 @@ impl<L: OpLike> Op<L> {
             }
 
             Op::CapList => {
-                let (x, list) = input.into_pair("CapList");
-                let (bounds, y) = list.into_list("CapList list");
+                let (x, list) = input.into_pair("CapList")?;
+                let (bounds, y) = list.into_list("CapList list")?;
                 let idx = owner_ids(&bounds);
                 Value::List(bounds, Box::new(Value::Prod(vec![gather(&x, &idx), y])))
             }
@@ -311,8 +320,10 @@ impl<L: OpLike> Op<L> {
             // Lane t's rows are the tag-t rows in tag order, so gathering the context at those
             // positions aligns with the carried within-variant offsets.
             Op::CapSum => {
-                let (x, s) = input.into_pair("CapSum");
-                let Value::Sum(tags, offset, lanes) = s else { panic!("CapSum: expected a sum") };
+                let (x, s) = input.into_pair("CapSum")?;
+                let Value::Sum(tags, offset, lanes) = s else {
+                    return Err(format!("CapSum expects (X, Sum), got (.., {})", shape_of_value(&s)));
+                };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
                 let mut per = vec![Vec::new(); lanes.len()];
                 let Prim::U8(t8) = &tags else { unreachable!("sum tags are a u8 column") };
@@ -328,20 +339,22 @@ impl<L: OpLike> Op<L> {
                 Value::Sum(tags, offset, new)
             }
 
-            Op::Cast(bits) => match input {
-                Value::Prim(p) => Value::Prim(p.cast(*bits)),
-                _ => panic!("Cast: expected a leaf"),
-            },
+            Op::Cast(bits) => {
+                if !matches!(*bits, 8 | 16 | 32 | 64) {
+                    return Err(format!("Cast: unsupported width {bits}"));
+                }
+                Value::Prim(input.into_prim("Cast")?.cast(*bits))
+            }
 
             // stable structural hash: one U64 per row, kind-blind over any shape (see `crate::hash`).
             Op::Hash => crate::hash::hash(&input),
 
             Op::Filter => {
-                let (data, mask) = input.into_pair("Filter");
-                let (bounds, vals) = data.into_list("Filter data");
-                let (mb, mv) = mask.into_list("Filter mask");
+                let (data, mask) = input.into_pair("Filter")?;
+                let (bounds, vals) = data.into_list("Filter data")?;
+                let (mb, mv) = mask.into_list("Filter mask")?;
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
-                let m = mv.into_u64("Filter mask");
+                let m = mv.into_u64("Filter mask")?;
                 let (idx, nb) = filter_mask(&bounds, &m);
                 Value::List(nb.into(), Box::new(gather(&vals, &idx)))
             }
@@ -350,9 +363,10 @@ impl<L: OpLike> Op<L> {
             // gather over the two value columns ([a, b]) reuses the engine's `gather_lanes`, so it
             // works for any element shape X (leaf / product / list / sum).
             Op::Append => {
-                let (a, b) = input.into_pair("Append");
-                let (ab, av) = a.into_list("Append lhs");
-                let (bb, bv) = b.into_list("Append rhs");
+                let (a, b) = input.into_pair("Append")?;
+                let (ab, av) = a.into_list("Append lhs")?;
+                let (bb, bv) = b.into_list("Append rhs")?;
+                same(&shape_of_value(&av), &shape_of_value(&bv)).map_err(|e| format!("Append: {e}"))?;
                 // both are SEQ columns, hence equal row count by the product invariant (defensive).
                 assert_eq!(ab.len(), bb.len(), "Append: row count mismatch");
                 let cap = av.len() + bv.len();
@@ -373,7 +387,7 @@ impl<L: OpLike> Op<L> {
 
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
-                let (bounds, _vals) = input.into_list("Len");
+                let (bounds, _vals) = input.into_list("Len")?;
                 let mut prev = 0;
                 let lens = bounds.ends().map(|e| { let l = (e - prev) as u64; prev = e; l }).collect();
                 Value::u64(lens)
@@ -382,7 +396,10 @@ impl<L: OpLike> Op<L> {
             // re-partition each row into k-wide sub-rows. Pure: the values never move — only the bounds
             // change, the new inner being a `Stride(k)` (the surface producer of wide strides).
             Op::Chunk(k) => {
-                let (bounds, vals) = input.into_list("Chunk");
+                if *k == 0 {
+                    return Err("Chunk width must be positive".into());
+                }
+                let (bounds, vals) = input.into_list("Chunk")?;
                 let mut outer = Vec::with_capacity(bounds.len());
                 let (mut total, mut prev) = (0usize, 0usize);
                 for end in bounds.ends() {
@@ -399,10 +416,12 @@ impl<L: OpLike> Op<L> {
             // tags ARE the sum's tag column; each variant gathers its rows in order (so the implicit
             // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
-                let (data, tags_v) = input.into_pair("Branch");
-                let tags = tags_v.into_u64("Branch tags");
+                let (data, tags_v) = input.into_pair("Branch")?;
+                let tags = tags_v.into_u64("Branch tags")?;
                 assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
-                assert!(*n <= 256, "Branch: arity {n} exceeds the u8 tag width");
+                if *n > 256 {
+                    return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
+                }
                 // one pass builds the tag column, each lane's row list, AND the within-variant offset
                 // (a row's offset is its lane's size when it arrives) — no decode/recompute afterwards.
                 let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n];
@@ -422,7 +441,11 @@ impl<L: OpLike> Op<L> {
             Op::Unwrap => {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
-                let (tags, offset, variants) = input.into_sum("Unwrap");
+                let (tags, offset, variants) = input.into_sum("Unwrap")?;
+                let first = variants.first().ok_or("Unwrap: empty sum")?;
+                for v in &variants[1..] {
+                    same(&shape_of_value(first), &shape_of_value(v)).map_err(|e| format!("Unwrap: {e}"))?;
+                }
                 let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
                 gather_lanes(&refs, &tags, &offset)
             }
@@ -432,7 +455,15 @@ impl<L: OpLike> Op<L> {
             // shapes. The unary dual of `tuple`.
             Op::Inject(tag, shapes) => {
                 let n = input.len();
-                assert!(shapes.len() <= 256, "Inject: arity {} exceeds the u8 tag width", shapes.len());
+                if *tag >= shapes.len() {
+                    return Err(format!("Inject: tag {tag} out of range for arity {}", shapes.len()));
+                }
+                if shapes.len() > 256 {
+                    return Err(format!("Inject: arity {} exceeds the u8 tag width", shapes.len()));
+                }
+                if shapes[*tag] != shape_of_value(&input) {
+                    return Err(format!("Inject: lane {tag} is declared {}, got {}", shapes[*tag], shape_of_value(&input)));
+                }
                 let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
                 variants[*tag] = input;
                 // a constant tag run: the within-variant offset is the row index.
@@ -440,8 +471,8 @@ impl<L: OpLike> Op<L> {
             }
 
             Op::MapList(body) => {
-                let (bounds, inner) = input.into_list("MapList");
-                Value::List(bounds, Box::new(eval_graph(body, inner)))
+                let (bounds, inner) = input.into_list("MapList")?;
+                Value::List(bounds, Box::new(try_eval_graph(body, inner)?))
             }
 
             // seeded left fold, vectorized across rows. `acc` is a column of one accumulator per row
@@ -449,8 +480,20 @@ impl<L: OpLike> Op<L> {
             // element, runs the body once over those active rows, scatters the results back. Rounds =
             // the longest row; empty rows never become active, so it is total (empty list -> seed).
             Op::Fold(body) => {
-                let (seed, list) = input.into_pair("Fold");
-                let (bounds, vals) = list.into_list("Fold list");
+                let (seed, list) = input.into_pair("Fold")?;
+                let (bounds, vals) = list.into_list("Fold list")?;
+                // the body must hand back the seed's shape: checked on the first round — or, when no
+                // row has an element (no rounds at all, the typer's zero-row run included), on a
+                // zero-row run of the body.
+                let seed_shape = shape_of_value(&seed);
+                let check = |updated: &Value| {
+                    same(&seed_shape, &shape_of_value(updated)).map(drop).map_err(|e| format!("Fold body: {e}"))
+                };
+                if bounds.total() == 0 {
+                    let z = try_eval_graph(body, Value::Prod(vec![gather(&seed, &[]), gather(&vals, &[])]))?;
+                    check(&z)?;
+                    return Ok(seed);
+                }
                 // Strided fast path: every row has length k, so every row is active in every
                 // round — no worklist, no per-round accumulator gather/scatter (the whole
                 // accumulator IS the active set); one strided element gather per round.
@@ -462,11 +505,14 @@ impl<L: OpLike> Op<L> {
                         elem.clear();
                         elem.extend((0..n).map(|r| r * k + t));
                         let elt = gather(&vals, &elem);
-                        let updated = eval_graph(body, Value::Prod(vec![acc, elt]));
+                        let updated = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
+                        if t == 0 {
+                            check(&updated)?;
+                        }
                         assert_eq!(updated.len(), n, "Fold body changed the row count");
                         acc = updated;
                     }
-                    return acc;
+                    return Ok(acc);
                 }
                 let mut acc = seed;
                 let mut active = init_active(&bounds);
@@ -476,7 +522,10 @@ impl<L: OpLike> Op<L> {
                     let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
                     let acc_active = gather(&acc, &rows);
                     let elt = gather(&vals, &elem);
-                    let updated = eval_graph(body, Value::Prod(vec![acc_active, elt]));
+                    let updated = try_eval_graph(body, Value::Prod(vec![acc_active, elt]))?;
+                    if t == 0 {
+                        check(&updated)?;
+                    }
                     assert_eq!(updated.len(), rows.len(), "Fold body changed the row count");
                     acc = scatter(acc, &rows, updated);
                     t += 1;
@@ -488,8 +537,13 @@ impl<L: OpLike> Op<L> {
             // mapAccumL: the body returns a PAIR (new state, output R). We thread field 0
             // (the state) into `acc` and record field 1 (R) into the chunks; return (final state, [R]).
             Op::FoldScan(body) => {
-                let (seed, list) = input.into_pair("FoldScan");
-                let (bounds, vals) = list.into_list("FoldScan list");
+                let (seed, list) = input.into_pair("FoldScan")?;
+                let (bounds, vals) = list.into_list("FoldScan list")?;
+                // the body's new state must have the seed's shape (checked as in `Fold`).
+                let seed_shape = shape_of_value(&seed);
+                let check = |state: &Value| {
+                    same(&seed_shape, &shape_of_value(state)).map(drop).map_err(|e| format!("FoldScan body: {e}"))
+                };
                 let total = vals.len();
                 // Strided fast path — as in `Fold`: no worklist, no scatter; round t's outputs
                 // land at positions r*k + t, chunk t, slot r.
@@ -504,7 +558,10 @@ impl<L: OpLike> Op<L> {
                         elem.extend((0..n).map(|r| r * k + t));
                         let elt = gather(&vals, &elem);
                         let (new_state, r) =
-                            eval_graph(body, Value::Prod(vec![acc, elt])).into_pair("FoldScan body");
+                            try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
+                        if t == 0 {
+                            check(&new_state)?;
+                        }
                         assert_eq!(new_state.len(), n, "FoldScan body changed the row count");
                         for (slot, &pos) in elem.iter().enumerate() {
                             tags[pos] = t;
@@ -514,13 +571,15 @@ impl<L: OpLike> Op<L> {
                         chunks.push(r);
                     }
                     let out_vals = if chunks.is_empty() {
-                        let z = eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]));
-                        z.into_pair("FoldScan body").1
+                        let z = try_eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
+                        let (state, r) = z.into_pair("FoldScan body")?;
+                        check(&state)?;
+                        r
                     } else {
                         let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
                         gather_lanes(&refs, &tags, &off)
                     };
-                    return Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))]);
+                    return Ok(Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))]));
                 }
                 let mut acc = seed;
                 let mut chunks: Vec<Value> = Vec::new();
@@ -533,7 +592,10 @@ impl<L: OpLike> Op<L> {
                     let acc_active = gather(&acc, &rows);
                     let elt = gather(&vals, &elem);
                     let (new_state, r) =
-                        eval_graph(body, Value::Prod(vec![acc_active, elt])).into_pair("FoldScan body");
+                        try_eval_graph(body, Value::Prod(vec![acc_active, elt]))?.into_pair("FoldScan body")?;
+                    if t == 0 {
+                        check(&new_state)?;
+                    }
                     assert_eq!(new_state.len(), rows.len(), "FoldScan body changed the row count");
                     for (slot, &pos) in elem.iter().enumerate() {
                         tags[pos] = chunks.len();
@@ -547,8 +609,10 @@ impl<L: OpLike> Op<L> {
                 // empty (no rounds): an empty R-shaped column, obtained by running the body on zero rows
                 // (R may differ from the state, so we can't reuse `acc`). Else stitch the recorded chunks.
                 let out_vals = if chunks.is_empty() {
-                    let z = eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]));
-                    z.into_pair("FoldScan body").1
+                    let z = try_eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
+                    let (state, r) = z.into_pair("FoldScan body")?;
+                    check(&state)?;
+                    r
                 } else {
                     let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
                     gather_lanes(&refs, &tags, &off)
@@ -559,12 +623,21 @@ impl<L: OpLike> Op<L> {
             Op::MapSum(arms) => {
                 // the tag and within-offset columns are untouched by a lane map (each lane keeps its
                 // row count), so move them through rather than decode + recompute them.
-                let Value::Sum(tags, offset, mut variants) = input else { panic!("MapSum: expected a sum") };
-                for (k, body) in arms {
+                let Value::Sum(tags, offset, mut variants) = input else {
+                    return Err(format!("MapSum expects a sum, got {}", shape_of_value(&input)));
+                };
+                for (i, (k, body)) in arms.iter().enumerate() {
+                    if *k >= variants.len() {
+                        return Err(format!("MapSum: no variant {k}"));
+                    }
+                    // disjoint indices keep the arms independent (so they commute).
+                    if arms[..i].iter().any(|(j, _)| j == k) {
+                        return Err(format!("MapSum: duplicate variant {k}"));
+                    }
                     // take the lane so the body's `Input` owns it (refcount 1 ⇒ in-place).
                     let lane = std::mem::replace(&mut variants[*k], Value::Unit(0));
                     let lane_len = lane.len();
-                    let res = eval_graph(body, lane);
+                    let res = try_eval_graph(body, lane)?;
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
                     variants[*k] = res;
                 }
@@ -574,11 +647,11 @@ impl<L: OpLike> Op<L> {
             // materialize: replace each (lo,hi) range with the haystack-row slice it
             // names. List<(lo,hi)> -> List<List<T>>; reuses `gather`. A list-introducer.
             Op::Slices => {
-                let (lohi, haystack) = input.into_pair("Slices");
-                let (lb, lvals) = lohi.into_list("Slices ranges");
-                let (hb, hvals) = haystack.into_list("Slices haystack");
-                let (lo, hi) = lvals.into_pair("Slices lo_hi");
-                let (lo_c, hi_c) = (lo.into_u64("Slices lo"), hi.into_u64("Slices hi"));
+                let (lohi, haystack) = input.into_pair("Slices")?;
+                let (lb, lvals) = lohi.into_list("Slices ranges")?;
+                let (hb, hvals) = haystack.into_list("Slices haystack")?;
+                let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
+                let (lo_c, hi_c) = (lo.into_u64("Slices lo")?, hi.into_u64("Slices hi")?);
                 assert_eq!(lb.len(), hb.len(), "Slices: row count");
                 let (idx, inner_bounds) = expand_ranges(&lb, &lo_c, &hi_c, &hb);
                 let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
@@ -588,16 +661,16 @@ impl<L: OpLike> Op<L> {
             // vector point gather: each row-relative index becomes the haystack element it names.
             // Output bounds are the index list's bounds (the indices decide the cardinality).
             Op::Gather => {
-                let (idx, haystack) = input.into_pair("Gather");
-                let (ib, ivals) = idx.into_list("Gather indices");
-                let (hb, hvals) = haystack.into_list("Gather haystack");
+                let (idx, haystack) = input.into_pair("Gather")?;
+                let (ib, ivals) = idx.into_list("Gather indices")?;
+                let (hb, hvals) = haystack.into_list("Gather haystack")?;
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
-                let idxs = ivals.into_u64("Gather indices");
+                let idxs = ivals.into_u64("Gather indices")?;
                 if ib.len() == 1 && hb.len() == 1 {
                     if let Value::Prim(p) = &hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
                         // indexing in the gather supplies that check without a separate scan.
-                        return Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs))));
+                        return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs)))));
                     }
                 }
                 let abs = resolve_indices(&ib, &idxs, &hb);
@@ -609,11 +682,11 @@ impl<L: OpLike> Op<L> {
             // comparison to a u64); only the routing into the two lanes is data-dependent. Output is a
             // list (the index list's bounds) of Sum{Oob:U64 | Found:T}.
             Op::GatherTry => {
-                let (idx, haystack) = input.into_pair("GatherTry");
-                let (ib, ivals) = idx.into_list("GatherTry indices");
-                let (hb, hvals) = haystack.into_list("GatherTry haystack");
+                let (idx, haystack) = input.into_pair("GatherTry")?;
+                let (ib, ivals) = idx.into_list("GatherTry indices")?;
+                let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
-                let idxs = ivals.into_u64("GatherTry indices");
+                let idxs = ivals.into_u64("GatherTry indices")?;
                 let mut tags = Vec::with_capacity(idxs.len());
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
@@ -642,8 +715,8 @@ impl<L: OpLike> Op<L> {
             // outputs are lists at the SAME top stratum, so they bundle as a Prod, and
             // `Slices` is the exact inverse — hence MapList(MapList(b)) == Flatten; b; Slices.
             Op::Flatten => {
-                let (ob, inner) = input.into_list("Flatten");
-                let (ib, vals) = inner.into_list("Flatten inner");
+                let (ob, inner) = input.into_list("Flatten")?;
+                let (ib, vals) = inner.into_list("Flatten inner")?;
                 let new_ob: Vec<usize> =
                     ob.ends().map(|e| if e == 0 { 0 } else { ib.end(e - 1) }).collect();
                 let mut lo_c = Vec::with_capacity(ib.len());
@@ -676,7 +749,7 @@ impl<L: OpLike> Op<L> {
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
             Op::Iota => {
-                let ns = input.into_u64("Iota");
+                let ns = input.into_u64("Iota")?;
                 let mut bounds = Vec::with_capacity(ns.len());
                 let mut vals = Vec::new();
                 let mut end = 0usize;
@@ -702,299 +775,18 @@ impl<L: OpLike> Op<L> {
             // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
             // identity offset reads row i from row i — the whole "computed both sides, pick per lane".
             Op::Select => {
-                let mut cols = input.into_prod("Select");
-                assert_eq!(cols.len(), 3, "Select: expected (mask, then, else)");
+                let mut cols = input.into_prod("Select")?;
+                if cols.len() != 3 {
+                    return Err("Select expects (U64 mask, T, T)".into());
+                }
                 let els = cols.pop().unwrap();
                 let then = cols.pop().unwrap();
-                let mask = cols.pop().unwrap().into_u64("Select mask");
+                let mask = cols.pop().unwrap().into_u64("Select mask")?;
+                same(&shape_of_value(&then), &shape_of_value(&els)).map_err(|e| format!("Select: {e}"))?;
                 let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
                 let off: Vec<usize> = (0..tags.len()).collect();
                 gather_lanes(&[Some(&els), Some(&then)], &tags, &off)
             }
-        }
-    }
-
-    /// the type-level shadow of `eval`: given the input's shape, return the output's
-    /// shape (or a structural error). Pattern-matches the input exactly like `eval`,
-    /// so adding an op means one rule here and one in `eval`. `Input`/`Tuple` are
-    /// handled by `graph::shape_of`, the analogue of `eval_graph`.
-    pub(crate) fn judge(&self, input: &Shape) -> Result<Shape, String> {
-        if let Some(judged) = super::fail::judge(self, input) {
-            return judged;
-        }
-        use Shape::*;
-        let err = |what: &str| Err(format!("{what}, got {input}"));
-        Ok(match self {
-            Op::Lit(v) => shape_of_value(v),
-
-            Op::Field(i) => match input {
-                Prod(ts) if *i < ts.len() => ts[*i].clone(),
-                _ => return err(&format!("Field({i}) expects a product with > {i} fields")),
-            },
-
-            // (List<X>, List<X>) -> List<X>: the two element shapes must agree.
-            Op::Append => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(x), List(y)) => List(Box::new(same(x, y).map_err(|e| format!("Append: {e}"))?)),
-                    _ => return err("Append expects (List<X>, List<X>)"),
-                },
-                _ => return err("Append expects a pair of lists"),
-            },
-
-            // List<X> -> U64, kind-blind: the element shape is irrelevant, only that it is a list.
-            Op::Len => match input {
-                List(_) => Prim(64),
-                _ => return err("Len expects a list"),
-            },
-
-            // List<X> -> List<List<X>>; `k` must be positive (re-partition into k-wide rows).
-            Op::Chunk(k) => match input {
-                List(inner) if *k > 0 => List(Box::new(List(inner.clone()))),
-                List(_) => return err("Chunk width must be positive"),
-                _ => return err("Chunk expects a list"),
-            },
-
-            Op::Transpose => match input {
-                List(inner) => match inner.as_ref() {
-                    Prod(ts) => Prod(ts.iter().map(|t| List(Box::new(t.clone()))).collect()),
-                    _ => return err("Transpose expects List<product>"),
-                },
-                _ => return err("Transpose expects a list"),
-            },
-
-            Op::Zip => match input {
-                Prod(ts) if !ts.is_empty() => {
-                    let inners = ts
-                        .iter()
-                        .map(|t| match t {
-                            List(x) => Ok((**x).clone()),
-                            _ => Err(format!("Zip expects a product of lists, got {input}")),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    List(Box::new(Prod(inners)))
-                }
-                _ => return err("Zip expects a nonempty product of lists"),
-            },
-
-            Op::Unweave => match input {
-                List(inner) => match inner.as_ref() {
-                    Sum(ls) => {
-                        let mut out = vec![List(Box::new(Prim(64)))];
-                        out.extend(ls.iter().map(|s| List(Box::new(s.clone()))));
-                        Prod(out)
-                    }
-                    _ => return err("Unweave expects List<Sum>"),
-                },
-                _ => return err("Unweave expects a list"),
-            },
-
-            Op::Weave => match input {
-                Prod(ts) if ts.len() >= 2 => {
-                    if !matches!(&ts[0], List(t) if **t == Prim(64)) {
-                        return err("Weave expects (List<U64> tags, List<A>, ..)");
-                    }
-                    // the tag column is u8-backed, so the lane count must fit (eval's
-                    // `Value::sum` asserts the same bound — keep judge and eval in agreement).
-                    if ts.len() - 1 > 256 {
-                        return err("Weave: arity exceeds the u8 tag width");
-                    }
-                    let lanes = ts[1..]
-                        .iter()
-                        .map(|t| match t {
-                            List(x) => Ok((**x).clone()),
-                            _ => Err(format!("Weave expects lane lists, got {input}")),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    List(Box::new(Sum(lanes)))
-                }
-                _ => return err("Weave expects (List<U64> tags, List<A>, ..)"),
-            },
-
-            Op::CapList => match input {
-                Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    List(y) => List(Box::new(Prod(vec![ts[0].clone(), (**y).clone()]))),
-                    _ => return err("CapList expects (X, List<Y>)"),
-                },
-                _ => return err("CapList expects a pair"),
-            },
-
-            // the context shape distributes into each lane.
-            Op::CapSum => match input {
-                Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    Sum(ls) => Sum(ls.iter().map(|l| Prod(vec![ts[0].clone(), l.clone()])).collect()),
-                    _ => return err("CapSum expects (X, Sum)"),
-                },
-                _ => return err("CapSum expects a pair"),
-            },
-
-            Op::Branch(n) => match input {
-                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
-                    // the tag column is u8-backed (same bound as Weave's; eval's `Value::sum` asserts it).
-                    if *n > 256 {
-                        return err(&format!("Branch: arity {n} exceeds the u8 tag width"));
-                    }
-                    Sum(vec![ts[0].clone(); *n])
-                }
-                _ => return err("Branch expects (X, U64-tags)"),
-            },
-
-            // only the widths the `prim!` macro generates exist; any other would judge fine and
-            // panic at eval — the typer owns the rejection.
-            Op::Cast(bits) => match input {
-                Prim(_) if matches!(*bits, 8 | 16 | 32 | 64) => Prim(*bits),
-                Prim(_) => return err(&format!("Cast: unsupported width {bits}")),
-                _ => return err("Cast expects a leaf"),
-            },
-
-            // any shape -> U64: structural and kind-blind, so the element shape is irrelevant.
-            Op::Hash => Prim(64),
-
-            Op::Filter => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(x), List(m)) if **m == Prim(64) => List(x.clone()),
-                    _ => return err("Filter expects (List<X>, List<U64>)"),
-                },
-                _ => return err("Filter expects a pair"),
-            },
-
-            Op::Slices => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(lh), List(t)) if **lh == Prod(vec![Prim(64), Prim(64)]) => {
-                        List(Box::new(List(t.clone())))
-                    }
-                    _ => return err("Slices expects (List<(U64,U64)>, List<T>)"),
-                },
-                _ => return err("Slices expects a pair"),
-            },
-
-            Op::Gather => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(i), List(t)) if **i == Prim(64) => List(t.clone()),
-                    _ => return err("Gather expects (List<U64>, List<T>)"),
-                },
-                _ => return err("Gather expects a pair"),
-            },
-
-            // total vector access: List<Sum{Oob: U64 | Found: T}> — the Oob lane carries the bad index.
-            Op::GatherTry => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(i), List(t)) if **i == Prim(64) => {
-                        List(Box::new(Sum(vec![Prim(64), (**t).clone()])))
-                    }
-                    _ => return err("GatherTry expects (List<U64>, List<T>)"),
-                },
-                _ => return err("GatherTry expects a pair"),
-            },
-
-            Op::Flatten => match input {
-                List(inner) => match inner.as_ref() {
-                    List(x) => Prod(vec![List(Box::new(Prod(vec![Prim(64), Prim(64)]))), List(x.clone())]),
-                    _ => return err("Flatten expects List<List<X>>"),
-                },
-                _ => return err("Flatten expects a list"),
-            },
-
-            Op::Enlist => List(Box::new(input.clone())),
-
-            Op::Iota => match input {
-                Prim(64) => List(Box::new(Prim(64))),
-                _ => return err("Iota expects U64"),
-            },
-
-            Op::Unit => Unit, // any shape -> Unit
-
-            Op::Try => input.clone(), // identity: a marker for `is_total`, not a value change
-
-            // the failure family was dispatched to `ops::fail::judge` above.
-            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_)
-            | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::judge handles the failure family"),
-
-            // (U64 mask, T, T) -> T: the two branches must share a shape.
-            Op::Select => match input {
-                Prod(ts) if ts.len() == 3 && ts[0] == Prim(64) => same(&ts[1], &ts[2])?,
-                _ => return err("Select expects (U64 mask, T, T)"),
-            },
-
-            // homogeneous: every lane must carry the same shape, which is the payload's.
-            Op::Unwrap => match input {
-                Sum(ts) => {
-                    let first = ts.first().ok_or_else(|| format!("Unwrap: empty sum, got {input}"))?.clone();
-                    ts.iter().try_fold(first, |a, t| same(&a, t)).map_err(|e| format!("Unwrap: {e}"))?
-                }
-                _ => return err("Unwrap expects a sum"),
-            },
-
-            // sum intro: the input lands in variant `tag` of the declared sum, whose lane `tag` must be
-            // the input's shape; the other lanes are the declared (empty) ones.
-            Op::Inject(tag, shapes) => {
-                if *tag >= shapes.len() {
-                    return err(&format!("Inject: tag {tag} out of range for arity {}", shapes.len()));
-                }
-                // u8 tag width, as in Branch/Weave — eval asserts the same bound.
-                if shapes.len() > 256 {
-                    return err(&format!("Inject: arity {} exceeds the u8 tag width", shapes.len()));
-                }
-                if shapes[*tag] != *input {
-                    return err(&format!("Inject: lane {tag} is declared {}", shapes[*tag]));
-                }
-                Sum(shapes.clone())
-            }
-
-            Op::MapList(body) => match input {
-                List(x) => List(Box::new(shape_of(body, x)?)),
-                _ => return err("MapList expects a list"),
-            },
-
-            // (B, List<A>) -> B. The body, on (B, A), must again yield B (the seed's shape).
-            // Heterogeneous: the accumulator B and element A need not match.
-            Op::Fold(body) => match input {
-                Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    List(a) => {
-                        let body_out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
-                        same(&ts[0], &body_out).map_err(|e| format!("Fold: {e}"))?
-                    }
-                    _ => return err("Fold expects (B, List<A>)"),
-                },
-                _ => return err("Fold expects a pair"),
-            },
-
-            // (T, List<A>) -> (T, List<R>). The body, on (T, A), must return (T, R) — the state shape
-            // is preserved; the result is the final state and the list of emitted R.
-            Op::FoldScan(body) => match input {
-                Prod(ts) if ts.len() == 2 => match &ts[1] {
-                    List(a) => {
-                        let out = shape_of(body, &Prod(vec![ts[0].clone(), (**a).clone()]))?;
-                        match out {
-                            Prod(os) if os.len() == 2 => {
-                                let state = same(&ts[0], &os[0]).map_err(|e| format!("FoldScan: {e}"))?;
-                                Prod(vec![state, List(Box::new(os[1].clone()))])
-                            }
-                            _ => return err("FoldScan body must return (T, R)"),
-                        }
-                    }
-                    _ => return err("FoldScan expects (T, List<A>)"),
-                },
-                _ => return err("FoldScan expects a pair"),
-            },
-
-            Op::MapSum(arms) => match input {
-                Sum(ts) => {
-                    let mut out = ts.clone();
-                    for (i, (k, body)) in arms.iter().enumerate() {
-                        if *k >= ts.len() {
-                            return err(&format!("MapSum: no variant {k}"));
-                        }
-                        // disjoint indices keep the arms independent (so they commute).
-                        if arms[..i].iter().any(|(j, _)| j == k) {
-                            return err(&format!("MapSum: duplicate variant {k}"));
-                        }
-                        out[*k] = shape_of(body, &ts[*k])?;
-                    }
-                    Sum(out)
-                }
-                _ => return err("MapSum expects a sum"),
-            },
-
         })
     }
 

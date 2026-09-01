@@ -9,7 +9,7 @@ pub(crate) mod order;
 
 use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
-use crate::shape::{same, Shape};
+use crate::shape::{same, shape_of_value};
 use crate::value::Value;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
@@ -50,10 +50,11 @@ pub enum CmpOp {
 }
 
 impl CmpOp {
-    pub(crate) fn eval(&self, input: Value) -> Value {
-        match self {
+    pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
+        Ok(match self {
             CmpOp::Rel(pred) => {
-                let (a, b) = input.into_pair("Rel");
+                let (a, b) = input.into_pair("Rel")?;
+                same(&shape_of_value(&a), &shape_of_value(&b)).map_err(|e| format!("Rel: {e}"))?;
                 assert_eq!(a.len(), b.len(), "Rel: operands at different strata");
                 let mask = match (&a, &b) {
                     // leaf pair: the vectorized lane compare. Resolve the predicate to its three
@@ -69,26 +70,29 @@ impl CmpOp {
 
             CmpOp::Min | CmpOp::Max => {
                 let take_max = matches!(self, CmpOp::Max);
-                let (a, b) = input.into_pair("min/max");
-                let (pa, pb) = (a.into_prim("min/max lhs"), b.into_prim("min/max rhs"));
+                let (a, b) = input.into_pair("min/max")?;
+                let (pa, pb) = (a.into_prim("min/max lhs")?, b.into_prim("min/max rhs")?);
+                if pa.bits() != pb.bits() {
+                    return Err(format!("min/max expects two equal-width leaves, got U{} and U{}", pa.bits(), pb.bits()));
+                }
                 assert_eq!(pa.len(), pb.len(), "min/max: operands at different strata");
                 Value::Prim(pa.lane_pick(pb, take_max))
             }
 
             CmpOp::Gt(c) => {
-                let xs = input.into_u64("Gt");
+                let xs = input.into_u64("Gt")?;
                 Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
             }
 
             CmpOp::SortList => {
-                let (bounds, vals) = input.into_list("SortList");
+                let (bounds, vals) = input.into_list("SortList")?;
                 let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
                 Value::List(bounds, Box::new(gather(&vals, &perm)))
             }
 
             CmpOp::DedupList => {
                 // distinct, per row: discriminate, then keep one representative per run.
-                let (bounds, vals) = input.into_list("DedupList");
+                let (bounds, vals) = input.into_list("DedupList")?;
                 let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
                 let (_ends, firsts) = run_layout(&labels);
                 let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
@@ -100,8 +104,8 @@ impl CmpOp {
             CmpOp::GroupKey => {
                 // group by key, per row: discriminate by K (stable → V keeps order); the
                 // K-runs are the groups, and each run's V-span is its inner list.
-                let (bounds, vals) = input.into_list("GroupKey");
-                let (k_col, v_col) = vals.into_pair("GroupKey values");
+                let (bounds, vals) = input.into_list("GroupKey")?;
+                let (k_col, v_col) = vals.into_pair("GroupKey values")?;
                 let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
                 let k_sorted = gather(&k_col, &perm);
                 let v_sorted = gather(&v_col, &perm);
@@ -116,9 +120,10 @@ impl CmpOp {
             // for each needle element, equal_range it in the matching haystack row (batched binary
             // search, see `batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
             CmpOp::Find => {
-                let (needle, haystack) = input.into_pair("Find");
-                let (nb, nvals) = needle.into_list("Find needle");
-                let (hb, hvals) = haystack.into_list("Find haystack");
+                let (needle, haystack) = input.into_pair("Find")?;
+                let (nb, nvals) = needle.into_list("Find needle")?;
+                let (hb, hvals) = haystack.into_list("Find haystack")?;
+                same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi) and its row start (row-relative answer).
@@ -144,60 +149,9 @@ impl CmpOp {
                 let hi_c: Vec<u64> = upper.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
                 Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
             }
-        }
-    }
-
-    /// the type-level shadow of `eval` — kind-blind, structural, exactly like `core::Op::judge`.
-    pub(crate) fn judge(&self, input: &Shape) -> Result<Shape, String> {
-        use Shape::*;
-        let err = |what: &str| Err(format!("{what}, got {input}"));
-        Ok(match self {
-            // the two operands must share one shape, as for Find.
-            CmpOp::Rel(_) => match input {
-                Prod(ts) if ts.len() == 2 => {
-                    same(&ts[0], &ts[1]).map_err(|e| format!("Rel: {e}"))?;
-                    Prim(64)
-                }
-                _ => return err("Rel expects a pair of unifiable shapes"),
-            },
-            CmpOp::Gt(_) => match input {
-                Prim(64) => Prim(64),
-                _ => return err("Gt expects U64"),
-            },
-            // (X, X) -> X for two equal-width leaves; kind-blind, so width is the only constraint.
-            CmpOp::Min | CmpOp::Max => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (Prim(a), Prim(b)) if a == b => Prim(*a),
-                    _ => return err("min/max expects two equal-width leaves"),
-                },
-                _ => return err("min/max expects a pair"),
-            },
-            CmpOp::SortList | CmpOp::DedupList => match input {
-                List(_) => input.clone(),
-                _ => return err("sort/dedup expects a list"),
-            },
-            CmpOp::GroupKey => match input {
-                List(inner) => match inner.as_ref() {
-                    Prod(ts) if ts.len() == 2 => {
-                        List(Box::new(Prod(vec![ts[0].clone(), List(Box::new(ts[1].clone()))])))
-                    }
-                    _ => return err("GroupKey expects List<(K,V)>"),
-                },
-                _ => return err("GroupKey expects a list"),
-            },
-            CmpOp::Find => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    // needle and haystack elements must share one shape.
-                    (List(a), List(b)) => {
-                        same(a, b).map_err(|e| format!("Find: {e}"))?;
-                        List(Box::new(Prod(vec![Prim(64), Prim(64)])))
-                    }
-                    _ => return err("Find expects (List<X>, List<X>)"),
-                },
-                _ => return err("Find expects a pair"),
-            },
         })
     }
+
 }
 
 /// one batched lower/upper-bound search: every needle element advances its window `[lo,hi)` in

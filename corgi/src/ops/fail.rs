@@ -19,7 +19,7 @@
 
 use crate::engine::gather;
 use crate::graph::OpLike;
-use crate::shape::Shape;
+use crate::shape::shape_of_value;
 use crate::value::{Bounds, Prim, Value};
 use std::sync::Arc;
 
@@ -45,27 +45,14 @@ pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
     Value::Sum(Prim::U8(Arc::new(tags)), off, vec![ok, Value::Unit(n_err)])
 }
 
-/// destructure a `Fail<T>` into its error mask and packed Ok lane.
-pub(crate) fn into_fail(v: Value, who: &str) -> (Vec<bool>, Value) {
+/// destructure a `Fail<T>` into its error mask and packed Ok lane; anything else is the shape error.
+pub(crate) fn into_fail(v: Value, who: &str) -> Result<(Vec<bool>, Value), String> {
     match v {
-        Value::Sum(Prim::U8(tags), _off, lanes) if lanes.len() == 2 => {
+        Value::Sum(Prim::U8(tags), _off, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)) => {
             let err = tags.iter().map(|&t| t != 0).collect();
-            (err, lanes.into_iter().next().unwrap())
+            Ok((err, lanes.into_iter().next().unwrap()))
         }
-        _ => panic!("{who}: expected a Fail (Sum{{T | Unit}})"),
-    }
-}
-
-/// the shape of `Fail<T>`.
-pub(crate) fn fail_shape(t: Shape) -> Shape {
-    Shape::Sum(vec![t, Shape::Unit])
-}
-
-/// the payload shape of a `Fail<T>` (a two-lane sum whose Err lane is `Unit`).
-pub(crate) fn unfail(s: &Shape, who: &str) -> Result<Shape, String> {
-    match s {
-        Shape::Sum(ls) if ls.len() == 2 && ls[1] == Shape::Unit => Ok(ls[0].clone()),
-        _ => Err(format!("{who}: expected a Fail (Sum{{T | Unit}}), got {s}")),
+        other => Err(format!("{who}: expected a Fail (Sum{{T | Unit}}), got {}", shape_of_value(&other))),
     }
 }
 
@@ -95,21 +82,24 @@ pub(crate) fn lift(v: Value) -> Value {
 }
 
 /// `Fail<Fail<T>> -> Fail<T>`: a row is Ok iff Ok at both levels; the inner Ok lane passes through.
-pub(crate) fn squash(v: Value) -> Value {
-    let (outer_err, inner) = into_fail(v, "Squash");
-    let (inner_err, ok) = into_fail(inner, "Squash inner");
+pub(crate) fn squash(v: Value) -> Result<Value, String> {
+    let (outer_err, inner) = into_fail(v, "Squash")?;
+    let (inner_err, ok) = into_fail(inner, "Squash inner")?;
     let mut inner = inner_err.iter();
     let err: Vec<bool> = outer_err.iter().map(|&oe| oe || *inner.next().unwrap()).collect();
-    fail(&err, ok)
+    Ok(fail(&err, ok))
 }
 
 // --- the distributive laws -----------------------------------------------------------------------
 
 /// `(Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>`: a row errs if ANY field errs; the survivors carry
 /// the product of the fields' Ok values (each field's packed lane read at the survivor's rank).
-pub(crate) fn hoist_prod(input: Value) -> Value {
-    let fields: Vec<(Vec<bool>, Value)> =
-        input.into_prod("HoistProd").into_iter().map(|f| into_fail(f, "HoistProd field")).collect();
+pub(crate) fn hoist_prod(input: Value) -> Result<Value, String> {
+    let fields: Vec<(Vec<bool>, Value)> = input
+        .into_prod("HoistProd")?
+        .into_iter()
+        .map(|f| into_fail(f, "HoistProd field"))
+        .collect::<Result<_, _>>()?;
     let n = fields.first().map_or(0, |(e, _)| e.len());
     let mut err = vec![false; n];
     for (e, _) in &fields {
@@ -122,16 +112,16 @@ pub(crate) fn hoist_prod(input: Value) -> Value {
         .into_iter()
         .map(|(e, ok)| if e == err { ok } else { gather(&ok, &ranks(&e, &keep)) }) // no drop: pass through
         .collect();
-    fail(&err, Value::Prod(cols))
+    Ok(fail(&err, Value::Prod(cols)))
 }
 
 /// `List<Fail<T>> -> Fail<List<T>>`: a row errs if ANY element errs; the survivors carry their whole
 /// list of Ok values (consecutive in the packed lane, so an all-Ok column needs no gather).
-pub(crate) fn hoist_list(input: Value) -> Value {
-    let (bounds, elems) = input.into_list("HoistList");
-    let (elem_err, ok) = into_fail(elems, "HoistList element");
+pub(crate) fn hoist_list(input: Value) -> Result<Value, String> {
+    let (bounds, elems) = input.into_list("HoistList")?;
+    let (elem_err, ok) = into_fail(elems, "HoistList element")?;
     if !elem_err.iter().any(|&e| e) {
-        return lift(Value::List(bounds, Box::new(ok)));
+        return Ok(lift(Value::List(bounds, Box::new(ok))));
     }
     let mut err = Vec::with_capacity(bounds.len());
     let mut keep = Vec::new();
@@ -149,19 +139,22 @@ pub(crate) fn hoist_list(input: Value) -> Value {
         rank += n_ok;
         start = end;
     }
-    fail(&err, Value::List(ok_bounds.into(), Box::new(gather(&ok, &keep))))
+    Ok(fail(&err, Value::List(ok_bounds.into(), Box::new(gather(&ok, &keep)))))
 }
 
 /// `Sum{.. Fail<A> ..} -> Fail<Sum{.. A ..}>` for the lanes listed in `fallible` (the others are pure
 /// and pass through): a row errs iff its own lane errs on it; the survivors re-tag over the lanes'
 /// Ok values, whose packed order is already the survivors' order.
-pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Value {
-    let (tags, off, lanes) = input.into_sum("HoistSum");
+pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Result<Value, String> {
+    let (tags, off, lanes) = input.into_sum("HoistSum")?;
+    if let Some(k) = fallible.iter().find(|&&k| k >= lanes.len()) {
+        return Err(format!("HoistSum: no lane {k}"));
+    }
     let mut errs: Vec<Option<Vec<bool>>> = vec![None; lanes.len()];
     let mut new_lanes: Vec<Value> = Vec::with_capacity(lanes.len());
     for (k, lane) in lanes.into_iter().enumerate() {
         if fallible.contains(&k) {
-            let (e, ok) = into_fail(lane, "HoistSum lane");
+            let (e, ok) = into_fail(lane, "HoistSum lane")?;
             errs[k] = Some(e);
             new_lanes.push(ok);
         } else {
@@ -171,16 +164,16 @@ pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Value {
     let err: Vec<bool> =
         tags.iter().zip(&off).map(|(&t, &o)| errs[t].as_ref().is_some_and(|e| e[o])).collect();
     let ok_tags: Vec<usize> = tags.iter().zip(&err).filter(|(_, &e)| !e).map(|(&t, _)| t).collect();
-    fail(&err, Value::sum(ok_tags, new_lanes))
+    Ok(fail(&err, Value::sum(ok_tags, new_lanes)))
 }
 
 // --- the total per-row producers -----------------------------------------------------------------
 
 /// `(idx:U64, haystack:List<T>) -> Fail<T>`: row r's element `idx[r]`, Err if out of that row's range.
-pub(crate) fn try_get(input: Value) -> Value {
-    let (idx, haystack) = input.into_pair("TryGet");
-    let idxs = idx.into_u64("TryGet index");
-    let (hb, hvals) = haystack.into_list("TryGet haystack");
+pub(crate) fn try_get(input: Value) -> Result<Value, String> {
+    let (idx, haystack) = input.into_pair("TryGet")?;
+    let idxs = idx.into_u64("TryGet index")?;
+    let (hb, hvals) = haystack.into_list("TryGet haystack")?;
     assert_eq!(idxs.len(), hb.len(), "TryGet: index/haystack row count");
     let mut err = Vec::with_capacity(idxs.len());
     let mut abs = Vec::new();
@@ -195,16 +188,16 @@ pub(crate) fn try_get(input: Value) -> Value {
         }
         hs = he;
     }
-    fail(&err, gather(&hvals, &abs))
+    Ok(fail(&err, gather(&hvals, &abs)))
 }
 
 /// `(idx:List<U64>, haystack:List<T>) -> Fail<List<T>>`: per row, all-or-nothing over its indices.
-pub(crate) fn try_gather(input: Value) -> Value {
-    let (idx, haystack) = input.into_pair("TryGather");
-    let (ib, ivals) = idx.into_list("TryGather indices");
-    let (hb, hvals) = haystack.into_list("TryGather haystack");
+pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
+    let (idx, haystack) = input.into_pair("TryGather")?;
+    let (ib, ivals) = idx.into_list("TryGather indices")?;
+    let (hb, hvals) = haystack.into_list("TryGather haystack")?;
     assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
-    let idxs = ivals.into_u64("TryGather indices");
+    let idxs = ivals.into_u64("TryGather indices")?;
     let mut err = Vec::with_capacity(ib.len());
     let mut abs = Vec::new();
     let mut bounds = Vec::new();
@@ -222,18 +215,18 @@ pub(crate) fn try_gather(input: Value) -> Value {
         is = ie;
         hs = he;
     }
-    fail(&err, Value::List(bounds.into(), Box::new(gather(&hvals, &abs))))
+    Ok(fail(&err, Value::List(bounds.into(), Box::new(gather(&hvals, &abs)))))
 }
 
 /// `(ranges:List<(lo,hi)>, haystack:List<T>) -> Fail<List<List<T>>>`: per row, every range must
 /// satisfy `lo <= hi <= rowlen`.
-pub(crate) fn try_slices(input: Value) -> Value {
-    let (lohi, haystack) = input.into_pair("TrySlices");
-    let (lb, lvals) = lohi.into_list("TrySlices ranges");
-    let (hb, hvals) = haystack.into_list("TrySlices haystack");
+pub(crate) fn try_slices(input: Value) -> Result<Value, String> {
+    let (lohi, haystack) = input.into_pair("TrySlices")?;
+    let (lb, lvals) = lohi.into_list("TrySlices ranges")?;
+    let (hb, hvals) = haystack.into_list("TrySlices haystack")?;
     assert_eq!(lb.len(), hb.len(), "TrySlices: row count");
-    let (lo, hi) = lvals.into_pair("TrySlices lo_hi");
-    let (lo_c, hi_c) = (lo.into_u64("TrySlices lo"), hi.into_u64("TrySlices hi"));
+    let (lo, hi) = lvals.into_pair("TrySlices lo_hi")?;
+    let (lo_c, hi_c) = (lo.into_u64("TrySlices lo")?, hi.into_u64("TrySlices hi")?);
     let mut err = Vec::with_capacity(lb.len());
     let mut abs = Vec::new();
     let mut inner = Vec::new();
@@ -260,16 +253,16 @@ pub(crate) fn try_slices(input: Value) -> Value {
         hs = he;
     }
     let mats = Value::List(inner.into(), Box::new(gather(&hvals, &abs)));
-    fail(&err, Value::List(outer.into(), Box::new(mats)))
+    Ok(fail(&err, Value::List(outer.into(), Box::new(mats))))
 }
 
 /// `(data:List<X>, mask:List<U64>) -> Fail<List<X>>`: per row, data and mask must agree in length.
-pub(crate) fn try_filter(input: Value) -> Value {
-    let (data, mask) = input.into_pair("TryFilter");
-    let (db, dvals) = data.into_list("TryFilter data");
-    let (mb, mvals) = mask.into_list("TryFilter mask");
+pub(crate) fn try_filter(input: Value) -> Result<Value, String> {
+    let (data, mask) = input.into_pair("TryFilter")?;
+    let (db, dvals) = data.into_list("TryFilter data")?;
+    let (mb, mvals) = mask.into_list("TryFilter mask")?;
     assert_eq!(db.len(), mb.len(), "TryFilter: row count");
-    let m = mvals.into_u64("TryFilter mask");
+    let m = mvals.into_u64("TryFilter mask")?;
     let mut err = Vec::with_capacity(db.len());
     let mut idx = Vec::new();
     let mut bounds = Vec::new();
@@ -286,13 +279,16 @@ pub(crate) fn try_filter(input: Value) -> Value {
         ds = de;
         ms = me;
     }
-    fail(&err, Value::List(bounds.into(), Box::new(gather(&dvals, &idx))))
+    Ok(fail(&err, Value::List(bounds.into(), Box::new(gather(&dvals, &idx)))))
 }
 
 /// `List<X> -> Fail<List<List<X>>>`: per row, the length must divide by `k`; Ok rows re-partition into
 /// a `Stride(k)` inner list with no value movement beyond the Ok-row gather.
-pub(crate) fn try_chunk(k: usize, input: Value) -> Value {
-    let (bounds, vals) = input.into_list("TryChunk");
+pub(crate) fn try_chunk(k: usize, input: Value) -> Result<Value, String> {
+    if k == 0 {
+        return Err("TryChunk width must be positive".into());
+    }
+    let (bounds, vals) = input.into_list("TryChunk")?;
     let mut err = Vec::with_capacity(bounds.len());
     let mut keep = Vec::new();
     let mut outer = Vec::new();
@@ -310,15 +306,17 @@ pub(crate) fn try_chunk(k: usize, input: Value) -> Value {
         prev = end;
     }
     let inner = Value::List(Bounds::Stride(k, total_sub), Box::new(gather(&vals, &keep)));
-    fail(&err, Value::List(outer.into(), Box::new(inner)))
+    Ok(fail(&err, Value::List(outer.into(), Box::new(inner))))
 }
 
 /// `(X, tags:U64) -> Fail<Sum{X × n}>`: the demux; a tag `>= n` errs its row.
-pub(crate) fn try_branch(n: usize, input: Value) -> Value {
-    let (data, tags_v) = input.into_pair("TryBranch");
-    let tags = tags_v.into_u64("TryBranch tags");
+pub(crate) fn try_branch(n: usize, input: Value) -> Result<Value, String> {
+    let (data, tags_v) = input.into_pair("TryBranch")?;
+    let tags = tags_v.into_u64("TryBranch tags")?;
     assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
-    assert!(n <= 256, "TryBranch: arity {n} exceeds the u8 tag width");
+    if n > 256 {
+        return Err(format!("TryBranch: arity {n} exceeds the u8 tag width"));
+    }
     let mut err = Vec::with_capacity(tags.len());
     let (mut ok_tags, mut ok_off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -334,14 +332,14 @@ pub(crate) fn try_branch(n: usize, input: Value) -> Value {
         }
     }
     let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-    fail(&err, Value::Sum(Prim::U8(Arc::new(ok_tags)), ok_off, variants))
+    Ok(fail(&err, Value::Sum(Prim::U8(Arc::new(ok_tags)), ok_off, variants)))
 }
 
 /// `(List<X>, List<Y>) -> Fail<List<(X, Y)>>`: per row, the two inner lists must agree in length.
-pub(crate) fn try_zip(input: Value) -> Value {
-    let (lx, ly) = input.into_pair("TryZip");
-    let (bx, vx) = lx.into_list("TryZip lhs");
-    let (by, vy) = ly.into_list("TryZip rhs");
+pub(crate) fn try_zip(input: Value) -> Result<Value, String> {
+    let (lx, ly) = input.into_pair("TryZip")?;
+    let (bx, vx) = lx.into_list("TryZip lhs")?;
+    let (by, vy) = ly.into_list("TryZip rhs")?;
     assert_eq!(bx.len(), by.len(), "TryZip: row count");
     let mut err = Vec::with_capacity(bx.len());
     let (mut ok_outer, mut ok_x, mut ok_y) = (Vec::new(), Vec::new(), Vec::new());
@@ -360,102 +358,24 @@ pub(crate) fn try_zip(input: Value) -> Value {
         sy = ey;
     }
     let pairs = Value::Prod(vec![gather(&vx, &ok_x), gather(&vy, &ok_y)]);
-    fail(&err, Value::List(ok_outer.into(), Box::new(pairs)))
+    Ok(fail(&err, Value::List(ok_outer.into(), Box::new(pairs))))
 }
 
-// --- the judges ----------------------------------------------------------------------------------
-
-/// the shape rules for the family, in the same order as the evals above. `None` = not a fail-family op.
-pub(crate) fn judge<L: OpLike>(op: &super::core::Op<L>, input: &Shape) -> Option<Result<Shape, String>> {
+/// is this op one of the family (dispatched to [`eval`] by `Op::eval`)?
+pub(crate) fn is_family<L: OpLike>(op: &super::core::Op<L>) -> bool {
     use super::core::Op;
-    use Shape::*;
-    let err = |what: &str| Err(format!("{what}, got {input}"));
-    Some(match op {
-        Op::Lift => Ok(fail_shape(input.clone())),
-        Op::Squash => unfail(input, "Squash").and_then(|t| unfail(&t, "Squash inner")).map(fail_shape),
-        Op::HoistProd => match input {
-            Prod(ts) => ts.iter().map(|t| unfail(t, "HoistProd field")).collect::<Result<Vec<_>, _>>()
-                .map(|ts| fail_shape(Prod(ts))),
-            _ => err("HoistProd expects a product of Fails"),
-        },
-        Op::HoistList => match input {
-            List(t) => unfail(t, "HoistList element").map(|t| fail_shape(List(Box::new(t)))),
-            _ => err("HoistList expects a list of Fails"),
-        },
-        Op::HoistSum(fallible) => match input {
-            Sum(ls) => (|| {
-                let mut out = ls.clone();
-                for &k in fallible {
-                    let Some(lane) = ls.get(k) else { return err(&format!("HoistSum: no lane {k}")) };
-                    out[k] = unfail(lane, "HoistSum lane")?;
-                }
-                Ok(fail_shape(Sum(out)))
-            })(),
-            _ => err("HoistSum expects a sum"),
-        },
-        Op::TryGet => match input {
-            Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                (Prim(64), List(t)) => Ok(fail_shape((**t).clone())),
-                _ => err("TryGet expects (U64, List<T>)"),
-            },
-            _ => err("TryGet expects a pair"),
-        },
-        Op::TryGather => match input {
-            Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                (List(i), List(t)) if **i == Prim(64) => Ok(fail_shape(List(t.clone()))),
-                _ => err("TryGather expects (List<U64>, List<T>)"),
-            },
-            _ => err("TryGather expects a pair"),
-        },
-        Op::TrySlices => match input {
-            Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                (List(lh), List(t)) if **lh == Prod(vec![Prim(64), Prim(64)]) => {
-                    Ok(fail_shape(List(Box::new(List(t.clone())))))
-                }
-                _ => err("TrySlices expects (List<(U64,U64)>, List<T>)"),
-            },
-            _ => err("TrySlices expects a pair"),
-        },
-        Op::TryFilter => match input {
-            Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                (List(x), List(m)) if **m == Prim(64) => Ok(fail_shape(List(x.clone()))),
-                _ => err("TryFilter expects (List<X>, List<U64>)"),
-            },
-            _ => err("TryFilter expects a pair"),
-        },
-        Op::TryChunk(k) => match input {
-            List(inner) if *k > 0 => Ok(fail_shape(List(Box::new(List(inner.clone()))))),
-            List(_) => err("TryChunk width must be positive"),
-            _ => err("TryChunk expects a list"),
-        },
-        Op::TryBranch(n) => match input {
-            Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
-                if *n > 256 {
-                    err(&format!("TryBranch: arity {n} exceeds the u8 tag width"))
-                } else {
-                    Ok(fail_shape(Sum(vec![ts[0].clone(); *n])))
-                }
-            }
-            _ => err("TryBranch expects (X, U64-tags)"),
-        },
-        Op::TryZip => match input {
-            Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                (List(x), List(y)) => {
-                    Ok(fail_shape(List(Box::new(Prod(vec![(**x).clone(), (**y).clone()])))))
-                }
-                _ => err("TryZip expects (List<X>, List<Y>)"),
-            },
-            _ => err("TryZip expects a pair of lists"),
-        },
-        _ => return None,
-    })
+    matches!(
+        op,
+        Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) | Op::TryGet | Op::TryGather
+            | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_) | Op::TryZip
+    )
 }
 
-/// the evals for the family, dispatched from `Op::eval`. `None` = not a fail-family op.
-pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<Value, Value> {
+/// the evals for the family, dispatched from `Op::eval`; `Err` is the shape error, as everywhere.
+pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<Value, String> {
     use super::core::Op;
-    Ok(match op {
-        Op::Lift => lift(input),
+    match op {
+        Op::Lift => Ok(lift(input)),
         Op::Squash => squash(input),
         Op::HoistProd => hoist_prod(input),
         Op::HoistList => hoist_list(input),
@@ -467,6 +387,6 @@ pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<V
         Op::TryChunk(k) => try_chunk(*k, input),
         Op::TryBranch(n) => try_branch(*n, input),
         Op::TryZip => try_zip(input),
-        _ => return Err(input),
-    })
+        _ => unreachable!("not a failure-family op"),
+    }
 }

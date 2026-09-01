@@ -17,8 +17,8 @@ src/
   cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
                is the diagonal case) + the linear discrimination sort (sort_blocks / run_layout /
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
-  graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph, shape_of,
-               check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
+  graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
+               shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
@@ -43,7 +43,7 @@ src/
                (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
                programs witness it), kept for the execution strategy the expansion loses. The
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
-               eval/judge/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
+               eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
@@ -51,7 +51,7 @@ src/
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
                per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
-               functor). Evals + judges live here; `Op::eval`/`judge` dispatch to them first.
+               functor). The evals live here; `Op::eval` dispatches to them first.
     text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
                total — ParseU64 returns Sum{Err: bytes | Ok: U64}, no data-dependent panic.
   frontend/
@@ -105,7 +105,12 @@ reasons. Adding a structural op means either filling a hole (and writing its law
 - **Every semantic op is a unary `T0 -> T1`** (the 1:1 map), run by `eval`. `Input`/`Tuple` are the
   only non-ops — they're `graph::NodeKind`.
 - **Shape = structure + leaf width, kind-blind.** Numeric kinds (signed/float) are an interpretation
-  a layer encodes, never a Shape. `shape_of` is `eval` lifted to shapes.
+  a layer encodes, never a Shape. `shape_of` is LITERALLY `eval` on a zero-row column: every op is
+  total on zero rows, reports a mismatched operand as `Err` (the accessors `into_pair`/`into_list`/…
+  carry the message), and builds an output of the shape it would at any length — so there is one
+  vocabulary, one evaluator, and no type-level shadow of it to keep in sync. `eval_graph` unwraps
+  (a typechecked program cannot fail); `try_eval_graph` is the fallible form the typer and the
+  body-bearing ops use.
 - **Layering = enum embedding via `OpLike` + body-generic `Op<L>`.** A layer is `{ Core(Op<Self>),
   <buckets> }` impl'ing `OpLike` by delegating; the graph machinery is unchanged across layers.
 - **The core is numeric-blind.** Arithmetic is `ops/numeric`; comparison is `ops/cmp`. The leaf is
@@ -121,7 +126,7 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
   via `to_f32`/`to_f64` (no float literal token: a constant is `lit_uN K to_fN`); the typed grid is
   reached by suffix (`add_i32`, `div_f64`, `lit_i16 N`, `signed`). Integer `div` is deferred (no NEON
-  op; div-by-zero would panic) — the judge rejects it.
+  op; div-by-zero would panic) — `eval` rejects it.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
 - **List rows carry a stride-aware `Bounds`.** `Value::List` holds `Bounds { Stride(stride, rows) |
@@ -200,7 +205,7 @@ NEON-vectorized; `sort_list` is the lone compute-bound op.
 Then the kernel-matrix session: `Op<L>` reorganized as (intro/elim/map/capture) × (Prod/Sum/List)
 with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (index-as-value) and
 `Head` (the stratum drop) added; the three iso pairs completed (`Zip`, `Unweave`/`Weave`);
-`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` judge by shape equality; the judge rejects what eval can't represent (`Cast` widths, sum
+`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` check shape equality; `eval` rejects what it can't represent (`Cast` widths, sum
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
 
@@ -301,5 +306,5 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 ## Conventions
 
 Run after any `src/` change: `cargo test && cargo clippy --all-targets`. Dependency-free and tight.
-Adding an op: one arm in `eval`, one in `judge` (exhaustiveness keeps them in sync); a failure-family op gets its two arms in `ops/fail.rs` instead. Adding a layer:
+Adding an op: ONE arm in `eval` (a failure-family op's lives in `ops/fail.rs`). There is no judge to keep in step: `eval` on a zero-row column IS the typer, so an op's shape rule is its accessor calls (`into_pair`/`into_list`/…, whose `Err` is the shape error) plus any explicit `same(..)` check it needs; the output shape is whatever it builds. Adding a layer:
 an enum + `OpLike` + `From` impls; touch nothing below.

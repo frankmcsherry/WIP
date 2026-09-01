@@ -83,11 +83,11 @@ pub mod arrange {
         let (n, h) = (needles.len(), haystack.len());
         let needle_list = Value::List(Bounds::Offsets(vec![n]), Box::new(needles.clone()));
         let hay_list = Value::List(Bounds::Offsets(vec![h]), Box::new(haystack.clone()));
-        let out = crate::ops::cmp::CmpOp::Find.eval(Value::Prod(vec![needle_list, hay_list]));
-        let (_b, vals) = out.into_list("find_ranges");
-        let (lo, hi) = vals.into_pair("find_ranges lo/hi");
-        let lo = lo.into_u64("find_ranges lo").into_iter().map(|x| x as usize).collect();
-        let hi = hi.into_u64("find_ranges hi").into_iter().map(|x| x as usize).collect();
+        let out = crate::ops::cmp::CmpOp::Find.eval(Value::Prod(vec![needle_list, hay_list])).expect("find_ranges: shapes");
+        let (_b, vals) = out.into_list("find_ranges").unwrap();
+        let (lo, hi) = vals.into_pair("find_ranges lo/hi").unwrap();
+        let lo = lo.into_u64("find_ranges lo").unwrap().into_iter().map(|x| x as usize).collect();
+        let hi = hi.into_u64("find_ranges hi").unwrap().into_iter().map(|x| x as usize).collect();
         (lo, hi)
     }
 
@@ -402,7 +402,7 @@ pub mod arrange {
             }
 
             // sorted WITHIN each segment.
-            let sorted = gather(&v, &perm).into_u64("sorted");
+            let sorted = gather(&v, &perm).into_u64("sorted").unwrap();
             assert_eq!(&sorted[0..3], &[1, 3, 3]);
             assert_eq!(&sorted[3..6], &[2, 5, 5]);
 
@@ -446,7 +446,7 @@ pub mod arrange {
             let ours = Value::List(bounds.clone(), Box::new(gather(&vals, &perm)));
 
             // the ML op.
-            let theirs = crate::ops::cmp::CmpOp::SortList.eval(list);
+            let theirs = crate::ops::cmp::CmpOp::SortList.eval(list).unwrap();
             assert_eq!(ours, theirs);
         }
 

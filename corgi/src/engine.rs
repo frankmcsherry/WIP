@@ -12,7 +12,7 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 }
 
 /// lift a single-row constant to a column of length `n` (its stratum): `n` copies of `row`'s row 0. Total
-/// over every shape — it is `gather` at the all-zero index, so `Op::Lit`'s `judge` (which accepts any value's
+/// over every shape — it is `gather` at the all-zero index, so `Op::Lit` (which accepts any value's
 /// shape) and `eval` agree.
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
     gather(row, &vec![0usize; n])

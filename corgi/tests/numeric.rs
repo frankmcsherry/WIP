@@ -16,7 +16,7 @@ fn u64(xs: &[u64]) -> Value {
 }
 
 fn dec_col(v: Value) -> Vec<i64> {
-    v.into_u64("dec_col").iter().map(|&u| dec_i64(u)).collect()
+    v.into_u64("dec_col").unwrap().iter().map(|&u| dec_i64(u)).collect()
 }
 
 #[test]

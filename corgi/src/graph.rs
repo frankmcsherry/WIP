@@ -4,14 +4,14 @@
 //! (e.g. `enum NumOp { Core(CoreOp), Arith(..) }` that embeds this one); the graph,
 //! `eval_graph`, and `shape_of` are unchanged across layers.
 
-use crate::shape::Shape;
+use crate::shape::{shape_of_value, Shape};
 use crate::value::Value;
 
-/// an op vocabulary: a value-level `eval`, a type-level `judge`, and any body
-/// sub-graphs it carries (so structural passes like `check` can recurse).
+/// an op vocabulary: a value-level `eval` — whose `Err` is the SHAPE error, so that `eval` run on a
+/// zero-row column is the typer — and any body sub-graphs it carries (so structural passes like
+/// `check` can recurse).
 pub trait OpLike: Sized {
-    fn eval(&self, input: Value) -> Value;
-    fn judge(&self, input: &Shape) -> Result<Shape, String>;
+    fn eval(&self, input: Value) -> Result<Value, String>;
     fn children(&self) -> Vec<&Graph<Self>> {
         Vec::new()
     }
@@ -70,6 +70,11 @@ impl<O: OpLike> Graph<O> {
 /// moves the argument in rather than cloning it, so a caller that hands off sole ownership pays no
 /// input copy. Backward edges (see [`Graph::check`]) make the per-node consumer count a single pass.
 pub fn eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Value {
+    try_eval_graph(g, arg).unwrap_or_else(|e| panic!("eval_graph: {e}"))
+}
+
+/// [`eval_graph`] with the shape error surfaced: the form the typer and body-bearing ops use.
+pub fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Value, String> {
     let mut uses = vec![0usize; g.nodes.len()];
     for node in &g.nodes { for &i in &node.inputs { uses[i] += 1; } }
     uses[g.output] += 1; // the returned value is a use too, so a consumer can't move it out first
@@ -89,25 +94,19 @@ pub fn eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Value {
             NodeKind::Tuple => {
                 Value::Prod(node.inputs.iter().map(|&i| take(&mut vals, &mut uses, i)).collect())
             }
-            NodeKind::Op(o) => o.eval(take(&mut vals, &mut uses, node.inputs[0])),
+            NodeKind::Op(o) => o.eval(take(&mut vals, &mut uses, node.inputs[0]))?,
         };
         vals.push(Some(v));
     }
-    vals[g.output].take().unwrap()
+    Ok(vals[g.output].take().unwrap())
 }
 
-/// shape-check the graph given the input's shape — the analogue of `eval_graph`.
+/// shape-check the graph given the input's shape: `eval` on a ZERO-ROW column of that shape. Every
+/// op is total on zero rows (no data-dependent work remains), reports a mismatched operand as an
+/// `Err`, and produces an output of the shape it would at any length — so the value's shape is the
+/// program's, and there is no second, type-level copy of the vocabulary to keep in step.
 pub fn shape_of<O: OpLike>(g: &Graph<O>, input: &Shape) -> Result<Shape, String> {
-    let mut shapes: Vec<Shape> = Vec::with_capacity(g.nodes.len());
-    for node in &g.nodes {
-        let t = match &node.kind {
-            NodeKind::Input => input.clone(),
-            NodeKind::Tuple => Shape::Prod(node.inputs.iter().map(|&i| shapes[i].clone()).collect()),
-            NodeKind::Op(o) => o.judge(&shapes[node.inputs[0]])?,
-        };
-        shapes.push(t);
-    }
-    Ok(shapes[g.output].clone())
+    try_eval_graph(g, Value::empty(input)).map(|v| shape_of_value(&v))
 }
 
 pub struct Builder<O> {
