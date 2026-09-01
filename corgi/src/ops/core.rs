@@ -7,7 +7,8 @@ use crate::engine::{
 };
 use crate::graph::{eval_graph, shape_of, Graph, OpLike};
 use crate::shape::{join, shape_of_value, Shape};
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Prim, Value};
+use std::sync::Arc;
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
 /// `gather`, the accumulator update for `Fold`/`Scan`.
@@ -312,18 +313,20 @@ impl<L: OpLike> Op<L> {
             // positions aligns with the carried within-variant offsets.
             Op::CapSum => {
                 let (x, s) = input.into_pair("CapSum");
-                let (tags, _offset, lanes) = s.into_sum("CapSum sum");
+                let Value::Sum(tags, offset, lanes) = s else { panic!("CapSum: expected a sum") };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
                 let mut per = vec![Vec::new(); lanes.len()];
-                for (i, &t) in tags.iter().enumerate() {
-                    per[t].push(i);
+                let Prim::U8(t8) = &tags else { unreachable!("sum tags are a u8 column") };
+                for (i, &t) in t8.iter().enumerate() {
+                    per[t as usize].push(i);
                 }
                 let new = lanes
                     .into_iter()
                     .zip(&per)
                     .map(|(o, rows)| o.map(|lane| Value::Prod(vec![gather(&x, rows), lane])))
                     .collect();
-                Value::sum_opt(tags, new)
+                // the tag and offset columns are unchanged: each lane keeps its rows, now paired.
+                Value::Sum(tags, offset, new)
             }
 
             Op::Cast(bits) => match input {
@@ -400,13 +403,21 @@ impl<L: OpLike> Op<L> {
                 let (data, tags_v) = input.into_pair("Branch");
                 let tags = tags_v.into_u64("Branch tags");
                 assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
+                assert!(*n <= 256, "Branch: arity {n} exceeds the u8 tag width");
+                // one pass builds the tag column, each lane's row list, AND the within-variant offset
+                // (a row's offset is its lane's size when it arrives) — no decode/recompute afterwards.
                 let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n];
+                let mut tag8 = Vec::with_capacity(tags.len());
+                let mut off = Vec::with_capacity(tags.len());
                 for (i, &t) in tags.iter().enumerate() {
-                    assert!((t as usize) < *n, "Branch: tag {t} out of range (n={n})");
-                    groups[t as usize].push(i);
+                    let t = t as usize;
+                    assert!(t < *n, "Branch: tag {t} out of range (n={n})");
+                    tag8.push(t as u8);
+                    off.push(groups[t].len());
+                    groups[t].push(i);
                 }
-                let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-                Value::sum(tags.iter().map(|&t| t as usize).collect(), variants)
+                let variants = groups.iter().map(|idx| Some(gather(&data, idx))).collect();
+                Value::Sum(Prim::U8(Arc::new(tag8)), off, variants)
             }
 
             Op::Unwrap => {
@@ -421,9 +432,11 @@ impl<L: OpLike> Op<L> {
             // payload column fills that lane, the others are zero-row. The unary dual of `tuple`.
             Op::Inject(tag, arity) => {
                 let n = input.len();
+                assert!(*arity <= 256, "Inject: arity {arity} exceeds the u8 tag width");
                 let mut variants = vec![None; *arity];
                 variants[*tag] = Some(input);
-                Value::sum_opt(vec![*tag; n], variants)
+                // a constant tag run: the within-variant offset is the row index.
+                Value::Sum(Prim::U8(Arc::new(vec![*tag as u8; n])), (0..n).collect(), variants)
             }
 
             Op::MapList(body) => {

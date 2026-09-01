@@ -327,21 +327,23 @@ pub(crate) fn try_branch(n: usize, input: Value) -> Value {
     let (data, tags_v) = input.into_pair("TryBranch");
     let tags = tags_v.into_u64("TryBranch tags");
     assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
+    assert!(n <= 256, "TryBranch: arity {n} exceeds the u8 tag width");
     let mut err = Vec::with_capacity(tags.len());
-    let mut ok_tags = Vec::with_capacity(tags.len());
+    let (mut ok_tags, mut ok_off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, &t) in tags.iter().enumerate() {
         let t = t as usize;
         if t < n {
             err.push(false);
-            ok_tags.push(t);
+            ok_tags.push(t as u8);
+            ok_off.push(groups[t].len()); // the within-variant offset: the lane's size on arrival
             groups[t].push(i);
         } else {
             err.push(true);
         }
     }
-    let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-    fail(&err, Value::sum(ok_tags, variants))
+    let variants = groups.iter().map(|idx| Some(gather(&data, idx))).collect();
+    fail(&err, Value::Sum(Prim::U8(Arc::new(ok_tags)), ok_off, variants))
 }
 
 /// `(List<X>, List<Y>) -> Fail<List<(X, Y)>>`: per row, the two inner lists must agree in length.
