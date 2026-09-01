@@ -610,7 +610,9 @@ impl<L: OpLike> Op<L> {
             }
 
             Op::MapSum(arms) => {
-                let (tags, _offset, mut variants) = input.into_sum("MapSum");
+                // the tag and within-offset columns are untouched by a lane map (each lane keeps its
+                // row count), so move them through rather than decode + recompute them.
+                let Value::Sum(tags, offset, mut variants) = input else { panic!("MapSum: expected a sum") };
                 for (k, body) in arms {
                     // take the lane so the body's `Input` owns it (refcount 1 ⇒ in-place). A ⊥ lane
                     // (`None`) has no rows and a deferred shape, so the body can't run on it — leave it
@@ -621,7 +623,7 @@ impl<L: OpLike> Op<L> {
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
                     variants[*k] = Some(res);
                 }
-                Value::sum_opt(tags, variants)
+                Value::Sum(tags, offset, variants)
             }
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it
