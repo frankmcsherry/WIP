@@ -1,7 +1,7 @@
 //! ML front-end tests: same demos through `let` and juxtaposed stages, plus a check that `let`
 //! sharing produces fewer nodes than the same join written with the shared subexpression inlined.
 
-use corgi::{eval_try, parse_ml, show, EffectValues, Program, Value};
+use corgi::{parse_ml, show, Program, Value};
 
 fn u64(xs: &[u64]) -> Value {
     Value::u64(xs.to_vec())
@@ -12,10 +12,7 @@ fn u64(xs: &[u64]) -> Value {
 fn run_ml(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
     p.check();
-    match p.run_effect(arg.clone()) {
-        EffectValues::Pure(v) => show(&v),
-        EffectValues::Fail(fv) => show(&eval_try(fv)),
-    }
+    show(&p.run_partial(arg.clone()))
 }
 
 fn sample() -> Value {

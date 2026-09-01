@@ -32,7 +32,7 @@ pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
 
-pub use effect::{effect_eval_graph, eval_try, is_total, EffectValues, FailValues};
+pub use effect::{is_total, lower_effects};
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;

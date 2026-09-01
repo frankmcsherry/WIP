@@ -4,6 +4,7 @@
 
 pub(crate) mod cmp;
 pub(crate) mod core;
+pub(crate) mod fail;
 pub(crate) mod numeric;
 pub(crate) mod text;
 

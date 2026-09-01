@@ -145,7 +145,7 @@ enum Apply {
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, usize),         // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
-    Head, // `head`: sugar for `(lit 0, list) get` — the first element (the get FailOp; empty row -> Oob)
+    Head, // `head`: sugar for `(lit 0, list) get` — the first element (an empty row errs)
 }
 
 enum E {
@@ -533,7 +533,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     // in the err-mask, observed by a downstream TRY, not a panic.
                     let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
-                    Ok(b.add(Op::GetTry, vec![pair]))
+                    Ok(b.add(Op::TryGet, vec![pair]))
                 }
             }
         }

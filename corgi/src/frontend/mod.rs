@@ -89,10 +89,11 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cast" => Op::Cast(n()? as u32).into(),
         "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
-        // One name per fallible method — each routes through the effect layer as a FailOp; the old
-        // `_try`/`_uns` tier split is retired (totality is `is_total`, not a name). The lone survivor,
-        // `gather_try`, is kept only as the DISTINCT per-element gather (below), never as an alias.
-        "zip" => Op::TryZip.into(),      // the zip FailOp: per-row Sum{Err | Ok} (length agreement)
+        // One name per fallible method — each is its TOTAL per-row `Try*` form (a row that would trip
+        // the kernel's assert lands in Err); `effect::lower_effects` threads the Err lane past the
+        // ops downstream, and `try` marks where the program takes it up as data. The partial kernels
+        // (`Op::Filter`, `Op::Gather`, ..) stay host-only, for a caller holding a bounds proof.
+        "zip" => Op::TryZip.into(),      // per row: inner lengths agree, else Err
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
         // iso-inverses (Zip pairs any two columns; Slices materializes any ranges, incl. Find's),
@@ -103,28 +104,25 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // a verb. (A `try_weave` would only carry an unactionable "inconsistent columns" error.)
         "cap_list" => Op::CapList.into(), // capture: pair a context with every list element
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
-        "branch" => Op::TryBranch(n()? as usize).into(), // the branch FailOp: tag>=n -> Oob (err-mask),
-                                                         // else the demux Sum{X×n}; `branch 2` is the split
-        "filter" => Op::Filter.into(),
+        "branch" => Op::TryBranch(n()? as usize).into(), // the demux; a tag >= n errs its row
+        "filter" => Op::TryFilter.into(), // per row: data/mask lengths agree, else Err
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
-        // point access — `get` (scalar, one index per row) and `gather` (vector, a list of indices) are
-        // the per-row FailOps: an out-of-range index folds into the err-mask. `gather_try` is the DISTINCT
-        // per-element gather (`List<Sum{Oob | Found}>`), reifying each element's miss as DATA rather than a
-        // per-row effect — kept as its own verb. `head` is sugar for `get 0` (see ml.rs): an empty row is
-        // `Oob`, so a total head needs no separate non-emptiness proof.
-        "slices" => Op::Slices.into(),        // the slices FailOp: per-row range-in-bounds check
-        "get" => Op::GetTry.into(),           // the get FailOp: (idx, haystack) -> per-row Found/Oob
-        "gather" => Op::Gather.into(),        // the gather FailOp: per-row all-or-nothing
+        // point access — `get` (scalar, one index per row) and `gather` (vector, a list of indices) err
+        // per ROW; `gather_try` is the DISTINCT per-element gather (`List<Sum{Oob | Found}>`), reifying
+        // each element's miss as data — kept as its own verb. `head` is sugar for `get 0` (see ml.rs).
+        "slices" => Op::TrySlices.into(),     // per row: every range in bounds, else Err
+        "get" => Op::TryGet.into(),           // (idx, haystack) -> the element, or Err out of range
+        "gather" => Op::TryGather.into(),     // per row all-or-nothing over its indices
         "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Oob | Found}>
-        "try" => Op::Try.into(), // handle a fallible stage: reveal its Fail as a pure Sum{T | Unit}
+        "try" => Op::Try.into(), // handle a fallible stage here: its Fail<T> = Sum{T | Unit} is now data to match
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
         "append" => Op::Append.into(), // (List<X>, List<X>) -> List<X>  row-wise concat (the list-monoid ⊕)
         "len" => Op::Len.into(),       // List<X> -> U64  per-row element count, read off the bounds
-        "chunk" => Op::Chunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records (Stride producer)
+        "chunk" => Op::TryChunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records; a row must divide by k
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),

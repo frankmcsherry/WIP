@@ -97,9 +97,6 @@ pub enum Op<L> {
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
                     //        PARTIAL: panics on tag >= n. The clean kernel; surface-usable once a
                     //        range pass proves tags < n (else write TryBranch).
-    TryBranch(usize), // intro: (X, U64-tags) -> Sum{Oob:U64 | X × n}  TOTAL Branch: an out-of-range
-                    // tag lands in lane 0 (Oob) carrying the bad tag; tag t<n lands in lane t+1. The
-                    // FOO_TRY of Branch — usable with no proof (the index/ParseU64 discipline).
     Inject(usize, usize), // intro: X -> Sum{tag: X, ⊥..} — the constant-tag Branch; the other
                     //        lanes are ⊥ (empty, shape uncommitted, pinned later by `join`).
     Unwrap,         // elim:  homogeneous (up to ⊥) Sum -> payload
@@ -134,9 +131,6 @@ pub enum Op<L> {
     Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse; bounds must
                     // agree (asserted). A pure rewrap — no data moves. PARTIAL: panics on differing
                     // bounds; surface-usable once the size pass proves the bounds agree (else TryZip).
-    TryZip,         // (List<X>, List<Y>) -> Sum{Err:(List<X>,List<Y>) | Ok:List<(X,Y)>}  TOTAL Zip,
-                    // per row: a row whose two inner lists have equal length zips into Ok; a mismatched
-                    // row lands in Err carrying its two inner lists. (Pair-only for now; N-ary later.)
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
     Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>  materialize each range —
                     // Flatten's inverse and the range form of Gather.
@@ -155,14 +149,10 @@ pub enum Op<L> {
                     // (the boundary id function — see [`crate::hash`]). TOTAL over any shape.
     Filter,         // (List<X>, List<U64-mask>) -> List<X>  keep mask-nonzero elements in one
                     // pass (the kernel expansion is zip; map(branch); unweave; field — see the law)
-    // point access — fetch a haystack element by index. The atom is the SCALAR `Get` (one O(1)
-    // lookup per row); `Gather` is its vectorization (the index arrives as a list), and `head` is
-    // sugar for `Get 0` (an empty row is `Oob 0`, so a TOTAL head needs no non-emptiness proof).
-    // Each comes in a `_uns` (assert in-bounds, panic) and a `_try` (total, Oob lane) tier; the plain
-    // checked tier (`get`/`gather`, a proven bound) is reserved for later.
-    GetTry,         // (idx:U64, haystack:List<T>) -> Sum{Oob:U64 | Found:T}  TOTAL scalar access: an
-                    // out-of-bounds index lands in Oob carrying the bad index, in-bounds in Found
-                    // (the ParseU64 discipline — failure is a committed lane, never a panic).
+    // point access — fetch a haystack element by index. The atom is the SCALAR get (one O(1)
+    // lookup per row; `TryGet` below is its total form), `Gather` is its vectorization (the index
+    // arrives as a list), and `head` is sugar for `get 0` (an empty row errs, so a TOTAL head needs
+    // no non-emptiness proof).
     Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  the vector form: a list of indices.
                     // The engine primitive surfaced; chains compose in-language —
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
@@ -187,14 +177,34 @@ pub enum Op<L> {
                     // (the uniform inverse of Flatten): a pure re-partition — values don't move, the
                     // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
                     // chunked record stream feeds the stride fast paths. Each row must divide by `k`.
-    Try,            // the TRY marker: identity to the pure engine, but the effect layer reads it as
-                    // "handle here" — it reveals a `Fail` column as a pure `Sum{T | Unit}` to match
-                    // (`eval_try`), the one transition that takes a column from the `Fail` regime to
-                    // `Pure`. Inert (no-op) on an already-pure value.
+
+    // ---- the failure family (see `ops::fail`) — partiality as data: `Fail<T> = Sum{Ok:T | Err:Unit}`.
+    // The `Try*` ops are the TOTAL per-row forms of the partial kernels above (a row that would trip
+    // the kernel's assert lands in Err); `Lift`/`Squash`/`Hoist*` are the plumbing `effect::lower_effects`
+    // inserts so pure programs run on the Ok lane. All ordinary ops: one eval, one judge.
+    TryGet,         // (idx:U64, haystack:List<T>) -> Fail<T>
+    TryGather,      // (idx:List<U64>, haystack:List<T>) -> Fail<List<T>>   per row all-or-nothing
+    TrySlices,      // (List<(lo,hi)>, List<T>) -> Fail<List<List<T>>>      every range in bounds
+    TryFilter,      // (List<X>, List<U64>) -> Fail<List<X>>                data/mask lengths agree
+    TryChunk(usize),// List<X> -> Fail<List<List<X>>>                       row length divides by k
+    TryBranch(usize), // (X, U64-tags) -> Fail<Sum{X × n}>                  tag < n
+    TryZip,         // (List<X>, List<Y>) -> Fail<List<(X,Y)>>              inner lengths agree
+    Lift,           // X -> Fail<X>                                         every row Ok
+    Squash,         // Fail<Fail<T>> -> Fail<T>                             the monad join
+    HoistProd,      // (Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>           errs if ANY field errs
+    HoistList,      // List<Fail<T>> -> Fail<List<T>>                       errs if ANY element errs
+    HoistSum(Vec<usize>), // Sum{.. Fail<A> ..} -> Fail<Sum{.. A ..}>       the listed lanes are Fail
+    Try,            // the TRY marker: identity on values. `is_total` reads it as "handled here" — the
+                    // point past which a fallible column is ordinary data the program matches on.
 }
 
 impl<L: OpLike> Op<L> {
     pub(crate) fn eval(&self, input: Value) -> Value {
+        // the failure family lives in `ops::fail`; everything else is below.
+        let input = match super::fail::eval(self, input) {
+            Ok(out) => return out,
+            Err(input) => input,
+        };
         match self {
             Op::Lit(v) => fill(v, input.len()),
 
@@ -228,58 +238,6 @@ impl<L: OpLike> Op<L> {
                     inner.push(v);
                 }
                 Value::List(bounds.expect("Zip: empty product"), Box::new(Value::Prod(inner)))
-            }
-
-            // total Zip (pair): each SEQ row whose two inner lists have equal length zips into the Ok
-            // lane (a List<(X,Y)>); a length-mismatched row goes to Err carrying its two inner lists.
-            // Failure is per-row and a committed lane — never the whole-column panic Zip would raise.
-            Op::TryZip => {
-                let (lx, ly) = input.into_pair("TryZip");
-                let (bx, vx) = lx.into_list("TryZip lhs");
-                let (by, vy) = ly.into_list("TryZip rhs");
-                assert_eq!(bx.len(), by.len(), "TryZip: row count"); // outer agreement (scope length)
-                let mut tags = Vec::with_capacity(bx.len());
-                let (mut ok_outer, mut ok_x, mut ok_y) = (Vec::new(), Vec::new(), Vec::new());
-                let (mut ex_outer, mut ex_idx) = (Vec::new(), Vec::new());
-                let (mut ey_outer, mut ey_idx) = (Vec::new(), Vec::new());
-                let (mut sx, mut sy) = (0, 0);
-                let (mut oka, mut exa, mut eya) = (0, 0, 0);
-                for r in 0..bx.len() {
-                    let (ex, ey) = (bx.end(r), by.end(r));
-                    let (lenx, leny) = (ex - sx, ey - sy);
-                    if lenx == leny {
-                        tags.push(1); // Ok
-                        for k in 0..lenx {
-                            ok_x.push(sx + k);
-                            ok_y.push(sy + k);
-                        }
-                        oka += lenx;
-                        ok_outer.push(oka);
-                    } else {
-                        tags.push(0); // Err
-                        for k in 0..lenx {
-                            ex_idx.push(sx + k);
-                        }
-                        for k in 0..leny {
-                            ey_idx.push(sy + k);
-                        }
-                        exa += lenx;
-                        ex_outer.push(exa);
-                        eya += leny;
-                        ey_outer.push(eya);
-                    }
-                    sx = ex;
-                    sy = ey;
-                }
-                let ok = Value::List(
-                    ok_outer.into(),
-                    Box::new(Value::Prod(vec![gather(&vx, &ok_x), gather(&vy, &ok_y)])),
-                );
-                let err = Value::Prod(vec![
-                    Value::List(ex_outer.into(), Box::new(gather(&vx, &ex_idx))),
-                    Value::List(ey_outer.into(), Box::new(gather(&vy, &ey_idx))),
-                ]);
-                Value::sum(tags, vec![err, ok]) // lane 0 = Err, lane 1 = Ok
             }
 
             // destructure a sum column: the tag list plus each lane re-sliced per outer row. A
@@ -451,30 +409,6 @@ impl<L: OpLike> Op<L> {
                 Value::sum(tags.iter().map(|&t| t as usize).collect(), variants)
             }
 
-            // total Branch: tag t<n routes to lane t+1 (payload), tag>=n to lane 0 (Oob, carrying the
-            // bad tag). No panic — out-of-range is a committed lane, exactly like Index's Oob.
-            Op::TryBranch(n) => {
-                let (data, tags_v) = input.into_pair("TryBranch");
-                let tags = tags_v.into_u64("TryBranch tags");
-                assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
-                let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n + 1];
-                let mut oob = Vec::new();
-                let mut lanes = Vec::with_capacity(tags.len());
-                for (i, &t) in tags.iter().enumerate() {
-                    if (t as usize) < *n {
-                        lanes.push(t as usize + 1); // payload lanes are 1..=n
-                        groups[t as usize + 1].push(i);
-                    } else {
-                        lanes.push(0); // the Oob lane
-                        groups[0].push(i);
-                        oob.push(t);
-                    }
-                }
-                let mut variants = vec![Value::u64(oob)]; // lane 0 = the out-of-range tags
-                variants.extend(groups[1..].iter().map(|idx| gather(&data, idx)));
-                Value::sum(lanes, variants)
-            }
-
             Op::Unwrap => {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
@@ -640,32 +574,6 @@ impl<L: OpLike> Op<L> {
                 Value::List(lb, Box::new(inner))
             }
 
-            // total scalar access: each index either names its row's element (Found) or is out of
-            // bounds (Oob, carrying the bad index). The empty-row case is just Oob 0 — which is why
-            // `head = GetTry 0` is total with no non-emptiness proof. Output is a bare Sum column.
-            Op::GetTry => {
-                let (idx, haystack) = input.into_pair("GetTry");
-                let idxs = idx.into_u64("GetTry index");
-                let (hb, hvals) = haystack.into_list("GetTry haystack");
-                assert_eq!(idxs.len(), hb.len(), "GetTry: index/haystack row count");
-                let mut tags = Vec::with_capacity(idxs.len());
-                let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
-                let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
-                let mut hs = 0;
-                for (r, he) in hb.ends().enumerate() {
-                    let x = idxs[r];
-                    if (x as usize) < he - hs {
-                        tags.push(1);
-                        abs.push(hs + x as usize);
-                    } else {
-                        tags.push(0);
-                        oob.push(x);
-                    }
-                    hs = he;
-                }
-                Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)])
-            }
-
             // vector point gather: each row-relative index becomes the haystack element it names.
             // Output bounds are the index list's bounds (the indices decide the cardinality).
             Op::Gather => {
@@ -772,8 +680,12 @@ impl<L: OpLike> Op<L> {
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
             Op::Unit => Value::Unit(input.len()),
 
-            // TRY is identity to the pure engine; the effect layer (`eval_try`) gives it its meaning.
+            // TRY is the identity on values; `effect::is_total` reads it as the handling point.
             Op::Try => input,
+
+            // the failure family was dispatched to `ops::fail::eval` above.
+            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_)
+            | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::eval handles the failure family"),
 
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the
             // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
@@ -796,6 +708,9 @@ impl<L: OpLike> Op<L> {
     /// so adding an op means one rule here and one in `eval`. `Input`/`Tuple` are
     /// handled by `graph::shape_of`, the analogue of `eval_graph`.
     pub(crate) fn judge(&self, input: &Shape) -> Result<Shape, String> {
+        if let Some(judged) = super::fail::judge(self, input) {
+            return judged;
+        }
         use Shape::*;
         let err = |what: &str| Err(format!("{what}, got {input}"));
         Ok(match self {
@@ -848,18 +763,6 @@ impl<L: OpLike> Op<L> {
                     List(Box::new(Prod(inners)))
                 }
                 _ => return err("Zip expects a nonempty product of lists"),
-            },
-
-            // total Zip (pair): Sum{ Err: (List<X>, List<Y>) | Ok: List<(X,Y)> }.
-            Op::TryZip => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (List(x), List(y)) => Sum(vec![
-                        Some(Prod(vec![List(x.clone()), List(y.clone())])),
-                        Some(List(Box::new(Prod(vec![(**x).clone(), (**y).clone()])))),
-                    ]),
-                    _ => return err("TryZip expects (List<X>, List<Y>)"),
-                },
-                _ => return err("TryZip expects a pair of lists"),
             },
 
             // every lane must be committed: a ⊥ lane would need a standalone List<⊥>, and ⊥ lives
@@ -935,20 +838,6 @@ impl<L: OpLike> Op<L> {
                 _ => return err("Branch expects (X, U64-tags)"),
             },
 
-            // total Branch: an extra leading Oob:U64 lane, then the n payload lanes (n+1 total, so the
-            // u8 tag bound is n+1).
-            Op::TryBranch(n) => match input {
-                Prod(ts) if ts.len() == 2 && ts[1] == Prim(64) => {
-                    if *n + 1 > 256 {
-                        return err(&format!("TryBranch: arity {n}+1 exceeds the u8 tag width"));
-                    }
-                    let mut lanes = vec![Some(Prim(64))];
-                    lanes.extend(std::iter::repeat_n(Some(ts[0].clone()), *n));
-                    Sum(lanes)
-                }
-                _ => return err("TryBranch expects (X, U64-tags)"),
-            },
-
             // only the widths the `prim!` macro generates exist; any other would judge fine and
             // panic at eval — the typer owns the rejection.
             Op::Cast(bits) => match input {
@@ -976,16 +865,6 @@ impl<L: OpLike> Op<L> {
                     _ => return err("Slices expects (List<(U64,U64)>, List<T>)"),
                 },
                 _ => return err("Slices expects a pair"),
-            },
-
-            // scalar access: (U64, List<T>) -> T — the index is a leaf column, the list stratum drops.
-            // total scalar access: (U64, List<T>) -> Sum{Oob: U64 | Found: T} — Oob carries the index.
-            Op::GetTry => match input {
-                Prod(ts) if ts.len() == 2 => match (&ts[0], &ts[1]) {
-                    (Prim(64), List(t)) => Sum(vec![Some(Prim(64)), Some((**t).clone())]),
-                    _ => return err("GetTry expects (U64, List<T>)"),
-                },
-                _ => return err("GetTry expects a pair"),
             },
 
             Op::Gather => match input {
@@ -1024,7 +903,11 @@ impl<L: OpLike> Op<L> {
 
             Op::Unit => Unit, // any shape -> Unit
 
-            Op::Try => input.clone(), // pure-level identity (the effect layer reshapes Fail -> Sum)
+            Op::Try => input.clone(), // identity: a marker for `is_total`, not a value change
+
+            // the failure family was dispatched to `ops::fail::judge` above.
+            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_)
+            | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::judge handles the failure family"),
 
             // (U64 mask, T, T) -> T. The two branches join (a ⊥ lane adopts its sibling, as in Unwrap);
             // eval never reads a branch the mask doesn't select, so the join is total.

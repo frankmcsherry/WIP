@@ -3,8 +3,8 @@
 //! `Field` of a `Tuple`).
 
 use corgi::{
-    cancel_isos, cse, dce, eval_try, fuse_maps, optimize, parse_ml, peephole, show, Builder,
-    EffectValues, Graph, NumOp, Op, Program, Value,
+    cancel_isos, cse, dce, fuse_maps, optimize, parse_ml, peephole, show, Builder, Graph, NumOp, Op,
+    Program, Value,
 };
 
 fn u64(xs: &[u64]) -> Value {
@@ -14,10 +14,7 @@ fn u64(xs: &[u64]) -> Value {
 fn eval_str(g: &Graph<NumOp>, arg: &Value) -> String {
     let p = Program::from_graph(g.clone());
     p.check();
-    match p.run_effect(arg.clone()) {
-        EffectValues::Pure(v) => show(&v),
-        EffectValues::Fail(fv) => show(&eval_try(fv)),
-    }
+    show(&p.run_partial(arg.clone()))
 }
 
 fn sample() -> Value {

@@ -4,6 +4,6 @@
 # `get 0`, so an empty list is Oob 0 and needs no separate non-emptiness proof. Here the haystack
 # is [0..n): index n-1 hits (Found n-1), index n is one past the end (Oob n).
 # n = 5
-# = Sum tags=[1] [⊥, ()x1]
+# = Sum tags=[1] [([], []), ()x1]
 let hay = input iota in
 ((input sub 1, hay) get, (input, hay) get)

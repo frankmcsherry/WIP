@@ -21,8 +21,11 @@ src/
                check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
-               the unoptimized graph (like `check_total`, a caller opts in); tested for semantic
-               preservation on every corpus program, so the passes are latent, not dead.
+               the unoptimized graph; tested for semantic preservation on every corpus program, so the
+               passes are latent, not dead.
+  effect.rs    the effect layer as a REWRITE: `lower_effects` threads `Fail<T>` columns past the ops
+               downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`; `is_total`
+               is the syntactic query. No second evaluator: the lowered graph is pure vocabulary.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture
@@ -45,6 +48,10 @@ src/
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+    fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
+               per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
+               three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
+               functor). Evals + judges live here; `Op::eval`/`judge` dispatch to them first.
     text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
                total — ParseU64 returns Sum{Err: bytes | Ok: U64}, no data-dependent panic.
   frontend/
@@ -157,30 +164,30 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
   identity acc-gather + scatter) for the uniform-length regime where every row is active every round.
 
-## Totality — the claim, scoped, and the assert→gate cover map
+## Totality — partiality as data, threaded by a rewrite
 
-The guarantee is precise: **every program in the GATED SUBSET runs to a value — no panic — for every
-input.** "Gated subset" = passes the typer + the length gate + the range gate, and `check_total` = Ok
-(no `_uns` op). Not "no panics, ever": a `_uns` op or a checker-bypassing hand-built `Graph` can still
-abort. The claim is witnessed, not asserted — every reachable `assert!`/`panic!` in `eval` is covered
-by exactly one of:
+The surface's fallible verbs (`get`/`head`, `gather`, `branch`, `zip`, `slices`, `filter`, `chunk`)
+are TOTAL per-row producers: a row that would trip the partial kernel's assert lands in the Err lane
+of `Fail<T> = Sum{ Ok: T | Err: Unit }` (`ops/fail.rs`). Everything downstream is written against `T`;
+`effect::lower_effects` makes that well-typed by inserting ordinary ops — a pure op fed a `Fail<T>`
+becomes `MapSum([(0, op)])` on the packed Ok lane, a second fallible op adds a `Squash`, a `Tuple`
+with a fallible field `Lift`s the pure ones and `HoistProd`s, and a body-bearing op whose body fails
+`HoistList`s / `HoistSum`s the per-element errors out to the row (all-or-nothing). `try` is the
+identity on values: it marks where the program takes the `Sum{T | Unit}` up as data to `match` on.
 
-- **a gate** — `Zip`/`Filter` bounds by `lengths`; `Branch` tag-in-range by `ranges`.
-- **a tier `check_total` reports** — `get`/`gather`/`slices` (`_uns`): the located opt-out (`head_uns`
-  lowers to `get_uns 0`, so it surfaces as `get_uns`).
-- **a defensive check of the 1:1 SEQ invariant the typer already enforces** — the "body changed the
-  row count" asserts in `Fold`/`FoldScan` (unreachable given the typer).
-- **made total instead** — integer arith is `wrapping_*`; float `div` yields inf/NaN; integer `div`
-  is judge-rejected; `get_try`/`gather_try`/`try_*`/`ParseU64` carry failure in an `Oob`/`Err` lane.
+So there is ONE evaluator and ONE typer. `Program::run_partial` = `eval_graph(lower_effects(g))`; the
+corpus test types every lowered program with `shape_of`, which is what proves the discipline: an op
+applied to a fallible column where lowering forgot to lift would be a shape error. `is_total` is the
+separate syntactic query — total iff every fallible column meets a `try` before the output; `run`
+refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
 
-**Audit rule for the gates (learned the hard way):** any analysis threaded through a *fixpoint*
-operator (`Fold`/`FoldScan`'s accumulator back-edge) must treat the fed-back value as unknown — ⊤ for
-a concrete lattice (`ranges`' intervals), fresh tokens for a unification lattice (`lengths`). The seed
-describes only round 0; the accumulator at round *t* is the body's prior output. Both gates now ⊤ the
-accumulator slot (the element keeps its annotation). A `branch` on a fold accumulator therefore needs
-`try_branch` (or a fixpoint proof), not a range proof — which is correct. The missing test class that
-let this slip: "gate-passing-but-faulting," run adversarially over fold/scan *body* contexts (a green
-corpus only certifies programs someone wrote, not the reachable space).
+The partial kernels (`Op::Gather`, `Filter`, `Slices`, `Chunk`, `Zip`, `Branch`) stay in the enum for
+a host holding a bounds proof (DDIR); they are not on the surface. `gather_try` is distinct: the
+per-ELEMENT `List<Sum{Oob | Found}>`, a value the program handles itself, not a per-row effect.
+
+**Audit rule, kept from the old gates:** an analysis threaded through a fixpoint (`Fold`/`FoldScan`'s
+accumulator back-edge) must treat the fed-back value as unknown; the lowering does this by making the
+accumulator itself a `Fail<B>`, so a row that errs on any round stays Err.
 
 ## Done (foundations in place)
 
@@ -291,5 +298,5 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 ## Conventions
 
 Run after any `src/` change: `cargo test && cargo clippy --all-targets`. Dependency-free and tight.
-Adding an op: one arm in `eval`, one in `judge` (exhaustiveness keeps them in sync). Adding a layer:
+Adding an op: one arm in `eval`, one in `judge` (exhaustiveness keeps them in sync); a failure-family op gets its two arms in `ops/fail.rs` instead. Adding a layer:
 an enum + `OpLike` + `From` impls; touch nothing below.

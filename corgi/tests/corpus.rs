@@ -1,11 +1,11 @@
 //! The example corpus: `programs/*.col` files, each a self-contained `ml` program that GENERATES
 //! its own data with `iota` (seeded only by a size). A `# n = …` header gives the seed and `# =`
-//! the expected `show` output; everything else is the program. This test runs each through the EFFECT
-//! layer (`run_effect`) and golden-checks it: a total program shows its pure value; a partial program
-//! (an un-`TRY`'d `FailOp`) shows its result TRY'd to a `Sum{T | Unit}` — the honest effect output.
+//! the expected `show` output; everything else is the program. This test runs each (`run_partial`) and
+//! golden-checks it: a total program shows its pure value; a partial program (an un-`try`'d fallible
+//! stage) shows its output as the `Sum{T | Unit}` a trailing `try` would reveal.
 //! Re-bless the goldens after an intended change with `CORGI_BLESS=1 cargo test --test corpus`.
 
-use corgi::{eval_try, show, EffectValues, Program, Value};
+use corgi::{show, Program, Shape, Value};
 use std::path::{Path, PathBuf};
 
 /// the `.col` files under `programs/`, sorted by name.
@@ -39,17 +39,7 @@ pub fn parse_col(text: &str) -> (u64, String, String) {
     (n, expected, prog.trim().to_string())
 }
 
-/// render a `run_effect` result for the golden: a pure value as-is, a `Fail` materialized by the
-/// top-level `TRY` reveal (`Sum{T | Unit}`).
-fn render(ev: EffectValues) -> String {
-    match ev {
-        EffectValues::Pure(v) => show(&v),
-        EffectValues::Fail(fv) => show(&eval_try(fv)),
-    }
-}
-
-/// Programs the effect layer can't run correctly (empty — `28-cse-round`'s fallible-`MapSum`-arm case
-/// is now handled by `eval_mapsum`, the Sum sibling of `Traverse`).
+/// Programs skipped for a known reason (none).
 const PENDING: &[&str] = &[];
 
 #[test]
@@ -66,14 +56,9 @@ fn corpus_matches_goldens() {
         let (n, expected, prog) = parse_col(&text);
         let p = Program::compile_ml(&prog).unwrap_or_else(|e| panic!("{who}: parse: {e}"));
         p.check();
-        let ev = p.run_effect(Value::u64(vec![n]));
-        // the effect-typer agrees with the evaluator on the regime: total iff the output is pure.
-        assert_eq!(
-            p.is_total(),
-            matches!(ev, EffectValues::Pure(_)),
-            "{who}: is_total disagrees with run_effect"
-        );
-        let got = render(ev);
+        // the lowered program is well-typed in the pure vocabulary — the typer covers effects.
+        p.shape(&Shape::Prim(64)).unwrap_or_else(|e| panic!("{who}: shape: {e}"));
+        let got = show(&p.run_partial(Value::u64(vec![n])));
         if bless {
             let blessed: Vec<String> = text
                 .lines()
