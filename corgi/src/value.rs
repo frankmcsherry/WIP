@@ -427,6 +427,34 @@ macro_rules! prim {
                 }
             }
 
+            /// lane-wise blend of two same-width columns by a 0/1 selector: `out[i]` is `self[i]`
+            /// where `pick[i]` is nonzero, else `other[i]`. KIND-BLIND — it moves stored bytes and
+            /// never interprets them — and BRANCHLESS: the lane body is an unconditional select, so
+            /// it vectorizes, where reading the chosen side through an index would not. The leaf of
+            /// [`crate::engine::blend`]. CONSUMES both and writes into whichever is uniquely owned
+            /// (the `lane_pick` reuse policy: same width, elementwise, so the shape allows it).
+            pub(crate) fn blend(self, other: Prim, pick: &[u64]) -> Prim {
+                match (self, other) {
+                    $( (Prim::$V(mut a), Prim::$V(mut b)) => {
+                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
+                            for (x, (&y, &m)) in dst.iter_mut().zip(b.iter().zip(pick)) {
+                                *x = if m != 0 { *x } else { y };
+                            }
+                            a
+                        } else if let Some(dst) = Arc::get_mut(&mut b) {
+                            for (y, (&x, &m)) in dst.iter_mut().zip(a.iter().zip(pick)) {
+                                *y = if m != 0 { x } else { *y };
+                            }
+                            b
+                        } else {
+                            Arc::new(a.iter().zip(b.iter()).zip(pick)
+                                .map(|((&x, &y), &m)| if m != 0 { x } else { y }).collect())
+                        })
+                    } )+
+                    _ => panic!("select: prim width mismatch"),
+                }
+            }
+
             /// XOR the top (sign) bit of every element, at this width — the order-preserving signed
             /// swizzle (`enc_i64` generalized), an involution. Converts an unsigned column to the
             /// signed encoding of the same non-negative values and back; the numeric layer's `signed`.

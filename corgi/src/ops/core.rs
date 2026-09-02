@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
+    blend, expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
@@ -825,9 +825,7 @@ impl<L: OpLike> Op<L> {
                 let then = cols.pop().unwrap();
                 let mask = cols.pop().unwrap().into_u64("Select mask")?;
                 same(&shape_of_value(&then), &shape_of_value(&els)).map_err(|e| format!("Select: {e}"))?;
-                let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
-                let off: Vec<usize> = (0..tags.len()).collect();
-                gather_lanes(&[Some(&els), Some(&then)], &tags, &off)
+                blend(&mask, then, els)
             }
         })
     }

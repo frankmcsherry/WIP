@@ -252,6 +252,30 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
     }
 }
 
+/// per-row blend: row `i` of the result is row `i` of `then` where `mask[i]` is nonzero, else row
+/// `i` of `els` (both same-shape columns at the mask's stratum) — what [`crate::ops::Op::Select`] is.
+///
+/// A FIXED-WIDTH level blends LANE-WISE: one pass reading both sides at the same position, which is
+/// a select instruction. A VARIABLE-WIDTH level (a `List` row is a span, a `Sum` row is a lane
+/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`]
+/// — the same split `scatter` makes, and for the same reason. The split is per LEVEL, not per value:
+/// a product blends each leaf field directly and only gathers the fields that need it.
+pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
+    match (then, els) {
+        (Value::Prim(t), Value::Prim(e)) => Value::Prim(t.blend(e, mask)),
+        (Value::Prod(ts), Value::Prod(es)) => {
+            Value::Prod(ts.into_iter().zip(es).map(|(t, e)| blend(mask, t, e)).collect())
+        }
+        (Value::Unit(_), Value::Unit(_)) => Value::Unit(mask.len()),
+        // row `i` from lane `mask[i] != 0`, at its own position — the offsets are the identity.
+        (t, e) => {
+            let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
+            let off: Vec<usize> = (0..tags.len()).collect();
+            gather_lanes(&[Some(&e), Some(&t)], &tags, &off)
+        }
+    }
+}
+
 /// concatenate same-shape columns end to end, re-basing witnesses. The pre-`gather_lanes` realization,
 /// kept as the reference the `gather_lanes` test validates against — no production op reduces to it.
 #[cfg(test)]
@@ -347,6 +371,41 @@ mod tests {
         let off: Vec<usize> = tags.iter().map(|&t| { let p = cur[t]; cur[t] += 1; p }).collect();
         let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
         assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
+    }
+
+    /// `blend` takes a lane-wise path at fixed-width levels and the `gather_lanes` path elsewhere.
+    /// The two must agree exactly, including inside a MIXED product where one field takes each.
+    #[test]
+    fn blend_matches_the_gather_lanes_path() {
+        // the general path, written out: row i from lane `mask[i] != 0`, at its own position.
+        fn oracle(mask: &[u64], then: &Value, els: &Value) -> Value {
+            let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
+            let off: Vec<usize> = (0..tags.len()).collect();
+            gather_lanes(&[Some(els), Some(then)], &tags, &off)
+        }
+        let mask = [1u64, 0, 0, 1];
+        let list = |ends: Vec<usize>, xs: &[u64]| Value::List(ends.into(), Box::new(u(xs)));
+
+        // leaf, product of leaves, unit — the lane-wise path.
+        for (t, e) in [
+            (u(&[1, 2, 3, 4]), u(&[10, 20, 30, 40])),
+            (
+                Value::Prod(vec![u(&[1, 2, 3, 4]), Value::u8(vec![5, 6, 7, 8])]),
+                Value::Prod(vec![u(&[9, 8, 7, 6]), Value::u8(vec![1, 2, 3, 4])]),
+            ),
+            (Value::Unit(4), Value::Unit(4)),
+        ] {
+            assert_eq!(blend(&mask, t.clone(), e.clone()), oracle(&mask, &t, &e));
+        }
+
+        // a list (ragged rows: no constant slot) — the fallback path.
+        let (t, e) = (list(vec![1, 3, 3, 6], &[1, 2, 3, 4, 5, 6]), list(vec![2, 2, 5, 5], &[7, 8, 9, 1, 2]));
+        assert_eq!(blend(&mask, t.clone(), e.clone()), oracle(&mask, &t, &e));
+
+        // a MIXED product: field 0 blends lane-wise, field 1 falls back, and the result is the same.
+        let t = Value::Prod(vec![u(&[1, 2, 3, 4]), list(vec![1, 3, 3, 6], &[1, 2, 3, 4, 5, 6])]);
+        let e = Value::Prod(vec![u(&[9, 8, 7, 6]), list(vec![2, 2, 5, 5], &[7, 8, 9, 1, 2])]);
+        assert_eq!(blend(&mask, t.clone(), e.clone()), oracle(&mask, &t, &e));
     }
 
     /// Two sources of one sum shape, each using only one of its lanes (the other is an empty
