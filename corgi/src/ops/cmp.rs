@@ -80,7 +80,7 @@ impl CmpOp {
             }
 
             CmpOp::Gt(c) => {
-                let xs = input.into_u64("Gt")?;
+                let xs = input.as_u64("Gt")?;
                 Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
             }
 

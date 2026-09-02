@@ -290,7 +290,7 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
                 }
                 let (tb, tv) = cols.pop().ok_or("Weave expects (List<U64> tags, List<A>, ..)")?.into_list("Weave tags")?;
-                let tags = tv.into_u64("Weave tags")?;
+                let tags = tv.as_u64("Weave tags")?;
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
@@ -364,8 +364,8 @@ impl<L: OpLike> Op<L> {
                 let (bounds, vals) = data.into_list("Filter data")?;
                 let (mb, mv) = mask.into_list("Filter mask")?;
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
-                let m = mv.into_u64("Filter mask")?;
-                let (idx, nb) = filter_mask(&bounds, &m);
+                let m = mv.as_u64("Filter mask")?;
+                let (idx, nb) = filter_mask(&bounds, m);
                 Value::List(nb.into(), Box::new(gather(&vals, &idx)))
             }
 
@@ -427,7 +427,7 @@ impl<L: OpLike> Op<L> {
             // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch")?;
-                let tags = tags_v.into_u64("Branch tags")?;
+                let tags = tags_v.as_u64("Branch tags")?;
                 assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
                 if *n > 256 {
                     return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
@@ -672,9 +672,9 @@ impl<L: OpLike> Op<L> {
                 let (lb, lvals) = lohi.into_list("Slices ranges")?;
                 let (hb, hvals) = haystack.into_list("Slices haystack")?;
                 let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
-                let (lo_c, hi_c) = (lo.into_u64("Slices lo")?, hi.into_u64("Slices hi")?);
+                let (lo_c, hi_c) = (lo.as_u64("Slices lo")?, hi.as_u64("Slices hi")?);
                 assert_eq!(lb.len(), hb.len(), "Slices: row count");
-                let (idx, inner_bounds) = expand_ranges(&lb, &lo_c, &hi_c, &hb);
+                let (idx, inner_bounds) = expand_ranges(&lb, lo_c, hi_c, &hb);
                 let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
                 Value::List(lb, Box::new(inner))
             }
@@ -683,7 +683,7 @@ impl<L: OpLike> Op<L> {
             // Output bounds are the index list's bounds (the indices decide the cardinality).
             Op::Get => {
                 let (idx, haystack) = input.into_pair("Get")?;
-                let idxs = idx.into_u64("Get index")?;
+                let idxs = idx.as_u64("Get index")?;
                 let (hb, hvals) = haystack.into_list("Get haystack")?;
                 assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
                 let mut abs = Vec::with_capacity(idxs.len());
@@ -702,15 +702,18 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("Gather indices")?;
                 let (hb, hvals) = haystack.into_list("Gather haystack")?;
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
-                let idxs = ivals.into_u64("Gather indices")?;
                 if ib.len() == 1 && hb.len() == 1 {
                     if let Value::Prim(p) = &hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
-                        // indexing in the gather supplies that check without a separate scan.
+                        // indexing in the gather supplies that check without a separate scan. This
+                        // is the one path that CONSUMES the indices — it rewrites that buffer into
+                        // the result — so it is also the only one that takes ownership.
+                        let idxs = ivals.into_u64("Gather indices")?;
                         return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs)))));
                     }
                 }
-                let abs = resolve_indices(&ib, &idxs, &hb);
+                let idxs = ivals.as_u64("Gather indices")?;
+                let abs = resolve_indices(&ib, idxs, &hb);
                 Value::List(ib, Box::new(gather(&hvals, &abs)))
             }
 
@@ -723,7 +726,7 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
                 let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
-                let idxs = ivals.into_u64("GatherTry indices")?;
+                let idxs = ivals.as_u64("GatherTry indices")?;
                 // one pass routes each index AND records its within-lane offset — the size its
                 // lane had when it arrived — so the assignment needs no second pass to derive.
                 let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
@@ -791,11 +794,11 @@ impl<L: OpLike> Op<L> {
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
             Op::Iota => {
-                let ns = input.into_u64("Iota")?;
+                let ns = input.as_u64("Iota")?;
                 let mut bounds = Vec::with_capacity(ns.len());
                 let mut vals = Vec::new();
                 let mut end = 0usize;
-                for &n in &ns {
+                for &n in ns {
                     vals.extend(0..n);
                     end += n as usize;
                     bounds.push(end);
@@ -823,9 +826,10 @@ impl<L: OpLike> Op<L> {
                 }
                 let els = cols.pop().unwrap();
                 let then = cols.pop().unwrap();
-                let mask = cols.pop().unwrap().into_u64("Select mask")?;
+                let mask_col = cols.pop().unwrap();
+                let mask = mask_col.as_u64("Select mask")?;
                 same(&shape_of_value(&then), &shape_of_value(&els)).map_err(|e| format!("Select: {e}"))?;
-                blend(&mask, then, els)
+                blend(mask, then, els)
             }
         })
     }

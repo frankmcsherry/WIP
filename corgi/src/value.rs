@@ -749,6 +749,31 @@ impl Value {
         }
     }
 
+    /// borrow the leaf as a `u64` slice — for an op that only READS its operand.
+    ///
+    /// `into_u64` forces ownership, and ownership is a full column COPY whenever anyone else still
+    /// holds the buffer: a graph node with fan-out 2, or a caller that keeps its input. Measured on
+    /// a one-pass `fold_add` at 1M rows, that copy was 7.9x the whole operation. Reading needs none
+    /// of it; only an op that rewrites its operand in place (`AddU64`, `Shr`, `And`, `Scan`) has to
+    /// consume it.
+    pub fn as_u64(&self, who: &str) -> Result<&[u64], String> {
+        match self {
+            Value::Prim(Prim::U64(xs)) => Ok(&xs[..]),
+            other => Err(format!("{who}: expected U64, got {}", shape_of_value(other))),
+        }
+    }
+
+    /// borrow the leaf as a `u8` slice — the byte-column sibling of [`Value::as_u64`].
+    pub fn as_u8(&self, who: &str) -> Result<&[u8], String> {
+        match self {
+            Value::Prim(Prim::U8(xs)) => Ok(&xs[..]),
+            other => Err(format!("{who}: expected U8, got {}", shape_of_value(other))),
+        }
+    }
+
+    /// take the leaf's `u64` buffer — for an op that REWRITES its operand in place. Moves the
+    /// buffer out at refcount 1, and copies it when shared; see [`Value::as_u64`], which most
+    /// callers want instead.
     pub fn into_u64(self, who: &str) -> Result<Vec<u64>, String> {
         match self {
             // move the buffer out if this is the last holder, else clone (shared leaf).

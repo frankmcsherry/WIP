@@ -38,7 +38,7 @@ impl TextOp {
         Ok(match self {
             TextOp::Split(d) => {
                 let (ends, vals) = input.into_list("Split")?;
-                let bytes = vals.into_u8("Split bytes")?;
+                let bytes = vals.as_u8("Split bytes")?;
                 // one pass over the flat buffer: non-delimiter bytes copy through, each delimiter
                 // (and each row end) closes a piece, each row end closes the outer row.
                 let mut out = Vec::with_capacity(bytes.len());
@@ -61,7 +61,7 @@ impl TextOp {
             }
             TextOp::ParseU64 => {
                 let (ends, vals) = input.into_list("ParseU64")?;
-                let bytes = vals.into_u8("ParseU64 bytes")?;
+                let bytes = vals.as_u8("ParseU64 bytes")?;
                 let mut tags = Vec::with_capacity(ends.len());
                 let mut oks = Vec::new();
                 let (mut err_ends, mut err_bytes) = (Vec::new(), Vec::new());

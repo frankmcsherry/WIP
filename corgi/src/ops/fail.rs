@@ -217,7 +217,7 @@ pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Result<Value, Strin
 /// `(idx:U64, haystack:List<T>) -> Fail<T>`: row r's element `idx[r]`, Err if out of that row's range.
 pub(crate) fn try_get(input: Value) -> Result<Value, String> {
     let (idx, haystack) = input.into_pair("TryGet")?;
-    let idxs = idx.into_u64("TryGet index")?;
+    let idxs = idx.as_u64("TryGet index")?;
     let (hb, hvals) = haystack.into_list("TryGet haystack")?;
     assert_eq!(idxs.len(), hb.len(), "TryGet: index/haystack row count");
     let mut err = Vec::with_capacity(idxs.len());
@@ -242,9 +242,10 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
     let (ib, ivals) = idx.into_list("TryGather indices")?;
     let (hb, hvals) = haystack.into_list("TryGather haystack")?;
     assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
-    let idxs = ivals.into_u64("TryGather indices")?;
     if ib.len() == 1 && hb.len() == 1 {
         if let Value::Prim(p) = &hvals {
+            // the one path that CONSUMES the indices: it validates and gathers in that buffer.
+            let idxs = ivals.into_u64("TryGather indices")?;
             // One row over a leaf: validate and gather in the index buffer itself (an identity
             // gather reuses the haystack leaf), and recover the uniform `Stride` form of the bounds
             // without another allocation. The one-row primitive gather is the pointer-chase kernel.
@@ -255,6 +256,7 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
             });
         }
     }
+    let idxs = ivals.as_u64("TryGather indices")?;
     let mut err = Vec::with_capacity(ib.len());
     let mut abs = Vec::new();
     let mut bounds = Vec::new();
@@ -283,7 +285,7 @@ pub(crate) fn try_slices(input: Value) -> Result<Value, String> {
     let (hb, hvals) = haystack.into_list("TrySlices haystack")?;
     assert_eq!(lb.len(), hb.len(), "TrySlices: row count");
     let (lo, hi) = lvals.into_pair("TrySlices lo_hi")?;
-    let (lo_c, hi_c) = (lo.into_u64("TrySlices lo")?, hi.into_u64("TrySlices hi")?);
+    let (lo_c, hi_c) = (lo.as_u64("TrySlices lo")?, hi.as_u64("TrySlices hi")?);
     let mut err = Vec::with_capacity(lb.len());
     let mut abs = Vec::new();
     let mut inner = Vec::new();
@@ -319,7 +321,7 @@ pub(crate) fn try_filter(input: Value) -> Result<Value, String> {
     let (db, dvals) = data.into_list("TryFilter data")?;
     let (mb, mvals) = mask.into_list("TryFilter mask")?;
     assert_eq!(db.len(), mb.len(), "TryFilter: row count");
-    let m = mvals.into_u64("TryFilter mask")?;
+    let m = mvals.as_u64("TryFilter mask")?;
     let mut err = Vec::with_capacity(db.len());
     let mut idx = Vec::new();
     let mut bounds = Vec::new();
@@ -369,7 +371,7 @@ pub(crate) fn try_chunk(k: usize, input: Value) -> Result<Value, String> {
 /// `(X, tags:U64) -> Fail<Sum{X × n}>`: the demux; a tag `>= n` errs its row.
 pub(crate) fn try_branch(n: usize, input: Value) -> Result<Value, String> {
     let (data, tags_v) = input.into_pair("TryBranch")?;
-    let tags = tags_v.into_u64("TryBranch tags")?;
+    let tags = tags_v.as_u64("TryBranch tags")?;
     assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
     if n > 256 {
         return Err(format!("TryBranch: arity {n} exceeds the u8 tag width"));
