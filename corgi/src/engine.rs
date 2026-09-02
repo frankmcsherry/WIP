@@ -120,11 +120,11 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
         Value::Sum(tags, within, variants) => {
             // `within` is the carried within-variant offset — read, not recomputed. Each selected row
             // lands in its variant's lane at that offset; `sum_from_prim` rebuilds the result's offset.
-            let tag_vec = tags.usize_vec();
+            let Prim::U8(tag_vec) = tags else { unreachable!("gather: sum discriminants are u8 columns") };
             let new_tags = tags.gather(idx); // the discriminant moves like any leaf column
             let mut per = vec![Vec::new(); variants.len()];
             for &i in idx {
-                per[tag_vec[i]].push(within[i]);
+                per[tag_vec[i] as usize].push(within[i]); // read in place: a gather of k rows is O(k)
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
             Value::sum_from_prim(new_tags, nv)
