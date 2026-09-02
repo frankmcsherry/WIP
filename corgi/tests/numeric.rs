@@ -153,7 +153,7 @@ fn unsigned_rem_is_total_at_a_zero_divisor() {
     let g = b.finish(out);
     g.check();
     assert_eq!(shape_of(&g, &shape_of_value(&input)).unwrap(), Shape::Prim(64));
-    assert_eq!(eval_graph(&g, input).into_u64("rem"), vec![2, 3, 0, 42]);
+    assert_eq!(eval_graph(&g, input).into_u64("rem").unwrap(), vec![2, 3, 0, 42]);
 }
 
 /// `Rem` on the signed row: the sign follows the DIVIDEND (Rust's `%`), the operands are

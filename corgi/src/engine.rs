@@ -327,29 +327,24 @@ mod tests {
         assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
     }
 
-    /// Sources may disagree on `Sum` arity: a column holding only tag 0 commits one lane, one
-    /// holding only tag 1 commits two. The gather must commit every lane ANY source does — taking
-    /// source 0's arity drops lanes the output tag column still names, and `sum_from_prim` then
-    /// indexes past its own lanes ("index out of bounds: the len is 1 but the index is 1").
+    /// Two sources of one sum shape, each using only one of its lanes (the other is an empty
+    /// column of the declared shape): the gather reads each row from its lane and the result
+    /// carries both lanes, whichever source comes first.
     #[test]
-    fn gather_lanes_sums_of_differing_arity() {
-        // src 0: tag 0 only  -> Sum([Some])         (arity 1)
-        // src 1: tag 1 only  -> Sum([None, Some])   (arity 2)
-        let a = Value::sum_opt(vec![0, 0], vec![Some(u(&[10, 11]))]);
-        let b = Value::sum_opt(vec![1, 1], vec![None, Some(u(&[20, 21]))]);
+    fn gather_lanes_sums_using_different_lanes() {
+        let a = Value::sum(vec![0, 0], vec![u(&[10, 11]), u(&[])]);
+        let b = Value::sum(vec![1, 1], vec![u(&[]), u(&[20, 21])]);
         let (tags, off) = (vec![0usize, 1, 0, 1], vec![0usize, 0, 1, 1]);
         let out = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
-        // The result commits both lanes, and reads back as the interleaving.
         match &out {
             Value::Sum(t, _, lanes) => {
-                assert_eq!(lanes.len(), 2, "output must commit both lanes");
+                assert_eq!(lanes.len(), 2);
                 assert_eq!(t.usize_vec(), vec![0, 1, 0, 1]);
-                assert_eq!(lanes[0], Some(u(&[10, 11])));
-                assert_eq!(lanes[1], Some(u(&[20, 21])));
+                assert_eq!(lanes[0], u(&[10, 11]));
+                assert_eq!(lanes[1], u(&[20, 21]));
             }
             other => panic!("expected a Sum, got {other:?}"),
         }
-        // ...and the shorter source in either position.
         let flipped = gather_lanes(&[Some(&b), Some(&a)], &tags, &off);
         assert_eq!(flipped.len(), 4);
     }
