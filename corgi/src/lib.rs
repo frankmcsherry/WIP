@@ -126,9 +126,18 @@ pub mod arrange {
     }
 
     /// Batched structural compare: `out[k]` = sign of row `ia[k]` of `a` vs row `ib[k]` of `b` (all
-    /// pairs in one pass). Use `ia=0..n-1`, `ib=1..n` to flag adjacent-equal runs after a sort.
+    /// pairs in one pass). For the two regular patterns prefer [`compare_adjacent`] and
+    /// [`group_bounds`]: naming the pattern is cheaper than describing it with index columns, and
+    /// lets the leaf read both sides densely.
     pub fn compare_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
         crate::ops::cmp::order::compare_idx(a, b, ia, ib)
+    }
+
+    /// Adjacent structural compare: `out[k]` = sign of row `k` of `v` vs row `k+1` (`v.len() - 1`
+    /// results). The run-boundary scan over a sorted column — `out[k] != 0` marks a boundary after
+    /// `k`, which is what [`group_bounds`] turns into segment ends.
+    pub fn compare_adjacent(v: &Value) -> Vec<i8> {
+        crate::ops::cmp::order::compare_adjacent(v)
     }
 
     /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given

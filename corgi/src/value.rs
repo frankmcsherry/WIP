@@ -593,6 +593,22 @@ macro_rules! prim {
                 }
             }
 
+            /// structural order of DENSE pairs: `out[k]` = sign of `self[k]` vs `other[k + skew]`,
+            /// for `n` pairs. The implicit-index leaf compare — `skew` 0 is the diagonal (row i vs
+            /// row i) and `skew` 1 the adjacent (row k vs row k+1). Both sides are read
+            /// sequentially, so this vectorizes where [`Prim::cmp_idx`] is two gathers per lane.
+            pub(crate) fn cmp_dense(&self, other: &Prim, n: usize, skew: usize) -> Vec<i8> {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => (0..n)
+                        .map(|k| {
+                            let (x, y) = (a[k], b[k + skew]);
+                            (x > y) as i8 - (x < y) as i8
+                        })
+                        .collect(), )+
+                    _ => panic!("cmp_dense: prim width mismatch"),
+                }
+            }
+
             /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
             /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
             /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.

@@ -738,15 +738,8 @@ fn family_arrange(n: usize, reps: u32) {
     let mut sorted = src.clone();
     sorted.sort_unstable();
     let sorted_col = Value::u64(sorted.clone());
-    let ia: Vec<usize> = (0..n.saturating_sub(1)).collect();
-    let ib: Vec<usize> = (1..n).collect();
     let c = rust_t(reps, || {
-        black_box(arrange::compare_idx(
-            black_box(&sorted_col),
-            &sorted_col,
-            &ia,
-            &ib,
-        ));
+        black_box(arrange::compare_adjacent(black_box(&sorted_col)));
     });
     let r = rust_t(reps, || {
         black_box(
@@ -758,7 +751,7 @@ fn family_arrange(n: usize, reps: u32) {
     });
     row(
         "R2 arrange_compare",
-        ia.len().max(1),
+        n.saturating_sub(1).max(1),
         c,
         r,
         "batched adjacent compare vs direct leaf compare",
