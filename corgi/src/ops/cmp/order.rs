@@ -139,10 +139,10 @@ pub fn group_bounds(keys: &Value) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
-    // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k.
-    let ia: Vec<usize> = (0..n - 1).collect();
-    let ib: Vec<usize> = (1..n).collect();
-    let signs = compare_idx(keys, keys, &ia, &ib);
+    // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k. The
+    // two index sides are ONE buffer offset by one, so build it once and slice it twice.
+    let idx: Vec<usize> = (0..n).collect();
+    let signs = compare_idx(keys, keys, &idx[..n - 1], &idx[1..]);
     let mut ends = Vec::new();
     for (k, &s) in signs.iter().enumerate() {
         if s != 0 {
@@ -368,10 +368,9 @@ mod discriminate {
     /// per-element labels seeding a SEGMENTED sort: each element of outer row `r` gets label `r`, so
     /// `sort_blocks` sorts within each row and rows stay contiguous and in order.
     pub fn segment_labels(bounds: &Bounds) -> Vec<u64> {
-        let bounds = bounds.to_vec(); // step 1: materialize; step 2 makes this stride-aware
-        let mut labels = Vec::with_capacity(bounds.last().copied().unwrap_or(0));
+        let mut labels = Vec::with_capacity(bounds.total());
         let mut start = 0;
-        for (r, &end) in bounds.iter().enumerate() {
+        for (r, end) in bounds.ends().enumerate() {
             for _ in start..end {
                 labels.push(r as u64);
             }
@@ -406,10 +405,9 @@ mod discriminate {
     /// `bounds[r]`, cumulative (both are ascending). This is the new outer-bounds `dedup`/`group`
     /// emit — a run never crosses a row, so each falls under exactly one outer row.
     pub fn runs_per_row(bounds: &Bounds, firsts: &[usize]) -> Vec<usize> {
-        let bounds = bounds.to_vec();
         let mut out = Vec::with_capacity(bounds.len());
         let mut g = 0;
-        for &end in &bounds {
+        for end in bounds.ends() {
             while g < firsts.len() && firsts[g] < end { g += 1; }
             out.push(g);
         }
@@ -526,13 +524,18 @@ mod discriminate {
                 return sort_leaf_blocks(labels, &Prim::U64(std::sync::Arc::new(keys)));
             }
         }
-        let bounds = bounds.to_vec();
-        // start-offsets (n+1): row i is vals[starts[i]..starts[i+1]).
-        let starts: Vec<usize> = std::iter::once(0).chain(bounds.iter().copied()).collect();
-        let lengths: Vec<u64> = starts.windows(2).map(|w| (w[1] - w[0]) as u64).collect();
-
-        // length-first: refine rows by length, then (below) position by position.
-        let (perm, cur_labels) = sort_blocks(labels, &Value::u64(lengths));
+        // length-first: refine rows by length, then (below) position by position. A UNIFORM
+        // partition has one length, so that refinement cannot split anything — skip it, rather
+        // than build a constant column and sort it to learn so. (The stride fast path above only
+        // covers byte leaves up to 8 wide; a wider or non-byte strided list lands here.)
+        let (perm, cur_labels) = match bounds.strided() {
+            Some(_) => ((0..n).collect::<Vec<usize>>(), labels.to_vec()),
+            None => {
+                let lengths: Vec<u64> =
+                    (0..n).map(|r| { let (s, e) = bounds.span(r); (e - s) as u64 }).collect();
+                sort_blocks(labels, &Value::u64(lengths))
+            }
+        };
 
         let mut new_perm = perm.clone();
         let mut new_labels = vec![0u64; n];
@@ -545,13 +548,14 @@ mod discriminate {
                 continue;
             }
             let sample = perm[lo]; // the whole block shares a length
-            let len = starts[sample + 1] - starts[sample];
+            let (sample_start, sample_end) = bounds.span(sample);
+            let len = sample_end - sample_start;
             // sort the block by element 0, then 1, … len-1 — each a structural recursion.
             let mut local_perm: Vec<usize> = (0..block_size).collect();
             let mut local_labels = vec![0u64; block_size];
             for pos in 0..len {
                 let positions: Vec<usize> =
-                    local_perm.iter().map(|&k| starts[perm[lo + k]] + pos).collect();
+                    local_perm.iter().map(|&k| bounds.span(perm[lo + k]).0 + pos).collect();
                 let elem = gather(vals, &positions);
                 let (sub_perm, sub_labels) = sort_blocks(&local_labels, &elem);
                 local_perm = sub_perm.iter().map(|&k| local_perm[k]).collect();

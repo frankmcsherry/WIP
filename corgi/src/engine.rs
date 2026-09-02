@@ -16,7 +16,17 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 /// over every shape — it is `gather` at the all-zero index, so `Op::Lit` (which accepts any value's
 /// shape) and `eval` agree.
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
-    gather(row, &vec![0usize; n])
+    match row {
+        // a FIXED-WIDTH row broadcasts directly: one `vec![x; n]` per leaf, and no index column
+        // to describe an index that is constant. (`Op::Lit` is the caller, and a literal is
+        // overwhelmingly a leaf or a product of them.)
+        Value::Prim(p) => Value::Prim(p.repeat(0, n)),
+        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| fill(c, n)).collect()),
+        Value::Unit(_) => Value::Unit(n),
+        // a VARIABLE-WIDTH row (a `List` span, a `Sum` lane) is a row move, which is what a
+        // `gather` at the all-zero index already is; there is no cheaper form of it here.
+        Value::List(..) | Value::Sum(..) => gather(row, &vec![0usize; n]),
+    }
 }
 
 mod generators {

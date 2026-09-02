@@ -107,10 +107,12 @@ impl CmpOp {
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
                 let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
-                let k_sorted = gather(&k_col, &perm);
                 let v_sorted = gather(&v_col, &perm);
                 let (ends, firsts) = run_layout(&klabels);
-                let keys = gather(&k_sorted, &firsts);
+                // the representatives compose: reading `perm` at the run starts is the same index
+                // as sorting the whole key column and then subsetting it (as `DedupList` does).
+                let reps: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
+                let keys = gather(&k_col, &reps);
                 let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
                 let no = runs_per_row(&bounds, &firsts);
@@ -126,15 +128,16 @@ impl CmpOp {
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
                 let n = nvals.len();
-                // each needle element's haystack-row window [lo,hi) and its row start (row-relative answer).
-                let (mut lo, mut hi, mut base) = (vec![0usize; n], vec![0usize; n], vec![0usize; n]);
+                // each needle element's haystack-row window [lo,hi). The window's start is also the
+                // row base the answer is relative to; the search moves `lo`, so the base is rewalked
+                // off the bounds at the end rather than kept as a third copy of the same column.
+                let (mut lo, mut hi) = (vec![0usize; n], vec![0usize; n]);
                 let (mut ns, mut hs) = (0, 0);
                 for r in 0..nb.len() {
                     let (ne, he) = (nb.end(r), hb.end(r));
                     for k in ns..ne {
                         lo[k] = hs;
                         hi[k] = he;
-                        base[k] = hs;
                     }
                     ns = ne;
                     hs = he;
@@ -145,8 +148,18 @@ impl CmpOp {
                 let mut upper = (lo, hi);
                 batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
                 batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
-                let lo_c: Vec<u64> = lower.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
-                let hi_c: Vec<u64> = upper.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
+                // row-relative: subtract each element's haystack row start, rewalked here.
+                let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                let (mut ns, mut hs) = (0, 0);
+                for r in 0..nb.len() {
+                    let (ne, he) = (nb.end(r), hb.end(r));
+                    for k in ns..ne {
+                        lo_c.push((lower.0[k] - hs) as u64);
+                        hi_c.push((upper.0[k] - hs) as u64);
+                    }
+                    ns = ne;
+                    hs = he;
+                }
                 Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
             }
         })

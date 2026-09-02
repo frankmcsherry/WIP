@@ -330,6 +330,16 @@ macro_rules! prim {
                 }
             }
 
+            /// `n` copies of row `i` — the leaf case of a constant column ([`crate::engine::fill`]).
+            /// One fill, no index column: the broadcast a `gather` at a constant index amounts to.
+            pub(crate) fn repeat(&self, i: usize, n: usize) -> Prim {
+                match self {
+                    $( Prim::$V(v) => Prim::$V(Arc::new(
+                        if n == 0 { Vec::new() } else { vec![v[i]; n] }
+                    )), )+
+                }
+            }
+
             /// row `j` of the result is row `idx[j]` of `self`.
             pub(crate) fn gather(&self, idx: &[usize]) -> Prim {
                 match self {

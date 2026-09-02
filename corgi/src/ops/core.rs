@@ -66,10 +66,9 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
 /// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
 /// targets: row `r`'s round-`t` element is at flat index `start + t`.
 pub(crate) fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
-    let bounds = bounds.to_vec();
     let mut v = Vec::with_capacity(bounds.len());
     let mut start = 0;
-    for (r, &end) in bounds.iter().enumerate() {
+    for (r, end) in bounds.ends().enumerate() {
         if end > start {
             v.push((r, start, end - start));
         }
@@ -725,7 +724,9 @@ impl<L: OpLike> Op<L> {
                 let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
                 let idxs = ivals.into_u64("GatherTry indices")?;
-                let mut tags = Vec::with_capacity(idxs.len());
+                // one pass routes each index AND records its within-lane offset — the size its
+                // lane had when it arrived — so the assignment needs no second pass to derive.
+                let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
                 let (mut is, mut hs) = (0, 0);
@@ -734,17 +735,20 @@ impl<L: OpLike> Op<L> {
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
-                            tags.push(1);
+                            tags.push(1u8);
+                            off.push(abs.len());
                             abs.push(hs + x as usize);
                         } else {
-                            tags.push(0);
+                            tags.push(0u8);
+                            off.push(oob.len());
                             oob.push(x);
                         }
                     }
                     is = ie;
                     hs = he;
                 }
-                let sum = Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)]);
+                let lanes = vec![Value::u64(oob), gather(&hvals, &abs)];
+                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
                 Value::List(ib, Box::new(sum))
             }
 
