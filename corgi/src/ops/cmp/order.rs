@@ -227,12 +227,17 @@ mod compare {
             // the next level's pairs.
             (Value::Sum(ta, oa, va), Value::Sum(tb, ob, vb)) => {
                 assert_eq!(va.len(), vb.len(), "compare_idx: sum arity");
-                let (ta_v, tb_v) = (ta.usize_vec(), tb.usize_vec());
+                // Read the u8 discriminants in place. Decoding a whole tag column per call made a
+                // scalar `compare_at` O(column): a chunk merge over sum-shaped keys spent 40% of
+                // its time re-decoding tags it looked at one row of.
+                let (Prim::U8(ta_v), Prim::U8(tb_v)) = (ta, tb) else {
+                    unreachable!("compare_idx: sum discriminants are u8 columns")
+                };
                 let mut ord: Vec<i8> =
                     ia.iter().zip(ib).map(|(&i, &j)| ta_v[i].cmp(&tb_v[j]) as i8).collect();
                 let mut by_tag: Vec<Vec<usize>> = vec![Vec::new(); va.len()];
                 for (k, (&i, &j)) in ia.iter().zip(ib).enumerate() {
-                    if ta_v[i] == tb_v[j] { by_tag[ta_v[i]].push(k); }
+                    if ta_v[i] == tb_v[j] { by_tag[ta_v[i] as usize].push(k); }
                 }
                 for (t, ks) in by_tag.iter().enumerate() {
                     if ks.is_empty() { continue; }
