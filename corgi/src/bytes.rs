@@ -139,20 +139,20 @@ pub fn read_from(bytes: &[u8]) -> Result<(Value, usize), String> {
 /// ```text
 ///                     release   debug
 ///   read_from            3660     479     <- this decoder
-///   hash_rows            4880    1164
+///   hash                 4880    1164
 ///   shape_of_value      10983    1688
 ///   write_to            21966    3760
 ///   Drop / len          32949    8780
 /// ```
 ///
 /// So the cap is not really protecting the decoder — it is protecting everything the decoder hands
-/// a value to, and `hash_rows` is the one that gives out first. 128 sits a factor of four under the
+/// a value to, and `hash` is the one that gives out first. 128 sits a factor of four under the
 /// lowest number in that table. Raising it means redoing the measurement, on whichever traversal is
 /// weakest at the time.
 ///
 /// This is also the answer to "why not make the decode iterative and drop the cap?". An explicit
 /// stack would move `read_from` off the bottom of that table, but only as far as the next row: the
-/// derived `Drop` recurses, and so do `len`, `shape_of_value`, `hash_rows` and `PartialEq`. Lifting
+/// derived `Drop` recurses, and so do `len`, `shape_of_value`, `hash` and `PartialEq`. Lifting
 /// the ceiling means making all of them iterative, which is a corgi-wide change with its own
 /// payoff (arbitrarily deep shapes) — not something a codec can do on its own.
 pub const MAX_DEPTH: usize = 128;
@@ -419,7 +419,7 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
 }
 
 /// The `Sum` invariants every reader indexes by: a u8 discriminant naming one of the lanes, and a
-/// carried offset that lands inside it. Without these, `hash_rows` and the comparators index out
+/// carried offset that lands inside it. Without these, `hash` and the comparators index out
 /// of bounds on a column the decoder handed them.
 fn check_sum(tags: &Tags, lanes: &[Value]) -> Result<(), String> {
     if lanes.len() > 256 {
@@ -635,7 +635,7 @@ mod test {
             let mut buf = Vec::new();
             write_to(&v, &mut buf).unwrap();
             let (back, _) = read_from(&buf).unwrap();
-            assert_eq!(crate::arrange::hash_rows(&back), crate::arrange::hash_rows(&v));
+            assert_eq!(crate::hash::hash(&back), crate::hash::hash(&v));
         }
     }
 
@@ -760,7 +760,7 @@ mod test {
             let mut buf = Vec::new();
             write_to(&v, &mut buf).unwrap();
             let (back, _) = read_from(&buf).unwrap();
-            assert_eq!(crate::arrange::hash_rows(&back), crate::arrange::hash_rows(&v), "{v:?}");
+            assert_eq!(crate::hash::hash(&back), crate::hash::hash(&v), "{v:?}");
         }
     }
 
@@ -790,7 +790,7 @@ mod test {
         // the guard a consumer is told to apply. Using it here is the test asserting that the
         // advice works: `Value::len` alone would not see a `Unit` nested in a `Sum` lane.
         if declared_rows(v) <= 10_000 {
-            let _ = crate::arrange::hash_rows(v);
+            let _ = crate::hash::hash(v);
         }
     }
 
@@ -898,7 +898,7 @@ mod test {
 
     /// The structural invariants the rest of corgi indexes by. Each of these is a byte string the
     /// framing accepts and the structure must not: without the checks, the first two panic inside
-    /// `hash_rows` on a column `read_from` handed back as valid.
+    /// `hash` on a column `read_from` handed back as valid.
     #[test]
     fn structurally_impossible_columns_are_refused() {
         /// Encode `v`, overwrite word `word` with `to`, and return the bytes — same length as a

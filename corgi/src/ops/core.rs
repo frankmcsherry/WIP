@@ -357,7 +357,7 @@ impl<L: OpLike> Op<L> {
             }
 
             // stable structural hash: one U64 per row, kind-blind over any shape (see `crate::hash`).
-            Op::Hash => crate::hash::hash(&input),
+            Op::Hash => Value::u64(crate::hash::hash(&input)),
 
             Op::Filter => {
                 let (data, mask) = input.into_pair("Filter")?;
