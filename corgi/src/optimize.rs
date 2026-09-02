@@ -171,10 +171,14 @@ pub fn fuse_maps(g: &Graph<NumOp>) -> Graph<NumOp> {
 /// regardless of fan-out — only this edge is redirected; a still-shared `inner` survives for dce.
 fn is_inverse(outer: &Op<NumOp>, inner: &Op<NumOp>) -> bool {
     use Op::*;
-    matches!(
-        (outer, inner),
-        (Zip, Transpose) | (Transpose, Zip) | (Weave, Unweave) | (Unweave, Weave)
-    )
+    match (outer, inner) {
+        (Zip, Transpose) | (Transpose, Zip) | (Weave, Unweave) | (Unweave, Weave) => true,
+        // `unwrap(inject x) = x`, the Sum-side pair. Only when every declared lane has one shape:
+        // otherwise `Unwrap` is a shape ERROR on this sum, and cancelling would turn a program the
+        // typer rejects into one it accepts.
+        (Unwrap, Inject(_, shapes)) => shapes.windows(2).all(|w| w[0] == w[1]),
+        _ => false,
+    }
 }
 
 /// cancel adjacent inverse isos (see [`is_inverse`]). The iso analogue of `peephole`'s Field-of-Tuple.

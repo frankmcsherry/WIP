@@ -9,7 +9,7 @@ use std::sync::Arc;
 pub enum Value {
     Prim(Prim),                   // a leaf column at one byte width
     Prod(Vec<Value>),             // parallel columns, equal length
-    Sum(Prim, Vec<usize>, Vec<Value>), // discriminant (u8 leaf) + within-variant offset per row + one
+    Sum(Tags, Vec<Value>),        // per-row discriminant + within-variant offset (see `Tags`) + one
                                   // packed lane per variant (a variant no row carries is an empty
                                   // column of its shape — every lane is concrete).
     List(Bounds, Box<Value>),     // row partition (see `Bounds`) + flattened values
@@ -150,6 +150,121 @@ impl std::hash::Hash for Bounds {
     }
 }
 
+/// how a `Sum`'s rows are assigned to its lanes: each row's discriminant, plus its offset WITHIN
+/// that lane (carried, so comparison/search/hash read a row's rank instead of rescanning for it).
+///
+/// `Const` is the UNIFORM case — every row carries one tag, so row `i` sits at offset `i` in that
+/// lane — and it is what `inject`, `lift`, and any `Fail` column that has not actually failed
+/// produce. This is the `Sum`-side twin of [`Bounds::Stride`]: uniformity is O(1) to detect
+/// (`const_tag`), it costs no columns at all to represent, and it PROPAGATES — a gather of one
+/// stays one, a lane map leaves it alone. It mirrors `columnar`'s `Discriminant`, whose
+/// "homogeneous" state stores `[tag, count]` and synthesises the identity offsets, so the dynamic
+/// and static columnar layouts agree on the case. Equality and hash are by the ASSIGNMENT, so a
+/// `Const` and the equivalent `Column` are interchangeable.
+#[derive(Clone, Debug)]
+pub enum Tags {
+    Const(usize, usize), // (tag, rows): every row carries `tag`, row i at offset i in that lane
+    Column(Prim, Arc<Vec<usize>>), // per-row discriminant (a u8 leaf) + per-row within-lane offset
+}
+
+impl Tags {
+    /// every one of `rows` rows carries `tag` — the uniform assignment, stored in two words.
+    pub(crate) fn constant(tag: usize, rows: usize) -> Tags {
+        Tags::Const(tag, rows)
+    }
+
+    /// the general assignment from a discriminant column and its within-lane offsets. Compacts to
+    /// `Const` when every row carries one tag (the offsets are then forced to be the identity), the
+    /// same construction-time check `Bounds::from` makes.
+    pub(crate) fn column(tags: Prim, offsets: Vec<usize>) -> Tags {
+        debug_assert_eq!(tags.len(), offsets.len(), "Tags: discriminant/offset length");
+        match Tags::uniform(&tags) {
+            Some(t) => Tags::Const(t, tags.len()),
+            None => Tags::Column(tags, Arc::new(offsets)),
+        }
+    }
+
+    /// the general assignment from tags alone: the within-lane offsets are each row's rank among
+    /// the rows sharing its tag, computed in one cursor pass. `arity` is the lane count.
+    pub(crate) fn from_tags(tags: Vec<usize>, arity: usize) -> Tags {
+        assert!(arity <= 256, "Value::sum: {arity} variants exceeds the u8 tag width");
+        let offsets = within_offsets(tags.iter().copied(), arity);
+        // tags are stored as a u8 discriminant, so the variant count must fit a u8 — else `t as u8`
+        // would silently truncate a tag onto the wrong lane.
+        Tags::column(Prim::U8(Arc::new(tags.iter().map(|&t| t as u8).collect())), offsets)
+    }
+
+    /// the single tag every row carries, if there is one — the O(1) uniformity test.
+    pub(crate) fn const_tag(&self) -> Option<usize> {
+        match self {
+            Tags::Const(t, _) => Some(*t),
+            Tags::Column(..) => None,
+        }
+    }
+
+    /// the one tag a discriminant column carries throughout, if any (an empty column carries none:
+    /// `Const` names a lane, and no lane is named by no rows — `len` 0 compares equal either way).
+    fn uniform(tags: &Prim) -> Option<usize> {
+        let first = (tags.len() > 0).then(|| tags.usize_at(0))?;
+        (0..tags.len()).all(|i| tags.usize_at(i) == first).then_some(first)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Tags::Const(_, rows) => *rows,
+            Tags::Column(t, _) => t.len(),
+        }
+    }
+
+    /// row `i`'s discriminant.
+    #[inline]
+    pub(crate) fn tag_at(&self, i: usize) -> usize {
+        match self {
+            Tags::Const(t, _) => *t,
+            Tags::Column(t, _) => t.usize_at(i),
+        }
+    }
+
+    /// row `i`'s offset within its lane — read, never recomputed.
+    #[inline]
+    pub(crate) fn offset_at(&self, i: usize) -> usize {
+        match self {
+            Tags::Const(..) => i, // one lane in row order: the offset IS the row index
+            Tags::Column(_, o) => o[i],
+        }
+    }
+
+    /// every row's discriminant, in row order.
+    pub(crate) fn tags_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |i| self.tag_at(i))
+    }
+}
+
+// equality/hash are by the ASSIGNMENT, so a `Const` and the equivalent `Column` agree (as a
+// `Bounds::Stride` does with its offsets). An empty sum is empty under either representation.
+impl PartialEq for Tags {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Tags::Const(t0, n0), Tags::Const(t1, n1)) => n0 == n1 && (n0 == &0 || t0 == t1),
+            _ => {
+                self.len() == other.len()
+                    && (0..self.len()).all(|i| {
+                        self.tag_at(i) == other.tag_at(i) && self.offset_at(i) == other.offset_at(i)
+                    })
+            }
+        }
+    }
+}
+impl Eq for Tags {}
+impl std::hash::Hash for Tags {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for i in 0..self.len() {
+            self.tag_at(i).hash(state);
+            self.offset_at(i).hash(state);
+        }
+    }
+}
+
 /// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
 /// (leaves are write-once read-many; `eval` clones freely for shared edges, so a leaf clone must be a
 /// refcount bump, not a buffer copy). The `prim!` macro lists the widths ONCE and generates the enum +
@@ -171,29 +286,14 @@ macro_rules! prim {
                 match self { $( Prim::$V(_) => (std::mem::size_of::<$t>() * 8) as u32, )+ }
             }
 
-            /// the whole column as `usize`s (for small-int columns like Sum discriminants).
-            /// Prefer [`Prim::usize_at`] / [`Prim::usize_iter`]: a reader that looks at rows does
-            /// not need an 8x-wide COPY of the column to do it.
-            pub(crate) fn usize_vec(&self) -> Vec<usize> {
-                match self { $( Prim::$V(v) => v.iter().map(|&x| x as usize).collect(), )+ }
-            }
-
-            /// row `i` as a `usize`, read in place. The element-wise form of [`Prim::usize_vec`],
-            /// and the ONE way a reader should touch a `Sum`'s discriminant: decoding the whole
-            /// column to look at some of it made a scalar `compare_at` O(column) (see #17).
-            /// Representation-agnostic on purpose — a tag column that is not a plain leaf answers
-            /// this the same way.
+            /// row `i` as a `usize`, read in place — how a small-int column (a `Sum`'s
+            /// discriminant) is read. There is deliberately no whole-column `Vec<usize>` decode:
+            /// producing one to look at some of a column made a scalar `compare_at` O(column).
             #[inline]
             pub(crate) fn usize_at(&self, i: usize) -> usize {
                 match self { $( Prim::$V(v) => v[i] as usize, )+ }
             }
 
-            /// every row as a `usize`, in row order — the iterator form of [`Prim::usize_at`].
-            /// The per-element match is on a loop-invariant discriminant, so it hoists; what does
-            /// not come back is the intermediate column.
-            pub(crate) fn usize_iter(&self) -> impl Iterator<Item = usize> + '_ {
-                (0..self.len()).map(move |i| self.usize_at(i))
-            }
 
             /// re-width every record to `bits`, kind-blind: read it zero-extended to u64,
             /// then keep the low bytes. (Signed/sign-extending widen is a numeric-layer job.)
@@ -518,19 +618,14 @@ impl Value {
     /// one place tags cross from `usize` into the `Prim` fold. The within-variant offset is computed
     /// here and carried, so comparison/search read it instead of re-deriving each row's rank.
     pub fn sum(tags: Vec<usize>, variants: Vec<Value>) -> Value {
-        // tags are stored as a u8 discriminant, so the variant count must fit a u8 — else `t as u8`
-        // would silently truncate a tag onto the wrong lane.
-        assert!(variants.len() <= 256, "Value::sum: {} variants exceeds the u8 tag width", variants.len());
-        let offset = within_offsets(tags.iter().copied(), variants.len());
-        let tags = Prim::U8(Arc::new(tags.iter().map(|&t| t as u8).collect()));
-        Value::Sum(tags, offset, variants)
+        let arity = variants.len();
+        Value::Sum(Tags::from_tags(tags, arity), variants)
     }
 
-    /// a Sum from an existing tag column and its lanes; the within-variant offset is derived from
-    /// the tags. For ops that already hold the tags as a `Prim` (`gather`/`concat`).
-    pub(crate) fn sum_from_prim(tags: Prim, lanes: Vec<Value>) -> Value {
-        let offset = within_offsets(tags.usize_iter(), lanes.len());
-        Value::Sum(tags, offset, lanes)
+    /// a Sum from a lane assignment and its lanes — the direct form for ops that computed the
+    /// assignment themselves (`gather`, `Branch`, `inject`).
+    pub(crate) fn sum_tagged(tags: Tags, lanes: Vec<Value>) -> Value {
+        Value::Sum(tags, lanes)
     }
 
     /// a zero-row value of the given shape — the all-empty witness of each constructor. `Inject`
@@ -540,7 +635,7 @@ impl Value {
             Shape::Prim(w) => Value::Prim(Prim::empty(*w)),
             Shape::Prod(ss) => Value::Prod(ss.iter().map(Value::empty).collect()),
             Shape::Sum(ss) => {
-                Value::sum_from_prim(Prim::U8(Arc::new(Vec::new())), ss.iter().map(Value::empty).collect())
+                Value::Sum(Tags::constant(0, 0), ss.iter().map(Value::empty).collect())
             }
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
@@ -552,7 +647,7 @@ impl Value {
         match self {
             Value::Prim(p) => p.len(),
             Value::Prod(c) => c.first().map_or(0, |c| c.len()),
-            Value::Sum(t, _, _) => t.len(),
+            Value::Sum(t, _) => t.len(),
             Value::List(b, _) => b.len(),
             Value::Unit(n) => *n,
         }
@@ -561,8 +656,8 @@ impl Value {
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
-/// a `Sum` taken apart: (tags as usize, within-variant offsets, lanes).
-pub type SumParts = (Vec<usize>, Vec<usize>, Vec<Value>);
+/// a `Sum` taken apart: its lane assignment and its lanes.
+pub type SumParts = (Tags, Vec<Value>);
 
 // input accessors: destructure a `Value` to the shape an op expects; a mismatch is the shape ERROR
 // the typer reports (an op's eval is `shape_of` when run on zero rows). `into_*` consume `self` and
@@ -595,7 +690,7 @@ impl Value {
 
     pub fn into_sum(self, who: &str) -> Result<SumParts, String> {
         match self {
-            Value::Sum(tags, offset, variants) => Ok((tags.usize_vec(), offset, variants)),
+            Value::Sum(tags, variants) => Ok((tags, variants)),
             other => Err(format!("{who}: expected a sum, got {}", shape_of_value(&other))),
         }
     }
@@ -628,9 +723,9 @@ pub fn show(v: &Value) -> String {
     match v {
         Value::Prim(p) => p.show(),
         Value::Prod(c) => format!("({})", c.iter().map(show).collect::<Vec<_>>().join(", ")),
-        Value::Sum(t, _, vs) => {
+        Value::Sum(t, vs) => {
             let lanes: Vec<String> = vs.iter().map(show).collect();
-            format!("Sum tags={:?} [{}]", t.usize_vec(), lanes.join(", "))
+            format!("Sum tags={:?} [{}]", t.tags_iter().collect::<Vec<_>>(), lanes.join(", "))
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
@@ -686,6 +781,37 @@ mod tests {
         assert_eq!(Bounds::offsets(vec![1, 3, 6]), Bounds::offsets(vec![1, 3, 6]));
         assert_eq!(Bounds::offsets(vec![2, 4, 6]), Bounds::Stride(2, 3));
         assert_ne!(Bounds::offsets(vec![1, 3, 6]), Bounds::offsets(vec![1, 3, 5]));
+    }
+
+    /// `inject` assigns every row one tag, so the assignment is two words: no discriminant column
+    /// and no offset column, at any row count. This is the `Sum`-side twin of a uniform `Bounds`
+    /// becoming a `Stride`, and it is the state a `Fail` column that has not failed stays in.
+    #[test]
+    fn one_tag_throughout_costs_no_columns() {
+        let t = Tags::from_tags(vec![2, 2, 2, 2], 3);
+        assert_eq!(t.const_tag(), Some(2));
+        assert!(matches!(t, Tags::Const(2, 4)));
+        // ...and every row still reads back the same as the column form would answer.
+        assert_eq!(t.tags_iter().collect::<Vec<_>>(), vec![2, 2, 2, 2]);
+        assert_eq!((0..4).map(|i| t.offset_at(i)).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    }
+
+    /// Equality and hash are by the ASSIGNMENT, so the two representations are interchangeable —
+    /// the property that lets `Const` appear anywhere a `Column` would without being observable.
+    #[test]
+    fn const_and_column_assignments_agree() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let konst = Tags::Const(1, 3);
+        let column = Tags::Column(Prim::U8(Arc::new(vec![1, 1, 1])), Arc::new(vec![0, 1, 2]));
+        assert_eq!(konst, column);
+        let h = |t: &Tags| {
+            let mut s = DefaultHasher::new();
+            t.hash(&mut s);
+            s.finish()
+        };
+        assert_eq!(h(&konst), h(&column));
+        // a mixed assignment is not equal to either.
+        assert_ne!(konst, Tags::from_tags(vec![1, 0, 1], 2));
     }
 
     /// Narrowing then widening back is `mod 2^bits` — the documented truncating semantics, not a

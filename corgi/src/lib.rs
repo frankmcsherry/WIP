@@ -39,7 +39,7 @@ pub use hash::hash;
 pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
-pub use value::{show, Bounds, Value};
+pub use value::{show, Bounds, Tags, Value};
 
 /// Arrangement-substrate support: row-level primitives for using corgi columns directly as a
 /// differential-dataflow batch (merge/sort/gather/compare over flat columns), without decoding
@@ -242,10 +242,15 @@ pub mod arrange {
                     .collect()
             }
             // Sum: mix the row's tag, then its lane's payload hash at the within-variant offset.
-            Value::Sum(tags, offset, variants) => {
+            Value::Sum(tags, variants) => {
                 let lanes: Vec<Vec<u64>> = variants.iter().map(hash_rows).collect();
-                // tags read in place — one look per row, no decoded copy (as in `crate::hash`).
-                tags.usize_iter().zip(offset.iter()).map(|(t, &o)| mix(mix(SEED_SUM, t as u64), lanes[t][o])).collect()
+                // the assignment is read in place — one look per row (as in `crate::hash`).
+                (0..tags.len())
+                    .map(|r| {
+                        let t = tags.tag_at(r);
+                        mix(mix(SEED_SUM, t as u64), lanes[t][tags.offset_at(r)])
+                    })
+                    .collect()
             }
             // List: mix the row's element count, then the row's flattened element hashes in order.
             Value::List(bounds, vals) => {

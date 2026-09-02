@@ -7,7 +7,7 @@ use crate::engine::{
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Tags, Value};
 use std::sync::Arc;
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
@@ -255,21 +255,25 @@ impl<L: OpLike> Op<L> {
             // only gains bounds (per-row cumulative tag counts) — no data moves but the tag widen.
             Op::Unweave => {
                 let (bounds, vals) = input.into_list("Unweave")?;
-                let (tags, _offset, lanes) = vals.into_sum("Unweave")?;
+                let (tags, lanes) = vals.into_sum("Unweave")?;
                 let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
                 let mut counts = vec![0usize; lanes.len()];
                 let mut start = 0;
                 for end in bounds.ends() {
-                    for &t in &tags[start..end] {
-                        counts[t] += 1;
+                    for i in start..end {
+                        counts[tags.tag_at(i)] += 1;
                     }
                     for (lb, &c) in lane_bounds.iter_mut().zip(&counts) {
                         lb.push(c);
                     }
                     start = end;
                 }
-                let tag_list =
-                    Value::List(bounds, Box::new(Value::u64(tags.iter().map(|&t| t as u64).collect())));
+                // the tag column widens ONCE, into the U64 list this op exists to produce — it is
+                // the output, not a decode of the input on the way to it.
+                let tag_list = Value::List(
+                    bounds,
+                    Box::new(Value::u64(tags.tags_iter().map(|t| t as u64).collect())),
+                );
                 let mut out = vec![tag_list];
                 for (lane, lb) in lanes.into_iter().zip(lane_bounds) {
                     out.push(Value::List(lb.into(), Box::new(lane)));
@@ -296,11 +300,16 @@ impl<L: OpLike> Op<L> {
                     lane_bounds.push(b);
                     lanes.push(v);
                 }
+                // one pass validates the per-row tag counts AND builds the Sum's assignment: a
+                // row's within-lane offset is its lane's running count, which this loop already has.
                 let mut counts = vec![0usize; lanes.len()];
+                let (mut tag8, mut off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
                 let mut start = 0;
                 for (r, end) in tb.ends().enumerate() {
                     for &t in &tags[start..end] {
                         assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
+                        tag8.push(t as u8);
+                        off.push(counts[t as usize]);
                         counts[t as usize] += 1;
                     }
                     for (t, (lb, &c)) in lane_bounds.iter().zip(&counts).enumerate() {
@@ -308,7 +317,7 @@ impl<L: OpLike> Op<L> {
                     }
                     start = end;
                 }
-                let sum = Value::sum(tags.iter().map(|&t| t as usize).collect(), lanes);
+                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), lanes);
                 Value::List(tb, Box::new(sum))
             }
 
@@ -324,12 +333,12 @@ impl<L: OpLike> Op<L> {
             // positions aligns with the carried within-variant offsets.
             Op::CapSum => {
                 let (x, s) = input.into_pair("CapSum")?;
-                let Value::Sum(tags, offset, lanes) = s else {
+                let Value::Sum(tags, lanes) = s else {
                     return Err(format!("CapSum expects (X, Sum), got (.., {})", shape_of_value(&s)));
                 };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
                 let mut per = vec![Vec::new(); lanes.len()];
-                for (i, t) in tags.usize_iter().enumerate() {
+                for (i, t) in tags.tags_iter().enumerate() {
                     per[t].push(i);
                 }
                 let new = lanes
@@ -337,8 +346,8 @@ impl<L: OpLike> Op<L> {
                     .zip(&per)
                     .map(|(lane, rows)| Value::Prod(vec![gather(&x, rows), lane]))
                     .collect();
-                // the tag and offset columns are unchanged: each lane keeps its rows, now paired.
-                Value::Sum(tags, offset, new)
+                // the assignment is unchanged: each lane keeps its rows, now paired.
+                Value::Sum(tags, new)
             }
 
             Op::Cast(bits) => {
@@ -437,19 +446,29 @@ impl<L: OpLike> Op<L> {
                     groups[t].push(i);
                 }
                 let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-                Value::Sum(Prim::U8(Arc::new(tag8)), off, variants)
+                Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), variants)
             }
 
             Op::Unwrap => {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
-                let (tags, offset, variants) = input.into_sum("Unwrap")?;
+                let (tags, variants) = input.into_sum("Unwrap")?;
                 let first = variants.first().ok_or("Unwrap: empty sum")?;
+                let first_shape = shape_of_value(first);
                 for v in &variants[1..] {
-                    same(&shape_of_value(first), &shape_of_value(v)).map_err(|e| format!("Unwrap: {e}"))?;
+                    same(&first_shape, &shape_of_value(v)).map_err(|e| format!("Unwrap: {e}"))?;
                 }
+                // every row in one lane, in row order: that lane already IS the answer. This is the
+                // `unwrap(inject x) = x` case, and it costs nothing.
+                if let Some(t) = tags.const_tag() {
+                    return Ok(variants.into_iter().nth(t).expect("tag names a lane"));
+                }
+                let Tags::Column(_, os) = &tags else { unreachable!("const handled above") };
+                // the carried offsets are already the `&[usize]` `gather_lanes` wants; only the u8
+                // discriminants widen, and only here, where every row is read exactly once anyway.
+                let ts: Vec<usize> = tags.tags_iter().collect();
                 let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
-                gather_lanes(&refs, &tags, &offset)
+                gather_lanes(&refs, &ts, os)
             }
 
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
@@ -468,8 +487,9 @@ impl<L: OpLike> Op<L> {
                 }
                 let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
                 variants[*tag] = input;
-                // a constant tag run: the within-variant offset is the row index.
-                Value::Sum(Prim::U8(Arc::new(vec![*tag as u8; n])), (0..n).collect(), variants)
+                // a constant tag run: the assignment is two words, and the within-lane offset IS
+                // the row index — neither column is materialised (see `Tags::Const`).
+                Value::sum_tagged(Tags::constant(*tag, n), variants)
             }
 
             Op::MapList(body) => {
@@ -625,7 +645,7 @@ impl<L: OpLike> Op<L> {
             Op::MapSum(arms) => {
                 // the tag and within-offset columns are untouched by a lane map (each lane keeps its
                 // row count), so move them through rather than decode + recompute them.
-                let Value::Sum(tags, offset, mut variants) = input else {
+                let Value::Sum(tags, mut variants) = input else {
                     return Err(format!("MapSum expects a sum, got {}", shape_of_value(&input)));
                 };
                 for (i, (k, body)) in arms.iter().enumerate() {
@@ -643,7 +663,7 @@ impl<L: OpLike> Op<L> {
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
                     variants[*k] = res;
                 }
-                Value::Sum(tags, offset, variants)
+                Value::Sum(tags, variants)
             }
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it

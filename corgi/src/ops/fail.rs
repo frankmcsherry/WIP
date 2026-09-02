@@ -20,13 +20,20 @@
 use crate::engine::gather;
 use crate::graph::OpLike;
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Tags, Value};
 use std::sync::Arc;
 
 // --- the representation --------------------------------------------------------------------------
 
 /// build a `Fail<T>` from a per-row error mask and the packed Ok lane (`ok.len()` = the Ok count).
+///
+/// A mask with no errors set is the CONSTANT assignment — two words, no tag column and no offset
+/// column — which is the same value [`lift`] builds and the common case for every producer here.
 pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
+    if !err.iter().any(|&e| e) {
+        debug_assert_eq!(ok.len(), err.len(), "fail: Ok lane length disagrees with the mask");
+        return Value::sum_tagged(Tags::constant(0, err.len()), vec![ok, Value::Unit(0)]);
+    }
     let mut tags = Vec::with_capacity(err.len());
     let mut off = Vec::with_capacity(err.len());
     let (mut n_ok, mut n_err) = (0usize, 0usize);
@@ -42,14 +49,21 @@ pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
         }
     }
     debug_assert_eq!(ok.len(), n_ok, "fail: Ok lane length disagrees with the mask");
-    Value::Sum(Prim::U8(Arc::new(tags)), off, vec![ok, Value::Unit(n_err)])
+    Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), vec![ok, Value::Unit(n_err)])
+}
+
+/// did NO row fail? O(1) — the Err lane is a length-carrying `Unit`, so the failure count is a
+/// field read, not a mask to materialise and scan. Every consumer below asks this first, because
+/// "nothing has failed yet" is the state a fallible pipeline spends most of its time in.
+pub(crate) fn no_errors(v: &Value) -> bool {
+    matches!(v, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(0)))
 }
 
 /// destructure a `Fail<T>` into its error mask and packed Ok lane; anything else is the shape error.
 pub(crate) fn into_fail(v: Value, who: &str) -> Result<(Vec<bool>, Value), String> {
     match v {
-        Value::Sum(tags, _off, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)) => {
-            let err = tags.usize_iter().map(|t| t != 0).collect();
+        Value::Sum(tags, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)) => {
+            let err = tags.tags_iter().map(|t| t != 0).collect();
             Ok((err, lanes.into_iter().next().unwrap()))
         }
         other => Err(format!("{who}: expected a Fail (Sum{{T | Unit}}), got {}", shape_of_value(&other))),
@@ -75,15 +89,28 @@ fn ranks(err: &[bool], keep: &[usize]) -> Vec<usize> {
 
 // --- Lift / Squash -------------------------------------------------------------------------------
 
-/// `X -> Fail<X>`: every row Ok.
+/// `X -> Fail<X>`: every row Ok. Two words: the assignment is constant, so neither the tag column
+/// nor the offset column exists. `lower_effects` inserts one of these per pure field of a mixed
+/// tuple and per element of a fallible fold body — the latter once per ROUND — so its cost is the
+/// difference between free and 9 bytes a row each time.
 pub(crate) fn lift(v: Value) -> Value {
     let n = v.len();
-    Value::Sum(Prim::U8(Arc::new(vec![0u8; n])), (0..n).collect(), vec![v, Value::Unit(0)])
+    Value::sum_tagged(Tags::constant(0, n), vec![v, Value::Unit(0)])
 }
 
 /// `Fail<Fail<T>> -> Fail<T>`: a row is Ok iff Ok at both levels; the inner Ok lane passes through.
 pub(crate) fn squash(v: Value) -> Result<Value, String> {
+    // nothing failed at the outer level: the inner `Fail<T>` already IS the answer, mask and all.
+    if no_errors(&v) {
+        let (_, inner) = into_fail(v, "Squash")?;
+        return into_fail(inner, "Squash inner").map(|(e, ok)| fail(&e, ok));
+    }
     let (outer_err, inner) = into_fail(v, "Squash")?;
+    // nothing failed at the inner level: the result's mask is the outer's, unchanged.
+    if no_errors(&inner) {
+        let (_, ok) = into_fail(inner, "Squash inner")?;
+        return Ok(fail(&outer_err, ok));
+    }
     let (inner_err, ok) = into_fail(inner, "Squash inner")?;
     let mut inner = inner_err.iter();
     let err: Vec<bool> = outer_err.iter().map(|&oe| oe || *inner.next().unwrap()).collect();
@@ -95,6 +122,19 @@ pub(crate) fn squash(v: Value) -> Result<Value, String> {
 /// `(Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>`: a row errs if ANY field errs; the survivors carry
 /// the product of the fields' Ok values (each field's packed lane read at the survivor's rank).
 pub(crate) fn hoist_prod(input: Value) -> Result<Value, String> {
+    // no field failed anywhere: the product of the Ok lanes is the answer, all rows Ok. This is
+    // the shape `lower_effects` emits for a tuple whose fields are all `Lift`s, and for every
+    // round of a fallible fold body in which nothing has yet gone wrong.
+    if let Value::Prod(fs) = &input {
+        if fs.iter().all(no_errors) {
+            let oks: Result<Vec<Value>, String> = input
+                .into_prod("HoistProd")?
+                .into_iter()
+                .map(|f| into_fail(f, "HoistProd field").map(|(_, ok)| ok))
+                .collect();
+            return Ok(lift(Value::Prod(oks?)));
+        }
+    }
     let fields: Vec<(Vec<bool>, Value)> = input
         .into_prod("HoistProd")?
         .into_iter()
@@ -119,10 +159,13 @@ pub(crate) fn hoist_prod(input: Value) -> Result<Value, String> {
 /// list of Ok values (consecutive in the packed lane, so an all-Ok column needs no gather).
 pub(crate) fn hoist_list(input: Value) -> Result<Value, String> {
     let (bounds, elems) = input.into_list("HoistList")?;
-    let (elem_err, ok) = into_fail(elems, "HoistList element")?;
-    if !elem_err.iter().any(|&e| e) {
+    // no element failed: the list of Ok values is the answer, and asking costs a field read rather
+    // than a mask to materialise and scan.
+    if no_errors(&elems) {
+        let (_, ok) = into_fail(elems, "HoistList element")?;
         return Ok(lift(Value::List(bounds, Box::new(ok))));
     }
+    let (elem_err, ok) = into_fail(elems, "HoistList element")?;
     let mut err = Vec::with_capacity(bounds.len());
     let mut keep = Vec::new();
     let mut ok_bounds = Vec::new();
@@ -146,7 +189,7 @@ pub(crate) fn hoist_list(input: Value) -> Result<Value, String> {
 /// and pass through): a row errs iff its own lane errs on it; the survivors re-tag over the lanes'
 /// Ok values, whose packed order is already the survivors' order.
 pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Result<Value, String> {
-    let (tags, off, lanes) = input.into_sum("HoistSum")?;
+    let (tags, lanes) = input.into_sum("HoistSum")?;
     if let Some(k) = fallible.iter().find(|&&k| k >= lanes.len()) {
         return Err(format!("HoistSum: no lane {k}"));
     }
@@ -161,9 +204,11 @@ pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Result<Value, Strin
             new_lanes.push(lane);
         }
     }
-    let err: Vec<bool> =
-        tags.iter().zip(&off).map(|(&t, &o)| errs[t].as_ref().is_some_and(|e| e[o])).collect();
-    let ok_tags: Vec<usize> = tags.iter().zip(&err).filter(|(_, &e)| !e).map(|(&t, _)| t).collect();
+    let err: Vec<bool> = (0..tags.len())
+        .map(|r| errs[tags.tag_at(r)].as_ref().is_some_and(|e| e[tags.offset_at(r)]))
+        .collect();
+    let ok_tags: Vec<usize> =
+        tags.tags_iter().zip(&err).filter(|(_, &e)| !e).map(|(t, _)| t).collect();
     Ok(fail(&err, Value::sum(ok_tags, new_lanes)))
 }
 
@@ -344,7 +389,7 @@ pub(crate) fn try_branch(n: usize, input: Value) -> Result<Value, String> {
         }
     }
     let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-    Ok(fail(&err, Value::Sum(Prim::U8(Arc::new(ok_tags)), ok_off, variants)))
+    Ok(fail(&err, Value::sum_tagged(Tags::column(Prim::U8(Arc::new(ok_tags)), ok_off), variants)))
 }
 
 /// `(List<X>, List<Y>) -> Fail<List<(X, Y)>>`: per row, the two inner lists must agree in length.
@@ -413,6 +458,38 @@ mod tests {
             Value::List(vec![idx.len()].into(), Box::new(Value::u64(idx))),
             Value::List(vec![hay.len()].into(), Box::new(Value::Prim(Prim::U64(hay.clone())))),
         ])
+    }
+
+    /// The state a fallible pipeline spends most of its time in: a `Fail` column that CAN fail but
+    /// has not. Its assignment is constant, so it carries no discriminant column and no offset
+    /// column, and "did anything fail" is a field read rather than a mask to build and scan.
+    #[test]
+    fn a_fail_that_has_not_failed_carries_no_witness_columns() {
+        let hay = Arc::new(vec![10, 20, 30]);
+        let ok = try_gather(one_row(vec![2, 0, 1], &hay)).unwrap();
+        assert!(no_errors(&ok));
+        let Value::Sum(tags, _) = &ok else { panic!("a Fail is a Sum") };
+        assert_eq!(tags.const_tag(), Some(0), "no failures: one tag throughout");
+
+        // ...and it survives the plumbing `lower_effects` wraps around it. `Lift` is constant by
+        // construction, and hoisting a product of un-failed columns stays constant.
+        let lifted = lift(Value::u64(vec![1, 2, 3]));
+        assert!(no_errors(&lifted));
+        let paired = hoist_prod(Value::Prod(vec![lifted, lift(Value::u64(vec![4, 5, 6]))])).unwrap();
+        assert!(no_errors(&paired));
+        let Value::Sum(tags, _) = &paired else { panic!("a Fail is a Sum") };
+        assert_eq!(tags.const_tag(), Some(0), "hoisting un-failed fields stays constant");
+    }
+
+    /// A row that DOES fail forces the general assignment — the two forms have to agree on what
+    /// they mean, so the mask read back is the same either way.
+    #[test]
+    fn a_failure_forces_the_general_assignment() {
+        let hay = Arc::new(vec![10, 20, 30]);
+        let bad = try_gather(one_row(vec![7], &hay)).unwrap();
+        assert!(!no_errors(&bad));
+        let (err, _) = into_fail(bad, "t").unwrap();
+        assert_eq!(err, vec![true]);
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, Value};
+use std::sync::Arc;
+use crate::value::{Bounds, Prim, Tags, Value};
 
 pub(crate) use generators::*;
 
@@ -117,16 +118,27 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             }
             Value::List(nb.into(), Box::new(gather(vals, &elem)))
         }
-        Value::Sum(tags, within, variants) => {
-            // `within` is the carried within-variant offset — read, not recomputed. Each selected row
-            // lands in its variant's lane at that offset; `sum_from_prim` rebuilds the result's offset.
-            let new_tags = tags.gather(idx); // the discriminant moves like any leaf column
+        Value::Sum(tags, variants) => {
+            // one tag throughout: the selected rows are lane `t`'s rows at exactly `idx` (a `Const`
+            // assignment's offset IS the row index), so this is one lane gather and no witness work.
+            if let Some(t) = tags.const_tag() {
+                let mut lanes: Vec<Value> = variants.iter().map(|v| gather(v, &[])).collect();
+                lanes[t] = gather(&variants[t], idx);
+                return Value::Sum(Tags::constant(t, idx.len()), lanes);
+            }
+            // Otherwise build the result's assignment in the SAME pass that routes the rows: a row's
+            // new offset is the size its lane had when the row arrived, so nothing is recomputed
+            // afterwards. Both reads are in place — a gather of k rows is O(k), not O(column).
             let mut per = vec![Vec::new(); variants.len()];
+            let (mut new_tags, mut new_off) = (Vec::with_capacity(idx.len()), Vec::with_capacity(idx.len()));
             for &i in idx {
-                per[tags.usize_at(i)].push(within[i]); // read in place: a gather of k rows is O(k)
+                let t = tags.tag_at(i);
+                new_tags.push(t as u8);
+                new_off.push(per[t].len());
+                per[t].push(tags.offset_at(i));
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
-            Value::sum_from_prim(new_tags, nv)
+            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
     }
@@ -195,35 +207,36 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             // pick each output row's tagged payload: build the output tag column, then per output-tag
             // gather that variant from the sources at the carried within-offset.
             // (tags, within-offsets, lanes) borrowed from each source sum.
-            type SumView<'a> = (&'a Prim, &'a [usize], &'a [Value]);
+            type SumView<'a> = (&'a Tags, &'a [Value]);
             let sums: Vec<SumView> = filled
                 .iter()
                 .map(|v| match v {
-                    Value::Sum(t, o, vs) => (t, o.as_slice(), vs.as_slice()),
+                    Value::Sum(t, vs) => (t, vs.as_slice()),
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
-            let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
-            let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
+            // each output row takes its source row's tag, read in place from that source.
+            let out_tag: Vec<usize> =
+                tags.iter().zip(off).map(|(&t, &o)| sums[t].0.tag_at(o)).collect();
             // every source has the same shape, hence the same arity (there is no uncommitted lane
             // for sources to disagree by); a mismatch is the caller's shape error.
-            let arity = sums[0].2.len();
-            assert!(sums.iter().all(|sm| sm.2.len() == arity), "gather_lanes: sum sources differ in arity");
+            let arity = sums[0].1.len();
+            assert!(sums.iter().all(|sm| sm.1.len() == arity), "gather_lanes: sum sources differ in arity");
             let out_vars: Vec<Value> = (0..arity)
                 .map(|s| {
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
-                    for (i, os) in out_tags.usize_iter().enumerate() {
+                    for (i, &os) in out_tag.iter().enumerate() {
                         if os == s {
                             let (t, o) = (tags[i], off[i]);
                             s_t.push(t);
-                            s_o.push(sums[t].1[o]); // carried offset = position in the source's variant s
+                            s_o.push(sums[t].0.offset_at(o)); // carried offset within the source's lane s
                         }
                     }
-                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.2[s])).collect();
+                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.1[s])).collect();
                     gather_lanes(&vsrcs, &s_t, &s_o)
                 })
                 .collect();
-            Value::sum_from_prim(out_tags, out_vars)
+            Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
     }
@@ -274,13 +287,13 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             }
             Value::List(nb.into(), Box::new(concat(&vp)))
         }
-        Value::Sum(_, _, v0) => {
-            let mut tag_parts: Vec<&Prim> = Vec::new();
-            let mut per: Vec<Vec<Value>> = vec![Vec::new(); v0.len()]; // committed contributions per lane
+        Value::Sum(_, v0) => {
+            let mut all_tags: Vec<usize> = Vec::new();
+            let mut per: Vec<Vec<Value>> = vec![Vec::new(); v0.len()]; // contributions per lane
             for p in parts {
                 match p {
-                    Value::Sum(t, _, v) => {
-                        tag_parts.push(t);
+                    Value::Sum(t, v) => {
+                        all_tags.extend(t.tags_iter());
                         for (i, c) in v.iter().enumerate() {
                             per[i].push(c.clone());
                         }
@@ -290,7 +303,8 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             }
             // the concatenated tags fix the offset, so it's rebuilt rather than spliced.
             let lanes = per.iter().map(|ps| concat(ps)).collect();
-            Value::sum_from_prim(Prim::concat(&tag_parts), lanes)
+            let arity = v0.len();
+            Value::Sum(Tags::from_tags(all_tags, arity), lanes)
         }
         Value::Unit(_) => Value::Unit(parts.iter().map(Value::len).sum()),
     }
@@ -335,9 +349,9 @@ mod tests {
         let (tags, off) = (vec![0usize, 1, 0, 1], vec![0usize, 0, 1, 1]);
         let out = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
         match &out {
-            Value::Sum(t, _, lanes) => {
+            Value::Sum(t, lanes) => {
                 assert_eq!(lanes.len(), 2);
-                assert_eq!(t.usize_vec(), vec![0, 1, 0, 1]);
+                assert_eq!(t.tags_iter().collect::<Vec<_>>(), vec![0, 1, 0, 1]);
                 assert_eq!(lanes[0], u(&[10, 11]));
                 assert_eq!(lanes[1], u(&[20, 21]));
             }

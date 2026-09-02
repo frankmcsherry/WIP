@@ -3,7 +3,7 @@
 //! reduce to) and `mod discriminate` (the discrimination sort `sort` uses); both re-exported at this level.
 
 use crate::engine::{gather, row_span};
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Tags, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
@@ -225,26 +225,33 @@ mod compare {
             // sum = tag order first; equal-tag pairs recurse into the lane at their within-variant
             // offsets (`oa`/`ob`, carried by the value). No gather: the remapped indices descend as
             // the next level's pairs.
-            (Value::Sum(ta, oa, va), Value::Sum(tb, ob, vb)) => {
+            (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
                 assert_eq!(va.len(), vb.len(), "compare_idx: sum arity");
+                // Both sides one lane, the same one: the tag decides nothing and the offsets are
+                // the identity, so the comparison IS the lane's, at the pairs we were handed.
+                if let (Some(t), Some(u)) = (ta.const_tag(), tb.const_tag()) {
+                    if t == u {
+                        return compare_idx(&va[t], &vb[t], ia, ib);
+                    }
+                }
                 // Read the discriminants in place. Decoding a whole tag column per call made a
                 // scalar `compare_at` O(column): a chunk merge over sum-shaped keys spent 40% of
                 // its time re-decoding tags it looked at one row of.
                 let mut ord: Vec<i8> = ia
                     .iter()
                     .zip(ib)
-                    .map(|(&i, &j)| ta.usize_at(i).cmp(&tb.usize_at(j)) as i8)
+                    .map(|(&i, &j)| ta.tag_at(i).cmp(&tb.tag_at(j)) as i8)
                     .collect();
                 let mut by_tag: Vec<Vec<usize>> = vec![Vec::new(); va.len()];
                 for (k, (&i, &j)) in ia.iter().zip(ib).enumerate() {
-                    let t = ta.usize_at(i);
-                    if t == tb.usize_at(j) { by_tag[t].push(k); }
+                    let t = ta.tag_at(i);
+                    if t == tb.tag_at(j) { by_tag[t].push(k); }
                 }
                 for (t, ks) in by_tag.iter().enumerate() {
                     if ks.is_empty() { continue; }
-                    // `oa`/`ob` are the carried within-variant offsets — read, not recomputed.
-                    let sia: Vec<usize> = ks.iter().map(|&k| oa[ia[k]]).collect();
-                    let sib: Vec<usize> = ks.iter().map(|&k| ob[ib[k]]).collect();
+                    // the carried within-lane offsets — read, not recomputed.
+                    let sia: Vec<usize> = ks.iter().map(|&k| ta.offset_at(ia[k])).collect();
+                    let sib: Vec<usize> = ks.iter().map(|&k| tb.offset_at(ib[k])).collect();
                     let sub = compare_idx(&va[t], &vb[t], &sia, &sib);
                     // tag was Equal on these pairs, so the payload order IS the order.
                     for (&k, o) in ks.iter().zip(sub) { ord[k] = o; }
@@ -343,7 +350,7 @@ mod discriminate {
         match v {
             Value::Prim(p) => sort_leaf_blocks(labels, p),
             Value::Prod(cols) => sort_prod_blocks(labels, cols),
-            Value::Sum(tags, within, variants) => sort_sum_blocks(labels, tags, within, variants),
+            Value::Sum(tags, variants) => sort_sum_blocks(labels, tags, variants),
             Value::List(bounds, vals) => sort_list_blocks(labels, bounds, vals),
             // unit rows are all equal: stable identity perm, no label refinement.
             Value::Unit(n) => ((0..*n).collect(), labels.to_vec()),
@@ -465,10 +472,16 @@ mod discriminate {
         (perm, cur)
     }
 
-    fn sort_sum_blocks(labels: &[u64], tags: &Prim, within: &[usize], variants: &[Value]) -> (Vec<usize>, Vec<u64>) {
+    fn sort_sum_blocks(labels: &[u64], tags: &Tags, variants: &[Value]) -> (Vec<usize>, Vec<u64>) {
         let n = labels.len();
+        // One lane throughout: the tag discriminates nothing and row i is that lane's row i, so
+        // sorting the sum IS sorting the lane — no discrimination pass, no gather, no remap.
+        if let Some(t) = tags.const_tag() {
+            return sort_blocks(labels, &variants[t]);
+        }
         // 1. discriminate by the tag column directly — a u8 leaf, so a single-pass radix.
-        let (perm_disc, labels_disc) = sort_leaf_blocks(labels, tags);
+        let Tags::Column(tag_col, within) = tags else { unreachable!("const handled above") };
+        let (perm_disc, labels_disc) = sort_leaf_blocks(labels, tag_col);
         // 2. within each tag-block, recurse into that lane's gathered rows, at each row's position
         //    within its lane — read from the carried offset (no recompute).
         let mut perm = perm_disc.clone();
@@ -482,7 +495,7 @@ mod discriminate {
             }
             // the whole block shares a tag, so this reads ONE tag per block — decoding the whole
             // column for it (as this did) is O(column) work for O(blocks) reads.
-            let t = tags.usize_at(perm_disc[lo]);
+            let t = tags.tag_at(perm_disc[lo]);
             let lane_pos: Vec<usize> = (lo..hi).map(|i| within[perm_disc[i]]).collect();
             let lane = gather(&variants[t], &lane_pos);
             let seed = vec![0u64; hi - lo];
@@ -598,8 +611,9 @@ mod tests {
                     o => o,
                 }
             }
-            (Value::Sum(ta, _, va), Value::Sum(tb, _, vb)) => {
-                let (tav, tbv) = (ta.usize_vec(), tb.usize_vec());
+            (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
+                let (tav, tbv): (Vec<usize>, Vec<usize>) =
+                    (ta.tags_iter().collect(), tb.tags_iter().collect());
                 let (ti, tj) = (tav[i], tbv[j]);
                 match ti.cmp(&tj) {
                     Ordering::Equal => {
