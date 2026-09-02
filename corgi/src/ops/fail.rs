@@ -48,8 +48,8 @@ pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
 /// destructure a `Fail<T>` into its error mask and packed Ok lane; anything else is the shape error.
 pub(crate) fn into_fail(v: Value, who: &str) -> Result<(Vec<bool>, Value), String> {
     match v {
-        Value::Sum(Prim::U8(tags), _off, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)) => {
-            let err = tags.iter().map(|&t| t != 0).collect();
+        Value::Sum(tags, _off, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)) => {
+            let err = tags.usize_iter().map(|t| t != 0).collect();
             Ok((err, lanes.into_iter().next().unwrap()))
         }
         other => Err(format!("{who}: expected a Fail (Sum{{T | Unit}}), got {}", shape_of_value(&other))),

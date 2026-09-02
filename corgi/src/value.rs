@@ -142,8 +142,27 @@ macro_rules! prim {
             }
 
             /// the whole column as `usize`s (for small-int columns like Sum discriminants).
+            /// Prefer [`Prim::usize_at`] / [`Prim::usize_iter`]: a reader that looks at rows does
+            /// not need an 8x-wide COPY of the column to do it.
             pub(crate) fn usize_vec(&self) -> Vec<usize> {
                 match self { $( Prim::$V(v) => v.iter().map(|&x| x as usize).collect(), )+ }
+            }
+
+            /// row `i` as a `usize`, read in place. The element-wise form of [`Prim::usize_vec`],
+            /// and the ONE way a reader should touch a `Sum`'s discriminant: decoding the whole
+            /// column to look at some of it made a scalar `compare_at` O(column) (see #17).
+            /// Representation-agnostic on purpose — a tag column that is not a plain leaf answers
+            /// this the same way.
+            #[inline]
+            pub(crate) fn usize_at(&self, i: usize) -> usize {
+                match self { $( Prim::$V(v) => v[i] as usize, )+ }
+            }
+
+            /// every row as a `usize`, in row order — the iterator form of [`Prim::usize_at`].
+            /// The per-element match is on a loop-invariant discriminant, so it hoists; what does
+            /// not come back is the intermediate column.
+            pub(crate) fn usize_iter(&self) -> impl Iterator<Item = usize> + '_ {
+                (0..self.len()).map(move |i| self.usize_at(i))
             }
 
             /// re-width every record to `bits`, kind-blind: read it zero-extended to u64,
@@ -452,9 +471,9 @@ prim! {
 
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in
 /// one cursor pass. A `Sum` carries this (see [`Value::sum`]).
-fn within_offsets(tags: &[usize], k: usize) -> Vec<usize> {
+fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
     let mut cursor = vec![0usize; k];
-    tags.iter().map(|&t| { let p = cursor[t]; cursor[t] += 1; p }).collect()
+    tags.map(|t| { let p = cursor[t]; cursor[t] += 1; p }).collect()
 }
 
 impl Value {
@@ -472,7 +491,7 @@ impl Value {
         // tags are stored as a u8 discriminant, so the variant count must fit a u8 — else `t as u8`
         // would silently truncate a tag onto the wrong lane.
         assert!(variants.len() <= 256, "Value::sum: {} variants exceeds the u8 tag width", variants.len());
-        let offset = within_offsets(&tags, variants.len());
+        let offset = within_offsets(tags.iter().copied(), variants.len());
         let tags = Prim::U8(Arc::new(tags.iter().map(|&t| t as u8).collect()));
         Value::Sum(tags, offset, variants)
     }
@@ -480,7 +499,7 @@ impl Value {
     /// a Sum from an existing tag column and its lanes; the within-variant offset is derived from
     /// the tags. For ops that already hold the tags as a `Prim` (`gather`/`concat`).
     pub(crate) fn sum_from_prim(tags: Prim, lanes: Vec<Value>) -> Value {
-        let offset = within_offsets(&tags.usize_vec(), lanes.len());
+        let offset = within_offsets(tags.usize_iter(), lanes.len());
         Value::Sum(tags, offset, lanes)
     }
 

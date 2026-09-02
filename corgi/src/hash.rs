@@ -83,9 +83,10 @@ pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
         // sum = tag first, then the payload read from the row's lane at its carried within-variant
         // offset.
         Value::Sum(tags, offset, variants) => {
-            let tags = tags.usize_vec();
             let lanes: Vec<Vec<u64>> = variants.iter().map(hash_cols).collect();
-            tags.iter().zip(offset).map(|(&t, &o)| combine(combine(SUM, t as u64), lanes[t][o])).collect()
+            // tags are read in place: this fold looks at each row's tag exactly once, so decoding
+            // the column into a wider one first is pure overhead.
+            tags.usize_iter().zip(offset).map(|(t, &o)| combine(combine(SUM, t as u64), lanes[t][o])).collect()
         }
 
         // list = length first, then each element in order, folded by SPAN — so a `Stride` and the

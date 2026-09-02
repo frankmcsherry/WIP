@@ -329,9 +329,8 @@ impl<L: OpLike> Op<L> {
                 };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
                 let mut per = vec![Vec::new(); lanes.len()];
-                let Prim::U8(t8) = &tags else { unreachable!("sum tags are a u8 column") };
-                for (i, &t) in t8.iter().enumerate() {
-                    per[t as usize].push(i);
+                for (i, t) in tags.usize_iter().enumerate() {
+                    per[t].push(i);
                 }
                 let new = lanes
                     .into_iter()

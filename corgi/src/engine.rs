@@ -120,11 +120,10 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
         Value::Sum(tags, within, variants) => {
             // `within` is the carried within-variant offset — read, not recomputed. Each selected row
             // lands in its variant's lane at that offset; `sum_from_prim` rebuilds the result's offset.
-            let Prim::U8(tag_vec) = tags else { unreachable!("gather: sum discriminants are u8 columns") };
             let new_tags = tags.gather(idx); // the discriminant moves like any leaf column
             let mut per = vec![Vec::new(); variants.len()];
             for &i in idx {
-                per[tag_vec[i] as usize].push(within[i]); // read in place: a gather of k rows is O(k)
+                per[tags.usize_at(i)].push(within[i]); // read in place: a gather of k rows is O(k)
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
             Value::sum_from_prim(new_tags, nv)
@@ -206,7 +205,6 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 .collect();
             let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
             let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
-            let out_tag_vec = out_tags.usize_vec();
             // every source has the same shape, hence the same arity (there is no uncommitted lane
             // for sources to disagree by); a mismatch is the caller's shape error.
             let arity = sums[0].2.len();
@@ -214,7 +212,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             let out_vars: Vec<Value> = (0..arity)
                 .map(|s| {
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
-                    for (i, &os) in out_tag_vec.iter().enumerate() {
+                    for (i, os) in out_tags.usize_iter().enumerate() {
                         if os == s {
                             let (t, o) = (tags[i], off[i]);
                             s_t.push(t);

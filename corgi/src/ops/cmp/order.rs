@@ -227,17 +227,18 @@ mod compare {
             // the next level's pairs.
             (Value::Sum(ta, oa, va), Value::Sum(tb, ob, vb)) => {
                 assert_eq!(va.len(), vb.len(), "compare_idx: sum arity");
-                // Read the u8 discriminants in place. Decoding a whole tag column per call made a
+                // Read the discriminants in place. Decoding a whole tag column per call made a
                 // scalar `compare_at` O(column): a chunk merge over sum-shaped keys spent 40% of
                 // its time re-decoding tags it looked at one row of.
-                let (Prim::U8(ta_v), Prim::U8(tb_v)) = (ta, tb) else {
-                    unreachable!("compare_idx: sum discriminants are u8 columns")
-                };
-                let mut ord: Vec<i8> =
-                    ia.iter().zip(ib).map(|(&i, &j)| ta_v[i].cmp(&tb_v[j]) as i8).collect();
+                let mut ord: Vec<i8> = ia
+                    .iter()
+                    .zip(ib)
+                    .map(|(&i, &j)| ta.usize_at(i).cmp(&tb.usize_at(j)) as i8)
+                    .collect();
                 let mut by_tag: Vec<Vec<usize>> = vec![Vec::new(); va.len()];
                 for (k, (&i, &j)) in ia.iter().zip(ib).enumerate() {
-                    if ta_v[i] == tb_v[j] { by_tag[ta_v[i] as usize].push(k); }
+                    let t = ta.usize_at(i);
+                    if t == tb.usize_at(j) { by_tag[t].push(k); }
                 }
                 for (t, ks) in by_tag.iter().enumerate() {
                     if ks.is_empty() { continue; }
@@ -468,9 +469,8 @@ mod discriminate {
         let n = labels.len();
         // 1. discriminate by the tag column directly — a u8 leaf, so a single-pass radix.
         let (perm_disc, labels_disc) = sort_leaf_blocks(labels, tags);
-        // 2. each row's position within its lane — read from the carried offset (no recompute).
-        let tag_vec = tags.usize_vec();
-        // 3. within each tag-block, recurse into that lane's gathered rows.
+        // 2. within each tag-block, recurse into that lane's gathered rows, at each row's position
+        //    within its lane — read from the carried offset (no recompute).
         let mut perm = perm_disc.clone();
         let mut new_labels = vec![0u64; n];
         let mut next = 0u64;
@@ -480,7 +480,9 @@ mod discriminate {
                 next += 1;
                 continue;
             }
-            let t = tag_vec[perm_disc[lo]]; // the whole block shares a tag
+            // the whole block shares a tag, so this reads ONE tag per block — decoding the whole
+            // column for it (as this did) is O(column) work for O(blocks) reads.
+            let t = tags.usize_at(perm_disc[lo]);
             let lane_pos: Vec<usize> = (lo..hi).map(|i| within[perm_disc[i]]).collect();
             let lane = gather(&variants[t], &lane_pos);
             let seed = vec![0u64; hi - lo];

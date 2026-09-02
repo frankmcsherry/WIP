@@ -243,9 +243,9 @@ pub mod arrange {
             }
             // Sum: mix the row's tag, then its lane's payload hash at the within-variant offset.
             Value::Sum(tags, offset, variants) => {
-                let tags = tags.usize_vec();
                 let lanes: Vec<Vec<u64>> = variants.iter().map(hash_rows).collect();
-                tags.iter().zip(offset.iter()).map(|(&t, &o)| mix(mix(SEED_SUM, t as u64), lanes[t][o])).collect()
+                // tags read in place — one look per row, no decoded copy (as in `crate::hash`).
+                tags.usize_iter().zip(offset.iter()).map(|(t, &o)| mix(mix(SEED_SUM, t as u64), lanes[t][o])).collect()
             }
             // List: mix the row's element count, then the row's flattened element hashes in order.
             Value::List(bounds, vals) => {
