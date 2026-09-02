@@ -186,7 +186,7 @@ applied to a fallible column where lowering forgot to lift would be a shape erro
 separate syntactic query — total iff every fallible column meets a `try` before the output; `run`
 refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
 
-The partial kernels (`Op::Gather`, `Filter`, `Slices`, `Chunk`, `Zip`, `Branch`) stay in the enum for
+The partial kernels (`Op::Get`, `Gather`, `Filter`, `Slices`, `Chunk`, `Zip`, `Branch`) stay in the enum for
 a host holding a bounds proof (DDIR); they are not on the surface. `gather_try` is distinct: the
 per-ELEMENT `List<Sum{Oob | Found}>`, a value the program handles itself, not a per-row effect.
 

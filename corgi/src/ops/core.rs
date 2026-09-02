@@ -154,6 +154,9 @@ pub enum Op<L> {
     // lookup per row; `TryGet` below is its total form), `Gather` is its vectorization (the index
     // arrives as a list), and `head` is sugar for `get 0` (an empty row errs, so a TOTAL head needs
     // no non-emptiness proof).
+    Get,            // (idx:U64, haystack:List<T>) -> T  the scalar point access, PARTIAL (panics out of
+                    // bounds): the host-side kernel for an index the host has already checked or whose
+                    // failure it defines as a fault. `TryGet` is the total form.
     Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  the vector form: a list of indices.
                     // The engine primitive surfaced; chains compose in-language —
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
@@ -660,6 +663,22 @@ impl<L: OpLike> Op<L> {
 
             // vector point gather: each row-relative index becomes the haystack element it names.
             // Output bounds are the index list's bounds (the indices decide the cardinality).
+            Op::Get => {
+                let (idx, haystack) = input.into_pair("Get")?;
+                let idxs = idx.into_u64("Get index")?;
+                let (hb, hvals) = haystack.into_list("Get haystack")?;
+                assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
+                let mut abs = Vec::with_capacity(idxs.len());
+                let mut hs = 0;
+                for (r, he) in hb.ends().enumerate() {
+                    let x = idxs[r] as usize;
+                    assert!(x < he - hs, "Get: index {x} out of range for a row of {} elements", he - hs);
+                    abs.push(hs + x);
+                    hs = he;
+                }
+                gather(&hvals, &abs)
+            }
+
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather")?;
                 let (ib, ivals) = idx.into_list("Gather indices")?;
