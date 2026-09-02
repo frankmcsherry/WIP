@@ -13,7 +13,7 @@ use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
-use crate::shape::Shape;
+
 use crate::value::{Prim, Value};
 use std::sync::Arc;
 
@@ -169,9 +169,9 @@ macro_rules! grid {
                         let m = !(<$u>::MAX >> 1);
                         if (y ^ m) as $i == 0 { x } else { swiz!($u, $i, x, y, wrapping_rem) }
                     }),
-                    // integer division is deferred; the judge rejects it, so this is never reached.
+                    // integer division is deferred; `eval` rejects it up front, so this is never reached.
                     (Kind::U, BinOp::Div) | (Kind::I, BinOp::Div) => {
-                        unreachable!("integer Div is rejected by judge")
+                        unreachable!("integer Div is rejected before dispatch")
                     }
                     // float is dispatched by `bin_eval` before reaching here.
                     (Kind::F, _) => unreachable!("int_bin: float dispatched by bin_eval"),
@@ -197,7 +197,7 @@ macro_rules! grid {
 grid! { U8 => u8:i8, U16 => u16:i16, U32 => u32:i32, U64 => u64:i64 }
 
 /// the binary leaf op, dispatching `Kind::F` to the float path (32/64 only) and `U`/`I` to the macro
-/// grid. The judge has already rejected float at widths 8/16 and integer `Div`, so the fallthroughs panic.
+/// grid. `eval` has already rejected float at widths 8/16 and integer `Div`, so the fallthroughs panic.
 fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
     match kind {
         Kind::F => float_bin(op, a, b),
@@ -223,7 +223,7 @@ fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
     macro_rules! f { ($V:ident, $dec:ident, $enc:ident, $av:ident, $bv:ident) => {
         Prim::$V(bin_into($av, $bv, |x, y| { let (x, y) = ($dec(x), $dec(y)); $enc(match op {
             BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
-            BinOp::Rem => unreachable!("float Rem is rejected by judge"),
+            BinOp::Rem => unreachable!("float Rem is rejected before dispatch"),
         })}))
     }}
     match (a, b) {
@@ -234,42 +234,63 @@ fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
 }
 
 impl ArithOp {
-    fn eval(&self, input: Value) -> Value {
-        match self {
-            ArithOp::Bin(op, kind, _) => {
-                let (a, b) = input.into_pair("binary arith");
-                let (pa, pb) = (a.into_prim("binary arith lhs"), b.into_prim("binary arith rhs"));
+    fn eval(&self, input: Value) -> Result<Value, String> {
+        Ok(match self {
+            ArithOp::Bin(op, kind, w) => {
+                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
+                    return Err(format!("float arith only at width 32/64, got {w}"));
+                }
+                if matches!(op, BinOp::Div) && !matches!(kind, Kind::F) {
+                    return Err("integer div is deferred — div is float-only (use div_f32/div_f64)".into());
+                }
+                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
+                    return Err("rem is integer-only".into());
+                }
+                let (a, b) = input.into_pair("binary arith")?;
+                let (pa, pb) = (a.into_prim("binary arith lhs")?, b.into_prim("binary arith rhs")?);
+                if pa.bits() != *w || pb.bits() != *w {
+                    return Err(format!("binary arith expects (U{w}, U{w}), got (U{}, U{})", pa.bits(), pb.bits()));
+                }
                 assert_eq!(pa.len(), pb.len(), "binary arith: operands at different strata");
                 Value::Prim(bin_eval(*op, *kind, pa, pb))
             }
-            ArithOp::Neg(kind, _) => Value::Prim(neg_eval(*kind, input.into_prim("Neg"))),
-            ArithOp::ToSigned => Value::Prim(input.into_prim("signed").xor_signbit()),
-            ArithOp::ToFloat(w) => Value::Prim(match (w, input.into_prim("to_float")) {
+            ArithOp::Neg(kind, w) => {
+                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
+                    return Err(format!("float neg only at width 32/64, got {w}"));
+                }
+                let p = input.into_prim("Neg")?;
+                if p.bits() != *w {
+                    return Err(format!("Neg expects U{w}, got U{}", p.bits()));
+                }
+                Value::Prim(neg_eval(*kind, p))
+            }
+            ArithOp::ToSigned => Value::Prim(input.into_prim("signed")?.xor_signbit()),
+            ArithOp::ToFloat(w) => Value::Prim(match (w, input.into_prim("to_float")?) {
                 (32, Prim::U32(v)) => Prim::U32(neg_into(v, |x| enc_f32(x as f32))),
                 (64, Prim::U64(v)) => Prim::U64(neg_into(v, |x| enc_f64(x as f64))),
-                _ => panic!("to_float: width/leaf mismatch"),
+                (w, p) => return Err(format!("to_float expects a U{w} leaf (w in 32/64), got U{}", p.bits())),
             }),
             ArithOp::AddU64(c) => {
                 // in place when uniquely owned: `into_u64` moves the buffer out at refcount 1, else clones.
-                let mut xs = input.into_u64("AddU64");
+                let mut xs = input.into_u64("AddU64")?;
                 xs.iter_mut().for_each(|x| *x = x.wrapping_add(*c));
                 Value::u64(xs)
             }
             // in place, like AddU64. Both vectorize (vector shift / vector AND) — the SIMD forms of
             // divide / modulo by a power of two, which general integer div/mod lack on NEON.
             ArithOp::Shr(k) => {
-                let mut xs = input.into_u64("Shr");
+                let mut xs = input.into_u64("Shr")?;
                 xs.iter_mut().for_each(|x| *x >>= *k);
                 Value::u64(xs)
             }
             ArithOp::And(m) => {
-                let mut xs = input.into_u64("And");
+                let mut xs = input.into_u64("And")?;
                 xs.iter_mut().for_each(|x| *x &= *m);
                 Value::u64(xs)
             }
             ArithOp::Reduce(r) => {
-                let (bounds, vals) = input.into_list("reduce");
-                let xs = vals.into_u64("reduce values");
+                let (bounds, vals) = input.into_list("reduce")?;
+                let xs = vals.into_u64("reduce values")?;
                 let mut out = Vec::with_capacity(bounds.len());
                 let mut start = 0;
                 for end in bounds.ends() {
@@ -290,8 +311,8 @@ impl ArithOp {
                 Value::u64(out)
             }
             ArithOp::Scan(r) => {
-                let (bounds, vals) = input.into_list("scan");
-                let mut xs = vals.into_u64("scan values"); // owned -> inclusive prefix written in place
+                let (bounds, vals) = input.into_list("scan")?;
+                let mut xs = vals.into_u64("scan values")?; // owned -> inclusive prefix written in place
                 // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
                 // sequential within a row, so this is a single memory pass, not a vectorizable one.
                 macro_rules! prefix {
@@ -319,59 +340,9 @@ impl ArithOp {
                 }
                 Value::List(bounds, Box::new(Value::u64(xs)))
             }
-        }
-    }
-
-    /// shape rule: kind-blind, leaf widths only.
-    fn judge(&self, input: &Shape) -> Result<Shape, String> {
-        use Shape::*;
-        Ok(match self {
-            ArithOp::Bin(op, kind, w) => {
-                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
-                    return Err(format!("float arith only at width 32/64, got {w}"));
-                }
-                if matches!(op, BinOp::Div) && !matches!(kind, Kind::F) {
-                    return Err("integer div is deferred — div is float-only (use div_f32/div_f64)".into());
-                }
-                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
-                    return Err("rem is integer-only".into());
-                }
-                match input {
-                    Prod(ts) if ts.len() == 2 && ts[0] == Prim(*w) && ts[1] == Prim(*w) => Prim(*w),
-                    _ => return Err(format!("binary arith expects (U{w}, U{w}), got {input}")),
-                }
-            }
-            ArithOp::Neg(kind, w) => {
-                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
-                    return Err(format!("float neg only at width 32/64, got {w}"));
-                }
-                match input {
-                    Prim(b) if b == w => Prim(*w),
-                    _ => return Err(format!("Neg expects U{w}, got {input}")),
-                }
-            }
-            ArithOp::ToSigned => match input {
-                Prim(w) => Prim(*w),
-                _ => return Err(format!("signed expects a leaf, got {input}")),
-            },
-            ArithOp::ToFloat(w) => match input {
-                Prim(b) if b == w && matches!(w, 32 | 64) => Prim(*w),
-                _ => return Err(format!("to_float expects a U{w} leaf (w in 32/64), got {input}")),
-            },
-            ArithOp::AddU64(_) | ArithOp::Shr(_) | ArithOp::And(_) => match input {
-                Prim(64) => Prim(64),
-                _ => return Err(format!("U64-constant arith expects U64, got {input}")),
-            },
-            ArithOp::Reduce(_) => match input {
-                List(t) if **t == Prim(64) => Prim(64),
-                _ => return Err(format!("reduce expects List<U64>, got {input}")),
-            },
-            ArithOp::Scan(_) => match input {
-                List(t) if **t == Prim(64) => List(Box::new(Prim(64))),
-                _ => return Err(format!("scan expects List<U64>, got {input}")),
-            },
         })
     }
+
 }
 
 /// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),
@@ -385,20 +356,12 @@ pub enum NumOp {
 }
 
 impl OpLike for NumOp {
-    fn eval(&self, input: Value) -> Value {
+    fn eval(&self, input: Value) -> Result<Value, String> {
         match self {
             NumOp::Core(c) => c.eval(input),
             NumOp::Cmp(c) => c.eval(input),
             NumOp::Arith(a) => a.eval(input),
             NumOp::Text(t) => t.eval(input),
-        }
-    }
-    fn judge(&self, input: &Shape) -> Result<Shape, String> {
-        match self {
-            NumOp::Core(c) => c.judge(input),
-            NumOp::Cmp(c) => c.judge(input),
-            NumOp::Arith(a) => a.judge(input),
-            NumOp::Text(t) => t.judge(input),
         }
     }
     fn children(&self) -> Vec<&Graph<NumOp>> {

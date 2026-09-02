@@ -17,12 +17,15 @@ src/
   cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
                is the diagonal case) + the linear discrimination sort (sort_blocks / run_layout /
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
-  graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph, shape_of,
-               check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
+  graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
+               shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
-               the unoptimized graph (like `check_total`, a caller opts in); tested for semantic
-               preservation on every corpus program, so the passes are latent, not dead.
+               the unoptimized graph; tested for semantic preservation on every corpus program, so the
+               passes are latent, not dead.
+  effect.rs    the effect layer as a REWRITE: `lower_effects` threads `Fail<T>` columns past the ops
+               downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`; `is_total`
+               is the syntactic query. No second evaluator: the lowered graph is pure vocabulary.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture
@@ -40,11 +43,15 @@ src/
                (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
                programs witness it), kept for the execution strategy the expansion loses. The
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
-               eval/judge/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
+               eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+    fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
+               per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
+               three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
+               functor). The evals live here; `Op::eval` dispatches to them first.
     text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
                total — ParseU64 returns Sum{Err: bytes | Ok: U64}, no data-dependent panic.
   frontend/
@@ -98,7 +105,12 @@ reasons. Adding a structural op means either filling a hole (and writing its law
 - **Every semantic op is a unary `T0 -> T1`** (the 1:1 map), run by `eval`. `Input`/`Tuple` are the
   only non-ops — they're `graph::NodeKind`.
 - **Shape = structure + leaf width, kind-blind.** Numeric kinds (signed/float) are an interpretation
-  a layer encodes, never a Shape. `shape_of` is `eval` lifted to shapes.
+  a layer encodes, never a Shape. `shape_of` is LITERALLY `eval` on a zero-row column: every op is
+  total on zero rows, reports a mismatched operand as `Err` (the accessors `into_pair`/`into_list`/…
+  carry the message), and builds an output of the shape it would at any length — so there is one
+  vocabulary, one evaluator, and no type-level shadow of it to keep in sync. `eval_graph` unwraps
+  (a typechecked program cannot fail); `try_eval_graph` is the fallible form the typer and the
+  body-bearing ops use.
 - **Layering = enum embedding via `OpLike` + body-generic `Op<L>`.** A layer is `{ Core(Op<Self>),
   <buckets> }` impl'ing `OpLike` by delegating; the graph machinery is unchanged across layers.
 - **The core is numeric-blind.** Arithmetic is `ops/numeric`; comparison is `ops/cmp`. The leaf is
@@ -114,7 +126,7 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
   via `to_f32`/`to_f64` (no float literal token: a constant is `lit_uN K to_fN`); the typed grid is
   reached by suffix (`add_i32`, `div_f64`, `lit_i16 N`, `signed`). Integer `div` is deferred (no NEON
-  op; div-by-zero would panic) — the judge rejects it.
+  op; div-by-zero would panic) — `eval` rejects it.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
 - **List rows carry a stride-aware `Bounds`.** `Value::List` holds `Bounds { Stride(stride, rows) |
@@ -157,30 +169,30 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
   identity acc-gather + scatter) for the uniform-length regime where every row is active every round.
 
-## Totality — the claim, scoped, and the assert→gate cover map
+## Totality — partiality as data, threaded by a rewrite
 
-The guarantee is precise: **every program in the GATED SUBSET runs to a value — no panic — for every
-input.** "Gated subset" = passes the typer + the length gate + the range gate, and `check_total` = Ok
-(no `_uns` op). Not "no panics, ever": a `_uns` op or a checker-bypassing hand-built `Graph` can still
-abort. The claim is witnessed, not asserted — every reachable `assert!`/`panic!` in `eval` is covered
-by exactly one of:
+The surface's fallible verbs (`get`/`head`, `gather`, `branch`, `zip`, `slices`, `filter`, `chunk`)
+are TOTAL per-row producers: a row that would trip the partial kernel's assert lands in the Err lane
+of `Fail<T> = Sum{ Ok: T | Err: Unit }` (`ops/fail.rs`). Everything downstream is written against `T`;
+`effect::lower_effects` makes that well-typed by inserting ordinary ops — a pure op fed a `Fail<T>`
+becomes `MapSum([(0, op)])` on the packed Ok lane, a second fallible op adds a `Squash`, a `Tuple`
+with a fallible field `Lift`s the pure ones and `HoistProd`s, and a body-bearing op whose body fails
+`HoistList`s / `HoistSum`s the per-element errors out to the row (all-or-nothing). `try` is the
+identity on values: it marks where the program takes the `Sum{T | Unit}` up as data to `match` on.
 
-- **a gate** — `Zip`/`Filter` bounds by `lengths`; `Branch` tag-in-range by `ranges`.
-- **a tier `check_total` reports** — `get`/`gather`/`slices` (`_uns`): the located opt-out (`head_uns`
-  lowers to `get_uns 0`, so it surfaces as `get_uns`).
-- **a defensive check of the 1:1 SEQ invariant the typer already enforces** — the "body changed the
-  row count" asserts in `Fold`/`FoldScan` (unreachable given the typer).
-- **made total instead** — integer arith is `wrapping_*`; float `div` yields inf/NaN; integer `div`
-  is judge-rejected; `get_try`/`gather_try`/`try_*`/`ParseU64` carry failure in an `Oob`/`Err` lane.
+So there is ONE evaluator and ONE typer. `Program::run_partial` = `eval_graph(lower_effects(g))`; the
+corpus test types every lowered program with `shape_of`, which is what proves the discipline: an op
+applied to a fallible column where lowering forgot to lift would be a shape error. `is_total` is the
+separate syntactic query — total iff every fallible column meets a `try` before the output; `run`
+refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
 
-**Audit rule for the gates (learned the hard way):** any analysis threaded through a *fixpoint*
-operator (`Fold`/`FoldScan`'s accumulator back-edge) must treat the fed-back value as unknown — ⊤ for
-a concrete lattice (`ranges`' intervals), fresh tokens for a unification lattice (`lengths`). The seed
-describes only round 0; the accumulator at round *t* is the body's prior output. Both gates now ⊤ the
-accumulator slot (the element keeps its annotation). A `branch` on a fold accumulator therefore needs
-`try_branch` (or a fixpoint proof), not a range proof — which is correct. The missing test class that
-let this slip: "gate-passing-but-faulting," run adversarially over fold/scan *body* contexts (a green
-corpus only certifies programs someone wrote, not the reachable space).
+The partial kernels (`Op::Get`, `Gather`, `Filter`, `Slices`, `Chunk`, `Zip`, `Branch`) stay in the enum for
+a host holding a bounds proof (DDIR); they are not on the surface. `gather_try` is distinct: the
+per-ELEMENT `List<Sum{Oob | Found}>`, a value the program handles itself, not a per-row effect.
+
+**Audit rule, kept from the old gates:** an analysis threaded through a fixpoint (`Fold`/`FoldScan`'s
+accumulator back-edge) must treat the fed-back value as unknown; the lowering does this by making the
+accumulator itself a `Fail<B>`, so a row that errs on any round stays Err.
 
 ## Done (foundations in place)
 
@@ -193,8 +205,7 @@ NEON-vectorized; `sort_list` is the lone compute-bound op.
 Then the kernel-matrix session: `Op<L>` reorganized as (intro/elim/map/capture) × (Prod/Sum/List)
 with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (index-as-value) and
 `Head` (the stratum drop) added; the three iso pairs completed (`Zip`, `Unweave`/`Weave`);
-`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` now judge by `join` (⊥-laned probes
-unify with committed operands); the judge rejects what eval can't represent (`Cast` widths, sum
+`Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` check shape equality; `eval` rejects what it can't represent (`Cast` widths, sum
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
 
@@ -270,11 +281,15 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **JSONL / Extern** — `split`/`parse_u64` landed as the `text` bucket (typed, not `Op::Extern`); `parse_json` remains open and still wants `Extern` or recursion (μ-types below).
 - **Named declarations — enum half DONE; struct half deliberately skipped.**
   `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
-  Use sites: `inject V` (both numbers off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
+  Use sites: `inject V` (the tag AND the whole sum's lane shapes off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
+  Payload shapes: `enum Node = Lit u64 | Add (u64, u64) | Str List(u8) | Wrap Other in …` — a variant may omit its shape unless the
+  enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
+  naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
+  is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
   Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1` ≡ `(x, x lit 1) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are untouched).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
-  Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; programs/10 deliberately keeps the numeric `inject 1 3` so both spellings stay exercised.
+  Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).
 
 - **Kind-checking numeric front-end** — where `i32` / `f32` live; type-checks kinds, inserts
   swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).
@@ -291,5 +306,5 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 ## Conventions
 
 Run after any `src/` change: `cargo test && cargo clippy --all-targets`. Dependency-free and tight.
-Adding an op: one arm in `eval`, one in `judge` (exhaustiveness keeps them in sync). Adding a layer:
+Adding an op: ONE arm in `eval` (a failure-family op's lives in `ops/fail.rs`). There is no judge to keep in step: `eval` on a zero-row column IS the typer, so an op's shape rule is its accessor calls (`into_pair`/`into_list`/…, whose `Err` is the shape error) plus any explicit `same(..)` check it needs; the output shape is whatever it builds. Adding a layer:
 an enum + `OpLike` + `From` impls; touch nothing below.

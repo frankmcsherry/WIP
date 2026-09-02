@@ -13,7 +13,7 @@
 //!     a decoder read wide leaves as words rather than bytes.
 //!   * **Self-describing.** The bytes carry the shape, exactly as a `Value` does: nothing outside
 //!     needs to agree on a schema in advance, and [`read_from`] reconstructs the same `Value` the
-//!     encoder held — same leaf widths, same `Bounds` encoding, same `⊥` lanes.
+//!     encoder held — same leaf widths, same `Bounds` encoding.
 //!
 //! The one thing the codec does NOT do is share buffers: a `Prim` is an `Arc<Vec<uN>>`, which owns
 //! its allocation, so a decode must copy the payload into a fresh `Vec`. That copy is one memcpy
@@ -26,7 +26,7 @@
 //!   Prod  = 1, fields, Value*fields
 //!   Sum   = 2, bits, len, payload[..],               the discriminant leaf, inline
 //!               offsets, u64*offsets,                the carried within-variant offset per row
-//!               lanes, (0 | 1, Value)*lanes          0 marks a `⊥` (uncommitted) lane
+//!               lanes, Value*lanes                     one column per variant (empty if unused)
 //!   List  = 3, 0, n, u64*n, Value                    `Offsets` form: one end offset per row
 //!         | 3, 1, stride, rows, Value                `Stride` form: the uniform partition
 //!   Unit  = 4, n
@@ -47,7 +47,7 @@ pub fn length_in_bytes(v: &Value) -> usize {
             24 + pad8(prim_payload_len(tags))          // the discriminant leaf, inline
                 + 8 + 8 * offsets.len()                 // the within-variant offsets
                 + 8                                     // the lane count
-                + lanes.iter().map(|l| 8 + l.as_ref().map_or(0, length_in_bytes)).sum::<usize>()
+                + lanes.iter().map(length_in_bytes).sum::<usize>()
         }
         Value::List(bounds, values) => 8 + bounds_len(bounds) + length_in_bytes(values),
         Value::Unit(_) => 16,
@@ -73,12 +73,7 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
             word(writer, offsets.len() as u64)?;
             for &o in offsets { word(writer, o as u64)?; }
             word(writer, lanes.len() as u64)?;
-            for lane in lanes {
-                match lane {
-                    None => word(writer, 0)?,
-                    Some(v) => { word(writer, 1)?; write_to(v, writer)?; }
-                }
-            }
+            for lane in lanes { write_to(lane, writer)?; }
             Ok(())
         }
         Value::List(bounds, values) => {
@@ -105,7 +100,7 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
 /// * **Depth.** The recursion is capped ([`MAX_DEPTH`]). A short message of nested headers cannot
 ///   exhaust the stack.
 /// * **Structure.** The returned `Value` satisfies the invariants the rest of corgi indexes by: a
-///   `Prod`'s fields agree on length, a `Sum`'s tags name committed lanes and its offsets land
+///   `Prod`'s fields agree on length, a `Sum`'s tags name its lanes and its offsets land
 ///   inside them, a `List`'s bounds are non-decreasing and stay within its values. So a decoded
 ///   column can be hashed, compared, gathered and sorted like any other.
 ///
@@ -178,7 +173,7 @@ pub fn declared_rows(v: &Value) -> u64 {
         Value::Prim(p) => prim_len(p) as u64,
         Value::Prod(cols) => cols.iter().map(declared_rows).max().unwrap_or(0),
         Value::Sum(tags, offsets, lanes) => (prim_len(tags).max(offsets.len()) as u64)
-            .max(lanes.iter().flatten().map(declared_rows).max().unwrap_or(0)),
+            .max(lanes.iter().map(declared_rows).max().unwrap_or(0)),
         Value::List(bounds, values) => (bounds_rows(bounds) as u64)
             .max(bounds_total(bounds))
             .max(declared_rows(values)),
@@ -404,17 +399,13 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
         }
         2 => {
             let tags = read_prim(r)?;
-            // A lane marker is one word, so that is the floor per lane.
             let n_offsets = r.count(8, "sum offsets")?;
             let offsets = r.words(n_offsets)?;
-            let n_lanes = r.count(8, "sum lanes")?;
+            // The smallest value (a `Unit`) is two words, so that is the floor per lane.
+            let n_lanes = r.count(16, "sum lanes")?;
             let mut lanes = Vec::with_capacity(n_lanes);
             for _ in 0..n_lanes {
-                lanes.push(match r.word()? {
-                    0 => None,
-                    1 => Some(r.nested(read_value)?),
-                    other => return Err(format!("corgi::bytes: bad lane marker {other}")),
-                });
+                lanes.push(r.nested(read_value)?);
             }
             check_sum(&tags, &offsets, &lanes)?;
             Ok(Value::Sum(tags, offsets, lanes))
@@ -430,11 +421,11 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
     }
 }
 
-/// The `Sum` invariants every reader indexes by: a u8 discriminant naming a committed lane, and a
+/// The `Sum` invariants every reader indexes by: a u8 discriminant naming one of the lanes, and a
 /// carried offset that lands inside it. Without these, `hash_rows` and the comparators index out
 /// of bounds on a column the decoder handed them.
-fn check_sum(tags: &Prim, offsets: &[usize], lanes: &[Option<Value>]) -> Result<(), String> {
-    // `Value::sum_opt` stores the discriminant as a u8 and asserts the arity fits it; a wider
+fn check_sum(tags: &Prim, offsets: &[usize], lanes: &[Value]) -> Result<(), String> {
+    // `Value::sum` stores the discriminant as a u8 and asserts the arity fits it; a wider
     // discriminant off the wire would be a shape corgi cannot construct.
     if !matches!(tags, Prim::U8(_)) {
         return Err("corgi::bytes: sum discriminant must be a u8 leaf".into());
@@ -449,16 +440,14 @@ fn check_sum(tags: &Prim, offsets: &[usize], lanes: &[Option<Value>]) -> Result<
     if offsets.len() != tag_vec.len() {
         return Err(format!("corgi::bytes: {} sum offsets for {} tags", offsets.len(), tag_vec.len()));
     }
-    // A `⊥` lane holds no rows, so a tag naming one is a contradiction, not just a bad index.
-    let lane_rows: Vec<Option<usize>> = lanes.iter().map(|l| l.as_ref().map(Value::len)).collect();
+    let lane_rows: Vec<usize> = lanes.iter().map(Value::len).collect();
     for (row, (&t, &o)) in tag_vec.iter().zip(offsets).enumerate() {
         match lane_rows.get(t as usize) {
             None => return Err(format!("corgi::bytes: row {row} has tag {t} but there are {} lanes", lanes.len())),
-            Some(None) => return Err(format!("corgi::bytes: row {row} carries the tag of uncommitted lane {t}")),
-            Some(Some(rows)) if o >= *rows => {
+            Some(rows) if o >= *rows => {
                 return Err(format!("corgi::bytes: row {row} offset {o} is outside lane {t} ({rows} rows)"));
             }
-            Some(Some(_)) => {}
+            Some(_) => {}
         }
     }
     Ok(())
@@ -552,7 +541,7 @@ mod test {
         assert_eq!(&back, v, "round trip changed the value");
     }
 
-    /// One of each constructor, at each leaf width, including the empty and `⊥` cases.
+    /// One of each constructor, at each leaf width, including the empty cases.
     fn corpus() -> Vec<Value> {
         vec![
             Value::Unit(0),
@@ -567,10 +556,10 @@ mod test {
             Value::List(Bounds::Offsets(vec![1, 1, 4]), Box::new(Value::u32(vec![9, 8, 7, 6]))),
             Value::List(Bounds::Stride(2, 3), Box::new(Value::u64(vec![1, 2, 3, 4, 5, 6]))),
             Value::Sum(Prim::U8(std::sync::Arc::new(vec![0, 1, 0])), vec![0, 0, 1],
-                       vec![Some(Value::u64(vec![10, 20])), Some(Value::u16(vec![30]))]),
-            // a `⊥` lane: uncommitted, holds no rows, and must survive as `None`
+                       vec![Value::u64(vec![10, 20]), Value::u16(vec![30])]),
+            // a lane no row uses: an empty column of its shape, which must survive as such
             Value::Sum(Prim::U8(std::sync::Arc::new(vec![0, 0])), vec![0, 1],
-                       vec![Some(Value::u64(vec![1, 2])), None]),
+                       vec![Value::u64(vec![1, 2]), Value::u16(vec![])]),
             // nesting: the recursion has to keep alignment across every level
             Value::Prod(vec![
                 Value::List(Bounds::Offsets(vec![2, 3]), Box::new(Value::Prod(vec![
@@ -683,7 +672,7 @@ mod test {
                 Value::List(bounds, Box::new(random_value(rng, total, depth - 1)))
             }
             _ => {
-                // Sums: pick a tag per row, count per lane, and leave some lanes uncommitted (`⊥`).
+                // Sums: pick a tag per row, count per lane; a lane no row picks is an empty column.
                 let lanes = 1 + rng.below(3);
                 let tags: Vec<usize> = (0..rows).map(|_| rng.below(lanes)).collect();
                 let mut counts = vec![0usize; lanes];
@@ -696,7 +685,7 @@ mod test {
                     .collect();
                 let variants = counts
                     .iter()
-                    .map(|&n| if n == 0 { None } else { Some(random_value(rng, n, depth - 1)) })
+                    .map(|&n| random_value(rng, n, depth - 1))
                     .collect();
                 Value::Sum(Prim::U8(std::sync::Arc::new(tags.iter().map(|&t| t as u8).collect())), offsets, variants)
             }
@@ -878,7 +867,7 @@ mod test {
         // A sum whose tag names a lane that is not there. Words: [Sum][bits][len][tags payload]…
         // and the payload word carries the single u8 discriminant in its low byte.
         let bad_tag = patched(
-            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Some(Value::u64(vec![7]))]),
+            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Value::u64(vec![7])]),
             3,
             5,
         );
@@ -886,7 +875,7 @@ mod test {
 
         // A sum whose carried offset points past the end of the lane it names.
         let bad_offset = patched(
-            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Some(Value::u64(vec![7]))]),
+            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Value::u64(vec![7])]),
             5, // [Sum][bits][len][tags][n_offsets][offsets[0]]
             9,
         );
@@ -909,7 +898,7 @@ mod test {
         // A sum discriminant at a width corgi cannot construct (`sum_opt` stores u8 and asserts
         // the arity fits it), which would otherwise let a tag column carry more than 256 lanes.
         let wide_tags = patched(
-            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Some(Value::u64(vec![7]))]),
+            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Value::u64(vec![7])]),
             1,
             64,
         );
@@ -926,7 +915,7 @@ mod test {
         let hidden_in_a_lane = Value::Sum(
             Prim::U8(std::sync::Arc::new(vec![0])),
             vec![0],
-            vec![Some(Value::Unit(huge))],
+            vec![Value::Unit(huge)],
         );
         assert_eq!(hidden_in_a_lane.len(), 1);
         assert_eq!(declared_rows(&hidden_in_a_lane), huge as u64);

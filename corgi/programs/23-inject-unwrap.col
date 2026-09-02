@@ -1,4 +1,4 @@
 # n = 5
 # = [5]
-enum Opt = None | Some in
-input inject Some unwrap
+enum Two = First u64 | Second u64 in
+input inject Second unwrap

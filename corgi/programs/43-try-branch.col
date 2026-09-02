@@ -3,5 +3,5 @@
 # element values [0..5); `branch 3` keeps 0,1,2 (lanes 1,2,3) and routes 3,4 to Oob. The clean
 # `branch` would be reachable only once a range pass proves tags < n; until then this is how you split.
 # n = 5
-# = Sum tags=[1] [⊥, ()x1]
+# = Sum tags=[1] [List ends=[] <Sum tags=[] [[], [], []]>, ()x1]
 input iota map (x -> (x, x) branch 3)

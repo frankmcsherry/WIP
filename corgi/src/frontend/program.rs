@@ -7,26 +7,29 @@
 //! `Program` is not ML-specific: `compile_ml` is one constructor; `from_graph` wraps any `Graph`.
 
 use super::parse_ml;
-use crate::effect::{effect_eval_graph, is_total, EffectValues};
-use crate::graph::{shape_of, Graph};
+use crate::effect::{is_total, lower_effects};
+use crate::graph::{eval_graph, shape_of, Graph};
 use crate::ops::NumOp;
 use crate::shape::Shape;
 use crate::value::Value;
 
 pub struct Program {
     graph: Graph<NumOp>,
+    /// the graph with its effects lowered into the pure vocabulary — what actually runs and types.
+    lowered: Graph<NumOp>,
 }
 
 impl Program {
     /// compile an `ml` source string into a runnable program (a parse — use [`Program::check`] for
     /// structural validation and [`Program::shape`] to type-check it against an input shape).
     pub fn compile_ml(src: &str) -> Result<Program, String> {
-        Ok(Program { graph: parse_ml(src)? })
+        Ok(Program::from_graph(parse_ml(src)?))
     }
 
     /// wrap an already-built graph — from the `Builder`, the optimizer, or a host's own lowering.
     pub fn from_graph(graph: Graph<NumOp>) -> Program {
-        Program { graph }
+        let lowered = lower_effects(&graph);
+        Program { graph, lowered }
     }
 
     /// the underlying graph, for inspection or optimization.
@@ -39,36 +42,35 @@ impl Program {
         self.graph.check();
     }
 
-    /// the output shape for a given input shape — the typer.
+    /// the output shape for a given input shape — the typer, over the lowered program: a fallible
+    /// stage's downstream types as running on its Ok lane, and an un-`try`'d output as `Sum{T | Unit}`.
     pub fn shape(&self, input: &Shape) -> Result<Shape, String> {
-        shape_of(&self.graph, input)
+        shape_of(&self.lowered, input)
     }
 
-    /// run a TOTAL program to its bare value — a convenience over [`Program::run_effect`] for programs
-    /// with no un-`TRY`'d `FailOp` (the output is `Pure`). A partial program is an `Err` here: there is
-    /// no single bare `Value` for a `Fail` column, so use [`Program::run_effect`] (or add a `TRY`).
-    /// (The old static length/range gates are gone — partiality is carried by the effect layer, not
-    /// rejected up front; their proofs would return only as opt-in optimizer demotion, not run-path.)
+    /// the lowered graph — the pure-vocabulary program that [`Program::run_partial`] evaluates.
+    pub fn lowered(&self) -> &Graph<NumOp> {
+        &self.lowered
+    }
+
+    /// run a TOTAL program to its value. A partial program (an un-`try`'d fallible stage) is an `Err`
+    /// here: its output is a `Fail` column, which [`Program::run_partial`] returns as a `Sum{T | Unit}`.
     pub fn run(&self, input: Value) -> Result<Value, String> {
-        match self.run_effect(input) {
-            EffectValues::Pure(v) => Ok(v),
-            EffectValues::Fail(_) => {
-                Err("partial program (an un-TRY'd FailOp); use run_effect or add a TRY".into())
-            }
+        if !self.is_total() {
+            return Err("partial program (an un-try'd fallible stage); use run_partial or add a try".into());
         }
+        Ok(self.run_partial(input))
     }
 
-    /// run over the EFFECT layer: the input is pure, the output is `Pure` or `Fail` (a per-row
-    /// Ok/Error column). A `Fail` output is the honest result of a partial program, not an error —
-    /// totality is the separate, syntactic [`Program::is_total`] query, and `TRY` (`eval_try`) is how
-    /// a program turns a `Fail` back into matchable `Pure` data. This is the total successor to `run`:
-    /// it needs no static length/range gate, because partiality is carried, not rejected.
-    pub fn run_effect(&self, input: Value) -> EffectValues {
-        effect_eval_graph(&self.graph, EffectValues::Pure(input))
+    /// run any program: a total program yields its value; a partial one yields its output wrapped as
+    /// `Fail<T> = Sum{ T | Unit }` (Ok rows at lane 0, errored rows counted at lane 1) — the same value
+    /// a trailing `try` would reveal. Totality is the separate, syntactic [`Program::is_total`].
+    pub fn run_partial(&self, input: Value) -> Value {
+        eval_graph(&self.lowered, input)
     }
 
-    /// is this program total — does its output column type `Pure` (every `FailOp` discharged by a
-    /// `TRY`)? The syntactic totality query, read off the op tags (the effect-typer).
+    /// is this program total — does every fallible stage get taken up by a `try` before the output?
+    /// Syntactic, read off the op tags.
     pub fn is_total(&self) -> bool {
         is_total(&self.graph)
     }

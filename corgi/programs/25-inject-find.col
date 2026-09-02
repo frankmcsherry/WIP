@@ -1,11 +1,10 @@
-# probe a committed ADT column with an inject-built literal: the needle's shape is
-# Sum{U64 | ⊥} (only the lane `inject` fills is committed), the sorted haystack's is
-# Sum{U64 | List<U64>} — `find` joins the two (⊥ adopts the sibling), so the probe
-# typechecks without ever constructing a dummy value for the other variant.
+# probe an ADT column with an inject-built literal: the declaration gives every lane's
+# shape, so the needle is Sum{U64 | List<U64>} (its Odd lane an empty list column), the
+# same shape as the sorted haystack — `find` needs no dummy value for the other variant.
 # The answer (3, 5) is the equal-range of `2`-in-variant-0: present twice, at [3, 5).
 # n = 10
 # = Sum tags=[0] [List ends=[1] <([3], [5])>, ()x0]
-enum Parity = Even | Odd in
+enum Parity = Even u64 | Odd List(u64) in
 let sums = input iota map (x ->
     (x, x and 1) branch Parity
     map_variant Even (e -> e and 3)

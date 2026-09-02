@@ -5,7 +5,8 @@
 //! stage — notably the `let` body's `in`, the one identifier allowed to follow a complete chain.
 //!
 //!   expr   = 'let' pat '=' expr 'in' expr
-//!          | 'enum' IDENT '=' IDENT ('|' IDENT)* 'in' expr  -- a compile-time table; names ERASE here
+//!          | 'enum' IDENT '=' IDENT shape? ('|' IDENT shape?)* 'in' expr  -- a compile-time table; names ERASE here
+//!   shape  = 'u8'|'u16'|'u32'|'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
 //!   pat    = IDENT | '(' IDENT (',' IDENT)* ')'
 //!   pipe   = proj apply*                               -- juxtaposition; chain ends before `in`
@@ -13,7 +14,7 @@
 //!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
 //!          | 'map_variant' tag '(' lambda ')'
 //!          | 'match' '(' (tag '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
-//!          | 'inject' (NUM NUM | VARIANT)                   -- sum construction (tag arity)
+//!          | 'inject' VARIANT                               -- sum construction (its enum fully shaped)
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
 //!          | 'split' STR                                    -- delimiter as a one-byte string
 //!          | BINARY NUM                                     -- immediate: `x sub 1` ≡ `(x, x lit 1) sub`
@@ -26,12 +27,12 @@
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
-//!       xs inject 0 2                                      -- tag xs into variant 0 of 2
-//!       xs inject Lo                                       -- both numbers off the declaration
+//!       enum Opt = None () | Some u64 in xs inject Some  -- tag xs into Some; None is an empty unit lane
 
 use super::{pair_imm, resolve, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::{NumOp, Op};
+use crate::shape::Shape;
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -144,8 +145,8 @@ enum Apply {
     FoldScan(Pat, Box<E>), // (T, List<A>) -> (T, List<R>); body (acc, x) -> (new state, output R)
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
-    Inject(usize, usize),         // tag + arity -> Op::Inject (sum construction; other lanes ⊥)
-    Head, // `head`: sugar for `(lit 0, list) get` — the first element (the get FailOp; empty row -> Oob)
+    Inject(usize, Vec<Shape>),    // tag + the declared sum's lane shapes -> Op::Inject
+    Head, // `head`: sugar for `(lit 0, list) get` — the first element (an empty row errs)
 }
 
 enum E {
@@ -163,8 +164,8 @@ struct P {
     i: usize,
     // the `enum` declarations' compile-time tables — names resolve HERE and erase from the AST,
     // so the core stays positional. Variant names are global (one table), hence unique program-wide.
-    variants: HashMap<String, (usize, usize)>, // variant name -> (tag, arity)
-    enums: HashMap<String, usize>,             // enum name -> arity (for `branch Name`)
+    variants: HashMap<String, (usize, String)>,   // variant name -> (tag, its enum)
+    enums: HashMap<String, Vec<Option<Shape>>>,   // enum name -> per-variant payload shape (if declared)
 }
 
 impl P {
@@ -212,23 +213,25 @@ impl P {
             let body = self.expr()?;
             Ok(E::Let(pat, Box::new(bound), Box::new(body)))
         } else if self.is_kw("enum") {
-            // `enum Name = V0 | V1 | … in body` — a declaration, not a value: it fills the tables
-            // and parses on into the body, leaving no AST node behind.
+            // `enum Name = V0 shape? | V1 shape? | … in body` — a declaration, not a value: it fills
+            // the tables and parses on into the body, leaving no AST node behind. A payload shape is
+            // needed only where the sum is BUILT by `inject` (every lane must then be declared);
+            // `branch Name` / `match` / `map_variant` read just the tags.
             self.bump();
             let name = self.ident()?;
             self.eat(&Tok::Eq)?;
-            let mut vs = vec![self.ident()?];
+            let mut vs = vec![self.variant_decl()?];
             while self.peek() == Some(&Tok::Bar) {
                 self.bump();
-                vs.push(self.ident()?);
+                vs.push(self.variant_decl()?);
             }
             self.kw_in()?;
-            let arity = vs.len();
-            if self.enums.insert(name.clone(), arity).is_some() {
+            let shapes: Vec<Option<Shape>> = vs.iter().map(|(_, s)| s.clone()).collect();
+            if self.enums.insert(name.clone(), shapes).is_some() {
                 return Err(format!("duplicate enum '{name}'"));
             }
-            for (tag, v) in vs.into_iter().enumerate() {
-                if self.variants.insert(v.clone(), (tag, arity)).is_some() {
+            for (tag, (v, _)) in vs.into_iter().enumerate() {
+                if self.variants.insert(v.clone(), (tag, name.clone())).is_some() {
                     return Err(format!("duplicate variant '{v}'"));
                 }
             }
@@ -263,15 +266,70 @@ impl P {
         Ok(())
     }
 
+    /// one `Name shape?` of an `enum` declaration.
+    fn variant_decl(&mut self) -> Result<(String, Option<Shape>), String> {
+        let v = self.ident()?;
+        let shape = match self.peek() {
+            Some(Tok::LParen) => Some(self.shape()?),
+            Some(Tok::Ident(k)) if k != "in" => Some(self.shape()?),
+            _ => None,
+        };
+        Ok((v, shape))
+    }
+
+    /// a payload shape in an `enum` declaration:
+    ///   shape = 'u8' | 'u16' | 'u32' | 'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
+    /// where ENUM names an earlier, fully-shaped enum (so sums nest, but never recursively).
+    fn shape(&mut self) -> Result<Shape, String> {
+        match self.bump() {
+            Some(Tok::LParen) => {
+                if self.peek() == Some(&Tok::RParen) {
+                    self.bump();
+                    return Ok(Shape::Unit);
+                }
+                let mut fields = vec![self.shape()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    fields.push(self.shape()?);
+                }
+                self.eat(&Tok::RParen)?;
+                Ok(Shape::Prod(fields))
+            }
+            Some(Tok::Ident(k)) => match k.as_str() {
+                "u8" => Ok(Shape::Prim(8)),
+                "u16" => Ok(Shape::Prim(16)),
+                "u32" => Ok(Shape::Prim(32)),
+                "u64" => Ok(Shape::Prim(64)),
+                "List" => {
+                    self.eat(&Tok::LParen)?;
+                    let inner = self.shape()?;
+                    self.eat(&Tok::RParen)?;
+                    Ok(Shape::List(Box::new(inner)))
+                }
+                e => self.enum_shape(e).map(Shape::Sum),
+            },
+            other => Err(format!("expected a shape, found {other:?}")),
+        }
+    }
+
+    /// the full lane shapes of a declared enum — an error if any variant left its payload undeclared.
+    fn enum_shape(&self, e: &str) -> Result<Vec<Shape>, String> {
+        let lanes = self.enums.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
+        lanes
+            .iter()
+            .enumerate()
+            .map(|(k, s)| s.clone().ok_or_else(|| format!("enum '{e}': variant {k} declares no payload shape")))
+            .collect()
+    }
+
     /// a variant tag at a use site: a literal number, or a declared variant name — which also
-    /// carries its enum's arity, so `inject` by name needs no second argument.
-    fn variant(&mut self) -> Result<(usize, Option<usize>), String> {
+    /// names its enum, so `inject` by name knows the whole sum it builds.
+    fn variant(&mut self) -> Result<(usize, Option<String>), String> {
         match self.bump() {
             Some(Tok::Num(n)) => Ok((n as usize, None)),
             Some(Tok::Ident(v)) => {
-                let (tag, arity) =
-                    *self.variants.get(&v).ok_or_else(|| format!("unknown variant '{v}'"))?;
-                Ok((tag, Some(arity)))
+                let (tag, e) = self.variants.get(&v).cloned().ok_or_else(|| format!("unknown variant '{v}'"))?;
+                Ok((tag, Some(e)))
             }
             other => Err(format!("expected a variant tag, found {other:?}")),
         }
@@ -358,16 +416,13 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(Apply::Match(arms))
             }
-            // inject: construct a sum — `inject tag arity`, the payload going to variant `tag` of
-            // `arity` lanes; the other lanes are ⊥ and adopt their type at a later merge. A variant
-            // name supplies both numbers from its declaration.
+            // inject: construct a sum — `inject Variant`, the payload going to that variant's lane
+            // of its enum, whose every lane must declare a payload shape (the other lanes are built
+            // empty at those shapes). No numeric form: a sum is only ever built from a declaration.
             "inject" => {
-                let (tag, known) = self.variant()?;
-                let arity = match known {
-                    Some(a) => a,
-                    None => self.num()? as usize,
-                };
-                Ok(Apply::Inject(tag, arity))
+                let (tag, e) = self.variant()?;
+                let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
+                Ok(Apply::Inject(tag, self.enum_shape(&e)?))
             }
             // head: first element, sugar for `get 0` — total (an empty row -> Oob, carried in the err-mask).
             "head" => Ok(Apply::Head),
@@ -384,7 +439,7 @@ impl P {
                 let lanes = match self.bump() {
                     Some(Tok::Num(n)) => n,
                     Some(Tok::Ident(e)) => {
-                        *self.enums.get(&e).ok_or_else(|| format!("unknown enum '{e}'"))? as u64
+                        self.enums.get(&e).ok_or_else(|| format!("unknown enum '{e}'"))?.len() as u64
                     }
                     other => return Err(format!("expected a lane count or enum, found {other:?}")),
                 };
@@ -526,14 +581,14 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     let ms = b.add(Op::MapSum(lowered), vec![id]);
                     Ok(b.add(Op::Unwrap, vec![ms]))
                 }
-                Apply::Inject(tag, arity) => Ok(b.add(Op::Inject(*tag, *arity), vec![id])),
+                Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
                 // first element = index 0 of the row: build the (0, list) pair and scalar-`get` it.
                 Apply::Head => {
                     // `head` lowers to `get` (GetTry) — the get FailOp; an empty row is an Oob carried
                     // in the err-mask, observed by a downstream TRY, not a panic.
                     let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
-                    Ok(b.add(Op::GetTry, vec![pair]))
+                    Ok(b.add(Op::TryGet, vec![pair]))
                 }
             }
         }

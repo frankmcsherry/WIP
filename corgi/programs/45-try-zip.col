@@ -3,5 +3,5 @@
 # and rhs [0..e+(e&1)) — so even e zips (Ok) and odd e mismatches (Err). The clean `zip` needs the
 # size pass to prove the inner bounds agree; zip handles ragged pairs with no proof.
 # n = 4
-# = Sum tags=[1] [⊥, ()x1]
+# = Sum tags=[1] [List ends=[] <List ends=[] <([], [])>>, ()x1]
 input iota map (x -> (x iota, (x, x and 1) add iota) zip)

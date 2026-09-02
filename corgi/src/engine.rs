@@ -12,7 +12,7 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 }
 
 /// lift a single-row constant to a column of length `n` (its stratum): `n` copies of `row`'s row 0. Total
-/// over every shape — it is `gather` at the all-zero index, so `Op::Lit`'s `judge` (which accepts any value's
+/// over every shape — it is `gather` at the all-zero index, so `Op::Lit` (which accepts any value's
 /// shape) and `eval` agree.
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
     gather(row, &vec![0usize; n])
@@ -126,8 +126,7 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             for &i in idx {
                 per[tag_vec[i]].push(within[i]);
             }
-            // gather each committed lane (possibly to fewer rows); a ⊥ lane stays ⊥.
-            let nv = variants.iter().zip(&per).map(|(v, s)| v.as_ref().map(|vv| gather(vv, s))).collect();
+            let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
             Value::sum_from_prim(new_tags, nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
@@ -135,13 +134,12 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
 }
 
 /// multi-source gather: result row `i` is row `off[i]` of source `srcs[tags[i]]` — all sources sharing
-/// one shape (up to `⊥`). The multi-source generalisation of [`gather`] (the 1-source case) and the fused
+/// one shape. The multi-source generalisation of [`gather`] (the 1-source case) and the fused
 /// inverse of `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from
 /// its variant instead of materialising `concat(variants)` first. `off` is the carried within-variant offset.
 pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize]) -> Value {
-    // `None` sources are ⊥ lanes — `tags` never names one (no row carries an uncommitted variant's tag),
-    // so they're never read. Fill each with a zero-row value of the witness (first committed) shape to hold
-    // its slot for tag-indexing. Every sum has ≥1 committed lane, so a witness exists.
+    // a `None` source is one `tags` never names; fill it with a zero-row value of the witness (first
+    // present) shape to hold its slot for tag-indexing. At least one source must be present.
     let witness = srcs.iter().flatten().next().copied().expect("gather_lanes: no committed source");
     let ws = shape_of_value(witness);
     let filled: Vec<Value> = srcs.iter().map(|s| s.map_or_else(|| Value::empty(&ws), |v| v.clone())).collect();
@@ -198,7 +196,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             // pick each output row's tagged payload: build the output tag column, then per output-tag
             // gather that variant from the sources at the carried within-offset.
             // (tags, within-offsets, lanes) borrowed from each source sum.
-            type SumView<'a> = (&'a Prim, &'a [usize], &'a [Option<Value>]);
+            type SumView<'a> = (&'a Prim, &'a [usize], &'a [Value]);
             let sums: Vec<SumView> = filled
                 .iter()
                 .map(|v| match v {
@@ -209,19 +207,12 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
             let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
             let out_tag_vec = out_tags.usize_vec();
-            // The output commits every lane ANY source commits, so the arity is the max over
-            // sources — not source 0's. Sources are independently inferred and may disagree on
-            // arity (a column holding only tag 0 infers one lane, one holding only tag 1 infers
-            // two); a source that stops short is ⊥ from there on, which is the same rule the
-            // `None` lanes below already follow. Taking source 0's arity instead drops lanes the
-            // gathered tag column still names, and `sum_from_prim` then indexes past its lanes.
-            let arity = sums.iter().map(|sm| sm.2.len()).max().unwrap_or(0);
-            let out_vars: Vec<Option<Value>> = (0..arity)
+            // every source has the same shape, hence the same arity (there is no uncommitted lane
+            // for sources to disagree by); a mismatch is the caller's shape error.
+            let arity = sums[0].2.len();
+            assert!(sums.iter().all(|sm| sm.2.len() == arity), "gather_lanes: sum sources differ in arity");
+            let out_vars: Vec<Value> = (0..arity)
                 .map(|s| {
-                    // out lane `s` is ⊥ only if no source committed it.
-                    if sums.iter().all(|sm| sm.2.get(s).map_or(true, Option::is_none)) {
-                        return None;
-                    }
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
                     for (i, &os) in out_tag_vec.iter().enumerate() {
                         if os == s {
@@ -230,9 +221,8 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                             s_o.push(sums[t].1[o]); // carried offset = position in the source's variant s
                         }
                     }
-                    let vsrcs: Vec<Option<&Value>> =
-                        sums.iter().map(|sm| sm.2.get(s).and_then(Option::as_ref)).collect();
-                    Some(gather_lanes(&vsrcs, &s_t, &s_o))
+                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.2[s])).collect();
+                    gather_lanes(&vsrcs, &s_t, &s_o)
                 })
                 .collect();
             Value::sum_from_prim(out_tags, out_vars)
@@ -294,17 +284,14 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
                     Value::Sum(t, _, v) => {
                         tag_parts.push(t);
                         for (i, c) in v.iter().enumerate() {
-                            if let Some(cv) = c {
-                                per[i].push(cv.clone());
-                            }
+                            per[i].push(c.clone());
                         }
                     }
                     _ => panic!("concat: shape mismatch"),
                 }
             }
-            // a lane committed by any part is committed in the result (the ⊥ parts add no rows); the
-            // concatenated tags fix the offset, so it's rebuilt rather than spliced.
-            let lanes = per.into_iter().map(|ps| (!ps.is_empty()).then(|| concat(&ps))).collect();
+            // the concatenated tags fix the offset, so it's rebuilt rather than spliced.
+            let lanes = per.iter().map(|ps| concat(ps)).collect();
             Value::sum_from_prim(Prim::concat(&tag_parts), lanes)
         }
         Value::Unit(_) => Value::Unit(parts.iter().map(Value::len).sum()),
@@ -340,29 +327,24 @@ mod tests {
         assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
     }
 
-    /// Sources may disagree on `Sum` arity: a column holding only tag 0 commits one lane, one
-    /// holding only tag 1 commits two. The gather must commit every lane ANY source does — taking
-    /// source 0's arity drops lanes the output tag column still names, and `sum_from_prim` then
-    /// indexes past its own lanes ("index out of bounds: the len is 1 but the index is 1").
+    /// Two sources of one sum shape, each using only one of its lanes (the other is an empty
+    /// column of the declared shape): the gather reads each row from its lane and the result
+    /// carries both lanes, whichever source comes first.
     #[test]
-    fn gather_lanes_sums_of_differing_arity() {
-        // src 0: tag 0 only  -> Sum([Some])         (arity 1)
-        // src 1: tag 1 only  -> Sum([None, Some])   (arity 2)
-        let a = Value::sum_opt(vec![0, 0], vec![Some(u(&[10, 11]))]);
-        let b = Value::sum_opt(vec![1, 1], vec![None, Some(u(&[20, 21]))]);
+    fn gather_lanes_sums_using_different_lanes() {
+        let a = Value::sum(vec![0, 0], vec![u(&[10, 11]), u(&[])]);
+        let b = Value::sum(vec![1, 1], vec![u(&[]), u(&[20, 21])]);
         let (tags, off) = (vec![0usize, 1, 0, 1], vec![0usize, 0, 1, 1]);
         let out = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
-        // The result commits both lanes, and reads back as the interleaving.
         match &out {
             Value::Sum(t, _, lanes) => {
-                assert_eq!(lanes.len(), 2, "output must commit both lanes");
+                assert_eq!(lanes.len(), 2);
                 assert_eq!(t.usize_vec(), vec![0, 1, 0, 1]);
-                assert_eq!(lanes[0], Some(u(&[10, 11])));
-                assert_eq!(lanes[1], Some(u(&[20, 21])));
+                assert_eq!(lanes[0], u(&[10, 11]));
+                assert_eq!(lanes[1], u(&[20, 21]));
             }
             other => panic!("expected a Sum, got {other:?}"),
         }
-        // ...and the shorter source in either position.
         let flipped = gather_lanes(&[Some(&b), Some(&a)], &tags, &off);
         assert_eq!(flipped.len(), 4);
     }

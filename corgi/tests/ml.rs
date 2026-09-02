@@ -1,7 +1,7 @@
 //! ML front-end tests: same demos through `let` and juxtaposed stages, plus a check that `let`
 //! sharing produces fewer nodes than the same join written with the shared subexpression inlined.
 
-use corgi::{eval_try, parse_ml, show, EffectValues, Program, Value};
+use corgi::{parse_ml, show, Program, Value};
 
 fn u64(xs: &[u64]) -> Value {
     Value::u64(xs.to_vec())
@@ -12,10 +12,7 @@ fn u64(xs: &[u64]) -> Value {
 fn run_ml(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
     p.check();
-    match p.run_effect(arg.clone()) {
-        EffectValues::Pure(v) => show(&v),
-        EffectValues::Fail(fv) => show(&eval_try(fv)),
-    }
+    show(&p.run_partial(arg.clone()))
 }
 
 fn sample() -> Value {
@@ -97,10 +94,18 @@ fn enum_names_resolve_and_erase() {
 }
 
 #[test]
-fn inject_by_name_carries_arity() {
-    // `inject Email` reads both tag and arity off the declaration (vs `inject 0 2`).
-    let src = "enum Contact = Email | Phone in input.0 inject Email unwrap";
+fn inject_by_name_carries_the_sum_shape() {
+    // `inject Email` reads the tag AND the whole sum's lane shapes off the declaration, so the
+    // Phone lane is built as an empty u64 column and `unwrap` typechecks.
+    let src = "enum Contact = Email u64 | Phone u64 in input.0 inject Email unwrap";
     assert_eq!(run_ml(src, &sample()), "[10, 20, 30]");
+    // a lane without a declared payload shape cannot be built empty.
+    assert!(parse_ml("enum Contact = Email u64 | Phone in input.0 inject Email").is_err());
+    // shapes nest: an enum names an earlier fully-shaped enum.
+    let src = "enum Contact = Email u64 | Phone u64 in enum Card = Anon () | Known Contact in \
+               input.0 inject Email inject Known";
+    let p = Program::compile_ml(src).unwrap();
+    assert_eq!(p.shape(&corgi::Shape::Prod(vec![corgi::Shape::Prim(64)])).unwrap().to_string(), "{() | {U64 | U64}}");
 }
 
 #[test]

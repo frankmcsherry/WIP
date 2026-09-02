@@ -19,7 +19,7 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{
-    arrange, effect_eval_graph, eval_graph, parse_ml, ArithOp, Builder, EffectValues, Graph, NumOp,
+    arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
     Op, Value,
 };
 use std::env;
@@ -28,22 +28,22 @@ use std::time::{Duration, Instant};
 
 // ----- harness -----------------------------------------------------------
 
-/// best-of-`reps` wall time for one whole-graph effect-aware `eval`. Surface graphs must use this path:
-/// `filter`, `gather`, `slices`, `branch`, etc. are FailOps in the current vocabulary. The arg is
-/// cloned (Arc bump) outside the timer, matching a pipeline that hands an owned column to each op.
+/// best-of-`reps` wall time for one whole-graph `eval` of a LOWERED surface graph (see `compile`):
+/// `filter`, `gather`, `slices`, `branch`, etc. are fallible in the current vocabulary, and the
+/// lowering threads their `Fail<T> = Sum{T | Unit}` past the ops downstream. The arg is cloned (Arc
+/// bump) outside the timer, matching a pipeline that hands an owned column to each op.
 fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
         let t = Instant::now();
-        let out = black_box(effect_eval_graph(g, black_box(EffectValues::Pure(a))));
-        let failed = matches!(&out, EffectValues::Fail(f) if f.err.iter().any(|&failed| failed));
+        let out = black_box(eval_graph(g, black_box(a)));
+        // a partial program's output is `Sum{T | Unit}`; rows in the Unit lane are its errors. No
+        // benchmark program yields an Option-like value of its own, so this reads only that lane.
+        let failed = matches!(&out, Value::Sum(_, _, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(n) if n > 0));
         black_box(out); // include output destruction in the timer, as rust_t's closures do
         let elapsed = t.elapsed();
-        assert!(
-            !failed,
-            "benchmark input unexpectedly exercised a FailOp error lane"
-        );
+        assert!(!failed, "benchmark input unexpectedly exercised a fallible op's error lane");
         best = best.min(elapsed);
     }
     best
@@ -165,7 +165,8 @@ fn sorted_list(n: usize) -> Value {
 }
 
 fn compile(src: &str) -> Graph<NumOp> {
-    parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"))
+    // the lowered graph is what a `Program` runs: fallible stages' downstream ops on the Ok lane.
+    lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}")))
 }
 
 /// a fixed 5-letter lowercase word, base-26 of `v` — the word-count vocabulary generator (mod a vocab
@@ -886,7 +887,7 @@ fn family_arrange(n: usize, reps: u32) {
 
 // ----- driver ------------------------------------------------------------
 
-/// time corgi (safe `effect_eval_graph` + raw `eval_graph`) and the three Rust ceilings for `gather`
+/// time corgi (the lowered surface path + the raw kernel) and the three Rust ceilings for `gather`
 /// with an `arith` applied to each gathered value — the SAME arith in corgi's `map` body and in every
 /// Rust closure, so the comparison is honest. `unsafe` = `get_unchecked`; `idx` = panicking `h[i[k]]`;
 /// `opt` = `.get()` mapped through `arith`, collected to `Option<Vec>` (the total Rust path).

@@ -32,7 +32,7 @@ pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
 
-pub use effect::{effect_eval_graph, eval_try, is_total, EffectValues, FailValues};
+pub use effect::{is_total, lower_effects};
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;
@@ -83,11 +83,11 @@ pub mod arrange {
         let (n, h) = (needles.len(), haystack.len());
         let needle_list = Value::List(Bounds::Offsets(vec![n]), Box::new(needles.clone()));
         let hay_list = Value::List(Bounds::Offsets(vec![h]), Box::new(haystack.clone()));
-        let out = crate::ops::cmp::CmpOp::Find.eval(Value::Prod(vec![needle_list, hay_list]));
-        let (_b, vals) = out.into_list("find_ranges");
-        let (lo, hi) = vals.into_pair("find_ranges lo/hi");
-        let lo = lo.into_u64("find_ranges lo").into_iter().map(|x| x as usize).collect();
-        let hi = hi.into_u64("find_ranges hi").into_iter().map(|x| x as usize).collect();
+        let out = crate::ops::cmp::CmpOp::Find.eval(Value::Prod(vec![needle_list, hay_list])).expect("find_ranges: shapes");
+        let (_b, vals) = out.into_list("find_ranges").unwrap();
+        let (lo, hi) = vals.into_pair("find_ranges lo/hi").unwrap();
+        let lo = lo.into_u64("find_ranges lo").unwrap().into_iter().map(|x| x as usize).collect();
+        let hi = hi.into_u64("find_ranges hi").unwrap().into_iter().map(|x| x as usize).collect();
         (lo, hi)
     }
 
@@ -241,21 +241,11 @@ pub mod arrange {
                     .map(|r| child.iter().fold(SEED_PROD, |h, c| mix(h, c[r])))
                     .collect()
             }
-            // Sum: mix the row's tag, then the committed lane's payload hash at the within-variant
-            // offset. A `None` lane holds no rows, so it is never indexed.
+            // Sum: mix the row's tag, then its lane's payload hash at the within-variant offset.
             Value::Sum(tags, offset, variants) => {
                 let tags = tags.usize_vec();
-                let lanes: Vec<Option<Vec<u64>>> =
-                    variants.iter().map(|o| o.as_ref().map(hash_rows)).collect();
-                tags.iter()
-                    .zip(offset.iter())
-                    .map(|(&t, &o)| {
-                        let payload = lanes[t]
-                            .as_ref()
-                            .expect("hash_rows: row committed to a ⊥ lane")[o];
-                        mix(mix(SEED_SUM, t as u64), payload)
-                    })
-                    .collect()
+                let lanes: Vec<Vec<u64>> = variants.iter().map(hash_rows).collect();
+                tags.iter().zip(offset.iter()).map(|(&t, &o)| mix(mix(SEED_SUM, t as u64), lanes[t][o])).collect()
             }
             // List: mix the row's element count, then the row's flattened element hashes in order.
             Value::List(bounds, vals) => {
@@ -331,15 +321,11 @@ pub mod arrange {
             assert_eq!(hp.len(), 3);
             assert!(hp[0] != hp[1] && hp[1] != hp[2]);
 
-            // Sum with a ⊥/None lane (variant 0 uncommitted) and a multi-arm committed shape.
+            // Sum with an empty lane (no row carries variant 0) and a multi-arm shape.
             // tags: rows go to lane 1 (u16) and lane 2 (u32).
-            let s = Value::sum_opt(
+            let s = Value::sum(
                 vec![1, 2, 1, 2],
-                vec![
-                    None,
-                    Some(Value::u16(vec![5, 7])),
-                    Some(Value::u32(vec![9, 11])),
-                ],
+                vec![Value::u8(vec![]), Value::u16(vec![5, 7]), Value::u32(vec![9, 11])],
             );
             let hs = hash_rows(&s);
             assert_eq!(hs.len(), 4);
@@ -416,7 +402,7 @@ pub mod arrange {
             }
 
             // sorted WITHIN each segment.
-            let sorted = gather(&v, &perm).into_u64("sorted");
+            let sorted = gather(&v, &perm).into_u64("sorted").unwrap();
             assert_eq!(&sorted[0..3], &[1, 3, 3]);
             assert_eq!(&sorted[3..6], &[2, 5, 5]);
 
@@ -460,7 +446,7 @@ pub mod arrange {
             let ours = Value::List(bounds.clone(), Box::new(gather(&vals, &perm)));
 
             // the ML op.
-            let theirs = crate::ops::cmp::CmpOp::SortList.eval(list);
+            let theirs = crate::ops::cmp::CmpOp::SortList.eval(list).unwrap();
             assert_eq!(ours, theirs);
         }
 
