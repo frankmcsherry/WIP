@@ -148,15 +148,27 @@ macro_rules! prim {
 
             /// re-width every record to `bits`, kind-blind: read it zero-extended to u64,
             /// then keep the low bytes. (Signed/sign-extending widen is a numeric-layer job.)
+            ///
+            /// Same width is the IDENTITY: the leaf is already correct storage for the result, so
+            /// this is an `Arc` bump, not a column copy. A genuine re-width is ONE pass — the
+            /// (source, destination) pair is dispatched ABOVE the loop, so the lane body is a single
+            /// `as` and there is no intermediate `u64` column between the two widths.
             #[allow(clippy::unnecessary_cast)]
             pub(crate) fn cast(&self, bits: u32) -> Prim {
-                let wide: Vec<u64> = match self {
-                    $( Prim::$V(v) => v.iter().map(|&x| x as u64).collect(), )+
-                };
-                match bits {
-                    $( b if b == (std::mem::size_of::<$t>() * 8) as u32 =>
-                        Prim::$V(Arc::new(wide.iter().map(|&x| x as $t).collect())), )+
-                    _ => panic!("cast: unsupported width {bits}"),
+                /// the destination half of the grid: collect zero-extended values at `bits`.
+                /// Each arm MOVES `src` — they are exclusive, so only one loop ever runs.
+                fn to_width(src: impl Iterator<Item = u64>, bits: u32) -> Prim {
+                    match bits {
+                        $( b if b == (std::mem::size_of::<$t>() * 8) as u32 =>
+                            Prim::$V(Arc::new(src.map(|x| x as $t).collect())), )+
+                        _ => panic!("cast: unsupported width {bits}"),
+                    }
+                }
+                if bits == self.bits() {
+                    return self.clone();
+                }
+                match self {
+                    $( Prim::$V(v) => to_width(v.iter().map(|&x| x as u64), bits), )+
                 }
             }
 
@@ -573,5 +585,42 @@ pub fn show(v: &Value) -> String {
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cast` to the width a leaf already has is the identity, and must not copy the column: the
+    /// stored bytes ARE the result's bytes, so the result shares the buffer (an `Arc` bump).
+    #[test]
+    fn identity_cast_reuses_the_buffer() {
+        let xs = Arc::new(vec![10u32, 20, 30]);
+        let p = Prim::U32(xs.clone());
+        let Prim::U32(out) = p.cast(32) else { panic!("cast(32) must stay a U32 leaf") };
+        assert!(Arc::ptr_eq(&out, &xs), "same-width cast copied the column");
+    }
+
+    /// A genuine re-width keeps the low bytes (narrowing) or zero-extends (widening), for every
+    /// (source, destination) pair the `prim!` grid generates.
+    #[test]
+    fn rewidth_keeps_the_low_bytes() {
+        let wide = Prim::U64(Arc::new(vec![0x0102_0304_0506_0708, 0xff, 0x1_0000]));
+        assert_eq!(wide.cast(8), Prim::U8(Arc::new(vec![0x08, 0xff, 0x00])));
+        assert_eq!(wide.cast(16), Prim::U16(Arc::new(vec![0x0708, 0x00ff, 0x0000])));
+        assert_eq!(wide.cast(32), Prim::U32(Arc::new(vec![0x0506_0708, 0xff, 0x1_0000])));
+
+        let narrow = Prim::U8(Arc::new(vec![0, 1, 255]));
+        assert_eq!(narrow.cast(16), Prim::U16(Arc::new(vec![0, 1, 255])));
+        assert_eq!(narrow.cast(64), Prim::U64(Arc::new(vec![0, 1, 255])));
+    }
+
+    /// Narrowing then widening back is `mod 2^bits` — the documented truncating semantics, not a
+    /// round trip. Pinned so a future "make cast lossless" change has to face the corpus.
+    #[test]
+    fn narrow_then_widen_truncates() {
+        let wide = Prim::U64(Arc::new(vec![0x1_0000, 0x1_0001]));
+        assert_eq!(wide.cast(16).cast(64), Prim::U64(Arc::new(vec![0, 1])));
     }
 }
