@@ -198,6 +198,21 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
     let (hb, hvals) = haystack.into_list("TryGather haystack")?;
     assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
     let idxs = ivals.into_u64("TryGather indices")?;
+    if ib.len() == 1 && hb.len() == 1 {
+        if let Value::Prim(p) = &hvals {
+            // One row over a leaf: validate and gather in the index buffer itself (an identity
+            // gather reuses the haystack leaf), and recover the uniform `Stride` form of the bounds
+            // without another allocation. The one-row primitive gather is the pointer-chase kernel.
+            let ib = match ib {
+                Bounds::Offsets(ends) => ends.into(),
+                bounds => bounds,
+            };
+            return Ok(match p.gather_u64_checked_owned(idxs, hb.end(0)) {
+                Some(g) => fail(&[false], Value::List(ib, Box::new(Value::Prim(g)))),
+                None => fail(&[true], Value::List(Bounds::Offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
+            });
+        }
+    }
     let mut err = Vec::with_capacity(ib.len());
     let mut abs = Vec::new();
     let mut bounds = Vec::new();
@@ -388,5 +403,64 @@ pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<V
         Op::TryBranch(n) => try_branch(*n, input),
         Op::TryZip => try_zip(input),
         _ => unreachable!("not a failure-family op"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn one_row(idx: Vec<u64>, hay: &Arc<Vec<u64>>) -> Value {
+        Value::Prod(vec![
+            Value::List(vec![idx.len()].into(), Box::new(Value::u64(idx))),
+            Value::List(vec![hay.len()].into(), Box::new(Value::Prim(Prim::U64(hay.clone())))),
+        ])
+    }
+
+    #[test]
+    fn one_row_identity_gather_reuses_the_haystack_leaf() {
+        let hay = Arc::new(vec![10, 20, 30]);
+        let (err, ok) = into_fail(try_gather(one_row(vec![0, 1, 2], &hay)).unwrap(), "t").unwrap();
+        assert_eq!(err, vec![false]);
+        let (_, vals) = ok.into_list("identity gather result").unwrap();
+        let Prim::U64(out) = vals.into_prim("identity gather result").unwrap() else { panic!("expected U64") };
+        assert!(Arc::ptr_eq(&out, &hay));
+    }
+
+    #[test]
+    fn one_row_u64_gather_discards_a_partially_rewritten_failure() {
+        let hay = Arc::new(vec![10, 20, 30]);
+        let (err, ok) = into_fail(try_gather(one_row(vec![1, 3, 0], &hay)).unwrap(), "t").unwrap();
+        assert_eq!(err, vec![true]);
+        assert_eq!(ok.len(), 0);
+        assert_eq!(hay.as_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn one_row_nonidentity_u64_gather_returns_values_and_normalizes_bounds() {
+        let hay = Arc::new(vec![10, 20, 30]);
+        let input = Value::Prod(vec![
+            Value::List(Bounds::Offsets(vec![3]), Box::new(Value::u64(vec![2, 0, 1]))),
+            Value::List(vec![3].into(), Box::new(Value::Prim(Prim::U64(hay.clone())))),
+        ]);
+        let (err, ok) = into_fail(try_gather(input).unwrap(), "t").unwrap();
+        assert_eq!(err, vec![false]);
+        let (bounds, vals) = ok.into_list("nonidentity gather result").unwrap();
+        assert_eq!(bounds.strided(), Some(3));
+        let Prim::U64(out) = vals.into_prim("nonidentity gather result").unwrap() else { panic!("expected U64") };
+        assert_eq!(out.as_slice(), &[30, 10, 20]);
+        assert!(!Arc::ptr_eq(&out, &hay));
+    }
+
+    #[test]
+    #[should_panic(expected = "Gather: index 3 out of row 0's bounds")]
+    fn raw_one_row_primitive_gather_still_panics_on_an_invalid_index() {
+        use crate::ops::{NumOp, Op};
+        use crate::graph::OpLike;
+        let _ = NumOp::Core(Op::Gather).eval(Value::Prod(vec![
+            Value::List(vec![2].into(), Box::new(Value::u64(vec![0, 3]))),
+            Value::List(vec![2].into(), Box::new(Value::u64(vec![10, 20]))),
+        ]));
     }
 }
