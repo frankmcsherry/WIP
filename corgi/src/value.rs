@@ -169,7 +169,7 @@ pub enum Tags {
 
 impl Tags {
     /// every one of `rows` rows carries `tag` — the uniform assignment, stored in two words.
-    pub(crate) fn constant(tag: usize, rows: usize) -> Tags {
+    pub fn constant(tag: usize, rows: usize) -> Tags {
         Tags::Const(tag, rows)
     }
 
@@ -195,7 +195,7 @@ impl Tags {
     }
 
     /// the single tag every row carries, if there is one — the O(1) uniformity test.
-    pub(crate) fn const_tag(&self) -> Option<usize> {
+    pub fn const_tag(&self) -> Option<usize> {
         match self {
             Tags::Const(t, _) => Some(*t),
             Tags::Column(..) => None,
@@ -209,16 +209,22 @@ impl Tags {
         (0..tags.len()).all(|i| tags.usize_at(i) == first).then_some(first)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// how many rows the assignment covers.
+    pub fn len(&self) -> usize {
         match self {
             Tags::Const(_, rows) => *rows,
             Tags::Column(t, _) => t.len(),
         }
     }
 
+    /// does the assignment cover no rows?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// row `i`'s discriminant.
     #[inline]
-    pub(crate) fn tag_at(&self, i: usize) -> usize {
+    pub fn tag_at(&self, i: usize) -> usize {
         match self {
             Tags::Const(t, _) => *t,
             Tags::Column(t, _) => t.usize_at(i),
@@ -227,7 +233,7 @@ impl Tags {
 
     /// row `i`'s offset within its lane — read, never recomputed.
     #[inline]
-    pub(crate) fn offset_at(&self, i: usize) -> usize {
+    pub fn offset_at(&self, i: usize) -> usize {
         match self {
             Tags::Const(..) => i, // one lane in row order: the offset IS the row index
             Tags::Column(_, o) => o[i],
@@ -235,7 +241,7 @@ impl Tags {
     }
 
     /// every row's discriminant, in row order.
-    pub(crate) fn tags_iter(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn tags_iter(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len()).map(move |i| self.tag_at(i))
     }
 }
