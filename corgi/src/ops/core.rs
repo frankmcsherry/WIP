@@ -3,11 +3,11 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
+    blend, expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Tags, Value};
 use std::sync::Arc;
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
@@ -66,10 +66,9 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
 /// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
 /// targets: row `r`'s round-`t` element is at flat index `start + t`.
 pub(crate) fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
-    let bounds = bounds.to_vec();
     let mut v = Vec::with_capacity(bounds.len());
     let mut start = 0;
-    for (r, &end) in bounds.iter().enumerate() {
+    for (r, end) in bounds.ends().enumerate() {
         if end > start {
             v.push((r, start, end - start));
         }
@@ -255,21 +254,25 @@ impl<L: OpLike> Op<L> {
             // only gains bounds (per-row cumulative tag counts) — no data moves but the tag widen.
             Op::Unweave => {
                 let (bounds, vals) = input.into_list("Unweave")?;
-                let (tags, _offset, lanes) = vals.into_sum("Unweave")?;
+                let (tags, lanes) = vals.into_sum("Unweave")?;
                 let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
                 let mut counts = vec![0usize; lanes.len()];
                 let mut start = 0;
                 for end in bounds.ends() {
-                    for &t in &tags[start..end] {
-                        counts[t] += 1;
+                    for i in start..end {
+                        counts[tags.tag_at(i)] += 1;
                     }
                     for (lb, &c) in lane_bounds.iter_mut().zip(&counts) {
                         lb.push(c);
                     }
                     start = end;
                 }
-                let tag_list =
-                    Value::List(bounds, Box::new(Value::u64(tags.iter().map(|&t| t as u64).collect())));
+                // the tag column widens ONCE, into the U64 list this op exists to produce — it is
+                // the output, not a decode of the input on the way to it.
+                let tag_list = Value::List(
+                    bounds,
+                    Box::new(Value::u64(tags.tags_iter().map(|t| t as u64).collect())),
+                );
                 let mut out = vec![tag_list];
                 for (lane, lb) in lanes.into_iter().zip(lane_bounds) {
                     out.push(Value::List(lb.into(), Box::new(lane)));
@@ -287,7 +290,7 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
                 }
                 let (tb, tv) = cols.pop().ok_or("Weave expects (List<U64> tags, List<A>, ..)")?.into_list("Weave tags")?;
-                let tags = tv.into_u64("Weave tags")?;
+                let tags = tv.as_u64("Weave tags")?;
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
@@ -296,11 +299,16 @@ impl<L: OpLike> Op<L> {
                     lane_bounds.push(b);
                     lanes.push(v);
                 }
+                // one pass validates the per-row tag counts AND builds the Sum's assignment: a
+                // row's within-lane offset is its lane's running count, which this loop already has.
                 let mut counts = vec![0usize; lanes.len()];
+                let (mut tag8, mut off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
                 let mut start = 0;
                 for (r, end) in tb.ends().enumerate() {
                     for &t in &tags[start..end] {
                         assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
+                        tag8.push(t as u8);
+                        off.push(counts[t as usize]);
                         counts[t as usize] += 1;
                     }
                     for (t, (lb, &c)) in lane_bounds.iter().zip(&counts).enumerate() {
@@ -308,7 +316,7 @@ impl<L: OpLike> Op<L> {
                     }
                     start = end;
                 }
-                let sum = Value::sum(tags.iter().map(|&t| t as usize).collect(), lanes);
+                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), lanes);
                 Value::List(tb, Box::new(sum))
             }
 
@@ -324,22 +332,21 @@ impl<L: OpLike> Op<L> {
             // positions aligns with the carried within-variant offsets.
             Op::CapSum => {
                 let (x, s) = input.into_pair("CapSum")?;
-                let Value::Sum(tags, offset, lanes) = s else {
+                let Value::Sum(tags, lanes) = s else {
                     return Err(format!("CapSum expects (X, Sum), got (.., {})", shape_of_value(&s)));
                 };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
                 let mut per = vec![Vec::new(); lanes.len()];
-                let Prim::U8(t8) = &tags else { unreachable!("sum tags are a u8 column") };
-                for (i, &t) in t8.iter().enumerate() {
-                    per[t as usize].push(i);
+                for (i, t) in tags.tags_iter().enumerate() {
+                    per[t].push(i);
                 }
                 let new = lanes
                     .into_iter()
                     .zip(&per)
                     .map(|(lane, rows)| Value::Prod(vec![gather(&x, rows), lane]))
                     .collect();
-                // the tag and offset columns are unchanged: each lane keeps its rows, now paired.
-                Value::Sum(tags, offset, new)
+                // the assignment is unchanged: each lane keeps its rows, now paired.
+                Value::Sum(tags, new)
             }
 
             Op::Cast(bits) => {
@@ -350,15 +357,15 @@ impl<L: OpLike> Op<L> {
             }
 
             // stable structural hash: one U64 per row, kind-blind over any shape (see `crate::hash`).
-            Op::Hash => crate::hash::hash(&input),
+            Op::Hash => Value::u64(crate::hash::hash(&input)),
 
             Op::Filter => {
                 let (data, mask) = input.into_pair("Filter")?;
                 let (bounds, vals) = data.into_list("Filter data")?;
                 let (mb, mv) = mask.into_list("Filter mask")?;
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
-                let m = mv.into_u64("Filter mask")?;
-                let (idx, nb) = filter_mask(&bounds, &m);
+                let m = mv.as_u64("Filter mask")?;
+                let (idx, nb) = filter_mask(&bounds, m);
                 Value::List(nb.into(), Box::new(gather(&vals, &idx)))
             }
 
@@ -420,7 +427,7 @@ impl<L: OpLike> Op<L> {
             // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch")?;
-                let tags = tags_v.into_u64("Branch tags")?;
+                let tags = tags_v.as_u64("Branch tags")?;
                 assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
                 if *n > 256 {
                     return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
@@ -438,19 +445,29 @@ impl<L: OpLike> Op<L> {
                     groups[t].push(i);
                 }
                 let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-                Value::Sum(Prim::U8(Arc::new(tag8)), off, variants)
+                Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), variants)
             }
 
             Op::Unwrap => {
                 // each row's payload, read straight from its variant by the carried within-offset —
                 // the fused inverse of `Inject` (no `concat(variants)` temporary).
-                let (tags, offset, variants) = input.into_sum("Unwrap")?;
+                let (tags, variants) = input.into_sum("Unwrap")?;
                 let first = variants.first().ok_or("Unwrap: empty sum")?;
+                let first_shape = shape_of_value(first);
                 for v in &variants[1..] {
-                    same(&shape_of_value(first), &shape_of_value(v)).map_err(|e| format!("Unwrap: {e}"))?;
+                    same(&first_shape, &shape_of_value(v)).map_err(|e| format!("Unwrap: {e}"))?;
                 }
+                // every row in one lane, in row order: that lane already IS the answer. This is the
+                // `unwrap(inject x) = x` case, and it costs nothing.
+                if let Some(t) = tags.const_tag() {
+                    return Ok(variants.into_iter().nth(t).expect("tag names a lane"));
+                }
+                let Tags::Column(_, os) = &tags else { unreachable!("const handled above") };
+                // the carried offsets are already the `&[usize]` `gather_lanes` wants; only the u8
+                // discriminants widen, and only here, where every row is read exactly once anyway.
+                let ts: Vec<usize> = tags.tags_iter().collect();
                 let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
-                gather_lanes(&refs, &tags, &offset)
+                gather_lanes(&refs, &ts, os)
             }
 
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
@@ -469,8 +486,9 @@ impl<L: OpLike> Op<L> {
                 }
                 let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
                 variants[*tag] = input;
-                // a constant tag run: the within-variant offset is the row index.
-                Value::Sum(Prim::U8(Arc::new(vec![*tag as u8; n])), (0..n).collect(), variants)
+                // a constant tag run: the assignment is two words, and the within-lane offset IS
+                // the row index — neither column is materialised (see `Tags::Const`).
+                Value::sum_tagged(Tags::constant(*tag, n), variants)
             }
 
             Op::MapList(body) => {
@@ -626,7 +644,7 @@ impl<L: OpLike> Op<L> {
             Op::MapSum(arms) => {
                 // the tag and within-offset columns are untouched by a lane map (each lane keeps its
                 // row count), so move them through rather than decode + recompute them.
-                let Value::Sum(tags, offset, mut variants) = input else {
+                let Value::Sum(tags, mut variants) = input else {
                     return Err(format!("MapSum expects a sum, got {}", shape_of_value(&input)));
                 };
                 for (i, (k, body)) in arms.iter().enumerate() {
@@ -644,7 +662,7 @@ impl<L: OpLike> Op<L> {
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
                     variants[*k] = res;
                 }
-                Value::Sum(tags, offset, variants)
+                Value::Sum(tags, variants)
             }
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it
@@ -654,9 +672,9 @@ impl<L: OpLike> Op<L> {
                 let (lb, lvals) = lohi.into_list("Slices ranges")?;
                 let (hb, hvals) = haystack.into_list("Slices haystack")?;
                 let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
-                let (lo_c, hi_c) = (lo.into_u64("Slices lo")?, hi.into_u64("Slices hi")?);
+                let (lo_c, hi_c) = (lo.as_u64("Slices lo")?, hi.as_u64("Slices hi")?);
                 assert_eq!(lb.len(), hb.len(), "Slices: row count");
-                let (idx, inner_bounds) = expand_ranges(&lb, &lo_c, &hi_c, &hb);
+                let (idx, inner_bounds) = expand_ranges(&lb, lo_c, hi_c, &hb);
                 let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
                 Value::List(lb, Box::new(inner))
             }
@@ -665,7 +683,7 @@ impl<L: OpLike> Op<L> {
             // Output bounds are the index list's bounds (the indices decide the cardinality).
             Op::Get => {
                 let (idx, haystack) = input.into_pair("Get")?;
-                let idxs = idx.into_u64("Get index")?;
+                let idxs = idx.as_u64("Get index")?;
                 let (hb, hvals) = haystack.into_list("Get haystack")?;
                 assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
                 let mut abs = Vec::with_capacity(idxs.len());
@@ -684,15 +702,18 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("Gather indices")?;
                 let (hb, hvals) = haystack.into_list("Gather haystack")?;
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
-                let idxs = ivals.into_u64("Gather indices")?;
                 if ib.len() == 1 && hb.len() == 1 {
                     if let Value::Prim(p) = &hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
-                        // indexing in the gather supplies that check without a separate scan.
+                        // indexing in the gather supplies that check without a separate scan. This
+                        // is the one path that CONSUMES the indices — it rewrites that buffer into
+                        // the result — so it is also the only one that takes ownership.
+                        let idxs = ivals.into_u64("Gather indices")?;
                         return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs)))));
                     }
                 }
-                let abs = resolve_indices(&ib, &idxs, &hb);
+                let idxs = ivals.as_u64("Gather indices")?;
+                let abs = resolve_indices(&ib, idxs, &hb);
                 Value::List(ib, Box::new(gather(&hvals, &abs)))
             }
 
@@ -705,8 +726,10 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
                 let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
-                let idxs = ivals.into_u64("GatherTry indices")?;
-                let mut tags = Vec::with_capacity(idxs.len());
+                let idxs = ivals.as_u64("GatherTry indices")?;
+                // one pass routes each index AND records its within-lane offset — the size its
+                // lane had when it arrived — so the assignment needs no second pass to derive.
+                let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
                 let (mut is, mut hs) = (0, 0);
@@ -715,17 +738,20 @@ impl<L: OpLike> Op<L> {
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
-                            tags.push(1);
+                            tags.push(1u8);
+                            off.push(abs.len());
                             abs.push(hs + x as usize);
                         } else {
-                            tags.push(0);
+                            tags.push(0u8);
+                            off.push(oob.len());
                             oob.push(x);
                         }
                     }
                     is = ie;
                     hs = he;
                 }
-                let sum = Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)]);
+                let lanes = vec![Value::u64(oob), gather(&hvals, &abs)];
+                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
                 Value::List(ib, Box::new(sum))
             }
 
@@ -768,11 +794,11 @@ impl<L: OpLike> Op<L> {
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
             Op::Iota => {
-                let ns = input.into_u64("Iota")?;
+                let ns = input.as_u64("Iota")?;
                 let mut bounds = Vec::with_capacity(ns.len());
                 let mut vals = Vec::new();
                 let mut end = 0usize;
-                for &n in &ns {
+                for &n in ns {
                     vals.extend(0..n);
                     end += n as usize;
                     bounds.push(end);
@@ -800,11 +826,10 @@ impl<L: OpLike> Op<L> {
                 }
                 let els = cols.pop().unwrap();
                 let then = cols.pop().unwrap();
-                let mask = cols.pop().unwrap().into_u64("Select mask")?;
+                let mask_col = cols.pop().unwrap();
+                let mask = mask_col.as_u64("Select mask")?;
                 same(&shape_of_value(&then), &shape_of_value(&els)).map_err(|e| format!("Select: {e}"))?;
-                let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
-                let off: Vec<usize> = (0..tags.len()).collect();
-                gather_lanes(&[Some(&els), Some(&then)], &tags, &off)
+                blend(mask, then, els)
             }
         })
     }

@@ -24,15 +24,17 @@
 //! Value ::= Prim | Prod | Sum | List | Unit          (all quantities are u64 little-endian words)
 //!   Prim  = 0, bits, len, payload[len * bits/8]      payload padded to a word boundary
 //!   Prod  = 1, fields, Value*fields
-//!   Sum   = 2, bits, len, payload[..],               the discriminant leaf, inline
-//!               offsets, u64*offsets,                the carried within-variant offset per row
+//!   Sum   = 2, 0, bits, len, payload[..],            `Column` form: the discriminant leaf, inline
+//!               offsets, u64*offsets,                  the carried within-lane offset per row
 //!               lanes, Value*lanes                     one column per variant (empty if unused)
+//!         | 2, 1, tag, rows, lanes, Value*lanes       `Const` form: every row carries `tag`, so
+//!                                                      neither witness column is on the wire
 //!   List  = 3, 0, n, u64*n, Value                    `Offsets` form: one end offset per row
 //!         | 3, 1, stride, rows, Value                `Stride` form: the uniform partition
 //!   Unit  = 4, n
 //! ```
 
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Tags, Value};
 
 /// Round a byte count up to a whole number of 64-bit words.
 #[inline]
@@ -43,9 +45,8 @@ pub fn length_in_bytes(v: &Value) -> usize {
     match v {
         Value::Prim(p) => 24 + pad8(prim_payload_len(p)),
         Value::Prod(cols) => 16 + cols.iter().map(length_in_bytes).sum::<usize>(),
-        Value::Sum(tags, offsets, lanes) => {
-            24 + pad8(prim_payload_len(tags))          // the discriminant leaf, inline
-                + 8 + 8 * offsets.len()                 // the within-variant offsets
+        Value::Sum(tags, lanes) => {
+            8 + tags_len(tags)                          // the Sum word, then the assignment
                 + 8                                     // the lane count
                 + lanes.iter().map(length_in_bytes).sum::<usize>()
         }
@@ -67,11 +68,9 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
             for c in cols { write_to(c, writer)?; }
             Ok(())
         }
-        Value::Sum(tags, offsets, lanes) => {
+        Value::Sum(tags, lanes) => {
             word(writer, 2)?;
-            write_prim(tags, writer)?;
-            word(writer, offsets.len() as u64)?;
-            for &o in offsets { word(writer, o as u64)?; }
+            write_tags(tags, writer)?;
             word(writer, lanes.len() as u64)?;
             for lane in lanes { write_to(lane, writer)?; }
             Ok(())
@@ -140,20 +139,20 @@ pub fn read_from(bytes: &[u8]) -> Result<(Value, usize), String> {
 /// ```text
 ///                     release   debug
 ///   read_from            3660     479     <- this decoder
-///   hash_rows            4880    1164
+///   hash                 4880    1164
 ///   shape_of_value      10983    1688
 ///   write_to            21966    3760
 ///   Drop / len          32949    8780
 /// ```
 ///
 /// So the cap is not really protecting the decoder — it is protecting everything the decoder hands
-/// a value to, and `hash_rows` is the one that gives out first. 128 sits a factor of four under the
+/// a value to, and `hash` is the one that gives out first. 128 sits a factor of four under the
 /// lowest number in that table. Raising it means redoing the measurement, on whichever traversal is
 /// weakest at the time.
 ///
 /// This is also the answer to "why not make the decode iterative and drop the cap?". An explicit
 /// stack would move `read_from` off the bottom of that table, but only as far as the next row: the
-/// derived `Drop` recurses, and so do `len`, `shape_of_value`, `hash_rows` and `PartialEq`. Lifting
+/// derived `Drop` recurses, and so do `len`, `shape_of_value`, `hash` and `PartialEq`. Lifting
 /// the ceiling means making all of them iterative, which is a corgi-wide change with its own
 /// payoff (arbitrarily deep shapes) — not something a codec can do on its own.
 pub const MAX_DEPTH: usize = 128;
@@ -172,7 +171,7 @@ pub fn declared_rows(v: &Value) -> u64 {
     match v {
         Value::Prim(p) => prim_len(p) as u64,
         Value::Prod(cols) => cols.iter().map(declared_rows).max().unwrap_or(0),
-        Value::Sum(tags, offsets, lanes) => (prim_len(tags).max(offsets.len()) as u64)
+        Value::Sum(tags, lanes) => (tags.len() as u64)
             .max(lanes.iter().map(declared_rows).max().unwrap_or(0)),
         Value::List(bounds, values) => (bounds_rows(bounds) as u64)
             .max(bounds_total(bounds))
@@ -283,7 +282,7 @@ fn write_bounds<W: std::io::Write>(bounds: &Bounds, writer: &mut W) -> std::io::
         Bounds::Offsets(v) => {
             word(writer, 0)?;
             word(writer, v.len() as u64)?;
-            for &e in v { word(writer, e as u64)?; }
+            for &e in v.iter() { word(writer, e as u64)?; }
             Ok(())
         }
         Bounds::Stride(k, rows) => {
@@ -398,17 +397,15 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
             Ok(Value::Prod(cols))
         }
         2 => {
-            let tags = read_prim(r)?;
-            let n_offsets = r.count(8, "sum offsets")?;
-            let offsets = r.words(n_offsets)?;
+            let tags = read_tags(r)?;
             // The smallest value (a `Unit`) is two words, so that is the floor per lane.
             let n_lanes = r.count(16, "sum lanes")?;
             let mut lanes = Vec::with_capacity(n_lanes);
             for _ in 0..n_lanes {
                 lanes.push(r.nested(read_value)?);
             }
-            check_sum(&tags, &offsets, &lanes)?;
-            Ok(Value::Sum(tags, offsets, lanes))
+            check_sum(&tags, &lanes)?;
+            Ok(Value::Sum(tags, lanes))
         }
         3 => {
             let bounds = read_bounds(r)?;
@@ -422,27 +419,16 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
 }
 
 /// The `Sum` invariants every reader indexes by: a u8 discriminant naming one of the lanes, and a
-/// carried offset that lands inside it. Without these, `hash_rows` and the comparators index out
+/// carried offset that lands inside it. Without these, `hash` and the comparators index out
 /// of bounds on a column the decoder handed them.
-fn check_sum(tags: &Prim, offsets: &[usize], lanes: &[Value]) -> Result<(), String> {
-    // `Value::sum` stores the discriminant as a u8 and asserts the arity fits it; a wider
-    // discriminant off the wire would be a shape corgi cannot construct.
-    if !matches!(tags, Prim::U8(_)) {
-        return Err("corgi::bytes: sum discriminant must be a u8 leaf".into());
-    }
+fn check_sum(tags: &Tags, lanes: &[Value]) -> Result<(), String> {
     if lanes.len() > 256 {
         return Err(format!("corgi::bytes: {} sum lanes exceeds the u8 tag width", lanes.len()));
     }
-    let tag_vec = match tags {
-        Prim::U8(v) => v,
-        _ => unreachable!("checked above"),
-    };
-    if offsets.len() != tag_vec.len() {
-        return Err(format!("corgi::bytes: {} sum offsets for {} tags", offsets.len(), tag_vec.len()));
-    }
     let lane_rows: Vec<usize> = lanes.iter().map(Value::len).collect();
-    for (row, (&t, &o)) in tag_vec.iter().zip(offsets).enumerate() {
-        match lane_rows.get(t as usize) {
+    for row in 0..tags.len() {
+        let (t, o) = (tags.tag_at(row), tags.offset_at(row));
+        match lane_rows.get(t) {
             None => return Err(format!("corgi::bytes: row {row} has tag {t} but there are {} lanes", lanes.len())),
             Some(rows) if o >= *rows => {
                 return Err(format!("corgi::bytes: row {row} offset {o} is outside lane {t} ({rows} rows)"));
@@ -451,6 +437,60 @@ fn check_sum(tags: &Prim, offsets: &[usize], lanes: &[Value]) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// The lane assignment, in the same two-form style as `Bounds`: `Const` is the uniform case and
+/// costs three words whatever the row count, `Column` writes the discriminant leaf and the offsets.
+/// The encoder records which form the sender held; normalizing on read would silently rewrite it.
+fn read_tags(r: &mut Reader) -> Result<Tags, String> {
+    match r.word()? {
+        0 => {
+            let tags = read_prim(r)?;
+            if !matches!(tags, Prim::U8(_)) {
+                // `Value::sum` stores the discriminant as a u8 and asserts the arity fits it; a
+                // wider discriminant off the wire would be a shape corgi cannot construct.
+                return Err("corgi::bytes: sum discriminant must be a u8 leaf".into());
+            }
+            let n_offsets = r.count(8, "sum offsets")?;
+            let offsets = r.words(n_offsets)?;
+            if offsets.len() != tags.len() {
+                return Err(format!("corgi::bytes: {} sum offsets for {} tags", offsets.len(), tags.len()));
+            }
+            Ok(Tags::Column(tags, std::sync::Arc::new(offsets)))
+        }
+        1 => {
+            let tag = r.word()? as usize;
+            let rows = r.word()? as usize;
+            Ok(Tags::constant(tag, rows))
+        }
+        other => Err(format!("corgi::bytes: bad sum tag form {other}")),
+    }
+}
+
+fn write_tags<W: std::io::Write>(tags: &Tags, writer: &mut W) -> std::io::Result<()> {
+    match tags {
+        Tags::Column(t, offsets) => {
+            word(writer, 0)?;
+            write_prim(t, writer)?;
+            word(writer, offsets.len() as u64)?;
+            for &o in offsets.iter() { word(writer, o as u64)?; }
+            Ok(())
+        }
+        Tags::Const(tag, rows) => {
+            word(writer, 1)?;
+            word(writer, *tag as u64)?;
+            word(writer, *rows as u64)
+        }
+    }
+}
+
+/// The bytes `write_tags` emits.
+fn tags_len(tags: &Tags) -> usize {
+    match tags {
+        // form, then the discriminant leaf (bits, len, payload), then the offsets (count, words).
+        Tags::Column(t, offsets) => 8 + 16 + pad8(prim_payload_len(t)) + 8 + 8 * offsets.len(),
+        Tags::Const(..) => 24, // form, tag, rows — whatever the row count
+    }
 }
 
 /// The `List` invariant: the partition has to stay inside the values it partitions, and it has to
@@ -515,7 +555,7 @@ fn read_bounds(r: &mut Reader) -> Result<Bounds, String> {
             // `Bounds::Offsets` directly, NOT `Bounds::from`: the encoder recorded which form the
             // sender held, and normalizing here would silently rewrite it. (The two compare equal
             // when they describe the same partition, so this is fidelity, not correctness.)
-            Ok(Bounds::Offsets(r.words(n)?))
+            Ok(Bounds::offsets(r.words(n)?))
         }
         1 => {
             let stride = r.word()? as usize;
@@ -553,16 +593,16 @@ mod test {
             Value::u64(vec![u64::MAX, 0, 12345]),
             Value::Prod(vec![]),
             Value::Prod(vec![Value::u64(vec![1, 2]), Value::u8(vec![3, 4])]),
-            Value::List(Bounds::Offsets(vec![1, 1, 4]), Box::new(Value::u32(vec![9, 8, 7, 6]))),
+            Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::u32(vec![9, 8, 7, 6]))),
             Value::List(Bounds::Stride(2, 3), Box::new(Value::u64(vec![1, 2, 3, 4, 5, 6]))),
-            Value::Sum(Prim::U8(std::sync::Arc::new(vec![0, 1, 0])), vec![0, 0, 1],
-                       vec![Value::u64(vec![10, 20]), Value::u16(vec![30])]),
+            Value::sum(vec![0, 1, 0], vec![Value::u64(vec![10, 20]), Value::u16(vec![30])]),
             // a lane no row uses: an empty column of its shape, which must survive as such
-            Value::Sum(Prim::U8(std::sync::Arc::new(vec![0, 0])), vec![0, 1],
-                       vec![Value::u64(vec![1, 2]), Value::u16(vec![])]),
+            Value::sum(vec![0, 0], vec![Value::u64(vec![1, 2]), Value::u16(vec![])]),
+            // the `Const` assignment: every row one tag, so neither witness column is on the wire
+            Value::sum_tagged(Tags::constant(1, 3), vec![Value::u64(vec![]), Value::u16(vec![4, 5, 6])]),
             // nesting: the recursion has to keep alignment across every level
             Value::Prod(vec![
-                Value::List(Bounds::Offsets(vec![2, 3]), Box::new(Value::Prod(vec![
+                Value::List(Bounds::offsets(vec![2, 3]), Box::new(Value::Prod(vec![
                     Value::u8(vec![1, 2, 3]),
                     Value::u64(vec![4, 5, 6]),
                 ]))),
@@ -595,7 +635,7 @@ mod test {
             let mut buf = Vec::new();
             write_to(&v, &mut buf).unwrap();
             let (back, _) = read_from(&buf).unwrap();
-            assert_eq!(crate::arrange::hash_rows(&back), crate::arrange::hash_rows(&v));
+            assert_eq!(crate::hash::hash(&back), crate::hash::hash(&v));
         }
     }
 
@@ -667,7 +707,7 @@ mod test {
                         acc += rng.below(3);
                         ends.push(acc);
                     }
-                    (Bounds::Offsets(ends), acc)
+                    (Bounds::offsets(ends), acc)
                 };
                 Value::List(bounds, Box::new(random_value(rng, total, depth - 1)))
             }
@@ -687,7 +727,13 @@ mod test {
                     .iter()
                     .map(|&n| random_value(rng, n, depth - 1))
                     .collect();
-                Value::Sum(Prim::U8(std::sync::Arc::new(tags.iter().map(|&t| t as u8).collect())), offsets, variants)
+                Value::sum_tagged(
+                    Tags::Column(
+                        Prim::U8(std::sync::Arc::new(tags.iter().map(|&t| t as u8).collect())),
+                        std::sync::Arc::new(offsets),
+                    ),
+                    variants,
+                )
             }
         }
     }
@@ -714,7 +760,7 @@ mod test {
             let mut buf = Vec::new();
             write_to(&v, &mut buf).unwrap();
             let (back, _) = read_from(&buf).unwrap();
-            assert_eq!(crate::arrange::hash_rows(&back), crate::arrange::hash_rows(&v), "{v:?}");
+            assert_eq!(crate::hash::hash(&back), crate::hash::hash(&v), "{v:?}");
         }
     }
 
@@ -744,7 +790,7 @@ mod test {
         // the guard a consumer is told to apply. Using it here is the test asserting that the
         // advice works: `Value::len` alone would not see a `Unit` nested in a `Sum` lane.
         if declared_rows(v) <= 10_000 {
-            let _ = crate::arrange::hash_rows(v);
+            let _ = crate::hash::hash(v);
         }
     }
 
@@ -852,7 +898,7 @@ mod test {
 
     /// The structural invariants the rest of corgi indexes by. Each of these is a byte string the
     /// framing accepts and the structure must not: without the checks, the first two panic inside
-    /// `hash_rows` on a column `read_from` handed back as valid.
+    /// `hash` on a column `read_from` handed back as valid.
     #[test]
     fn structurally_impossible_columns_are_refused() {
         /// Encode `v`, overwrite word `word` with `to`, and return the bytes — same length as a
@@ -867,22 +913,28 @@ mod test {
         // A sum whose tag names a lane that is not there. Words: [Sum][bits][len][tags payload]…
         // and the payload word carries the single u8 discriminant in its low byte.
         let bad_tag = patched(
-            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Value::u64(vec![7])]),
-            3,
+            &Value::sum_tagged(
+                Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+                vec![Value::u64(vec![7])],
+            ),
+            4,
             5,
         );
         assert!(read_from(&bad_tag).is_err(), "a tag naming a missing lane must be refused");
 
         // A sum whose carried offset points past the end of the lane it names.
         let bad_offset = patched(
-            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Value::u64(vec![7])]),
-            5, // [Sum][bits][len][tags][n_offsets][offsets[0]]
+            &Value::sum_tagged(
+                Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+                vec![Value::u64(vec![7])],
+            ),
+            6, // [Sum][form][bits][len][tags][n_offsets][offsets[0]]
             9,
         );
         assert!(read_from(&bad_offset).is_err(), "an offset outside its lane must be refused");
 
         // A list whose partition reaches past its values. Words: [List][form][n][ends[0]]…
-        let over_reach = patched(&Value::List(Bounds::Offsets(vec![2]), Box::new(Value::u64(vec![1, 2]))), 3, 10);
+        let over_reach = patched(&Value::List(Bounds::offsets(vec![2]), Box::new(Value::u64(vec![1, 2]))), 3, 10);
         assert!(read_from(&over_reach).is_err(), "bounds reaching past the values must be refused");
 
         // The `Stride` form of the same thing: three rows of two over a two-element leaf.
@@ -898,8 +950,11 @@ mod test {
         // A sum discriminant at a width corgi cannot construct (`sum_opt` stores u8 and asserts
         // the arity fits it), which would otherwise let a tag column carry more than 256 lanes.
         let wide_tags = patched(
-            &Value::Sum(Prim::U8(std::sync::Arc::new(vec![0])), vec![0], vec![Value::u64(vec![7])]),
-            1,
+            &Value::sum_tagged(
+                Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+                vec![Value::u64(vec![7])],
+            ),
+            2,
             64,
         );
         assert!(read_from(&wide_tags).is_err(), "a non-u8 sum discriminant must be refused");
@@ -912,16 +967,15 @@ mod test {
         let huge = 1usize << 40;
 
         // A one-row sum whose lane names a trillion rows.
-        let hidden_in_a_lane = Value::Sum(
-            Prim::U8(std::sync::Arc::new(vec![0])),
-            vec![0],
+        let hidden_in_a_lane = Value::sum_tagged(
+            Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
             vec![Value::Unit(huge)],
         );
         assert_eq!(hidden_in_a_lane.len(), 1);
         assert_eq!(declared_rows(&hidden_in_a_lane), huge as u64);
 
         // A one-row list whose values do.
-        let hidden_under_a_list = Value::List(Bounds::Offsets(vec![huge]), Box::new(Value::Unit(huge)));
+        let hidden_under_a_list = Value::List(Bounds::offsets(vec![huge]), Box::new(Value::Unit(huge)));
         assert_eq!(hidden_under_a_list.len(), 1);
         assert_eq!(declared_rows(&hidden_under_a_list), huge as u64);
 

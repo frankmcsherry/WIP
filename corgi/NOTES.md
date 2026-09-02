@@ -10,8 +10,8 @@ language; `cargo bench --bench eval` measures throughput.
 ```
 src/
   value.rs     Value (columnar data) + show. Leaf = Prim, a width-tagged Arc<Vec<uN>>
-               (u8/u16/u32/u64) via the `prim!` macro. Sum = (u8 tag column, carried within-variant
-               offset per row, variants); build via Value::sum / sum_from_prim to keep the offset valid.
+               (u8/u16/u32/u64) via the `prim!` macro. Sum = (Tags, variants), where Tags is the
+               lane assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
   engine.rs    row-movement primitives: gather, concat, fill + index generators
                (filter_mask / owner_ids / resolve_indices / expand_ranges).
   cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
@@ -140,8 +140,28 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   dense leaf sort at 1M/8M; `tests/kernel.rs::stride_sort_matches_offsets` pins the fast path to the
   structural result). `enlist` emits `Stride(1)`; `eq`/`hash`/`show` are by the partition, so a
   `Stride` and the equivalent `Offsets` are interchangeable. Array languages are the all-uniform case.
+- **Sum rows carry a uniformity-aware `Tags`.** `Value::Sum` holds `Tags { Const(tag, rows) |
+  Column(u8 tags, Arc<Vec<usize>> within-lane offsets) }` — the `Sum`-side twin of `Bounds`, and the
+  dynamic mirror of `columnar`'s `Discriminant` (whose "homogeneous" state stores `[tag, count]` and
+  synthesises identity offsets). `Const` is the ONE-TAG case: it costs two words at any row count,
+  because row `i`'s offset in the single lane is `i`. It is what `inject` and `lift` build, and what
+  a `Fail` column that has not actually failed stays in — so a fallible pipeline in its normal state
+  carries no witness columns at all. Uniformity is O(1) to detect (`const_tag`) and it PROPAGATES: a
+  gather of a one-tag sum is one, a lane map leaves the assignment alone, and `unwrap`/`sort`/
+  `compare` each take a no-witness path on it. Equality and hash are by the ASSIGNMENT, so a `Const`
+  and the equivalent `Column` are interchangeable — including on the wire, where the codec records
+  which form the sender held (as it does for `Bounds`).
+- **`Fail<T> = Sum{T | Unit}`, so "did anything fail" is a field read.** The Err lane carries no
+  payload, only a length, so the failure count is O(1) on any fallible column. `into_fail`,
+  `squash`, `hoist_prod` and `hoist_list` ask that FIRST and take a no-copy path when the answer is
+  zero; materialising a `Vec<bool>` mask to discover it was the cost of the common case. The static
+  optimizer cannot do this work instead: `lower_effects` inserts `Lift`/`Squash`/`Hoist*` only where
+  a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
+  *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
   sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
+  The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
+  offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
   *Reuse policy:* an op that is elementwise AND same-width (`AddU64`/`Shr`/`And`, `bin_into`, `neg_into`,
   `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
@@ -295,13 +315,11 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).
 - **Length / stratum checker** — the one judgment `shape_of` skips (Tuple/Add same length; map body
   one stratum deeper). A pass beside `check`.
-- **Sum random-access cost — RESOLVED (via representation).** A `Value::Sum` now carries the
-  within-variant offset per row (`Sum(tags, offset, variants)`), built once at construction by
-  `Value::sum`/`sum_from_prim` and maintained by `gather`/`concat`. `compare_idx` reads it O(1), so
-  `Rel`/`find` over sum-shaped data are linear (no per-call rank scan). The earlier plan was find-local
-  block-starts *avoiding* a representation change; carrying the offset proved simpler and uniform. The
-  offset is a DERIVED field (droppable at serialization: content-address `(tags, variants)`, rebuild on
-  load). Future optimization: skip computing it for sums a pass proves are never `find`/`Rel` operands.
+- **Sum random-access cost — RESOLVED (via representation).** A `Value::Sum` carries each row's
+  offset WITHIN its lane, built once at construction and maintained by `gather`/`concat`.
+  `compare_idx` reads it O(1), so `Rel`/`find` over sum-shaped data are linear (no per-call rank
+  scan). The earlier plan was find-local block-starts *avoiding* a representation change; carrying
+  the offset proved simpler and uniform.
 
 ## Conventions
 

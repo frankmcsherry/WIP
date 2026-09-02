@@ -3,7 +3,8 @@
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, Value};
+use std::sync::Arc;
+use crate::value::{Bounds, Prim, Tags, Value};
 
 pub(crate) use generators::*;
 
@@ -15,7 +16,17 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 /// over every shape — it is `gather` at the all-zero index, so `Op::Lit` (which accepts any value's
 /// shape) and `eval` agree.
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
-    gather(row, &vec![0usize; n])
+    match row {
+        // a FIXED-WIDTH row broadcasts directly: one `vec![x; n]` per leaf, and no index column
+        // to describe an index that is constant. (`Op::Lit` is the caller, and a literal is
+        // overwhelmingly a leaf or a product of them.)
+        Value::Prim(p) => Value::Prim(p.repeat(0, n)),
+        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| fill(c, n)).collect()),
+        Value::Unit(_) => Value::Unit(n),
+        // a VARIABLE-WIDTH row (a `List` span, a `Sum` lane) is a row move, which is what a
+        // `gather` at the all-zero index already is; there is no cheaper form of it here.
+        Value::List(..) | Value::Sum(..) => gather(row, &vec![0usize; n]),
+    }
 }
 
 mod generators {
@@ -117,17 +128,27 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             }
             Value::List(nb.into(), Box::new(gather(vals, &elem)))
         }
-        Value::Sum(tags, within, variants) => {
-            // `within` is the carried within-variant offset — read, not recomputed. Each selected row
-            // lands in its variant's lane at that offset; `sum_from_prim` rebuilds the result's offset.
-            let Prim::U8(tag_vec) = tags else { unreachable!("gather: sum discriminants are u8 columns") };
-            let new_tags = tags.gather(idx); // the discriminant moves like any leaf column
+        Value::Sum(tags, variants) => {
+            // one tag throughout: the selected rows are lane `t`'s rows at exactly `idx` (a `Const`
+            // assignment's offset IS the row index), so this is one lane gather and no witness work.
+            if let Some(t) = tags.const_tag() {
+                let mut lanes: Vec<Value> = variants.iter().map(|v| gather(v, &[])).collect();
+                lanes[t] = gather(&variants[t], idx);
+                return Value::Sum(Tags::constant(t, idx.len()), lanes);
+            }
+            // Otherwise build the result's assignment in the SAME pass that routes the rows: a row's
+            // new offset is the size its lane had when the row arrived, so nothing is recomputed
+            // afterwards. Both reads are in place — a gather of k rows is O(k), not O(column).
             let mut per = vec![Vec::new(); variants.len()];
+            let (mut new_tags, mut new_off) = (Vec::with_capacity(idx.len()), Vec::with_capacity(idx.len()));
             for &i in idx {
-                per[tag_vec[i] as usize].push(within[i]); // read in place: a gather of k rows is O(k)
+                let t = tags.tag_at(i);
+                new_tags.push(t as u8);
+                new_off.push(per[t].len());
+                per[t].push(tags.offset_at(i));
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
-            Value::sum_from_prim(new_tags, nv)
+            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
     }
@@ -196,38 +217,62 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             // pick each output row's tagged payload: build the output tag column, then per output-tag
             // gather that variant from the sources at the carried within-offset.
             // (tags, within-offsets, lanes) borrowed from each source sum.
-            type SumView<'a> = (&'a Prim, &'a [usize], &'a [Value]);
+            type SumView<'a> = (&'a Tags, &'a [Value]);
             let sums: Vec<SumView> = filled
                 .iter()
                 .map(|v| match v {
-                    Value::Sum(t, o, vs) => (t, o.as_slice(), vs.as_slice()),
+                    Value::Sum(t, vs) => (t, vs.as_slice()),
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
-            let tag_prims: Vec<&Prim> = sums.iter().map(|s| s.0).collect();
-            let out_tags = Prim::gather_lanes(&tag_prims, tags, off);
-            let out_tag_vec = out_tags.usize_vec();
+            // each output row takes its source row's tag, read in place from that source.
+            let out_tag: Vec<usize> =
+                tags.iter().zip(off).map(|(&t, &o)| sums[t].0.tag_at(o)).collect();
             // every source has the same shape, hence the same arity (there is no uncommitted lane
             // for sources to disagree by); a mismatch is the caller's shape error.
-            let arity = sums[0].2.len();
-            assert!(sums.iter().all(|sm| sm.2.len() == arity), "gather_lanes: sum sources differ in arity");
+            let arity = sums[0].1.len();
+            assert!(sums.iter().all(|sm| sm.1.len() == arity), "gather_lanes: sum sources differ in arity");
             let out_vars: Vec<Value> = (0..arity)
                 .map(|s| {
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
-                    for (i, &os) in out_tag_vec.iter().enumerate() {
+                    for (i, &os) in out_tag.iter().enumerate() {
                         if os == s {
                             let (t, o) = (tags[i], off[i]);
                             s_t.push(t);
-                            s_o.push(sums[t].1[o]); // carried offset = position in the source's variant s
+                            s_o.push(sums[t].0.offset_at(o)); // carried offset within the source's lane s
                         }
                     }
-                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.2[s])).collect();
+                    let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.1[s])).collect();
                     gather_lanes(&vsrcs, &s_t, &s_o)
                 })
                 .collect();
-            Value::sum_from_prim(out_tags, out_vars)
+            Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
+    }
+}
+
+/// per-row blend: row `i` of the result is row `i` of `then` where `mask[i]` is nonzero, else row
+/// `i` of `els` (both same-shape columns at the mask's stratum) — what [`crate::ops::Op::Select`] is.
+///
+/// A FIXED-WIDTH level blends LANE-WISE: one pass reading both sides at the same position, which is
+/// a select instruction. A VARIABLE-WIDTH level (a `List` row is a span, a `Sum` row is a lane
+/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`]
+/// — the same split `scatter` makes, and for the same reason. The split is per LEVEL, not per value:
+/// a product blends each leaf field directly and only gathers the fields that need it.
+pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
+    match (then, els) {
+        (Value::Prim(t), Value::Prim(e)) => Value::Prim(t.blend(e, mask)),
+        (Value::Prod(ts), Value::Prod(es)) => {
+            Value::Prod(ts.into_iter().zip(es).map(|(t, e)| blend(mask, t, e)).collect())
+        }
+        (Value::Unit(_), Value::Unit(_)) => Value::Unit(mask.len()),
+        // row `i` from lane `mask[i] != 0`, at its own position — the offsets are the identity.
+        (t, e) => {
+            let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
+            let off: Vec<usize> = (0..tags.len()).collect();
+            gather_lanes(&[Some(&e), Some(&t)], &tags, &off)
+        }
     }
 }
 
@@ -276,13 +321,13 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             }
             Value::List(nb.into(), Box::new(concat(&vp)))
         }
-        Value::Sum(_, _, v0) => {
-            let mut tag_parts: Vec<&Prim> = Vec::new();
-            let mut per: Vec<Vec<Value>> = vec![Vec::new(); v0.len()]; // committed contributions per lane
+        Value::Sum(_, v0) => {
+            let mut all_tags: Vec<usize> = Vec::new();
+            let mut per: Vec<Vec<Value>> = vec![Vec::new(); v0.len()]; // contributions per lane
             for p in parts {
                 match p {
-                    Value::Sum(t, _, v) => {
-                        tag_parts.push(t);
+                    Value::Sum(t, v) => {
+                        all_tags.extend(t.tags_iter());
                         for (i, c) in v.iter().enumerate() {
                             per[i].push(c.clone());
                         }
@@ -292,7 +337,8 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             }
             // the concatenated tags fix the offset, so it's rebuilt rather than spliced.
             let lanes = per.iter().map(|ps| concat(ps)).collect();
-            Value::sum_from_prim(Prim::concat(&tag_parts), lanes)
+            let arity = v0.len();
+            Value::Sum(Tags::from_tags(all_tags, arity), lanes)
         }
         Value::Unit(_) => Value::Unit(parts.iter().map(Value::len).sum()),
     }
@@ -327,6 +373,41 @@ mod tests {
         assert_eq!(gather_lanes(&refs, tags, &off), oracle(&variants, tags, &off));
     }
 
+    /// `blend` takes a lane-wise path at fixed-width levels and the `gather_lanes` path elsewhere.
+    /// The two must agree exactly, including inside a MIXED product where one field takes each.
+    #[test]
+    fn blend_matches_the_gather_lanes_path() {
+        // the general path, written out: row i from lane `mask[i] != 0`, at its own position.
+        fn oracle(mask: &[u64], then: &Value, els: &Value) -> Value {
+            let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
+            let off: Vec<usize> = (0..tags.len()).collect();
+            gather_lanes(&[Some(els), Some(then)], &tags, &off)
+        }
+        let mask = [1u64, 0, 0, 1];
+        let list = |ends: Vec<usize>, xs: &[u64]| Value::List(ends.into(), Box::new(u(xs)));
+
+        // leaf, product of leaves, unit — the lane-wise path.
+        for (t, e) in [
+            (u(&[1, 2, 3, 4]), u(&[10, 20, 30, 40])),
+            (
+                Value::Prod(vec![u(&[1, 2, 3, 4]), Value::u8(vec![5, 6, 7, 8])]),
+                Value::Prod(vec![u(&[9, 8, 7, 6]), Value::u8(vec![1, 2, 3, 4])]),
+            ),
+            (Value::Unit(4), Value::Unit(4)),
+        ] {
+            assert_eq!(blend(&mask, t.clone(), e.clone()), oracle(&mask, &t, &e));
+        }
+
+        // a list (ragged rows: no constant slot) — the fallback path.
+        let (t, e) = (list(vec![1, 3, 3, 6], &[1, 2, 3, 4, 5, 6]), list(vec![2, 2, 5, 5], &[7, 8, 9, 1, 2]));
+        assert_eq!(blend(&mask, t.clone(), e.clone()), oracle(&mask, &t, &e));
+
+        // a MIXED product: field 0 blends lane-wise, field 1 falls back, and the result is the same.
+        let t = Value::Prod(vec![u(&[1, 2, 3, 4]), list(vec![1, 3, 3, 6], &[1, 2, 3, 4, 5, 6])]);
+        let e = Value::Prod(vec![u(&[9, 8, 7, 6]), list(vec![2, 2, 5, 5], &[7, 8, 9, 1, 2])]);
+        assert_eq!(blend(&mask, t.clone(), e.clone()), oracle(&mask, &t, &e));
+    }
+
     /// Two sources of one sum shape, each using only one of its lanes (the other is an empty
     /// column of the declared shape): the gather reads each row from its lane and the result
     /// carries both lanes, whichever source comes first.
@@ -337,9 +418,9 @@ mod tests {
         let (tags, off) = (vec![0usize, 1, 0, 1], vec![0usize, 0, 1, 1]);
         let out = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
         match &out {
-            Value::Sum(t, _, lanes) => {
+            Value::Sum(t, lanes) => {
                 assert_eq!(lanes.len(), 2);
-                assert_eq!(t.usize_vec(), vec![0, 1, 0, 1]);
+                assert_eq!(t.tags_iter().collect::<Vec<_>>(), vec![0, 1, 0, 1]);
                 assert_eq!(lanes[0], u(&[10, 11]));
                 assert_eq!(lanes[1], u(&[20, 21]));
             }

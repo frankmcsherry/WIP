@@ -40,7 +40,7 @@ fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
         let out = black_box(eval_graph(g, black_box(a)));
         // a partial program's output is `Sum{T | Unit}`; rows in the Unit lane are its errors. No
         // benchmark program yields an Option-like value of its own, so this reads only that lane.
-        let failed = matches!(&out, Value::Sum(_, _, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(n) if n > 0));
+        let failed = matches!(&out, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(n) if n > 0));
         black_box(out); // include output destruction in the timer, as rust_t's closures do
         let elapsed = t.elapsed();
         assert!(!failed, "benchmark input unexpectedly exercised a fallible op's error lane");
@@ -738,15 +738,8 @@ fn family_arrange(n: usize, reps: u32) {
     let mut sorted = src.clone();
     sorted.sort_unstable();
     let sorted_col = Value::u64(sorted.clone());
-    let ia: Vec<usize> = (0..n.saturating_sub(1)).collect();
-    let ib: Vec<usize> = (1..n).collect();
     let c = rust_t(reps, || {
-        black_box(arrange::compare_idx(
-            black_box(&sorted_col),
-            &sorted_col,
-            &ia,
-            &ib,
-        ));
+        black_box(arrange::compare_adjacent(black_box(&sorted_col)));
     });
     let r = rust_t(reps, || {
         black_box(
@@ -758,7 +751,7 @@ fn family_arrange(n: usize, reps: u32) {
     });
     row(
         "R2 arrange_compare",
-        ia.len().max(1),
+        n.saturating_sub(1).max(1),
         c,
         r,
         "batched adjacent compare vs direct leaf compare",

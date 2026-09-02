@@ -290,7 +290,7 @@ impl ArithOp {
             }
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
-                let xs = vals.into_u64("reduce values")?;
+                let xs = vals.as_u64("reduce values")?;
                 let mut out = Vec::with_capacity(bounds.len());
                 let mut start = 0;
                 for end in bounds.ends() {

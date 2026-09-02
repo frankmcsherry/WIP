@@ -57,14 +57,13 @@ fn combine(acc: u64, x: u64) -> u64 {
     (acc ^ mix64(x)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-/// the columnar structural hash: a `U64` column whose row `r` is the stable hash of row `r` of `v`.
-/// One bottom-up pass; each level folds its children exactly as the comparator orders them.
-pub fn hash(v: &Value) -> Value {
-    Value::u64(hash_cols(v))
-}
-
-/// the raw per-row hashes (the kernel [`hash`] wraps as a `Value`). See the module doc for the fold.
-pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
+/// the columnar structural hash: `out[r]` is the stable id of row `r` of `v`. One bottom-up pass;
+/// each level folds its children exactly as the comparator orders them.
+///
+/// THE id function — there is one, and every caller reaches it here. `Op::Hash` wraps the result as
+/// a `U64` column because an op must return a `Value`; nothing else wants the wrapper, so nothing
+/// else pays for it.
+pub fn hash(v: &Value) -> Vec<u64> {
     match v {
         Value::Prim(p) => p.hashes(),
 
@@ -73,7 +72,7 @@ pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
         Value::Prod(cols) => {
             let mut acc = vec![PROD; v.len()];
             for c in cols {
-                for (a, x) in acc.iter_mut().zip(hash_cols(c)) {
+                for (a, x) in acc.iter_mut().zip(hash(c)) {
                     *a = combine(*a, x);
                 }
             }
@@ -82,17 +81,23 @@ pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
 
         // sum = tag first, then the payload read from the row's lane at its carried within-variant
         // offset.
-        Value::Sum(tags, offset, variants) => {
-            let tags = tags.usize_vec();
-            let lanes: Vec<Vec<u64>> = variants.iter().map(hash_cols).collect();
-            tags.iter().zip(offset).map(|(&t, &o)| combine(combine(SUM, t as u64), lanes[t][o])).collect()
+        Value::Sum(tags, variants) => {
+            let lanes: Vec<Vec<u64>> = variants.iter().map(hash).collect();
+            // the assignment is read in place: this fold looks at each row's tag and offset exactly
+            // once, so decoding either into a wider column first is pure overhead.
+            (0..tags.len())
+                .map(|r| {
+                    let t = tags.tag_at(r);
+                    combine(combine(SUM, t as u64), lanes[t][tags.offset_at(r)])
+                })
+                .collect()
         }
 
         // list = length first, then each element in order, folded by SPAN — so a `Stride` and the
         // equivalent `Offsets` hash identically (matching `Bounds` equality, which is by the
         // partition, not its representation).
         Value::List(bounds, vals) => {
-            let ch = hash_cols(vals);
+            let ch = hash(vals);
             (0..bounds.len())
                 .map(|r| {
                     let (s, e) = bounds.span(r);
@@ -119,7 +124,7 @@ mod tests {
         Value::u64(xs.to_vec())
     }
     fn h(v: &Value) -> Vec<u64> {
-        hash_cols(v)
+        hash(v)
     }
 
     #[test]
@@ -154,7 +159,7 @@ mod tests {
         // `Stride` must hash the same as the equivalent end-offset form (they are `Bounds`-equal).
         let vals = u(&[0, 1, 2, 3, 4, 5]);
         let strided = Value::List(Bounds::Stride(2, 3), Box::new(vals.clone()));
-        let offsets = Value::List(Bounds::Offsets(vec![2, 4, 6]), Box::new(vals));
+        let offsets = Value::List(Bounds::offsets(vec![2, 4, 6]), Box::new(vals));
         assert_eq!(h(&strided), h(&offsets));
     }
 
@@ -162,7 +167,7 @@ mod tests {
     fn structure_disambiguates() {
         // length-first folding separates lists of different length/content and different nestings.
         let lists = Value::List(
-            Bounds::Offsets(vec![0, 1, 3]),
+            Bounds::offsets(vec![0, 1, 3]),
             Box::new(u(&[9, 9, 9])),
         ); // rows [], [9], [9,9]
         let hs = h(&lists);
@@ -187,6 +192,66 @@ mod tests {
         let hs = h(&s);
         assert_ne!(hs[0], hs[1]); // tag 0 val 5  vs  tag 1 val 5
         assert_eq!(hs[0], hs[2]); // both tag 0 val 5
+    }
+
+    /// The id addresses the CONTENT of a row, not the buffer holding it: distinct `Arc`s and an
+    /// over-capacity backing vector must not change it.
+    #[test]
+    fn ignores_arc_identity_and_capacity() {
+        let a = u(&[7, 8, 9]);
+        let mut backing = Vec::with_capacity(64);
+        backing.extend_from_slice(&[7u64, 8, 9]);
+        let b = Value::Prim(crate::value::Prim::U64(std::sync::Arc::new(backing)));
+        assert_eq!(h(&a), h(&b));
+    }
+
+    /// ...nor the row's POSITION: reordering a column carries each row's id with it. This is the
+    /// property the dataflow boundary rests on — a row keeps its id across a gather, a merge, or a
+    /// round trip through another operator.
+    #[test]
+    fn permutation_is_position_independent() {
+        let v = Value::Prod(vec![
+            Value::u32(vec![3, 1, 4, 1, 5, 9]),
+            Value::u16(vec![30, 10, 40, 10, 50, 90]),
+        ]);
+        let perm = vec![5usize, 0, 3, 2, 1, 4];
+        let base = h(&v);
+        let permuted = h(&crate::engine::gather(&v, &perm));
+        for (k, &p) in perm.iter().enumerate() {
+            assert_eq!(permuted[k], base[p]);
+        }
+    }
+
+    /// One pass over every constructor: a nested product, a sum with an unused lane, a ragged list,
+    /// and a unit column whose rows are all identical.
+    #[test]
+    fn covers_prim_prod_sum_list_unit() {
+        let prod = Value::Prod(vec![
+            Value::u8(vec![1, 2, 3]),
+            Value::Prod(vec![Value::u16(vec![10, 20, 30]), Value::u32(vec![100, 200, 300])]),
+        ]);
+        let hp = h(&prod);
+        assert_eq!(hp.len(), 3);
+        assert!(hp[0] != hp[1] && hp[1] != hp[2]);
+
+        // rows 0 and 2 both land in lane 1, with different payloads.
+        let s = Value::sum(
+            vec![1, 2, 1, 2],
+            vec![Value::u8(vec![]), Value::u16(vec![5, 7]), Value::u32(vec![9, 11])],
+        );
+        let hs = h(&s);
+        assert_eq!(hs.len(), 4);
+        assert_ne!(hs[0], hs[2]);
+
+        let list = Value::List(Bounds::offsets(vec![2, 2, 5]), Box::new(Value::u8(vec![1, 2, 3, 4, 5])));
+        let hl = h(&list);
+        assert_eq!(hl.len(), 3);
+        assert_ne!(hl[0], hl[1]); // a width-2 row and an empty row differ
+        assert_ne!(hl[1], hl[2]);
+
+        let hu = h(&Value::Unit(4));
+        assert_eq!(hu.len(), 4);
+        assert!(hu.iter().all(|&x| x == hu[0]));
     }
 
     #[test]
