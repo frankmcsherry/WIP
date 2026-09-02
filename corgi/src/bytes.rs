@@ -283,7 +283,7 @@ fn write_bounds<W: std::io::Write>(bounds: &Bounds, writer: &mut W) -> std::io::
         Bounds::Offsets(v) => {
             word(writer, 0)?;
             word(writer, v.len() as u64)?;
-            for &e in v { word(writer, e as u64)?; }
+            for &e in v.iter() { word(writer, e as u64)?; }
             Ok(())
         }
         Bounds::Stride(k, rows) => {
@@ -515,7 +515,7 @@ fn read_bounds(r: &mut Reader) -> Result<Bounds, String> {
             // `Bounds::Offsets` directly, NOT `Bounds::from`: the encoder recorded which form the
             // sender held, and normalizing here would silently rewrite it. (The two compare equal
             // when they describe the same partition, so this is fidelity, not correctness.)
-            Ok(Bounds::Offsets(r.words(n)?))
+            Ok(Bounds::offsets(r.words(n)?))
         }
         1 => {
             let stride = r.word()? as usize;
@@ -553,7 +553,7 @@ mod test {
             Value::u64(vec![u64::MAX, 0, 12345]),
             Value::Prod(vec![]),
             Value::Prod(vec![Value::u64(vec![1, 2]), Value::u8(vec![3, 4])]),
-            Value::List(Bounds::Offsets(vec![1, 1, 4]), Box::new(Value::u32(vec![9, 8, 7, 6]))),
+            Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::u32(vec![9, 8, 7, 6]))),
             Value::List(Bounds::Stride(2, 3), Box::new(Value::u64(vec![1, 2, 3, 4, 5, 6]))),
             Value::Sum(Prim::U8(std::sync::Arc::new(vec![0, 1, 0])), vec![0, 0, 1],
                        vec![Value::u64(vec![10, 20]), Value::u16(vec![30])]),
@@ -562,7 +562,7 @@ mod test {
                        vec![Value::u64(vec![1, 2]), Value::u16(vec![])]),
             // nesting: the recursion has to keep alignment across every level
             Value::Prod(vec![
-                Value::List(Bounds::Offsets(vec![2, 3]), Box::new(Value::Prod(vec![
+                Value::List(Bounds::offsets(vec![2, 3]), Box::new(Value::Prod(vec![
                     Value::u8(vec![1, 2, 3]),
                     Value::u64(vec![4, 5, 6]),
                 ]))),
@@ -667,7 +667,7 @@ mod test {
                         acc += rng.below(3);
                         ends.push(acc);
                     }
-                    (Bounds::Offsets(ends), acc)
+                    (Bounds::offsets(ends), acc)
                 };
                 Value::List(bounds, Box::new(random_value(rng, total, depth - 1)))
             }
@@ -882,7 +882,7 @@ mod test {
         assert!(read_from(&bad_offset).is_err(), "an offset outside its lane must be refused");
 
         // A list whose partition reaches past its values. Words: [List][form][n][ends[0]]…
-        let over_reach = patched(&Value::List(Bounds::Offsets(vec![2]), Box::new(Value::u64(vec![1, 2]))), 3, 10);
+        let over_reach = patched(&Value::List(Bounds::offsets(vec![2]), Box::new(Value::u64(vec![1, 2]))), 3, 10);
         assert!(read_from(&over_reach).is_err(), "bounds reaching past the values must be refused");
 
         // The `Stride` form of the same thing: three rows of two over a two-element leaf.
@@ -921,7 +921,7 @@ mod test {
         assert_eq!(declared_rows(&hidden_in_a_lane), huge as u64);
 
         // A one-row list whose values do.
-        let hidden_under_a_list = Value::List(Bounds::Offsets(vec![huge]), Box::new(Value::Unit(huge)));
+        let hidden_under_a_list = Value::List(Bounds::offsets(vec![huge]), Box::new(Value::Unit(huge)));
         assert_eq!(hidden_under_a_list.len(), 1);
         assert_eq!(declared_rows(&hidden_under_a_list), huge as u64);
 

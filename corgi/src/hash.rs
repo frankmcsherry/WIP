@@ -155,7 +155,7 @@ mod tests {
         // `Stride` must hash the same as the equivalent end-offset form (they are `Bounds`-equal).
         let vals = u(&[0, 1, 2, 3, 4, 5]);
         let strided = Value::List(Bounds::Stride(2, 3), Box::new(vals.clone()));
-        let offsets = Value::List(Bounds::Offsets(vec![2, 4, 6]), Box::new(vals));
+        let offsets = Value::List(Bounds::offsets(vec![2, 4, 6]), Box::new(vals));
         assert_eq!(h(&strided), h(&offsets));
     }
 
@@ -163,7 +163,7 @@ mod tests {
     fn structure_disambiguates() {
         // length-first folding separates lists of different length/content and different nestings.
         let lists = Value::List(
-            Bounds::Offsets(vec![0, 1, 3]),
+            Bounds::offsets(vec![0, 1, 3]),
             Box::new(u(&[9, 9, 9])),
         ); // rows [], [9], [9,9]
         let hs = h(&lists);

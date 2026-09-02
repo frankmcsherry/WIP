@@ -27,7 +27,10 @@ pub enum Value {
 /// equivalent `Offsets` are interchangeable.
 #[derive(Clone, Debug)]
 pub enum Bounds {
-    Offsets(Vec<usize>),  // end offset of each row
+    // end offset of each row. Behind an `Arc` for the same reason a leaf is: a partition is
+    // write-once read-many and `eval` clones a value at every shared edge, so a clone must be a
+    // refcount bump. A bare `Vec` here made cloning a `List<U64>` copy as many bytes as the data.
+    Offsets(Arc<Vec<usize>>),
     Stride(usize, usize), // (stride, rows): row i spans [i*stride .. (i+1)*stride), total = stride*rows
 }
 
@@ -75,11 +78,41 @@ impl Bounds {
         (0..self.len()).map(move |i| self.end(i))
     }
     /// materialize the general end-offset form — for ops not yet stride-aware, and for eq/show.
-    pub(crate) fn to_vec(&self) -> Vec<usize> {
+    pub fn to_vec(&self) -> Vec<usize> {
         match self {
-            Bounds::Offsets(v) => v.clone(),
+            Bounds::Offsets(v) => (**v).clone(),
             Bounds::Stride(..) => self.ends().collect(),
         }
+    }
+
+    /// the general end-offset form, verbatim — NO uniformity check. For a caller that must preserve
+    /// which representation it was handed (the codec records the form the sender held); everyone
+    /// else wants `From<Vec<usize>>`, which compacts a uniform partition to a `Stride`.
+    pub fn offsets(ends: Vec<usize>) -> Bounds {
+        Bounds::Offsets(Arc::new(ends))
+    }
+
+    /// the uniform stride of `ends`, if the partition is uniform (`ends[i] == (i+1)*k`).
+    fn uniform(ends: &[usize]) -> Option<usize> {
+        let &last = ends.last()?;
+        let n = ends.len();
+        if last % n != 0 {
+            return None;
+        }
+        let k = last / n;
+        ends.iter().enumerate().all(|(i, &e)| e == (i + 1) * k).then_some(k)
+    }
+
+    /// recover the uniform `Stride` form if this partition happens to be uniform. `From<Vec<usize>>`
+    /// is this check applied at construction; this is it applied to a partition already in hand, so
+    /// a caller that must rebuild a `Bounds` does not have to unwrap and re-wrap the buffer.
+    pub(crate) fn compact(self) -> Bounds {
+        if let Bounds::Offsets(v) = &self {
+            if let Some(k) = Bounds::uniform(v) {
+                return Bounds::Stride(k, v.len());
+            }
+        }
+        self
     }
 }
 
@@ -87,17 +120,12 @@ impl From<Vec<usize>> for Bounds {
     fn from(v: Vec<usize>) -> Self {
         // One O(n) uniformity check at construction: a uniform partition becomes a `Stride`,
         // so `strided()` recovers the array kernels downstream at every `.into()` site for
-        // free. Equality/hash are by the partition, so this is representation-invisible.
-        if let Some(&last) = v.last() {
-            let n = v.len();
-            if last % n == 0 {
-                let k = last / n;
-                if v.iter().enumerate().all(|(i, &e)| e == (i + 1) * k) {
-                    return Bounds::Stride(k, n);
-                }
-            }
+        // free (and needs no allocation at all). Equality/hash are by the partition, so this
+        // is representation-invisible.
+        match Bounds::uniform(&v) {
+            Some(k) => Bounds::Stride(k, v.len()),
+            None => Bounds::Offsets(Arc::new(v)),
         }
-        Bounds::Offsets(v)
     }
 }
 
@@ -105,7 +133,9 @@ impl From<Vec<usize>> for Bounds {
 impl PartialEq for Bounds {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Bounds::Offsets(a), Bounds::Offsets(b)) => a == b,
+            // one buffer is one partition: the common case where two columns descend from the
+            // same list, which is exactly what `Zip` and `Filter` assert about their operands.
+            (Bounds::Offsets(a), Bounds::Offsets(b)) => Arc::ptr_eq(a, b) || a == b,
             (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => k0 == k1 && n0 == n1,
             _ => self.len() == other.len() && self.ends().eq(other.ends()),
         }
@@ -512,7 +542,7 @@ impl Value {
             Shape::Sum(ss) => {
                 Value::sum_from_prim(Prim::U8(Arc::new(Vec::new())), ss.iter().map(Value::empty).collect())
             }
-            Shape::List(s) => Value::List(Bounds::Offsets(Vec::new()), Box::new(Value::empty(s))),
+            Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
         }
     }
@@ -633,6 +663,29 @@ mod tests {
         let narrow = Prim::U8(Arc::new(vec![0, 1, 255]));
         assert_eq!(narrow.cast(16), Prim::U16(Arc::new(vec![0, 1, 255])));
         assert_eq!(narrow.cast(64), Prim::U64(Arc::new(vec![0, 1, 255])));
+    }
+
+    /// A `Value` clone must be a refcount bump, not a column copy: `eval_graph` clones at every
+    /// shared edge. A `List`'s partition is the same size as a `u64` payload column, so a bare
+    /// `Vec` here made a shared edge cost as much again as the data it carried.
+    #[test]
+    fn cloning_a_list_shares_its_partition() {
+        let list = Value::List(Bounds::offsets(vec![1, 3, 6]), Box::new(Value::u64(vec![0; 6])));
+        let copy = list.clone();
+        let (Value::List(Bounds::Offsets(a), _), Value::List(Bounds::Offsets(b), _)) = (&list, &copy)
+        else {
+            panic!("expected two offset-partitioned lists")
+        };
+        assert!(Arc::ptr_eq(a, b), "clone copied the partition");
+    }
+
+    /// Equality is still by the PARTITION — the shared-buffer check is only a fast path, so two
+    /// distinct buffers describing one partition stay equal, as do a `Stride` and its offsets.
+    #[test]
+    fn equality_is_by_partition_not_buffer() {
+        assert_eq!(Bounds::offsets(vec![1, 3, 6]), Bounds::offsets(vec![1, 3, 6]));
+        assert_eq!(Bounds::offsets(vec![2, 4, 6]), Bounds::Stride(2, 3));
+        assert_ne!(Bounds::offsets(vec![1, 3, 6]), Bounds::offsets(vec![1, 3, 5]));
     }
 
     /// Narrowing then widening back is `mod 2^bits` — the documented truncating semantics, not a

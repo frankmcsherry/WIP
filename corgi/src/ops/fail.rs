@@ -203,13 +203,10 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
             // One row over a leaf: validate and gather in the index buffer itself (an identity
             // gather reuses the haystack leaf), and recover the uniform `Stride` form of the bounds
             // without another allocation. The one-row primitive gather is the pointer-chase kernel.
-            let ib = match ib {
-                Bounds::Offsets(ends) => ends.into(),
-                bounds => bounds,
-            };
+            let ib = ib.compact();
             return Ok(match p.gather_u64_checked_owned(idxs, hb.end(0)) {
                 Some(g) => fail(&[false], Value::List(ib, Box::new(Value::Prim(g)))),
-                None => fail(&[true], Value::List(Bounds::Offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
+                None => fail(&[true], Value::List(Bounds::offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
             });
         }
     }
@@ -441,7 +438,7 @@ mod tests {
     fn one_row_nonidentity_u64_gather_returns_values_and_normalizes_bounds() {
         let hay = Arc::new(vec![10, 20, 30]);
         let input = Value::Prod(vec![
-            Value::List(Bounds::Offsets(vec![3]), Box::new(Value::u64(vec![2, 0, 1]))),
+            Value::List(Bounds::offsets(vec![3]), Box::new(Value::u64(vec![2, 0, 1]))),
             Value::List(vec![3].into(), Box::new(Value::Prim(Prim::U64(hay.clone())))),
         ]);
         let (err, ok) = into_fail(try_gather(input).unwrap(), "t").unwrap();

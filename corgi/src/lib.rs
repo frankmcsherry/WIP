@@ -81,8 +81,8 @@ pub mod arrange {
             return (lo, hi);
         }
         let (n, h) = (needles.len(), haystack.len());
-        let needle_list = Value::List(Bounds::Offsets(vec![n]), Box::new(needles.clone()));
-        let hay_list = Value::List(Bounds::Offsets(vec![h]), Box::new(haystack.clone()));
+        let needle_list = Value::List(Bounds::offsets(vec![n]), Box::new(needles.clone()));
+        let hay_list = Value::List(Bounds::offsets(vec![h]), Box::new(haystack.clone()));
         let out = crate::ops::cmp::CmpOp::Find.eval(Value::Prod(vec![needle_list, hay_list])).expect("find_ranges: shapes");
         let (_b, vals) = out.into_list("find_ranges").unwrap();
         let (lo, hi) = vals.into_pair("find_ranges lo/hi").unwrap();
@@ -293,7 +293,7 @@ pub mod arrange {
             // same logical list two ways: Stride(2,3) vs the equivalent Offsets([2,4,6]).
             let vals = Value::u16(vec![1, 2, 3, 4, 5, 6]);
             let strided = Value::List(Bounds::Stride(2, 3), Box::new(vals.clone()));
-            let offsets = Value::List(Bounds::Offsets(vec![2, 4, 6]), Box::new(vals));
+            let offsets = Value::List(Bounds::offsets(vec![2, 4, 6]), Box::new(vals));
             assert_eq!(strided, offsets); // PartialEq-equal by the partition
             assert_eq!(hash_rows(&strided), hash_rows(&offsets));
         }
@@ -334,7 +334,7 @@ pub mod arrange {
 
             // List with varying row widths.
             let list = Value::List(
-                Bounds::Offsets(vec![2, 2, 5]), // rows of width 2, 0, 3
+                Bounds::offsets(vec![2, 2, 5]), // rows of width 2, 0, 3
                 Box::new(Value::u8(vec![1, 2, 3, 4, 5])),
             );
             let hl = hash_rows(&list);
@@ -353,7 +353,7 @@ pub mod arrange {
         fn empty_row_distinct_from_singleton_zero() {
             // a width-0 list row must not hash like a row holding a single 0 element.
             let list = Value::List(
-                Bounds::Offsets(vec![0, 1]),
+                Bounds::offsets(vec![0, 1]),
                 Box::new(Value::u8(vec![0])),
             );
             let h = hash_rows(&list);
@@ -418,7 +418,7 @@ pub mod arrange {
         fn segment_labels_offsets_and_stride_agree() {
             // Offsets([2,4,6]) and the equivalent Stride(2,3) describe the same 3-row partition
             // (rows of width 2), so per-element segment labels are identical.
-            let off = Bounds::Offsets(vec![2, 4, 6]);
+            let off = Bounds::offsets(vec![2, 4, 6]);
             let stride = Bounds::Stride(2, 3);
             assert_eq!(segment_labels(&off), vec![0, 0, 1, 1, 2, 2]);
             assert_eq!(segment_labels(&off), segment_labels(&stride));
@@ -436,7 +436,7 @@ pub mod arrange {
         fn roundtrip_matches_sortlist_op() {
             // build List<u64> with ragged rows, segmented-sort it via the arrange surface, and check
             // it reproduces exactly what the ML `sort` op (CmpOp::SortList) produces on the same list.
-            let bounds = Bounds::Offsets(vec![3, 3, 6]); // rows [3,1,2], [], [5,0,4]
+            let bounds = Bounds::offsets(vec![3, 3, 6]); // rows [3,1,2], [], [5,0,4]
             let vals = Value::u64(vec![3, 1, 2, 5, 0, 4]);
             let list = Value::List(bounds.clone(), Box::new(vals.clone()));
 

@@ -38,7 +38,7 @@ fn stride_sort_matches_offsets() {
         Value::List(vec![n].into(), Box::new(Value::List(inner, Box::new(Value::u8(bytes.clone())))))
     };
     let strided = one_row(Bounds::Stride(k, n));
-    let offsets = one_row(Bounds::Offsets((1..=n).map(|r| r * k).collect()));
+    let offsets = one_row(Bounds::offsets((1..=n).map(|r| r * k).collect()));
 
     let mut b = Builder::<NumOp>::default();
     let i = b.input();
