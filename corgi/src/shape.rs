@@ -13,6 +13,7 @@
 use crate::value::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Shape {
     Prim(u32), // a leaf column, by bit width (8/16/32/64, matching the `Prim` widths)
     Prod(Vec<Shape>),
