@@ -5,7 +5,7 @@
 use crate::engine::{
     blend, expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
 };
-use crate::graph::{try_eval_graph, Graph, OpLike};
+use crate::graph::{try_eval_graph, Graph, OpLike, Prepared};
 use crate::shape::{same, shape_of_value, Shape};
 use crate::value::{Bounds, Prim, Tags, Value};
 use std::sync::Arc;
@@ -57,6 +57,70 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
         }
         (Value::Unit(_), Value::Unit(_)) => {} // no payload to overwrite (length is unchanged)
         _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod/Unit"),
+    }
+}
+
+/// Where a `FoldScan` round's outputs go.
+///
+/// A round produces one output per ACTIVE row, at known flat positions, so a FIXED-WIDTH output has
+/// a constant slot for each and every round can be scattered straight into one column — one
+/// allocation for the whole scan. That is the `Direct` state, and it is the common case.
+///
+/// A `List`/`Sum` output has no constant slot (its rows differ in size), so those rounds are kept
+/// and stitched at the end by a multi-source gather — the `Chunks` state, which is what this used
+/// to do unconditionally. That cost one retained `Value` and two `usize` per element: on one long
+/// row, where a round IS an element, it made the scan's bookkeeping bigger than the scan.
+///
+/// The split is the one [`scatter`] makes for the accumulator, and for the same reason.
+#[derive(Default)]
+enum OutputSink {
+    #[default]
+    Empty,
+    Direct(Value),
+    Chunks { chunks: Vec<Value>, tags: Vec<usize>, off: Vec<usize> },
+}
+
+impl OutputSink {
+    /// record round `r`'s outputs, which land at flat positions `elem`. `total` is the output
+    /// column's length.
+    fn take(&mut self, elem: &[usize], r: Value, total: usize) {
+        if let OutputSink::Empty = self {
+            // the first round fixes the output's shape. Fixed-width rows get one column, filled
+            // from row 0 so it has the right shape at the right length; every slot is overwritten.
+            *self = if fixed_width(&r) && !r.is_empty() {
+                OutputSink::Direct(fill(&r, total))
+            } else {
+                OutputSink::Chunks {
+                    chunks: Vec::new(),
+                    tags: vec![0usize; total],
+                    off: vec![0usize; total],
+                }
+            };
+        }
+        match self {
+            OutputSink::Direct(out) => scatter_fixed(out, elem, &r),
+            OutputSink::Chunks { chunks, tags, off } => {
+                for (slot, &pos) in elem.iter().enumerate() {
+                    tags[pos] = chunks.len();
+                    off[pos] = slot;
+                }
+                chunks.push(r);
+            }
+            OutputSink::Empty => unreachable!("the branch above leaves Empty only for no rounds"),
+        }
+    }
+
+    /// the output column, or `None` if no round ever ran (the caller then builds an empty one of
+    /// the body's output shape, which it can only learn by running the body on zero rows).
+    fn finish(self) -> Option<Value> {
+        match self {
+            OutputSink::Empty => None,
+            OutputSink::Direct(v) => Some(v),
+            OutputSink::Chunks { chunks, tags, off } => {
+                let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+                Some(gather_lanes(&refs, &tags, &off))
+            }
+        }
     }
 }
 
@@ -510,8 +574,12 @@ impl<L: OpLike> Op<L> {
                 let check = |updated: &Value| {
                     same(&seed_shape, &shape_of_value(updated)).map(drop).map_err(|e| format!("Fold body: {e}"))
                 };
+                // the body runs once per ROUND, and on one long row a round is one element — so the
+                // consumer counts and the evaluation buffers are prepared ONCE, out here, rather
+                // than rebuilt per call. See `graph::Prepared`.
+                let mut run = Prepared::new(&**body);
                 if bounds.total() == 0 {
-                    let z = try_eval_graph(body, Value::Prod(vec![gather(&seed, &[]), gather(&vals, &[])]))?;
+                    let z = run.run(Value::Prod(vec![gather(&seed, &[]), gather(&vals, &[])]))?;
                     check(&z)?;
                     return Ok(seed);
                 }
@@ -526,7 +594,7 @@ impl<L: OpLike> Op<L> {
                         elem.clear();
                         elem.extend((0..n).map(|r| r * k + t));
                         let elt = gather(&vals, &elem);
-                        let updated = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
+                        let updated = run.run(Value::Prod(vec![acc, elt]))?;
                         if t == 0 {
                             check(&updated)?;
                         }
@@ -543,7 +611,7 @@ impl<L: OpLike> Op<L> {
                     let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
                     let acc_active = gather(&acc, &rows);
                     let elt = gather(&vals, &elem);
-                    let updated = try_eval_graph(body, Value::Prod(vec![acc_active, elt]))?;
+                    let updated = run.run(Value::Prod(vec![acc_active, elt]))?;
                     if t == 0 {
                         check(&updated)?;
                     }
@@ -565,46 +633,43 @@ impl<L: OpLike> Op<L> {
                 let check = |state: &Value| {
                     same(&seed_shape, &shape_of_value(state)).map(drop).map_err(|e| format!("FoldScan body: {e}"))
                 };
+                // prepared once, as in `Fold` — the body runs once per round.
+                let mut run = Prepared::new(&**body);
                 let total = vals.len();
                 // Strided fast path — as in `Fold`: no worklist, no scatter; round t's outputs
                 // land at positions r*k + t, chunk t, slot r.
                 if let Some(k) = bounds.strided() {
                     let n = bounds.len();
                     let mut acc = seed;
-                    let mut chunks: Vec<Value> = Vec::with_capacity(k);
-                    let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                    let mut sink = OutputSink::default();
                     let mut elem: Vec<usize> = Vec::with_capacity(n);
                     for t in 0..k {
                         elem.clear();
                         elem.extend((0..n).map(|r| r * k + t));
                         let elt = gather(&vals, &elem);
                         let (new_state, r) =
-                            try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
+                            run.run(Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
                         if t == 0 {
                             check(&new_state)?;
                         }
                         assert_eq!(new_state.len(), n, "FoldScan body changed the row count");
-                        for (slot, &pos) in elem.iter().enumerate() {
-                            tags[pos] = t;
-                            off[pos] = slot;
-                        }
+                        sink.take(&elem, r, total);
                         acc = new_state;
-                        chunks.push(r);
                     }
-                    let out_vals = if chunks.is_empty() {
-                        let z = try_eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
-                        let (state, r) = z.into_pair("FoldScan body")?;
-                        check(&state)?;
-                        r
-                    } else {
-                        let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
-                        gather_lanes(&refs, &tags, &off)
+                    let out_vals = match sink.finish() {
+                        Some(v) => v,
+                        None => {
+                            let z = run
+                                .run(Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
+                            let (state, r) = z.into_pair("FoldScan body")?;
+                            check(&state)?;
+                            r
+                        }
                     };
                     return Ok(Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))]));
                 }
                 let mut acc = seed;
-                let mut chunks: Vec<Value> = Vec::new();
-                let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
+                let mut sink = OutputSink::default();
                 let mut active = init_active(&bounds);
                 let mut t = 0;
                 while !active.is_empty() {
@@ -613,30 +678,26 @@ impl<L: OpLike> Op<L> {
                     let acc_active = gather(&acc, &rows);
                     let elt = gather(&vals, &elem);
                     let (new_state, r) =
-                        try_eval_graph(body, Value::Prod(vec![acc_active, elt]))?.into_pair("FoldScan body")?;
+                        run.run(Value::Prod(vec![acc_active, elt]))?.into_pair("FoldScan body")?;
                     if t == 0 {
                         check(&new_state)?;
                     }
                     assert_eq!(new_state.len(), rows.len(), "FoldScan body changed the row count");
-                    for (slot, &pos) in elem.iter().enumerate() {
-                        tags[pos] = chunks.len();
-                        off[pos] = slot;
-                    }
+                    sink.take(&elem, r, total);
                     acc = scatter(acc, &rows, new_state);
-                    chunks.push(r);
                     t += 1;
                     active.retain(|&(_, _, len)| len > t);
                 }
-                // empty (no rounds): an empty R-shaped column, obtained by running the body on zero rows
-                // (R may differ from the state, so we can't reuse `acc`). Else stitch the recorded chunks.
-                let out_vals = if chunks.is_empty() {
-                    let z = try_eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
-                    let (state, r) = z.into_pair("FoldScan body")?;
-                    check(&state)?;
-                    r
-                } else {
-                    let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
-                    gather_lanes(&refs, &tags, &off)
+                // no rounds at all: an empty R-shaped column, obtained by running the body on zero
+                // rows (R may differ from the state, so we can't reuse `acc`).
+                let out_vals = match sink.finish() {
+                    Some(v) => v,
+                    None => {
+                        let z = run.run(Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
+                        let (state, r) = z.into_pair("FoldScan body")?;
+                        check(&state)?;
+                        r
+                    }
                 };
                 Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))])
             }

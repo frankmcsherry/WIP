@@ -75,30 +75,75 @@ pub fn eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Value {
 
 /// [`eval_graph`] with the shape error surfaced: the form the typer and body-bearing ops use.
 pub fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Value, String> {
-    let mut uses = vec![0usize; g.nodes.len()];
-    for node in &g.nodes { for &i in &node.inputs { uses[i] += 1; } }
-    uses[g.output] += 1; // the returned value is a use too, so a consumer can't move it out first
+    Prepared::new(g).run(arg)
+}
 
-    // take node `i`'s value: move it out on its last use, else clone (a cheap `Arc` bump).
-    let take = |vals: &mut Vec<Option<Value>>, uses: &mut [usize], i: usize| -> Value {
-        uses[i] -= 1;
-        if uses[i] == 0 { vals[i].take().unwrap() }
-        else { vals[i].as_ref().unwrap().clone() }
-    };
+/// A graph with everything that does not change between runs computed once: the per-node consumer
+/// counts, and the two buffers a run needs.
+///
+/// [`try_eval_graph`] is `Prepared::new(g).run(arg)`, which is right for a graph run once — but
+/// `Fold` and `FoldScan` run their body once per ROUND, and on one long row a round is one
+/// element. There the setup is the work: two allocations and a pass over the nodes, per element.
+/// Preparing once outside the round loop removes both.
+///
+/// This is also where a physical plan would live if corgi grows one — which strategy an op should
+/// take, which tile schedule to run — since those are properties of the graph, not of a call.
+pub(crate) struct Prepared<'g, O> {
+    graph: &'g Graph<O>,
+    /// consumer count per node, including the output's own use: the template `live` is reset from.
+    uses: Vec<usize>,
+    live: Vec<usize>,
+    vals: Vec<Option<Value>>,
+}
 
-    let mut arg = Some(arg); // moved into the (single) `Input` node; `take` errors on a second one
-    let mut vals: Vec<Option<Value>> = Vec::with_capacity(g.nodes.len());
-    for node in &g.nodes {
-        let v = match &node.kind {
-            NodeKind::Input => arg.take().expect("graph has more than one Input node"),
-            NodeKind::Tuple => {
-                Value::Prod(node.inputs.iter().map(|&i| take(&mut vals, &mut uses, i)).collect())
+impl<'g, O: OpLike> Prepared<'g, O> {
+    pub(crate) fn new(graph: &'g Graph<O>) -> Self {
+        let mut uses = vec![0usize; graph.nodes.len()];
+        for node in &graph.nodes {
+            for &i in &node.inputs {
+                uses[i] += 1;
             }
-            NodeKind::Op(o) => o.eval(take(&mut vals, &mut uses, node.inputs[0]))?,
-        };
-        vals.push(Some(v));
+        }
+        // the returned value is a use too, so a consumer can't move it out first.
+        uses[graph.output] += 1;
+        Prepared {
+            live: uses.clone(),
+            uses,
+            vals: Vec::with_capacity(graph.nodes.len()),
+            graph,
+        }
     }
-    Ok(vals[g.output].take().unwrap())
+
+    /// Evaluate on one argument, CONSUMING it. A node's value is MOVED to its last consumer and
+    /// only cloned for earlier ones, so the final reader holds the sole `Arc` to each leaf —
+    /// `into_*` can move the buffer out (refcount 1) and an op can `Arc::make_mut` in place.
+    pub(crate) fn run(&mut self, arg: Value) -> Result<Value, String> {
+        let g = self.graph;
+        self.live.copy_from_slice(&self.uses);
+        self.vals.clear();
+
+        // take node `i`'s value: move it out on its last use, else clone (a cheap `Arc` bump).
+        let take = |vals: &mut Vec<Option<Value>>, live: &mut [usize], i: usize| -> Value {
+            live[i] -= 1;
+            if live[i] == 0 { vals[i].take().unwrap() } else { vals[i].as_ref().unwrap().clone() }
+        };
+
+        let mut arg = Some(arg); // moved into the (single) `Input` node
+        for node in &g.nodes {
+            let v = match &node.kind {
+                NodeKind::Input => arg.take().expect("graph has more than one Input node"),
+                NodeKind::Tuple => Value::Prod(
+                    node.inputs
+                        .iter()
+                        .map(|&i| take(&mut self.vals, &mut self.live, i))
+                        .collect(),
+                ),
+                NodeKind::Op(o) => o.eval(take(&mut self.vals, &mut self.live, node.inputs[0]))?,
+            };
+            self.vals.push(Some(v));
+        }
+        Ok(self.vals[g.output].take().unwrap())
+    }
 }
 
 /// shape-check the graph given the input's shape: `eval` on a ZERO-ROW column of that shape. Every

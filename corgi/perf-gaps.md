@@ -79,9 +79,9 @@ instead. "Lever" names what would close it.
 | C1 fold_add | aggregation | 1.10× | **1.03×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | **C3 group_by_sum** | aggregation | 22× | **55×** | **74×** | sort-based group where a 256-bucket accumulate is one O(n) pass | see *the group-by decomposition* |
-| **C4 scan_prefix** (general) | aggregation | **1082×** | **272×** | **244×** | lockstep foldscan on ONE long row: #rounds = row length, body re-evaluated per round | monoid body → C4k; general → a prepared evaluator, then an affine-recurrence kernel |
+| **C4 scan_prefix** (general) | aggregation | **776×** | **200×** | **164×** | lockstep foldscan on ONE long row: #rounds = row length, and every round allocates | monoid body → C4k; general → a single-row interpreter |
 | C4k scan_add (kernel) | aggregation | 1.41× | 1.11× | 1.76× | the monoid prefix kernel — one in-place pass | **DONE** |
-| **C5 fold_sum_count** | aggregation | **5998×** | **4592×** | **2764×** | same lockstep degeneration, product-of-monoids accumulator | recognize the product of monoids |
+| **C5 fold_sum_count** | aggregation | **4761×** | **3812×** | **2056×** | same lockstep degeneration, product-of-monoids accumulator | recognize the product of monoids |
 | D1 sort_u64 | order | **0.51×** | **0.45×** | **0.71×** | the value radix: no permutation, no gather | — past the ceiling |
 | D2 dedup | order | **0.64×** | **0.54×** | **0.79×** | value radix + one compacting pass | — past the ceiling |
 | D3 sort_compound | order | 1.10× | **0.98×** | 2.23× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
@@ -119,15 +119,25 @@ Rust loop's 0.06, so the rest of the fusion-prize column is a compiler, not a ca
 
 ## What this reorders
 
-**The largest gap is still the general fold, and its mechanism is now half measured.**
-`scan_prefix` and `fold_sum_count` are 244–5998× off a trivial loop, and nothing else on the board is
+**The largest gap is still the general fold, and the mechanism is now measured rather than guessed.**
+`scan_prefix` and `fold_sum_count` are 164–4761× off a trivial loop, and nothing else on the board is
 within two orders of magnitude. The lockstep fold is built to vectorize across *many short rows*;
-handed one long row it runs one round per element, re-evaluating the body sub-graph each round. But a
-5-node body graph costs ~155 ns per `eval_graph` call at one row and only ~7 ns more at sixteen, and
-C4/C5 measure 250–300 ns per round — so **the majority of the two worst rows is evaluator setup, not
-the recurrence.** A prepared form (consumer counts, value slots and physical choices computed once
-per graph rather than once per call) is the first lever, ahead of anything as exotic as a
-single-row interpreter.
+handed one long row it runs one round per element.
+
+Two contributors have been removed and a third named. The body's graph is now PREPARED once outside
+the round loop (consumer counts and evaluation buffers computed per graph, not per call — see
+`graph::Prepared`), and `FoldScan` SCATTERS a fixed-width output straight into one column instead of
+keeping a `Value` and two `usize` per element and stitching at the end. Together: C4 255 → 175 ns/row
+at 1 M (1.45×) and C5 291 → 245 (1.19×).
+
+**What is left is allocation, and it is most of what remains.** With one long row, a round processes
+ONE element, and it still allocates a one-element gather result, a two-element `Prod` for the body's
+argument, and — in `Fold` — the accumulator gather and scatter. Those are per-element allocations
+around a per-element scalar op. Removing them is the single-row interpreter (register/stack scratch,
+no heap per step), or the windowed leaf that would let a round borrow its element instead of
+gathering it. The earlier reading of this — "most of the two worst rows is evaluator setup" — was
+half right: setup was worth 1.2–1.5×, not the 3× it looked like, because the setup is only one of
+about five allocations a round makes.
 
 The cases still stratify by fixability:
 
@@ -137,7 +147,7 @@ The cases still stratify by fixability:
   monoid updates decomposes into independent `Reduce`s. This is C5, the worst row on the board, and
   it needs a recognition pass rather than a new op.
 - **fixed-width non-monoid body** — inherently sequential, so the lever is the per-step constant, and
-  most of that constant is the prepared-form item above. **One subcase is not inherently sequential:**
+  what is left of that constant is per-round allocation. **One subcase is not inherently sequential:**
   an affine recurrence (`x[t+1] = a·x[t] + b`) is a monoid in disguise, since composition of affine
   maps is associative, so it reduces to a scan over the affine semigroup — the same kernel C4k
   already is, with a pair accumulator.
