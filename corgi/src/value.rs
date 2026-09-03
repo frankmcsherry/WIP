@@ -622,6 +622,16 @@ macro_rules! prim {
                 }
             }
 
+            /// order of ONE pair: `self[i]` vs `other[j]`, width-dispatched and returning the
+            /// `Ordering` directly. The scalar sibling of [`Prim::cmp_idx`], which answers the same
+            /// question for a batch — and, for a batch of one, spends a heap allocation doing it.
+            pub(crate) fn cmp_at(&self, i: usize, other: &Prim, j: usize) -> std::cmp::Ordering {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => a[i].cmp(&b[j]), )+
+                    _ => panic!("cmp_at: prim width mismatch"),
+                }
+            }
+
             /// structural order of paired records: `out[k]` = sign of `self[ia[k]]` vs `other[ib[k]]`
             /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and scalar
             /// on NEON; the dense column-vs-column compare is [`Prim::rel`].

@@ -18,14 +18,62 @@ pub(crate) use discriminate::*;
 pub use merge::*;
 pub(crate) use sortedness::*;
 
-/// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
-/// scalar form of [`compare_idx`]; exposed (via `crate::arrange`) for using corgi columns as a
-/// differential-dataflow arrangement substrate.
+/// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape).
+///
+/// A DIRECT walk of the type, not a batch of one. `compare_idx` answers this question too, but it
+/// answers it for a list of pairs: it allocates a sign vector, and at each product level a tie set
+/// and two index vectors, all to carry one pair down. A merge that calls this per row — which is
+/// what a chunk merge and a join probe do — pays a heap allocation per comparison.
+///
+/// The `Sum` arm is why this is O(depth) rather than O(column): a `Value::Sum` carries each row's
+/// offset within its lane, so an equal-tag pair descends by reading it. Recovering that offset by
+/// scanning, as a naive scalar comparator must, is what made the batch form worth having in the
+/// first place.
 pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
-    match compare_idx(a, b, &[i], &[j])[0] {
-        s if s < 0 => Ordering::Less,
-        0 => Ordering::Equal,
-        _ => Ordering::Greater,
+    match (a, b) {
+        (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_at(i, pb, j),
+        // single-field product: the field's order IS the order (as `compare_pairs` peels it).
+        (Value::Prod(ca), Value::Prod(cb)) if ca.len() == 1 && cb.len() == 1 => {
+            compare_at(&ca[0], i, &cb[0], j)
+        }
+        (Value::Prod(ca), Value::Prod(cb)) => {
+            assert_eq!(ca.len(), cb.len(), "compare_at: product arity");
+            for (x, y) in ca.iter().zip(cb) {
+                match compare_at(x, i, y, j) {
+                    Ordering::Equal => continue,
+                    o => return o,
+                }
+            }
+            Ordering::Equal
+        }
+        // tag first, then the payload at each row's CARRIED within-lane offset.
+        (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
+            let (ti, tj) = (ta.tag_at(i), tb.tag_at(j));
+            match ti.cmp(&tj) {
+                Ordering::Equal => {
+                    compare_at(&va[ti], ta.offset_at(i), &vb[tj], tb.offset_at(j))
+                }
+                o => o,
+            }
+        }
+        // length first; equal lengths compare element-wise, stopping at the first difference.
+        (Value::List(ba, va), Value::List(bb, vb)) => {
+            let ((sa, ea), (sb, eb)) = (row_span(ba, i), row_span(bb, j));
+            match (ea - sa).cmp(&(eb - sb)) {
+                Ordering::Equal => {
+                    for k in 0..(ea - sa) {
+                        match compare_at(va, sa + k, vb, sb + k) {
+                            Ordering::Equal => continue,
+                            o => return o,
+                        }
+                    }
+                    Ordering::Equal
+                }
+                o => o,
+            }
+        }
+        (Value::Unit(_), Value::Unit(_)) => Ordering::Equal,
+        _ => panic!("compare_at: shape mismatch"),
     }
 }
 
@@ -941,6 +989,36 @@ mod tests {
                 }
             }
             _ => panic!("compare2: shape mismatch"),
+        }
+    }
+
+    /// The scalar [`compare_at`] and the batch `compare_idx` answer the same question, and one of
+    /// them is a direct walk while the other pushes indices down through a fold — so they are
+    /// checked against each other on every shape, not only against the oracle.
+    #[test]
+    fn scalar_and_batched_compare_agree() {
+        let shapes = [
+            u(&[5, 3, 3, 8, 1]),
+            Value::u8(vec![9, 2, 2, 7, 0]),
+            Value::Prod(vec![u(&[1, 1, 1, 2, 2]), u(&[7, 7, 9, 0, 0])]),
+            Value::Prod(vec![u(&[4, 4, 4, 4, 4])]),
+            Value::sum(vec![0, 0, 1, 1, 0], vec![u(&[4, 4, 6]), u(&[2, 2])]),
+            Value::List(Bounds::offsets(vec![1, 3, 3, 6, 8]), Box::new(u(&[1, 2, 2, 4, 5, 6, 7, 7]))),
+            Value::Unit(5),
+            // a product OF the structured shapes, so the recursion nests
+            Value::Prod(vec![
+                Value::sum(vec![1, 0, 1, 0, 1], vec![u(&[3, 9]), u(&[1, 1, 5])]),
+                Value::List(Bounds::Stride(2, 5), Box::new(u(&[1, 2, 1, 2, 3, 0, 1, 2, 9, 9]))),
+            ]),
+        ];
+        for v in shapes {
+            let n = v.len();
+            for i in 0..n {
+                for j in 0..n {
+                    let batched = compare_idx(&v, &v, &[i], &[j])[0].cmp(&0);
+                    assert_eq!(compare_at(&v, i, &v, j), batched, "{} at ({i},{j})", crate::value::show(&v));
+                }
+            }
         }
     }
 

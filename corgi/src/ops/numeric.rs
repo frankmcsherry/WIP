@@ -590,7 +590,18 @@ mod monoid_fold {
         Const(u64),
     }
 
+    /// How the body names the accumulator it updates.
+    enum Accum {
+        /// `Field(0)` of `Input` — a scalar accumulator, `fold(xs, 0, acc + x)`. The overwhelmingly
+        /// common shape: it is what a `sum` or a `product` over a collected list lowers to when the
+        /// surface has no reducer for it.
+        Bare,
+        /// `Field(j)` of `Field(0)` of `Input` — a product accumulator, one field per monoid.
+        Fields,
+    }
+
     pub(super) struct MonoidFold {
+        accum: Accum,
         fields: Vec<(Red, Contribution)>,
         /// body nodes the element side needs, marked in graph order.
         needed: Vec<bool>,
@@ -611,17 +622,26 @@ mod monoid_fold {
         }
     }
 
-    /// is `node` exactly `Field(j)` of `Field(0)` of `Input` — i.e. the accumulator's field `j`?
+    /// is `node` exactly `Field(0)` of `Input` — the accumulator itself?
+    fn is_acc(g: &Graph<NumOp>, node: usize) -> bool {
+        let n = &g.nodes[node];
+        matches!(&n.kind, NodeKind::Op(NumOp::Core(Op::Field(0))))
+            && matches!(g.nodes[n.inputs[0]].kind, NodeKind::Input)
+    }
+
+    /// is `node` exactly `Field(j)` of the accumulator — i.e. its field `j`?
     fn is_acc_field(g: &Graph<NumOp>, node: usize, j: usize) -> bool {
         let outer = &g.nodes[node];
-        if !matches!(&outer.kind, NodeKind::Op(NumOp::Core(Op::Field(i))) if *i == j) {
-            return false;
+        matches!(&outer.kind, NodeKind::Op(NumOp::Core(Op::Field(i))) if *i == j)
+            && is_acc(g, outer.inputs[0])
+    }
+
+    /// does `node` name the accumulator this body updates — the whole of it, or its field `j`?
+    fn names_acc(g: &Graph<NumOp>, node: usize, accum: &Accum, j: usize) -> bool {
+        match accum {
+            Accum::Bare => is_acc(g, node),
+            Accum::Fields => is_acc_field(g, node, j),
         }
-        let mid = &g.nodes[outer.inputs[0]];
-        if !matches!(&mid.kind, NodeKind::Op(NumOp::Core(Op::Field(0)))) {
-            return false;
-        }
-        matches!(g.nodes[mid.inputs[0]].kind, NodeKind::Input)
     }
 
     /// mark `root` and everything it reads. Returns `None` if any of it touches the accumulator —
@@ -654,17 +674,22 @@ mod monoid_fold {
         /// fold, which computes the same thing.
         pub(super) fn recognize(g: &Graph<NumOp>) -> Option<MonoidFold> {
             let out = &g.nodes[g.output];
-            let NodeKind::Tuple = out.kind else { return None };
-            let mut fields = Vec::with_capacity(out.inputs.len());
+            // a `Tuple` output updates each accumulator FIELD; anything else updates the
+            // accumulator itself, which is the scalar `fold(xs, 0, acc + x)` a `sum` lowers to.
+            let (accum, updates) = match &out.kind {
+                NodeKind::Tuple => (Accum::Fields, out.inputs.clone()),
+                _ => (Accum::Bare, vec![g.output]),
+            };
+            let mut fields = Vec::with_capacity(updates.len());
             let mut needed = vec![false; g.nodes.len()];
-            for (j, &upd) in out.inputs.iter().enumerate() {
+            for (j, &upd) in updates.iter().enumerate() {
                 let node = &g.nodes[upd];
                 let NodeKind::Op(op) = &node.kind else { return None };
                 let red = monoid_of(op)?;
                 let contribution = match op {
                     // the immediate form: `acc.j <op> c`, whose operand IS the accumulator field.
                     NumOp::Arith(ArithOp::BinImm(_, _, _, c)) => {
-                        if !is_acc_field(g, node.inputs[0], j) {
+                        if !names_acc(g, node.inputs[0], &accum, j) {
                             return None;
                         }
                         Contribution::Const(*c)
@@ -674,7 +699,7 @@ mod monoid_fold {
                         let pair = &g.nodes[node.inputs[0]];
                         let NodeKind::Tuple = pair.kind else { return None };
                         let [acc, elem] = pair.inputs[..] else { return None };
-                        if !is_acc_field(g, acc, j) {
+                        if !names_acc(g, acc, &accum, j) {
                             return None;
                         }
                         mark_elem_side(g, elem, &mut needed)?;
@@ -683,7 +708,7 @@ mod monoid_fold {
                 };
                 fields.push((red, contribution));
             }
-            Some(MonoidFold { fields, needed })
+            Some(MonoidFold { accum, fields, needed })
         }
 
         /// Does this input fit the plan? The recognizer inspects the BODY; this inspects the
@@ -692,17 +717,28 @@ mod monoid_fold {
         /// would widen under the grid's rule and the result would no longer be the seed's shape,
         /// which is a shape error the lockstep path reports and this one must not paper over.
         pub(super) fn applies(&self, input: &Value) -> bool {
+            fn is_u64(v: &Value) -> bool {
+                matches!(v, Value::Prim(crate::value::Prim::U64(_)))
+            }
             let Value::Prod(pair) = input else { return false };
-            let [Value::Prod(seed), Value::List(..)] = &pair[..] else { return false };
-            seed.len() == self.fields.len()
-                && seed.iter().all(|f| matches!(f, Value::Prim(crate::value::Prim::U64(_))))
+            let [seed, Value::List(..)] = &pair[..] else { return false };
+            match (&self.accum, seed) {
+                (Accum::Bare, s) => is_u64(s),
+                (Accum::Fields, Value::Prod(fs)) => {
+                    fs.len() == self.fields.len() && fs.iter().all(is_u64)
+                }
+                _ => false,
+            }
         }
 
         /// `(seed, list) -> seed ⊕ reduce(list)`, per field.
         pub(super) fn eval(&self, g: &Graph<NumOp>, input: Value) -> Result<Value, String> {
             use crate::graph::OpLike;
             let (seed, list) = input.into_pair("Fold")?;
-            let seeds = seed.into_prod("Fold seed")?;
+            let seeds = match self.accum {
+                Accum::Bare => vec![seed],
+                Accum::Fields => seed.into_prod("Fold seed")?,
+            };
             let (bounds, vals) = list.into_list("Fold list")?;
             let total = vals.len();
 
@@ -754,7 +790,10 @@ mod monoid_fold {
                     combine.eval(Value::Prod(vec![s, reduced]))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok(Value::Prod(out))
+            Ok(match self.accum {
+                Accum::Bare => out.into_iter().next().expect("one field"),
+                Accum::Fields => Value::Prod(out),
+            })
         }
     }
 }
@@ -904,6 +943,37 @@ mod monoid_fold_tests {
         }
     }
 
+    /// The SCALAR accumulator — `fold(xs, 0, acc + x)`, which is what a `sum` over a collected list
+    /// lowers to when the surface has no reducer for it, and the shape 23 of the 33 folds in DDIR's
+    /// AoC suite have. The body's output is the update itself rather than a `Tuple` of them.
+    #[test]
+    fn a_scalar_accumulator_agrees_with_the_lockstep_fold() {
+        let cases = [
+            ("let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) add)", true),
+            ("let s = input lit 1 in (s, input) fold ((acc, x) -> (acc, x) mul)", true),
+            ("let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) max)", true),
+            ("let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x mul 3 add_u64 1) add)", true),
+            ("let s = input lit 0 in (s, input) fold ((acc, x) -> acc add_u64 1)", true),
+            // not associative, and the element side reads the accumulator: both must decline.
+            ("let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) sub)", false),
+            ("let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, acc) add)", false),
+        ];
+        let lists = [
+            Value::List(vec![6].into(), Box::new(u(&[3, 1, 4, 1, 5, 9]))),
+            Value::List(vec![2, 2, 5].into(), Box::new(u(&[7, 2, 8, 1, 6]))),
+            Value::List(vec![0, 3, 3].into(), Box::new(u(&[4, 5, 6]))),
+            Value::List(vec![0].into(), Box::new(u(&[]))),
+            Value::List(Bounds::Stride(2, 3), Box::new(u(&[9, 1, 8, 2, 7, 3]))),
+        ];
+        for (src, recognized) in cases {
+            for list in &lists {
+                let rows = list.len();
+                let seed = u(&vec![if src.contains("lit 1") { 1 } else { 0 }; rows]);
+                agree(src, recognized, seed, list.clone());
+            }
+        }
+    }
+
     #[test]
     fn unrecognized_bodies_fall_through_unchanged() {
         let cases = [
@@ -942,6 +1012,14 @@ mod monoid_fold_tests {
             list.clone()
         ])));
         // the wrong number of fields.
+        assert!(!plan.applies(&Value::Prod(vec![Value::Prod(vec![u(&[0])]), list.clone()])));
+
+        // ...and the same for a SCALAR accumulator, whose seed is the leaf itself.
+        let bare = body_of("let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) add)");
+        let plan = MonoidFold::recognize(&bare).expect("recognized");
+        assert!(plan.applies(&Value::Prod(vec![u(&[0]), list.clone()])));
+        assert!(!plan.applies(&Value::Prod(vec![Value::u32(vec![0]), list.clone()])));
+        // a product seed under a scalar body is the other way round, and equally wrong.
         assert!(!plan.applies(&Value::Prod(vec![Value::Prod(vec![u(&[0])]), list])));
     }
 }
