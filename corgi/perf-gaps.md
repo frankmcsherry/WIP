@@ -82,9 +82,9 @@ instead. "Lever" names what would close it.
 | **C4 scan_prefix** (general) | aggregation | **1082×** | **272×** | **244×** | lockstep foldscan on ONE long row: #rounds = row length, body re-evaluated per round | monoid body → C4k; general → a prepared evaluator, then an affine-recurrence kernel |
 | C4k scan_add (kernel) | aggregation | 1.41× | 1.11× | 1.76× | the monoid prefix kernel — one in-place pass | **DONE** |
 | **C5 fold_sum_count** | aggregation | **5998×** | **4592×** | **2764×** | same lockstep degeneration, product-of-monoids accumulator | recognize the product of monoids |
-| D1 sort_u64 | order | 1.40× | 2.42× | 4.36× | index radix (keys read through the permutation) + gather | **key-carrying radix, wider digits** |
-| D2 dedup | order | 1.70× | 2.70× | 4.34× | sort + adjacent unique | as D1 |
-| D3 sort_compound | order | **1.04×** | 1.73× | 3.07× | 2-field discrimination + 2 gathers vs pdqsort on pairs | as D1 |
+| D1 sort_u64 | order | **0.51×** | **0.45×** | **0.71×** | the value radix: no permutation, no gather | — past the ceiling |
+| D2 dedup | order | **0.64×** | **0.54×** | **0.79×** | value radix + one compacting pass | — past the ceiling |
+| D3 sort_compound | order | 1.10× | **0.98×** | 2.23× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
 | D4 sort_sorted | order | **1.14×** | **1.13×** | **1.11×** | already ordered: detect and return | — at ceiling |
 | D5 dedup_sorted | order | 5.7× | 4.0× | 3.6× | run boundaries off the order check, then a gather | a writer (as B1) |
 | **E1 join_find_slices** | relational | — | 3.1–7.8× | 3.1× | `find` searches per probe instead of merging two sorted runs | merge-join path |
@@ -96,7 +96,7 @@ instead. "Lever" names what would close it.
 | G2 csv_sum | text | — | 1.7× | 1.7× | total `parse_u64` (Sum) + reduce vs hand atoi | — near ceiling |
 | H gather (safe) | safety | 0.33 vs 0.67 | 1.04 vs 1.32 | 1.05 vs 1.40 ns/row | corgi's TOTAL (bounds-checked) sequential gather vs Rust `unsafe` | — **no safety tax** |
 | I pointer-chase | latency | — | 0.63 vs 4.76 | 0.80 vs 9.43 ns/step | lockstep gather extracts MLP a serial chase cannot | — **8–12× FASTER** |
-| R1 arrange_sort_perm | arrangement | — | 1.03× | 1.37× | stable radix argsort vs Rust stable sort with cached keys | the ceiling is weak; see D1 |
+| R1 arrange_sort_perm | arrangement | — | **0.64×** | **0.96×** | stable key-carrying radix argsort | — past the ceiling |
 | R2 arrange_compare | arrangement | — | 3.9× | 3.1× | batched adjacent compare vs a direct leaf compare | — |
 | R3 arrange_find | arrangement | — | 1.17× | 0.98× | the u64 fast path, at the Rust partition-point ceiling | — |
 | R4 arrange_survey | arrangement | — | **0.23×** | **0.75×** | galloping runs beat a two-pointer survey | — |
@@ -165,9 +165,16 @@ per-element bounds check, and competitive with eliding the check entirely.
 2. **D4 sort_sorted, a row that did not exist, is at the ceiling.** `sort`, `dedup` and `group` now
    ask whether the column is already ordered before they sort it, and answer cheaply or decline.
    An already-ordered 1 M column sorts in 0.26 ns/row against 24 for the old path.
-3. **D3 sort_compound, also new, went 2.55× → 1.73× at 1 M.** The discrimination sort now stops once
-   no two rows are tied, as `compare_pairs` next door always has, and reads field 0 directly instead
-   of gathering it through an identity permutation.
+3. **The sort is now past its ceiling.** Three changes: the discrimination stops once no two rows
+   are tied (as `compare_pairs` next door always has) and reads field 0 directly instead of
+   gathering it through an identity permutation; a bare leaf sorts its VALUES, with no permutation
+   to build and no gather after; and the permutation path materializes each key once and carries it,
+   so every radix pass reads sequentially instead of twice-per-element through the index. D1 went
+   24.3 → 4.4 ns/row at 1 M and 48.4 → 8.2 at 8 M, D2 28.3 → 5.7 and 52.4 → 9.1, D3 25.6 → 14.7 and
+   54.5 → 39.9, R1 23.1 → 13.9 and 44.4 → 31.8. corgi now sorts a u64 column faster than
+   `sort_unstable`. The one cost is at the 8 K L1 control, where D3 is ~10% slower: carrying the key
+   is extra traffic that an L1-resident indirect read does not repay. That point is a control, not a
+   target.
 4. **F1 branch_match was 16×/15×** at `b9bb413` and is 8.7–10.9× now (PR #18's copies work).
 
 **E1's number was wrong, not just stale.** Its probe side was built by a `dedup` — a full sort —
@@ -190,12 +197,14 @@ Both sides are now built outside the timer.
    problem, because corgi's list order is LENGTH-FIRST and length-first is exactly the order that
    lacks prefix contiguity (the extensions of a prefix scatter across one range per length class,
    where plain lexicographic order would make them one contiguous range).
-3. **the leaf sort reads keys through the permutation, one byte at a time.** `sort_block_scratch`
-   radixes an index slice and reads `v[idx[k]]` twice per element per byte pass. A value radix at
-   16-bit digits measures 5.4/9.9 ns/row against corgi's 24/48 and `sort_unstable`'s 9.5/10.8 — so
-   with the keys carried and a wider digit corgi should be FASTER than pdqsort, not 2.4–4.4× slower.
-   Note R1's 1.03×/1.37× does not contradict this: its ceiling is a Rust stable sort with cached
-   keys, which is itself 22–32 ns/row. Being near a weak ceiling is not being fast.
+3. **narrow compound keys still radix once per field.** The sort now stops as soon as no two rows
+   are tied and carries each key with its permutation, so a compound key costs one pass per field
+   that actually discriminates. When several fields are narrow, one packed key would do instead of
+   several: four discriminating u16 fields measure 27.7 ns/row as a `Prod`, against 9.5 for the same
+   key packed into a single u64. That is the trick `sort_list_blocks` already has for strided byte
+   lists, generalized: pack a fixed-width prefix of the structural key into one wide integer, radix
+   once, refine only if ties remain. Not built — and it does NOT help DDIR's key, whose leading
+   field is a full 64-bit hash that the tie check already stops on.
 
 ## The optimizer
 

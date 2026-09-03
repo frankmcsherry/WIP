@@ -621,12 +621,12 @@ mod discriminate {
         let n = p.len();
         let mut perm: Vec<usize> = Vec::with_capacity(n);
         let mut ends: Vec<usize> = Vec::new();
-        let mut tmp: Vec<usize> = Vec::new();
+        let mut scratch = crate::value::SortScratch::default();
         for (lo, hi) in find_blocks(labels) {
             let start = perm.len();
             perm.extend(lo..hi);
             if hi - lo > 1 {
-                p.sort_block_scratch(&mut perm[start..], &mut tmp);
+                p.sort_block_scratch(&mut perm[start..], &mut scratch);
             }
             ends.push(perm.len());
         }

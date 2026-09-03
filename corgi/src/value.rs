@@ -507,20 +507,22 @@ macro_rules! prim {
                 }
             }
 
-            /// stable LSD byte-radix over a mutable index slice, IN PLACE (`tmp` is caller
-            /// scratch, resized as needed and reusable across calls — a refinement pass calls
-            /// this once per block, and per-block allocations dominated a join-heavy profile).
-            /// A counting sort per *significant* byte (high all-zero bytes skipped); blocks of
-            /// <= 16 take a stable insertion sort instead — the radix set-up dwarfs tiny
-            /// blocks, the common case once a prior pass has split the column into groups.
-            pub(crate) fn sort_block_scratch(&self, idx: &mut [usize], tmp: &mut Vec<usize>) {
+            /// Stable sort of `idx` by this column's values, IN PLACE — the PERMUTATION sort,
+            /// for a caller that has a payload to move alongside or labels to refine. `scratch` is
+            /// caller-owned and reused across every block of a column.
+            ///
+            /// The key of each row is materialized ONCE and travels with the permutation from
+            /// there (see [`radix_perm_by_keys`]); blocks of 32 or fewer take a stable insertion
+            /// sort instead, since the radix set-up dwarfs a tiny block and tiny blocks are the
+            /// common case once a prior pass has split the column into groups.
+            pub(crate) fn sort_block_scratch(&self, idx: &mut [usize], scratch: &mut SortScratch) {
                 match self {
                     $( Prim::$V(v) => {
                         let n = idx.len();
                         if n <= 1 {
                             return;
                         }
-                        if n <= 16 {
+                        if n <= 32 {
                             for k in 1..n {
                                 let mut j = k;
                                 while j > 0 && v[idx[j - 1]] > v[idx[j]] {
@@ -530,48 +532,10 @@ macro_rules! prim {
                             }
                             return;
                         }
-                        let max = idx.iter().map(|&i| v[i]).max().unwrap_or(0);
-                        let bits = std::mem::size_of::<$t>() * 8;
-                        let nbytes = (bits - max.leading_zeros() as usize).div_ceil(8);
-                        if tmp.len() < n {
-                            tmp.resize(n, 0);
-                        }
-                        let mut src_is_idx = true;
-                        for byte in 0..nbytes {
-                            let shift = (byte * 8) as u32;
-                            let mut counts = [0usize; 256];
-                            {
-                                let src: &[usize] = if src_is_idx { &idx[..] } else { &tmp[..n] };
-                                for &i in src {
-                                    counts[((v[i] >> shift) & 0xff) as usize] += 1;
-                                }
-                            }
-                            let mut start = 0;
-                            for c in counts.iter_mut() {
-                                let cnt = *c;
-                                *c = start;
-                                start += cnt;
-                            }
-                            if src_is_idx {
-                                for k in 0..n {
-                                    let i = idx[k];
-                                    let b = ((v[i] >> shift) & 0xff) as usize;
-                                    tmp[counts[b]] = i;
-                                    counts[b] += 1;
-                                }
-                            } else {
-                                for k in 0..n {
-                                    let i = tmp[k];
-                                    let b = ((v[i] >> shift) & 0xff) as usize;
-                                    idx[counts[b]] = i;
-                                    counts[b] += 1;
-                                }
-                            }
-                            src_is_idx = !src_is_idx;
-                        }
-                        if !src_is_idx {
-                            idx.copy_from_slice(&tmp[..n]);
-                        }
+                        // the one indirect read; widened to u64 so the radix itself is written once.
+                        scratch.keys.clear();
+                        scratch.keys.extend(idx.iter().map(|&i| v[i] as u64));
+                        radix_perm_by_keys(idx, scratch);
                     } )+
                 }
             }
@@ -732,6 +696,20 @@ prim! {
     U64 => u64,
 }
 
+/// Digit width for a radix pass over `n` elements. A wide digit halves the number of passes but
+/// pays a counter array — cleared and prefix-scanned once per pass — so it is only worth it when
+/// the buckets are small against the block. The rule is `buckets <= n/16`, which holds the counter
+/// work under a sixteenth of the element work; below that, the extra pass is the cheaper trade.
+fn digit_width(n: usize) -> u32 {
+    if n >= (1 << 20) {
+        16
+    } else if n >= (1 << 15) {
+        11
+    } else {
+        8
+    }
+}
+
 /// LSD radix sort of a slice, IN PLACE, at a digit width chosen from its length.
 ///
 /// This is the VALUE sort. Where [`Prim::sort_block_scratch`] produces a permutation — because its
@@ -740,10 +718,9 @@ prim! {
 /// gather afterwards. It is what `sort`/`dedup` want when the list's element is a bare leaf, which
 /// is the majority of what they are asked to sort.
 ///
-/// The digit width scales with the block: a wide digit halves the number of passes but pays a
-/// counter array per pass, so 256 buckets for a small block and up to 65536 for a large one. High
-/// all-zero digits are skipped, so a narrow key costs fewer passes. `tmp` and `counts` are caller
-/// scratch, reused across every row of a column.
+/// The digit width scales with the block ([`digit_width`]) and high all-zero digits are skipped, so
+/// a narrow key costs fewer passes. `tmp` and `counts` are caller scratch, reused across every row
+/// of a column.
 fn radix_sort_slice<T: Copy + Ord + Default + Into<u64>>(
     s: &mut [T],
     tmp: &mut Vec<T>,
@@ -770,13 +747,7 @@ fn radix_sort_slice<T: Copy + Ord + Default + Into<u64>>(
     if sig == 0 {
         return;
     }
-    let d: u32 = if n < 4096 {
-        8
-    } else if n < (1 << 18) {
-        11
-    } else {
-        16
-    };
+    let d = digit_width(n);
     let buckets = 1usize << d;
     let mask = (buckets - 1) as u64;
     let passes = sig.div_ceil(d);
@@ -819,6 +790,89 @@ fn radix_sort_slice<T: Copy + Ord + Default + Into<u64>>(
     }
     if !from_s {
         s.copy_from_slice(&tmp[..n]);
+    }
+}
+
+/// Reusable scratch for the permutation sort: the key column materialized once, its alternate
+/// buffer, the permutation's alternate buffer, and the digit counters. Hoisted to the caller
+/// because a refinement pass calls the sort once per block and produces millions of tiny blocks —
+/// per-block allocation was ~17% self of a join-heavy profile.
+#[derive(Default)]
+pub(crate) struct SortScratch {
+    keys: Vec<u64>,
+    keys_alt: Vec<u64>,
+    idx_alt: Vec<usize>,
+    counts: Vec<u32>,
+}
+
+/// LSD radix over a permutation whose KEYS TRAVEL WITH IT: `scratch.keys[k]` is the key of
+/// `idx[k]`, and every pass permutes both together.
+///
+/// The point is that the key is read once, when it is materialized, and sequentially thereafter.
+/// Reading it through the permutation instead — `v[idx[k]]`, twice per element per pass — is two
+/// random reads into the key column, up to eight times over, which is what this replaces. Where
+/// there is no permutation to keep (no payload to carry, no labels to refine),
+/// [`radix_sort_slice`] moves the values themselves and is cheaper still.
+///
+/// Stable: each pass scatters in ascending source order from prefix offsets, so equal keys keep
+/// their relative order — which `sort_blocks` promises and `dedup`/`group` rely on.
+fn radix_perm_by_keys(idx: &mut [usize], scratch: &mut SortScratch) {
+    let n = idx.len();
+    let max = scratch.keys[..n].iter().copied().max().unwrap_or(0);
+    let sig = 64 - max.leading_zeros();
+    if sig == 0 {
+        return; // every key equal: the permutation is already the stable answer
+    }
+    let d = digit_width(n);
+    let buckets = 1usize << d;
+    let mask = (buckets - 1) as u64;
+    let passes = sig.div_ceil(d);
+    if scratch.keys_alt.len() < n {
+        scratch.keys_alt.resize(n, 0);
+    }
+    if scratch.idx_alt.len() < n {
+        scratch.idx_alt.resize(n, 0);
+    }
+    if scratch.counts.len() < buckets {
+        scratch.counts.resize(buckets, 0);
+    }
+    let mut from_idx = true;
+    for p in 0..passes {
+        let shift = p * d;
+        scratch.counts[..buckets].iter_mut().for_each(|c| *c = 0);
+        {
+            let src = if from_idx { &scratch.keys[..n] } else { &scratch.keys_alt[..n] };
+            for &k in src {
+                scratch.counts[((k >> shift) & mask) as usize] += 1;
+            }
+        }
+        let mut start = 0u32;
+        for c in scratch.counts[..buckets].iter_mut() {
+            let cnt = *c;
+            *c = start;
+            start += cnt;
+        }
+        for j in 0..n {
+            let (key, row) = if from_idx {
+                (scratch.keys[j], idx[j])
+            } else {
+                (scratch.keys_alt[j], scratch.idx_alt[j])
+            };
+            let b = ((key >> shift) & mask) as usize;
+            let slot = scratch.counts[b] as usize;
+            scratch.counts[b] += 1;
+            if from_idx {
+                scratch.keys_alt[slot] = key;
+                scratch.idx_alt[slot] = row;
+            } else {
+                scratch.keys[slot] = key;
+                idx[slot] = row;
+            }
+        }
+        from_idx = !from_idx;
+    }
+    if !from_idx {
+        idx.copy_from_slice(&scratch.idx_alt[..n]);
     }
 }
 
