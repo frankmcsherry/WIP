@@ -518,6 +518,205 @@ fn reduce_rows(bounds: &crate::value::Bounds, r: Red, p: &Prim) -> Vec<u64> {
     }
 }
 
+/// A `Fold` body recognized as a PRODUCT OF MONOIDS, and the kernels it becomes.
+///
+/// `fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))` computes a sum and a count. Each field is
+/// updated by an ASSOCIATIVE op from a contribution that never reads the accumulator, so the whole
+/// thing is `seed_i ⊕ reduce_i(list)` — one pass per field, where the lockstep fold runs the body
+/// once per ROUND, and on one long row a round is one element. That is C5, and it is the worst row
+/// on the board by two orders of magnitude.
+///
+/// This lives in the NUMERIC layer, not the core: "is this op a monoid" is a numeric question, and
+/// `Op<L>` is deliberately blind to it. It is a physical choice made at eval time, in the spirit of
+/// the `strided` and `known_sorted` fast paths, rather than an optimizer rewrite — the optimizer
+/// runs on no evaluated path.
+///
+/// Deliberately conservative. Only `Add`/`Mul` (from the grid) and `Min`/`Max` (from `cmp`) at
+/// `Kind::U` width 64 count as monoids here; `Sub` is not associative, and bitwise `And`/`Or` are
+/// NOT the `All`/`Any` reductions except on 0/1 columns, which nothing here proves.
+mod monoid_fold {
+    use super::{ArithOp, BinOp, Kind, NumOp, Red};
+    use crate::graph::{Graph, NodeKind};
+    use crate::ops::cmp::CmpOp;
+    use crate::ops::core::Op;
+    use crate::value::Value;
+
+    /// what a field contributes per element: a body node's column, or a constant (the `count`
+    /// idiom, `acc.i add_u64 1`, whose contribution does not depend on the element at all).
+    enum Contribution {
+        Node(usize),
+        Const(u64),
+    }
+
+    pub(super) struct MonoidFold {
+        fields: Vec<(Red, Contribution)>,
+        /// body nodes the element side needs, marked in graph order.
+        needed: Vec<bool>,
+    }
+
+    /// the monoid an update op names, if it names one.
+    fn monoid_of(kind: &NumOp) -> Option<Red> {
+        match kind {
+            NumOp::Arith(ArithOp::Bin(op, Kind::U, 64))
+            | NumOp::Arith(ArithOp::BinImm(op, Kind::U, 64, _)) => match op {
+                BinOp::Add => Some(Red::Add),
+                BinOp::Mul => Some(Red::Mul),
+                _ => None,
+            },
+            NumOp::Cmp(CmpOp::Min) => Some(Red::Min),
+            NumOp::Cmp(CmpOp::Max) => Some(Red::Max),
+            _ => None,
+        }
+    }
+
+    /// is `node` exactly `Field(j)` of `Field(0)` of `Input` — i.e. the accumulator's field `j`?
+    fn is_acc_field(g: &Graph<NumOp>, node: usize, j: usize) -> bool {
+        let outer = &g.nodes[node];
+        if !matches!(&outer.kind, NodeKind::Op(NumOp::Core(Op::Field(i))) if *i == j) {
+            return false;
+        }
+        let mid = &g.nodes[outer.inputs[0]];
+        if !matches!(&mid.kind, NodeKind::Op(NumOp::Core(Op::Field(0)))) {
+            return false;
+        }
+        matches!(g.nodes[mid.inputs[0]].kind, NodeKind::Input)
+    }
+
+    /// mark `root` and everything it reads. Returns `None` if any of it touches the accumulator —
+    /// which is exactly "some node reads `Input` other than through `Field(1)`", since `Field(1)`
+    /// of the body's pair IS the element.
+    fn mark_elem_side(g: &Graph<NumOp>, root: usize, needed: &mut [bool]) -> Option<()> {
+        let mut stack = vec![root];
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut needed[i], true) {
+                continue;
+            }
+            let node = &g.nodes[i];
+            if matches!(node.kind, NodeKind::Input) {
+                continue;
+            }
+            for &e in &node.inputs {
+                if matches!(g.nodes[e].kind, NodeKind::Input)
+                    && !matches!(&node.kind, NodeKind::Op(NumOp::Core(Op::Field(1))))
+                {
+                    return None; // reads the pair itself, so it can see the accumulator
+                }
+                stack.push(e);
+            }
+        }
+        Some(())
+    }
+
+    impl MonoidFold {
+        /// Recognize the body, or decline. Declining is always safe: the caller runs the lockstep
+        /// fold, which computes the same thing.
+        pub(super) fn recognize(g: &Graph<NumOp>) -> Option<MonoidFold> {
+            let out = &g.nodes[g.output];
+            let NodeKind::Tuple = out.kind else { return None };
+            let mut fields = Vec::with_capacity(out.inputs.len());
+            let mut needed = vec![false; g.nodes.len()];
+            for (j, &upd) in out.inputs.iter().enumerate() {
+                let node = &g.nodes[upd];
+                let NodeKind::Op(op) = &node.kind else { return None };
+                let red = monoid_of(op)?;
+                let contribution = match op {
+                    // the immediate form: `acc.j <op> c`, whose operand IS the accumulator field.
+                    NumOp::Arith(ArithOp::BinImm(_, _, _, c)) => {
+                        if !is_acc_field(g, node.inputs[0], j) {
+                            return None;
+                        }
+                        Contribution::Const(*c)
+                    }
+                    // the pair form: `(acc.j, e) <op>`, where `e` never reads the accumulator.
+                    _ => {
+                        let pair = &g.nodes[node.inputs[0]];
+                        let NodeKind::Tuple = pair.kind else { return None };
+                        let [acc, elem] = pair.inputs[..] else { return None };
+                        if !is_acc_field(g, acc, j) {
+                            return None;
+                        }
+                        mark_elem_side(g, elem, &mut needed)?;
+                        Contribution::Node(elem)
+                    }
+                };
+                fields.push((red, contribution));
+            }
+            Some(MonoidFold { fields, needed })
+        }
+
+        /// Does this input fit the plan? The recognizer inspects the BODY; this inspects the
+        /// VALUE, because the two have to agree about the accumulator's shape. Every field must be
+        /// a `U64` leaf, since that is the width the recognized cells compute at — a narrower seed
+        /// would widen under the grid's rule and the result would no longer be the seed's shape,
+        /// which is a shape error the lockstep path reports and this one must not paper over.
+        pub(super) fn applies(&self, input: &Value) -> bool {
+            let Value::Prod(pair) = input else { return false };
+            let [Value::Prod(seed), Value::List(..)] = &pair[..] else { return false };
+            seed.len() == self.fields.len()
+                && seed.iter().all(|f| matches!(f, Value::Prim(crate::value::Prim::U64(_))))
+        }
+
+        /// `(seed, list) -> seed ⊕ reduce(list)`, per field.
+        pub(super) fn eval(&self, g: &Graph<NumOp>, input: Value) -> Result<Value, String> {
+            use crate::graph::OpLike;
+            let (seed, list) = input.into_pair("Fold")?;
+            let seeds = seed.into_prod("Fold seed")?;
+            let (bounds, vals) = list.into_list("Fold list")?;
+            let total = vals.len();
+
+            // the element side, evaluated ONCE over every element. The accumulator slot is a unit
+            // column of the same length: `Field(0)` of the pair is unreachable by construction (see
+            // `mark_elem_side`), so nothing can look at it, and it costs two words.
+            let mut vals_at: Vec<Option<Value>> = vec![None; g.nodes.len()];
+            let arg = Value::Prod(vec![Value::Unit(total), vals]);
+            for (i, node) in g.nodes.iter().enumerate() {
+                if !self.needed[i] {
+                    continue;
+                }
+                let v = match &node.kind {
+                    NodeKind::Input => arg.clone(),
+                    NodeKind::Tuple => Value::Prod(
+                        node.inputs
+                            .iter()
+                            .map(|&e| vals_at[e].clone().expect("marked in order"))
+                            .collect(),
+                    ),
+                    NodeKind::Op(o) => {
+                        o.eval(vals_at[node.inputs[0]].clone().expect("marked in order"))?
+                    }
+                };
+                vals_at[i] = Some(v);
+            }
+
+            let out = seeds
+                .into_iter()
+                .zip(&self.fields)
+                .map(|(s, (red, c))| {
+                    let column = match c {
+                        Contribution::Node(n) => vals_at[*n].clone().expect("marked"),
+                        // a constant contribution still reduces per row: `count` is `Add` over a
+                        // column of ones, i.e. the row length, and `Min`/`Max` of a constant is it.
+                        Contribution::Const(k) => Value::u64(vec![*k; total]),
+                    };
+                    let reduced = ArithOp::Reduce(*red)
+                        .eval(Value::List(bounds.clone(), Box::new(column)))?;
+                    // seed ⊕ reduction: associativity is what makes the split legal, and every
+                    // monoid here is commutative, so the order of the two does not matter.
+                    let combine: NumOp = match red {
+                        Red::Add => ArithOp::Bin(BinOp::Add, Kind::U, 64).into(),
+                        Red::Mul => ArithOp::Bin(BinOp::Mul, Kind::U, 64).into(),
+                        Red::Min => CmpOp::Min.into(),
+                        Red::Max => CmpOp::Max.into(),
+                        _ => unreachable!("monoid_of yields only Add/Mul/Min/Max"),
+                    };
+                    combine.eval(Value::Prod(vec![s, reduced]))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Value::Prod(out))
+        }
+    }
+}
+
 /// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),
 /// `arith`, and `text` buckets — the layer the `ml` surface and the optimizer are typed at.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -531,7 +730,18 @@ pub enum NumOp {
 impl OpLike for NumOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
         match self {
-            NumOp::Core(c) => c.eval(input),
+            NumOp::Core(c) => {
+                // a `Fold` whose body is a product of monoids becomes one reduce per field (see
+                // `monoid_fold`). Recognized here rather than in the core, which is numeric-blind.
+                if let Op::Fold(body) = c {
+                    if let Some(plan) = monoid_fold::MonoidFold::recognize(body) {
+                        if plan.applies(&input) {
+                            return plan.eval(body, input);
+                        }
+                    }
+                }
+                c.eval(input)
+            }
             NumOp::Cmp(c) => c.eval(input),
             NumOp::Arith(a) => a.eval(input),
             NumOp::Text(t) => t.eval(input),
@@ -564,5 +774,132 @@ impl From<ArithOp> for NumOp {
 impl From<TextOp> for NumOp {
     fn from(t: TextOp) -> Self {
         NumOp::Text(t)
+    }
+}
+
+#[cfg(test)]
+mod monoid_fold_tests {
+    //! The product-of-monoids fast path must compute EXACTLY what the lockstep fold computes, and
+    //! must decline every body it does not understand. Each case runs both paths on the same input
+    //! and compares — `NumOp::eval` is the intercepted one, `Op::eval` the core's lockstep — and
+    //! asserts which path the body was expected to take, so a case that silently declines cannot
+    //! pass by accident.
+
+    use super::monoid_fold::MonoidFold;
+    use super::NumOp;
+    use crate::graph::{Graph, NodeKind, OpLike};
+    use crate::ops::core::Op;
+    use crate::value::{Bounds, Value};
+
+    /// the body of the (single) `fold` in a surface program — written in the surface language so
+    /// the cases exercise the real lowering rather than a hand-built graph.
+    fn body_of(src: &str) -> Graph<NumOp> {
+        let g = crate::parse_ml(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        for n in &g.nodes {
+            if let NodeKind::Op(NumOp::Core(Op::Fold(b))) = &n.kind {
+                return (**b).clone();
+            }
+        }
+        panic!("no fold in {src}");
+    }
+
+    fn u(xs: &[u64]) -> Value {
+        Value::u64(xs.to_vec())
+    }
+
+    /// run both paths on `(seed, list)` and require them to agree, including on the error.
+    fn agree(src: &str, recognized: bool, seed: Value, list: Value) {
+        let body = body_of(src);
+        assert_eq!(
+            MonoidFold::recognize(&body).is_some(),
+            recognized,
+            "{src}: recognition"
+        );
+        let input = Value::Prod(vec![seed, list]);
+        let fast = NumOp::Core(Op::Fold(Box::new(body.clone()))).eval(input.clone());
+        let slow = Op::<NumOp>::Fold(Box::new(body)).eval(input);
+        assert_eq!(fast, slow, "{src}");
+    }
+
+    /// the inputs each case is checked over: one long row, several rows, an empty row, an empty
+    /// list, and a single element — the shapes the lockstep path treats differently.
+    fn lists() -> Vec<(Value, Value)> {
+        let seed2 = |n: usize| Value::Prod(vec![u(&vec![0; n]), u(&vec![0; n])]);
+        vec![
+            (seed2(1), Value::List(vec![6].into(), Box::new(u(&[3, 1, 4, 1, 5, 9])))),
+            (seed2(3), Value::List(vec![2, 2, 5].into(), Box::new(u(&[7, 2, 8, 1, 6])))),
+            (seed2(3), Value::List(vec![0, 3, 3].into(), Box::new(u(&[4, 5, 6])))),
+            (seed2(1), Value::List(vec![0].into(), Box::new(u(&[])))),
+            (seed2(1), Value::List(vec![1].into(), Box::new(u(&[42])))),
+            // a STRIDED partition, which the lockstep path takes a different branch for
+            (seed2(3), Value::List(Bounds::Stride(2, 3), Box::new(u(&[9, 1, 8, 2, 7, 3])))),
+            // a non-zero seed, so `seed ⊕ reduce` is distinguishable from `reduce` alone
+            (
+                Value::Prod(vec![u(&[100]), u(&[7])]),
+                Value::List(vec![4].into(), Box::new(u(&[1, 2, 3, 4]))),
+            ),
+        ]
+    }
+
+    #[test]
+    fn recognized_bodies_agree_with_the_lockstep_fold() {
+        let cases = [
+            // C5: sum and count. The count's contribution is a CONSTANT, not the element.
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))",
+            // min and max, from the `cmp` bucket rather than the arithmetic grid
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) min, (acc.1, x) max))",
+            // a contribution that is an EXPRESSION of the element, not the element
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x mul 2 add_u64 1) add, (acc.1, x) max))",
+            // product and sum together; the element expression is shared between the two fields
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x add_u64 1) mul, (acc.1, x add_u64 1) add))",
+            // both fields immediate: neither contribution depends on the element at all
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> (acc.0 add_u64 3, acc.1 mul 2))",
+        ];
+        for src in cases {
+            for (seed, list) in lists() {
+                agree(src, true, seed, list);
+            }
+        }
+    }
+
+    #[test]
+    fn unrecognized_bodies_fall_through_unchanged() {
+        let cases = [
+            // `sub` is not associative, so the split would be wrong
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) sub, (acc.1, x) add))",
+            // the element side READS the accumulator: `acc.1` is not a function of x
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, acc.1) add, (acc.1, x) add))",
+            // field 0 is updated from acc.1 — the wrong field, so the updates are not independent
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.1, x) add, (acc.1, x) add))",
+            // bitwise AND is a monoid but NOT the `All` reduction, except on 0/1 columns
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) and, (acc.1, x) add))",
+            // the accumulator is threaded whole rather than field by field
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, (acc.0, x) add))",
+        ];
+        for src in cases {
+            for (seed, list) in lists() {
+                agree(src, false, seed, list);
+            }
+        }
+    }
+
+    /// The plan inspects the BODY; the seed's shape is a separate question, and a seed the
+    /// recognized cells cannot compute at must fall back rather than change the answer.
+    #[test]
+    fn a_narrow_seed_falls_back() {
+        let body = body_of("let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))");
+        let plan = MonoidFold::recognize(&body).expect("recognized");
+        let list = Value::List(vec![3].into(), Box::new(u(&[1, 2, 3])));
+        assert!(plan.applies(&Value::Prod(vec![
+            Value::Prod(vec![u(&[0]), u(&[0])]),
+            list.clone()
+        ])));
+        // a u32 field: the cells compute at 64, so the result would not be the seed's shape.
+        assert!(!plan.applies(&Value::Prod(vec![
+            Value::Prod(vec![Value::u32(vec![0]), u(&[0])]),
+            list.clone()
+        ])));
+        // the wrong number of fields.
+        assert!(!plan.applies(&Value::Prod(vec![Value::Prod(vec![u(&[0])]), list])));
     }
 }

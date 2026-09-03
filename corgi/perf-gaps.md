@@ -76,14 +76,14 @@ instead. "Lever" names what would close it.
 | A2 add_chain8 | pointwise | tax 0.93 / prize 6.6 | tax 1.05 / prize 3.7 | tax 0.95 / prize 2.1 | per-pass at the Rust ceiling; the gap is un-fused passes | **tiling, then fusion** |
 | A3 mixed_chain | pointwise | tax 1.07 | tax 0.99 | tax 1.00 | at the Rust ceiling — the immediate cells landed | — at ceiling |
 | A4 map_reduce | pointwise | tax 1.67 / prize 2.4 | tax 0.81 / prize 11.5 | tax 1.20 / prize 7.5 | intermediate map column, then a fold over it | **fusion — the biggest prize on the board** |
-| B1 filter_values | selection | 3.1× | 2.1× | 3.5× | u64 mask column + scalar `filter_mask` + gather vs one predicated push | narrow masks; a writer; SIMD compaction |
-| B2 cmp_select | selection | 2.9× | 2.6× | 3.4× | 4 passes vs 1 fused | tiling, then fusion |
+| B1 filter_values | selection | 3.3× | 1.9× | 2.7× | u64 mask column + scalar `filter_mask` + gather vs one predicated push | narrow masks; a writer; SIMD compaction |
+| B2 cmp_select | selection | 2.6× | 2.7× | 2.0× | 4 passes vs 1 fused | tiling, then fusion |
 | C1 fold_add | aggregation | 1.10× | **1.03×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | **C3 group_by_sum** | aggregation | 22× | **48×** | **74×** | sort-based group where a 256-bucket accumulate is one O(n) pass | see *the group-by decomposition* |
-| **C4 scan_prefix** (general) | aggregation | **747×** | **321×** | **163×** | lockstep foldscan on ONE long row: #rounds = row length, and every round allocates | monoid body → C4k; general → a single-row interpreter |
+| **C4 scan_prefix** (general) | aggregation | **757×** | **192×** | **153×** | lockstep foldscan on ONE long row: #rounds = row length, and every round allocates | monoid body → C4k; general → a single-row interpreter |
 | C4k scan_add (kernel) | aggregation | 1.41× | 1.17× | 0.98× | the monoid prefix kernel — one in-place pass | **DONE** |
-| **C5 fold_sum_count** | aggregation | **5169×** | **4153×** | **2290×** | same lockstep degeneration, product-of-monoids accumulator | recognize the product of monoids |
+| C5 fold_sum_count | aggregation | 6.9× | 6.8× | 9.9× | recognized as a product of monoids: one reduce per field. What is left is the ordinary un-fused-passes gap | tiling, then fusion |
 | D1 sort_u64 | order | **0.55×** | **0.47×** | **0.81×** | the value radix: no permutation, no gather | — past the ceiling |
 | D2 dedup | order | **0.64×** | **0.52×** | **0.89×** | value radix + one compacting pass | — past the ceiling |
 | D3 sort_compound | order | 1.21× | **1.05×** | 2.22× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
@@ -121,16 +121,17 @@ Rust loop's 0.06, so the rest of the fusion-prize column is a compiler, not a ca
 
 ## What this reorders
 
-**The largest gap is still the general fold, and the mechanism is now measured rather than guessed.**
-`scan_prefix` and `fold_sum_count` are 164–4761× off a trivial loop, and nothing else on the board is
-within two orders of magnitude. The lockstep fold is built to vectorize across *many short rows*;
-handed one long row it runs one round per element.
+**The largest gap is the general SCAN, and it is now alone there.**
+`scan_prefix` is 153–757× off a trivial loop; `fold_sum_count`, which used to sit beside it at
+2000–5000×, is 6.9–9.9× since the product-of-monoids recognition landed. The lockstep fold is built
+to vectorize across *many short rows*; handed one long row it runs one round per element.
 
-Two contributors have been removed and a third named. The body's graph is now PREPARED once outside
+Three contributors have been removed and a fourth named. The body's graph is PREPARED once outside
 the round loop (consumer counts and evaluation buffers computed per graph, not per call — see
-`graph::Prepared`), and `FoldScan` SCATTERS a fixed-width output straight into one column instead of
-keeping a `Value` and two `usize` per element and stitching at the end. Together: C4 255 → 175 ns/row
-at 1 M (1.45×) and C5 291 → 245 (1.19×).
+`graph::Prepared`); `FoldScan` SCATTERS a fixed-width output straight into one column instead of
+keeping a `Value` and two `usize` per element and stitching at the end; and a `Fold` whose body is a
+product of monoids does not run the loop at all. Together: C4 255 → 170 ns/row at 1 M (1.5×) and
+C5 291 → 0.44 (660×).
 
 **What is left is allocation, and it is most of what remains.** With one long row, a round processes
 ONE element, and it still allocates a one-element gather result, a two-element `Prod` for the body's
@@ -145,9 +146,12 @@ The cases still stratify by fixability:
 
 - **scalar-leaf monoid** (cumsum, running min/max/product/all/any) — **done.** `ArithOp::Scan(Red)`
   is a one-pass in-place kernel and C4k measures 1.1–1.8×.
-- **product-of-monoids accumulator** (`(sum, count)`) — a `Fold` whose body is a `Tuple` of per-field
-  monoid updates decomposes into independent `Reduce`s. This is C5, the worst row on the board, and
-  it needs a recognition pass rather than a new op.
+- **product-of-monoids accumulator** (`(sum, count)`) — **done.** A `Fold` whose body is a `Tuple`
+  of per-field monoid updates, each from a contribution that never reads the accumulator, is
+  `seed_i ⊕ reduce_i(list)` — one pass per field. Recognized at eval time in the NUMERIC layer
+  (`ops::numeric::monoid_fold`), since "is this op a monoid" is a numeric question and the core is
+  blind to it. C5 went 240 → 0.44 ns/row at 1 M, from the worst row on the board by two orders of
+  magnitude to a single-digit multiple of a fused loop.
 - **fixed-width non-monoid body** — inherently sequential, so the lever is the per-step constant, and
   what is left of that constant is per-round allocation. **One subcase is not inherently sequential:**
   an affine recurrence (`x[t+1] = a·x[t] + b`) is a monoid in disguise, since composition of affine
