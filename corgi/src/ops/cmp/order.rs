@@ -353,8 +353,7 @@ mod compare {
 }
 
 /// The first leaf a structural order reads, when the order starts at one: a `Prim`, or the leading
-/// field of a `Prod`, recursively. `List` and `Sum` order by length and by tag first, so they
-/// answer `None` and the caller has to do the structural pass.
+/// field of a `Prod`, recursively.
 fn leading_leaf(v: &Value) -> Option<&Prim> {
     match v {
         Value::Prim(p) => Some(p),
@@ -363,58 +362,108 @@ fn leading_leaf(v: &Value) -> Option<&Prim> {
     }
 }
 
-/// What one pass over the leading leaf settles about a column's order.
+/// What one pass over a column's LEADING component settles about its order. The leading component
+/// is whatever the structural order consults first: a leaf's value, a product's leading leaf, a
+/// list's ROW LENGTH (the order is length-first), a sum's TAG.
 enum Leading {
-    /// A row's leading leaf decreases: the column is NOT in order, whatever the later fields say.
+    /// It decreases somewhere: the column is NOT in order, whatever the rest says.
     Inversion,
-    /// Every row's leading leaf strictly increases, so it already separates every adjacent pair:
-    /// the column IS in order, and no later field is consulted (a lexicographic order stops at the
-    /// first component that decides). This is the compound key whose leading field is an
-    /// identifier or a hash — the shape DDIR sorts.
+    /// It strictly increases, so it already separates every adjacent pair: the column IS in order,
+    /// and nothing below it is consulted (a lexicographic order stops at the first component that
+    /// decides). This is the compound key whose leading field is an identifier or a hash — the
+    /// shape DDIR sorts.
     Strict,
-    /// Non-decreasing with equal neighbours: the later fields decide, so the structural pass runs.
+    /// Every row compares equal at every level (no payload at all): in order, trivially.
+    AllEqual,
+    /// Non-decreasing with equal neighbours: what lies below decides.
     Ties,
-    /// No leading leaf to read.
-    Unknown,
 }
 
-fn leading_order(bounds: &Bounds, vals: &Value) -> Leading {
-    let Some(p) = leading_leaf(vals) else { return Leading::Unknown };
+/// Scan a monotone per-element key within each row of `bounds`, with early exit at the first
+/// inversion.
+fn scan_key(bounds: &Bounds, key: impl Fn(usize) -> u64) -> Leading {
     let mut strict = true;
     let mut start = 0;
     for end in bounds.ends() {
-        match p.order_of_range(start, end) {
-            None => return Leading::Inversion,
-            Some(s) => strict &= s,
+        for i in start + 1..end {
+            let (a, b) = (key(i - 1), key(i));
+            if a > b {
+                return Leading::Inversion;
+            }
+            strict &= a != b;
         }
         start = end;
     }
     if strict { Leading::Strict } else { Leading::Ties }
 }
 
-/// Is every row of `bounds` already in non-decreasing structural order?
-///
-/// This is the question `sort`/`dedup`/`group` should ask before they sort. The answer is usually
-/// yes for the data a dataflow hands them (an arrangement batch is in key order by construction),
-/// a sort is 20-40x the cost of asking, and a wrong guess is impossible: this checks, it does not
-/// assume. An unsorted column exits at its first inversion, so the sort it was going to get anyway
-/// pays a few loads for the question.
-pub(crate) fn rows_sorted(bounds: &Bounds, vals: &Value) -> bool {
-    match leading_order(bounds, vals) {
-        Leading::Inversion => false,
-        // the leading leaf decided every pair — and for a bare leaf it IS the order.
-        Leading::Strict => true,
-        Leading::Ties if matches!(vals, Value::Prim(_)) => true,
-        Leading::Ties | Leading::Unknown => signs_sorted(bounds, &compare_adjacent(vals)),
+fn leading_order(bounds: &Bounds, vals: &Value) -> Leading {
+    match vals {
+        // no payload to compare: every row is equal to every other.
+        Value::Unit(_) => Leading::AllEqual,
+        Value::Prod(cols) if cols.is_empty() => Leading::AllEqual,
+        // the leaf scan is width-dispatched once, above the loop.
+        Value::Prim(_) | Value::Prod(_) => {
+            let Some(p) = leading_leaf(vals) else { return Leading::AllEqual };
+            let mut strict = true;
+            let mut start = 0;
+            for end in bounds.ends() {
+                match p.order_of_range(start, end) {
+                    None => return Leading::Inversion,
+                    Some(s) => strict &= s,
+                }
+                start = end;
+            }
+            if strict { Leading::Strict } else { Leading::Ties }
+        }
+        // length-first: a row's length is what the order reads before any element.
+        Value::List(inner, _) => scan_key(bounds, |i| {
+            let (s, e) = inner.span(i);
+            (e - s) as u64
+        }),
+        // tag-first.
+        Value::Sum(tags, _) => scan_key(bounds, |i| tags.tag_at(i) as u64),
     }
 }
 
-/// The adjacent-order signs of `vals` when every row is already in order — `None` when some row is
-/// not. The signs come back rather than a bool because they ARE what the sorted path needs next:
-/// `out[k]` compares flattened row `k` with row `k+1`, so a zero marks a duplicate and a nonzero a
-/// run boundary — the run structure `dedup` and `group` would otherwise sort to discover.
+/// Can we CHEAPLY establish that every row of `bounds` is already in non-decreasing structural
+/// order? `false` means "not established", which is not the same as "not sorted" — declining is
+/// always safe, since the caller then sorts.
+///
+/// This is the question `sort`/`dedup`/`group` should ask before they sort. The answer is usually
+/// yes for the data a dataflow hands them (an arrangement batch is in key order by construction), a
+/// sort is 20-40x the cost of asking, and a wrong guess is impossible: this checks, it does not
+/// assume. An unsorted column exits at its first inversion, so the sort it was going to get anyway
+/// pays a few loads for the question.
+///
+/// The CHEAPLY is load-bearing. A leaf settles the whole question in its own scan, and a product
+/// narrows to the surviving ties field by field, so its structural pass costs in proportion to what
+/// the leading field left undecided. A list or sum whose leading component ties would need a full
+/// structural pass, which is not cheaper than the sort it would save — so we decline rather than
+/// spend it on a question the sort answers anyway.
+pub(crate) fn known_sorted(bounds: &Bounds, vals: &Value) -> bool {
+    match leading_order(bounds, vals) {
+        Leading::Inversion => false,
+        Leading::Strict | Leading::AllEqual => true,
+        Leading::Ties => match vals {
+            Value::Prim(_) => true,
+            Value::Prod(_) => signs_sorted(bounds, &compare_adjacent(vals)),
+            _ => false,
+        },
+    }
+}
+
+/// The adjacent-order signs of `vals` when [`known_sorted`] holds — `None` otherwise. The signs
+/// come back rather than a bool because they ARE what the sorted path needs next: `out[k]` compares
+/// flattened row `k` with row `k+1`, so a zero marks a duplicate and a nonzero a run boundary — the
+/// run structure `dedup` and `group` would otherwise sort to discover.
 pub(crate) fn sorted_signs(bounds: &Bounds, vals: &Value) -> Option<Vec<i8>> {
-    if matches!(leading_order(bounds, vals), Leading::Inversion) {
+    let established = match leading_order(bounds, vals) {
+        Leading::Inversion => false,
+        Leading::Strict | Leading::AllEqual => true,
+        Leading::Ties => matches!(vals, Value::Prim(_) | Value::Prod(_)),
+    };
+    if !established {
         return None;
     }
     let signs = compare_adjacent(vals);

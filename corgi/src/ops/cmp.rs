@@ -9,7 +9,7 @@ pub(crate) mod order;
 
 use crate::engine::gather;
 use order::{
-    compare_cols, compare_idx, run_firsts, run_layout, rows_sorted, runs_per_row, segment_labels,
+    compare_cols, compare_idx, known_sorted, run_firsts, run_layout, runs_per_row, segment_labels,
     sort_blocks, sorted_signs,
 };
 use crate::shape::{same, shape_of_value};
@@ -100,7 +100,7 @@ impl CmpOp {
                 // Already ordered: the permutation is the identity, so the discrimination pass and
                 // the gather after it would together copy the column to reproduce it. See
                 // `sorted_signs` for why asking is worth it — a dataflow's batches arrive sorted.
-                if rows_sorted(&bounds, &vals) {
+                if known_sorted(&bounds, &vals) {
                     return Ok(Value::List(bounds, Box::new(vals)));
                 }
                 let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
