@@ -1,6 +1,13 @@
-//! Structural comparison and discrimination — the order machinery `sort`/`dedup`/`group`/`find` reduce to.
-//! Two coherent pieces: `mod compare` (the bulk structural comparator `compare_idx`, which `Rel` and `find`
-//! reduce to) and `mod discriminate` (the discrimination sort `sort` uses); both re-exported at this level.
+//! Structural order — the machinery `sort`/`dedup`/`group`/`find` reduce to, in four pieces, all
+//! re-exported at this level:
+//!
+//!   * `mod compare`     — the bulk structural comparator `compare_idx`, which `Rel` and `find` use
+//!   * `mod discriminate`— the discrimination sort, which `sort`/`dedup`/`group` use
+//!   * `mod merge`       — walking two sorted runs together, which a join uses
+//!   * `mod sortedness`  — "is it already in order, and what are its runs", which they ALL ask first
+//!
+//! [`compare_at`] stays at this level: it is the scalar front door, and every piece below is
+//! ultimately a way of not calling it once per row.
 
 use crate::engine::{gather, row_span};
 use crate::value::{Bounds, Prim, Tags, Value};
@@ -8,6 +15,8 @@ use std::cmp::Ordering;
 
 pub(crate) use compare::*;
 pub(crate) use discriminate::*;
+pub use merge::*;
+pub(crate) use sortedness::*;
 
 /// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
 /// scalar form of [`compare_idx`]; exposed (via `crate::arrange`) for using corgi columns as a
@@ -18,187 +27,6 @@ pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
         0 => Ordering::Equal,
         _ => Ordering::Greater,
     }
-}
-
-/// One report from [`survey`]: a maximal range drawn from one side of the interleaving, or a
-/// single matched pair present in both. The bidirectional generalization of `find_ranges`' report.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Run {
-    /// Rows `a[lo..hi)` come next in merged order, all strictly less than the current head of `b`
-    /// (exclusive to `a` over this range).
-    A(usize, usize),
-    /// Rows `b[lo..hi)` come next in merged order, all strictly less than the current head of `a`
-    /// (exclusive to `b` over this range).
-    B(usize, usize),
-    /// A single matched pair: row `a[ia]` and row `b[ib]` are structurally equal.
-    Both(usize, usize),
-}
-
-/// Advance `idx` while the supplied sorted-position predicate remains true. Exponential probe plus
-/// binary refinement costs `O(log gap)` comparisons rather than one per row.
-fn gallop_lt_by(idx: &mut usize, hi: usize, lt: impl Fn(usize) -> bool) {
-    // nothing to do unless the row at the cursor is itself still below the pivot.
-    if *idx < hi && lt(*idx) {
-        let mut step = 1;
-        while *idx + step < hi && lt(*idx + step) {
-            *idx += step;
-            step <<= 1;
-        }
-        // binary refine over the last (overshot) doubling.
-        step >>= 1;
-        while step > 0 {
-            if *idx + step < hi && lt(*idx + step) {
-                *idx += step;
-            }
-            step >>= 1;
-        }
-        // `*idx` sits on the last row `< piv`; step past it to the first row `>= piv`.
-        *idx += 1;
-    }
-}
-
-/// Shared zig-zag gallop over two sorted domains with a caller-supplied comparison.
-///
-/// Surveying mutual interleaving returns a sequence of [`Run`]s — maximal ranges exclusive to one
-/// side and the single matched pairs present in both — instead of a per-pair two-pointer. The
-/// bidirectional generalization of `find_ranges` (the one-directional needle-into-haystack gallop).
-///
-/// The caller bulk-`gather`s each `A`/`B` range and consolidates only at the `Both` pairs, so the
-/// merge crosses the corgi/Rust boundary once per *range* rather than once per *row*. This owns no
-/// times/diffs: it reports only positions, and the caller drives its own lattice logic off the runs.
-///
-/// Guarantees: the `A` ranges plus every `Both`'s `ia` cover `0..a.len()` in order with no gap or
-/// overlap (`b` likewise via `hi`/`ib`); expanding the runs to their rows yields a non-decreasing
-/// structural sequence; every `Both(ia, ib)` has `compare_at(a, ia, b, ib) == Equal`. Equal
-/// duplicates within one side after the match fall through as follow-on `A`/`B` runs (as in DD's
-/// `trie_merger::survey`, the reference this ports).
-fn survey_by(
-    na: usize,
-    nb: usize,
-    compare: impl Fn(usize, usize) -> Ordering,
-) -> Vec<Run> {
-    let (mut i, mut j) = (0usize, 0usize);
-    let mut out = Vec::new();
-    while i < na && j < nb {
-        match compare(i, j) {
-            Ordering::Less => {
-                let start = i;
-                i += 1;
-                gallop_lt_by(&mut i, na, |k| compare(k, j) == Ordering::Less);
-                out.push(Run::A(start, i));
-            }
-            Ordering::Equal => {
-                out.push(Run::Both(i, j));
-                i += 1;
-                j += 1;
-            }
-            Ordering::Greater => {
-                let start = j;
-                j += 1;
-                gallop_lt_by(&mut j, nb, |k| compare(i, k) == Ordering::Greater);
-                out.push(Run::B(start, j));
-            }
-        }
-    }
-    // one side exhausted: the remainder of the other is a single trailing run.
-    if i < na {
-        out.push(Run::A(i, na));
-    }
-    if j < nb {
-        out.push(Run::B(j, nb));
-    }
-    out
-}
-
-/// Survey two structurally-sorted columns, hoisting primitive-width dispatch out of the gallop.
-pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
-    match (a, b) {
-        (Value::Prim(Prim::U8(a)), Value::Prim(Prim::U8(b))) => {
-            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
-        }
-        (Value::Prim(Prim::U16(a)), Value::Prim(Prim::U16(b))) => {
-            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
-        }
-        (Value::Prim(Prim::U32(a)), Value::Prim(Prim::U32(b))) => {
-            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
-        }
-        (Value::Prim(Prim::U64(a)), Value::Prim(Prim::U64(b))) => {
-            survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
-        }
-        _ => survey_by(a.len(), b.len(), |i, j| compare_at(a, i, b, j)),
-    }
-}
-
-/// Equal-range of every element of a SORTED needle in its haystack row: one forward walk with
-/// galloping, instead of an independent binary search per probe.
-///
-/// This is the one-directional form of [`survey`] — same kernel, same gallop — for the shape the
-/// surface join has: both sides in key order, and the question "where does each needle sit". A
-/// per-probe search costs `|needle| * log|haystack|` comparisons and cannot use the fact that the
-/// probes are ordered; a merged walk costs `|needle| + |haystack|` in the worst case and much less
-/// when the needle is dense, because the cursor never goes backwards.
-///
-/// LEAF ONLY (`None` otherwise), and deliberately: the generic comparator allocates per call, which
-/// a per-element gallop cannot afford, and the shape this exists for is the scalar or hashed key.
-/// Everything else keeps the batched search, which is batched precisely so it does not pay that.
-pub(crate) fn find_ranges_sorted(
-    nb: &Bounds,
-    nvals: &Value,
-    hb: &Bounds,
-    hvals: &Value,
-) -> Option<(Vec<u64>, Vec<u64>)> {
-    fn walk<T: Ord + Copy>(nb: &Bounds, hb: &Bounds, needles: &[T], hay: &[T]) -> (Vec<u64>, Vec<u64>) {
-        let n = needles.len();
-        let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        let (mut ns, mut hs) = (0usize, 0usize);
-        for r in 0..nb.len() {
-            let (ne, he) = (nb.end(r), hb.end(r));
-            let mut cursor = hs; // monotone within the row: the needles are ordered
-            for &want in &needles[ns..ne] {
-                let mut lo = cursor;
-                gallop_lt_by(&mut lo, he, |j| hay[j] < want);
-                let mut hi = lo;
-                gallop_lt_by(&mut hi, he, |j| hay[j] <= want);
-                lo_c.push((lo - hs) as u64);
-                hi_c.push((hi - hs) as u64);
-                // resume from `lo`, not `hi`: a repeated needle must find the same range, and the
-                // gallop from `lo` then costs nothing.
-                cursor = lo;
-            }
-            ns = ne;
-            hs = he;
-        }
-        (lo_c, hi_c)
-    }
-    match (nvals, hvals) {
-        (Value::Prim(Prim::U8(nv)), Value::Prim(Prim::U8(hv))) => Some(walk(nb, hb, nv, hv)),
-        (Value::Prim(Prim::U16(nv)), Value::Prim(Prim::U16(hv))) => Some(walk(nb, hb, nv, hv)),
-        (Value::Prim(Prim::U32(nv)), Value::Prim(Prim::U32(hv))) => Some(walk(nb, hb, nv, hv)),
-        (Value::Prim(Prim::U64(nv)), Value::Prim(Prim::U64(hv))) => Some(walk(nb, hb, nv, hv)),
-        _ => None,
-    }
-}
-
-/// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
-/// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
-/// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
-/// single-column analogue of the equal-key boundaries a [`survey`] reveals across two runs, and the
-/// `Value`-column counterpart of [`run_layout`]'s `ends` (which reads a precomputed labels vector).
-pub fn group_bounds(keys: &Value) -> Vec<usize> {
-    let n = keys.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k.
-    let signs = compare_adjacent(keys);
-    let mut ends = Vec::new();
-    for (k, &s) in signs.iter().enumerate() {
-        if s != 0 {
-            ends.push(k + 1);
-        }
-    }
-    ends.push(n);
-    ends
 }
 
 mod compare {
@@ -402,152 +230,362 @@ mod compare {
     }
 }
 
-/// The first leaf a structural order reads, when the order starts at one: a `Prim`, or the leading
-/// field of a `Prod`, recursively.
-fn leading_leaf(v: &Value) -> Option<&Prim> {
-    match v {
-        Value::Prim(p) => Some(p),
-        Value::Prod(cols) => cols.first().and_then(leading_leaf),
-        _ => None,
+mod merge {
+    //! Walking two sorted domains together. [`survey`] reports the whole interleaving of two runs;
+    //! [`find_ranges_sorted`] is its one-directional form, where only one side is being placed. Both
+    //! GALLOP rather than step, so a cursor that is far from its answer costs `O(log gap)` rather
+    //! than one comparison per row — and neither ever goes backwards, which is what makes a merge
+    //! `|a| + |b|` where a per-probe search is `|a| · log|b|`.
+
+    use super::*;
+
+    /// One report from [`survey`]: a maximal range drawn from one side of the interleaving, or a
+    /// single matched pair present in both. The bidirectional generalization of `find_ranges`' report.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Run {
+        /// Rows `a[lo..hi)` come next in merged order, all strictly less than the current head of `b`
+        /// (exclusive to `a` over this range).
+        A(usize, usize),
+        /// Rows `b[lo..hi)` come next in merged order, all strictly less than the current head of `a`
+        /// (exclusive to `b` over this range).
+        B(usize, usize),
+        /// A single matched pair: row `a[ia]` and row `b[ib]` are structurally equal.
+        Both(usize, usize),
     }
-}
 
-/// What one pass over a column's LEADING component settles about its order. The leading component
-/// is whatever the structural order consults first: a leaf's value, a product's leading leaf, a
-/// list's ROW LENGTH (the order is length-first), a sum's TAG.
-enum Leading {
-    /// It decreases somewhere: the column is NOT in order, whatever the rest says.
-    Inversion,
-    /// It strictly increases, so it already separates every adjacent pair: the column IS in order,
-    /// and nothing below it is consulted (a lexicographic order stops at the first component that
-    /// decides). This is the compound key whose leading field is an identifier or a hash — the
-    /// shape DDIR sorts.
-    Strict,
-    /// Every row compares equal at every level (no payload at all): in order, trivially.
-    AllEqual,
-    /// Non-decreasing with equal neighbours: what lies below decides.
-    Ties,
-}
-
-/// Scan a monotone per-element key within each row of `bounds`, with early exit at the first
-/// inversion.
-fn scan_key(bounds: &Bounds, key: impl Fn(usize) -> u64) -> Leading {
-    let mut strict = true;
-    let mut start = 0;
-    for end in bounds.ends() {
-        for i in start + 1..end {
-            let (a, b) = (key(i - 1), key(i));
-            if a > b {
-                return Leading::Inversion;
+    /// Advance `idx` while the supplied sorted-position predicate remains true. Exponential probe plus
+    /// binary refinement costs `O(log gap)` comparisons rather than one per row.
+    fn gallop_lt_by(idx: &mut usize, hi: usize, lt: impl Fn(usize) -> bool) {
+        // nothing to do unless the row at the cursor is itself still below the pivot.
+        if *idx < hi && lt(*idx) {
+            let mut step = 1;
+            while *idx + step < hi && lt(*idx + step) {
+                *idx += step;
+                step <<= 1;
             }
-            strict &= a != b;
-        }
-        start = end;
-    }
-    if strict { Leading::Strict } else { Leading::Ties }
-}
-
-fn leading_order(bounds: &Bounds, vals: &Value) -> Leading {
-    match vals {
-        // no payload to compare: every row is equal to every other.
-        Value::Unit(_) => Leading::AllEqual,
-        Value::Prod(cols) if cols.is_empty() => Leading::AllEqual,
-        // the leaf scan is width-dispatched once, above the loop.
-        Value::Prim(_) | Value::Prod(_) => {
-            let Some(p) = leading_leaf(vals) else { return Leading::AllEqual };
-            let mut strict = true;
-            let mut start = 0;
-            for end in bounds.ends() {
-                match p.order_of_range(start, end) {
-                    None => return Leading::Inversion,
-                    Some(s) => strict &= s,
+            // binary refine over the last (overshot) doubling.
+            step >>= 1;
+            while step > 0 {
+                if *idx + step < hi && lt(*idx + step) {
+                    *idx += step;
                 }
-                start = end;
+                step >>= 1;
             }
-            if strict { Leading::Strict } else { Leading::Ties }
+            // `*idx` sits on the last row `< piv`; step past it to the first row `>= piv`.
+            *idx += 1;
         }
-        // length-first: a row's length is what the order reads before any element.
-        Value::List(inner, _) => scan_key(bounds, |i| {
-            let (s, e) = inner.span(i);
-            (e - s) as u64
-        }),
-        // tag-first.
-        Value::Sum(tags, _) => scan_key(bounds, |i| tags.tag_at(i) as u64),
     }
-}
 
-/// Can we CHEAPLY establish that every row of `bounds` is already in non-decreasing structural
-/// order? `false` means "not established", which is not the same as "not sorted" — declining is
-/// always safe, since the caller then sorts.
-///
-/// This is the question `sort`/`dedup`/`group` should ask before they sort. The answer is usually
-/// yes for the data a dataflow hands them (an arrangement batch is in key order by construction), a
-/// sort is 20-40x the cost of asking, and a wrong guess is impossible: this checks, it does not
-/// assume. An unsorted column exits at its first inversion, so the sort it was going to get anyway
-/// pays a few loads for the question.
-///
-/// The CHEAPLY is load-bearing. A leaf settles the whole question in its own scan, and a product
-/// narrows to the surviving ties field by field, so its structural pass costs in proportion to what
-/// the leading field left undecided. A list or sum whose leading component ties would need a full
-/// structural pass, which is not cheaper than the sort it would save — so we decline rather than
-/// spend it on a question the sort answers anyway.
-pub(crate) fn known_sorted(bounds: &Bounds, vals: &Value) -> bool {
-    match leading_order(bounds, vals) {
-        Leading::Inversion => false,
-        Leading::Strict | Leading::AllEqual => true,
-        Leading::Ties => match vals {
-            Value::Prim(_) => true,
-            Value::Prod(_) => signs_sorted(bounds, &compare_adjacent(vals)),
-            _ => false,
-        },
-    }
-}
-
-/// The adjacent-order signs of `vals` when [`known_sorted`] holds — `None` otherwise. The signs
-/// come back rather than a bool because they ARE what the sorted path needs next: `out[k]` compares
-/// flattened row `k` with row `k+1`, so a zero marks a duplicate and a nonzero a run boundary — the
-/// run structure `dedup` and `group` would otherwise sort to discover.
-pub(crate) fn sorted_signs(bounds: &Bounds, vals: &Value) -> Option<Vec<i8>> {
-    let established = match leading_order(bounds, vals) {
-        Leading::Inversion => false,
-        Leading::Strict | Leading::AllEqual => true,
-        Leading::Ties => matches!(vals, Value::Prim(_) | Value::Prod(_)),
-    };
-    if !established {
-        return None;
-    }
-    let signs = compare_adjacent(vals);
-    signs_sorted(bounds, &signs).then_some(signs)
-}
-
-/// Do the adjacent signs describe rows that are each non-decreasing? Row boundaries are skipped: a
-/// row's last element may exceed the next row's first without the column being out of order.
-fn signs_sorted(bounds: &Bounds, signs: &[i8]) -> bool {
-    let mut start = 0;
-    for end in bounds.ends() {
-        if end > start && signs[start..end - 1].iter().any(|&o| o > 0) {
-            return false;
-        }
-        start = end;
-    }
-    true
-}
-
-/// First index of each maximal equal-value run, given per-row `bounds` and the adjacent signs of an
-/// already-sorted column ([`sorted_signs`]). A row boundary always starts a run, since runs never
-/// cross rows — the same partition [`run_layout`] reads off a sorted column's refined labels.
-pub(crate) fn run_firsts(bounds: &Bounds, signs: &[i8]) -> Vec<usize> {
-    let mut firsts = Vec::new();
-    let mut start = 0;
-    for end in bounds.ends() {
-        for k in start..end {
-            if k == start || signs[k - 1] != 0 {
-                firsts.push(k);
+    /// Shared zig-zag gallop over two sorted domains with a caller-supplied comparison.
+    ///
+    /// Surveying mutual interleaving returns a sequence of [`Run`]s — maximal ranges exclusive to one
+    /// side and the single matched pairs present in both — instead of a per-pair two-pointer. The
+    /// bidirectional generalization of `find_ranges` (the one-directional needle-into-haystack gallop).
+    ///
+    /// The caller bulk-`gather`s each `A`/`B` range and consolidates only at the `Both` pairs, so the
+    /// merge crosses the corgi/Rust boundary once per *range* rather than once per *row*. This owns no
+    /// times/diffs: it reports only positions, and the caller drives its own lattice logic off the runs.
+    ///
+    /// Guarantees: the `A` ranges plus every `Both`'s `ia` cover `0..a.len()` in order with no gap or
+    /// overlap (`b` likewise via `hi`/`ib`); expanding the runs to their rows yields a non-decreasing
+    /// structural sequence; every `Both(ia, ib)` has `compare_at(a, ia, b, ib) == Equal`. Equal
+    /// duplicates within one side after the match fall through as follow-on `A`/`B` runs (as in DD's
+    /// `trie_merger::survey`, the reference this ports).
+    pub(super) fn survey_by(
+        na: usize,
+        nb: usize,
+        compare: impl Fn(usize, usize) -> Ordering,
+    ) -> Vec<Run> {
+        let (mut i, mut j) = (0usize, 0usize);
+        let mut out = Vec::new();
+        while i < na && j < nb {
+            match compare(i, j) {
+                Ordering::Less => {
+                    let start = i;
+                    i += 1;
+                    gallop_lt_by(&mut i, na, |k| compare(k, j) == Ordering::Less);
+                    out.push(Run::A(start, i));
+                }
+                Ordering::Equal => {
+                    out.push(Run::Both(i, j));
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    let start = j;
+                    j += 1;
+                    gallop_lt_by(&mut j, nb, |k| compare(i, k) == Ordering::Greater);
+                    out.push(Run::B(start, j));
+                }
             }
         }
-        start = end;
+        // one side exhausted: the remainder of the other is a single trailing run.
+        if i < na {
+            out.push(Run::A(i, na));
+        }
+        if j < nb {
+            out.push(Run::B(j, nb));
+        }
+        out
     }
-    firsts
+
+    /// Survey two structurally-sorted columns, hoisting primitive-width dispatch out of the gallop.
+    pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
+        match (a, b) {
+            (Value::Prim(Prim::U8(a)), Value::Prim(Prim::U8(b))) => {
+                survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+            }
+            (Value::Prim(Prim::U16(a)), Value::Prim(Prim::U16(b))) => {
+                survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+            }
+            (Value::Prim(Prim::U32(a)), Value::Prim(Prim::U32(b))) => {
+                survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+            }
+            (Value::Prim(Prim::U64(a)), Value::Prim(Prim::U64(b))) => {
+                survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
+            }
+            _ => survey_by(a.len(), b.len(), |i, j| compare_at(a, i, b, j)),
+        }
+    }
+
+    /// Equal-range of every element of a SORTED needle in its haystack row: one forward walk with
+    /// galloping, instead of an independent binary search per probe.
+    ///
+    /// This is the one-directional form of [`survey`] — same kernel, same gallop — for the shape the
+    /// surface join has: both sides in key order, and the question "where does each needle sit". A
+    /// per-probe search costs `|needle| * log|haystack|` comparisons and cannot use the fact that the
+    /// probes are ordered; a merged walk costs `|needle| + |haystack|` in the worst case and much less
+    /// when the needle is dense, because the cursor never goes backwards.
+    ///
+    /// LEAF ONLY (`None` otherwise), and deliberately: the generic comparator allocates per call, which
+    /// a per-element gallop cannot afford, and the shape this exists for is the scalar or hashed key.
+    /// Everything else keeps the batched search, which is batched precisely so it does not pay that.
+    pub(crate) fn find_ranges_sorted(
+        nb: &Bounds,
+        nvals: &Value,
+        hb: &Bounds,
+        hvals: &Value,
+    ) -> Option<(Vec<u64>, Vec<u64>)> {
+        fn walk<T: Ord + Copy>(nb: &Bounds, hb: &Bounds, needles: &[T], hay: &[T]) -> (Vec<u64>, Vec<u64>) {
+            let n = needles.len();
+            let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
+            let (mut ns, mut hs) = (0usize, 0usize);
+            for r in 0..nb.len() {
+                let (ne, he) = (nb.end(r), hb.end(r));
+                let mut cursor = hs; // monotone within the row: the needles are ordered
+                for &want in &needles[ns..ne] {
+                    let mut lo = cursor;
+                    gallop_lt_by(&mut lo, he, |j| hay[j] < want);
+                    let mut hi = lo;
+                    gallop_lt_by(&mut hi, he, |j| hay[j] <= want);
+                    lo_c.push((lo - hs) as u64);
+                    hi_c.push((hi - hs) as u64);
+                    // resume from `lo`, not `hi`: a repeated needle must find the same range, and the
+                    // gallop from `lo` then costs nothing.
+                    cursor = lo;
+                }
+                ns = ne;
+                hs = he;
+            }
+            (lo_c, hi_c)
+        }
+        match (nvals, hvals) {
+            (Value::Prim(Prim::U8(nv)), Value::Prim(Prim::U8(hv))) => Some(walk(nb, hb, nv, hv)),
+            (Value::Prim(Prim::U16(nv)), Value::Prim(Prim::U16(hv))) => Some(walk(nb, hb, nv, hv)),
+            (Value::Prim(Prim::U32(nv)), Value::Prim(Prim::U32(hv))) => Some(walk(nb, hb, nv, hv)),
+            (Value::Prim(Prim::U64(nv)), Value::Prim(Prim::U64(hv))) => Some(walk(nb, hb, nv, hv)),
+            _ => None,
+        }
+    }
+}
+
+mod sortedness {
+    //! Is this column ALREADY in order, and if so what are its runs?
+    //!
+    //! The question `sort`/`dedup`/`group` should ask before they sort, because the answer is
+    //! usually yes for the data a dataflow hands them and a sort is 20-40x the cost of asking. It
+    //! is answered from the LEADING component of the structural order — a leaf's value, a product's
+    //! leading leaf, a list's row LENGTH, a sum's TAG — which can settle the question in EITHER
+    //! direction in one pass: an inversion rules the column out whatever follows, and a strictly
+    //! increasing leading component rules it in, because a lexicographic order whose first component
+    //! separates every adjacent pair never consults the rest.
+    //!
+    //! Everything here answers CHEAPLY or declines; declining is always safe, since the caller then
+    //! sorts. [`sorted_signs`] returns the adjacent-order signs rather than a bool because they ARE
+    //! the run structure the sorted path needs next — a zero is a duplicate, a nonzero a boundary —
+    //! which is what `dedup` and `group` would otherwise sort to discover.
+
+    use super::*;
+
+    /// The first leaf a structural order reads, when the order starts at one: a `Prim`, or the leading
+    /// field of a `Prod`, recursively.
+    fn leading_leaf(v: &Value) -> Option<&Prim> {
+        match v {
+            Value::Prim(p) => Some(p),
+            Value::Prod(cols) => cols.first().and_then(leading_leaf),
+            _ => None,
+        }
+    }
+
+    /// What one pass over a column's LEADING component settles about its order. The leading component
+    /// is whatever the structural order consults first: a leaf's value, a product's leading leaf, a
+    /// list's ROW LENGTH (the order is length-first), a sum's TAG.
+    enum Leading {
+        /// It decreases somewhere: the column is NOT in order, whatever the rest says.
+        Inversion,
+        /// It strictly increases, so it already separates every adjacent pair: the column IS in order,
+        /// and nothing below it is consulted (a lexicographic order stops at the first component that
+        /// decides). This is the compound key whose leading field is an identifier or a hash — the
+        /// shape DDIR sorts.
+        Strict,
+        /// Every row compares equal at every level (no payload at all): in order, trivially.
+        AllEqual,
+        /// Non-decreasing with equal neighbours: what lies below decides.
+        Ties,
+    }
+
+    /// Scan a monotone per-element key within each row of `bounds`, with early exit at the first
+    /// inversion.
+    fn scan_key(bounds: &Bounds, key: impl Fn(usize) -> u64) -> Leading {
+        let mut strict = true;
+        let mut start = 0;
+        for end in bounds.ends() {
+            for i in start + 1..end {
+                let (a, b) = (key(i - 1), key(i));
+                if a > b {
+                    return Leading::Inversion;
+                }
+                strict &= a != b;
+            }
+            start = end;
+        }
+        if strict { Leading::Strict } else { Leading::Ties }
+    }
+
+    fn leading_order(bounds: &Bounds, vals: &Value) -> Leading {
+        match vals {
+            // no payload to compare: every row is equal to every other.
+            Value::Unit(_) => Leading::AllEqual,
+            Value::Prod(cols) if cols.is_empty() => Leading::AllEqual,
+            // the leaf scan is width-dispatched once, above the loop.
+            Value::Prim(_) | Value::Prod(_) => {
+                let Some(p) = leading_leaf(vals) else { return Leading::AllEqual };
+                let mut strict = true;
+                let mut start = 0;
+                for end in bounds.ends() {
+                    match p.order_of_range(start, end) {
+                        None => return Leading::Inversion,
+                        Some(s) => strict &= s,
+                    }
+                    start = end;
+                }
+                if strict { Leading::Strict } else { Leading::Ties }
+            }
+            // length-first: a row's length is what the order reads before any element.
+            Value::List(inner, _) => scan_key(bounds, |i| {
+                let (s, e) = inner.span(i);
+                (e - s) as u64
+            }),
+            // tag-first.
+            Value::Sum(tags, _) => scan_key(bounds, |i| tags.tag_at(i) as u64),
+        }
+    }
+
+    /// Can we CHEAPLY establish that every row of `bounds` is already in non-decreasing structural
+    /// order? `false` means "not established", which is not the same as "not sorted" — declining is
+    /// always safe, since the caller then sorts.
+    ///
+    /// This is the question `sort`/`dedup`/`group` should ask before they sort. The answer is usually
+    /// yes for the data a dataflow hands them (an arrangement batch is in key order by construction), a
+    /// sort is 20-40x the cost of asking, and a wrong guess is impossible: this checks, it does not
+    /// assume. An unsorted column exits at its first inversion, so the sort it was going to get anyway
+    /// pays a few loads for the question.
+    ///
+    /// The CHEAPLY is load-bearing. A leaf settles the whole question in its own scan, and a product
+    /// narrows to the surviving ties field by field, so its structural pass costs in proportion to what
+    /// the leading field left undecided. A list or sum whose leading component ties would need a full
+    /// structural pass, which is not cheaper than the sort it would save — so we decline rather than
+    /// spend it on a question the sort answers anyway.
+    pub(crate) fn known_sorted(bounds: &Bounds, vals: &Value) -> bool {
+        match leading_order(bounds, vals) {
+            Leading::Inversion => false,
+            Leading::Strict | Leading::AllEqual => true,
+            Leading::Ties => match vals {
+                Value::Prim(_) => true,
+                Value::Prod(_) => signs_sorted(bounds, &compare_adjacent(vals)),
+                _ => false,
+            },
+        }
+    }
+
+    /// The adjacent-order signs of `vals` when [`known_sorted`] holds — `None` otherwise. The signs
+    /// come back rather than a bool because they ARE what the sorted path needs next: `out[k]` compares
+    /// flattened row `k` with row `k+1`, so a zero marks a duplicate and a nonzero a run boundary — the
+    /// run structure `dedup` and `group` would otherwise sort to discover.
+    pub(crate) fn sorted_signs(bounds: &Bounds, vals: &Value) -> Option<Vec<i8>> {
+        let established = match leading_order(bounds, vals) {
+            Leading::Inversion => false,
+            Leading::Strict | Leading::AllEqual => true,
+            Leading::Ties => matches!(vals, Value::Prim(_) | Value::Prod(_)),
+        };
+        if !established {
+            return None;
+        }
+        let signs = compare_adjacent(vals);
+        signs_sorted(bounds, &signs).then_some(signs)
+    }
+
+    /// Do the adjacent signs describe rows that are each non-decreasing? Row boundaries are skipped: a
+    /// row's last element may exceed the next row's first without the column being out of order.
+    fn signs_sorted(bounds: &Bounds, signs: &[i8]) -> bool {
+        let mut start = 0;
+        for end in bounds.ends() {
+            if end > start && signs[start..end - 1].iter().any(|&o| o > 0) {
+                return false;
+            }
+            start = end;
+        }
+        true
+    }
+
+    /// First index of each maximal equal-value run, given per-row `bounds` and the adjacent signs of an
+    /// already-sorted column ([`sorted_signs`]). A row boundary always starts a run, since runs never
+    /// cross rows — the same partition [`run_layout`] reads off a sorted column's refined labels.
+    pub(crate) fn run_firsts(bounds: &Bounds, signs: &[i8]) -> Vec<usize> {
+        let mut firsts = Vec::new();
+        let mut start = 0;
+        for end in bounds.ends() {
+            for k in start..end {
+                if k == start || signs[k - 1] != 0 {
+                    firsts.push(k);
+                }
+            }
+            start = end;
+        }
+        firsts
+    }
+
+    /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
+    /// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
+    /// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
+    /// single-column analogue of the equal-key boundaries a [`survey`] reveals across two runs, and the
+    /// `Value`-column counterpart of [`run_layout`]'s `ends` (which reads a precomputed labels vector).
+    pub fn group_bounds(keys: &Value) -> Vec<usize> {
+        let n = keys.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k.
+        let signs = compare_adjacent(keys);
+        let mut ends = Vec::new();
+        for (k, &s) in signs.iter().enumerate() {
+            if s != 0 {
+                ends.push(k + 1);
+            }
+        }
+        ends.push(n);
+        ends
+    }
 }
 
 mod discriminate {
@@ -847,6 +885,7 @@ mod discriminate {
 
 #[cfg(test)]
 mod tests {
+    use super::merge::survey_by;
     use super::*;
 
     fn u(xs: &[u64]) -> Value {
