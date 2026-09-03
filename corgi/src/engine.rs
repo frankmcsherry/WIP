@@ -40,20 +40,32 @@ mod generators {
 
     /// the mask family: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
     /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`.
-    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
-        let mut idx = Vec::new();
-        let mut nb = Vec::with_capacity(bounds.len());
-        let mut start = 0;
-        for end in bounds.ends() {
-            for (off, &b) in mask[start..end].iter().enumerate() {
-                if b != 0 {
-                    idx.push(start + off);
+    ///
+    /// The mask's WIDTH is the producer's choice — the core's idiom is "nonzero is true" and a leaf
+    /// is width-tagged — so this dispatches it once, above the pass, rather than making the caller
+    /// normalize (which would be a pass over the mask to save nothing).
+    pub(crate) fn filter_mask(bounds: &Bounds, mask: &Prim) -> (Vec<usize>, Vec<usize>) {
+        fn scan<T: Copy + Default + PartialEq>(bounds: &Bounds, m: &[T]) -> (Vec<usize>, Vec<usize>) {
+            let mut idx = Vec::new();
+            let mut nb = Vec::with_capacity(bounds.len());
+            let mut start = 0;
+            for end in bounds.ends() {
+                for (off, b) in m[start..end].iter().enumerate() {
+                    if *b != T::default() {
+                        idx.push(start + off);
+                    }
                 }
+                nb.push(idx.len()); // cumulative survivors = this row's end offset
+                start = end;
             }
-            nb.push(idx.len()); // cumulative survivors = this row's end offset
-            start = end;
+            (idx, nb)
         }
-        (idx, nb)
+        match mask {
+            Prim::U8(v) => scan(bounds, v),
+            Prim::U16(v) => scan(bounds, v),
+            Prim::U32(v) => scan(bounds, v),
+            Prim::U64(v) => scan(bounds, v),
+        }
     }
 
     /// the capture family: expand a list's `bounds` to the owner row of each element — `[2,3,6]` →

@@ -315,7 +315,8 @@ pub(crate) fn try_slices(input: Value) -> Result<Value, String> {
     Ok(fail(&err, Value::List(outer.into(), Box::new(mats))))
 }
 
-/// `(data:List<X>, mask:List<U64>) -> Fail<List<X>>`: per row, data and mask must agree in length.
+/// `(data:List<X>, mask:List<M>) -> Fail<List<X>>`: per row, data and mask must agree in length.
+/// The mask's WIDTH is the producer's choice — `Rel` makes a byte mask — so this reads any leaf.
 pub(crate) fn try_filter(input: Value) -> Result<Value, String> {
     let (data, mask) = input.into_pair("TryFilter")?;
     let (db, dvals) = data.into_list("TryFilter data")?;
@@ -368,7 +369,8 @@ pub(crate) fn try_chunk(k: usize, input: Value) -> Result<Value, String> {
     Ok(fail(&err, Value::List(outer.into(), Box::new(inner))))
 }
 
-/// `(X, tags:U64) -> Fail<Sum{X × n}>`: the demux; a tag `>= n` errs its row.
+/// `(X, tags:T) -> Fail<Sum{X × n}>`: the demux; a tag `>= n` errs its row. The discriminant's
+/// width is the producer's choice, as a mask's is: a `branch 2` is routinely fed a `Rel` mask.
 pub(crate) fn try_branch(n: usize, input: Value) -> Result<Value, String> {
     let (data, tags_v) = input.into_pair("TryBranch")?;
     let tags = tags_v.as_u64("TryBranch tags")?;

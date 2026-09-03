@@ -507,20 +507,22 @@ macro_rules! prim {
                 }
             }
 
-            /// stable LSD byte-radix over a mutable index slice, IN PLACE (`tmp` is caller
-            /// scratch, resized as needed and reusable across calls — a refinement pass calls
-            /// this once per block, and per-block allocations dominated a join-heavy profile).
-            /// A counting sort per *significant* byte (high all-zero bytes skipped); blocks of
-            /// <= 16 take a stable insertion sort instead — the radix set-up dwarfs tiny
-            /// blocks, the common case once a prior pass has split the column into groups.
-            pub(crate) fn sort_block_scratch(&self, idx: &mut [usize], tmp: &mut Vec<usize>) {
+            /// Stable sort of `idx` by this column's values, IN PLACE — the PERMUTATION sort,
+            /// for a caller that has a payload to move alongside or labels to refine. `scratch` is
+            /// caller-owned and reused across every block of a column.
+            ///
+            /// The key of each row is materialized ONCE and travels with the permutation from
+            /// there (see [`radix_perm_by_keys`]); blocks of 32 or fewer take a stable insertion
+            /// sort instead, since the radix set-up dwarfs a tiny block and tiny blocks are the
+            /// common case once a prior pass has split the column into groups.
+            pub(crate) fn sort_block_scratch(&self, idx: &mut [usize], scratch: &mut SortScratch) {
                 match self {
                     $( Prim::$V(v) => {
                         let n = idx.len();
                         if n <= 1 {
                             return;
                         }
-                        if n <= 16 {
+                        if n <= 32 {
                             for k in 1..n {
                                 let mut j = k;
                                 while j > 0 && v[idx[j - 1]] > v[idx[j]] {
@@ -530,48 +532,87 @@ macro_rules! prim {
                             }
                             return;
                         }
-                        let max = idx.iter().map(|&i| v[i]).max().unwrap_or(0);
-                        let bits = std::mem::size_of::<$t>() * 8;
-                        let nbytes = (bits - max.leading_zeros() as usize).div_ceil(8);
-                        if tmp.len() < n {
-                            tmp.resize(n, 0);
+                        // more rows than a `u32` counter can hold (see `COUNTED_MAX`). One branch
+                        // covers both permutation paths, since it sits above their dispatch;
+                        // `sort_by_key` is stable, which is what those promise.
+                        if n > sorting::COUNTED_MAX {
+                            idx.sort_by_key(|&i| v[i]);
+                            return;
                         }
-                        let mut src_is_idx = true;
-                        for byte in 0..nbytes {
-                            let shift = (byte * 8) as u32;
-                            let mut counts = [0usize; 256];
-                            {
-                                let src: &[usize] = if src_is_idx { &idx[..] } else { &tmp[..n] };
-                                for &i in src {
-                                    counts[((v[i] >> shift) & 0xff) as usize] += 1;
+                        let max = idx.iter().map(|&i| v[i] as u64).max().unwrap_or(0);
+                        let sig = 64 - max.leading_zeros();
+                        if sig == 0 {
+                            return; // every key equal: the identity is already the stable answer
+                        }
+                        let d = sorting::digit_width(n);
+                        if sig <= d {
+                            // one digit covers the key: nothing to carry (see `single_pass_perm`).
+                            sorting::single_pass_perm(idx, scratch, d, |i| v[i] as u64);
+                            return;
+                        }
+                        // the one indirect read; widened to u64 so the radix itself is written once.
+                        scratch.load_keys(idx.iter().map(|&i| v[i] as u64));
+                        sorting::radix_perm_by_keys(idx, scratch, d, sig);
+                    } )+
+                }
+            }
+
+            /// The order of `self[lo..hi]` in one pass: `None` at the first inversion, else
+            /// whether the range is STRICTLY increasing (no two neighbours equal). Both answers
+            /// carry: an inversion settles that a column is unsorted whatever follows the leading
+            /// leaf, and strict increase settles that it IS sorted, since a lexicographic order
+            /// whose leading component already separates every pair never consults the rest.
+            /// The scan exits at the first inversion, so an unsorted column costs a few loads.
+            pub(crate) fn order_of_range(&self, lo: usize, hi: usize) -> Option<bool> {
+                match self {
+                    $( Prim::$V(v) => {
+                        let mut strict = true;
+                        for w in v[lo..hi].windows(2) {
+                            if w[0] > w[1] { return None; }
+                            strict &= w[0] != w[1];
+                        }
+                        Some(strict)
+                    } )+
+                }
+            }
+
+            /// Sort every row of `bounds` ascending, IN PLACE — the value sort (see
+            /// [`radix_sort_slice`]). One scratch buffer and one counter array serve every row.
+            pub(crate) fn sort_rows(&mut self, bounds: &Bounds) {
+                match self {
+                    $( Prim::$V(v) => {
+                        let vals = Arc::make_mut(v);
+                        let (mut tmp, mut counts): (Vec<$t>, Vec<u32>) = (Vec::new(), Vec::new());
+                        let mut start = 0;
+                        for end in bounds.ends() {
+                            sorting::radix_sort_slice(&mut vals[start..end], &mut tmp, &mut counts);
+                            start = end;
+                        }
+                    } )+
+                }
+            }
+
+            /// Keep the first element of each equal run of every row of an ALREADY SORTED column,
+            /// compacting in place, and return the new row ends. The `dedup` half of the value
+            /// sort: one pass, no index column, no gather.
+            pub(crate) fn dedup_sorted_rows(&mut self, bounds: &Bounds) -> Vec<usize> {
+                match self {
+                    $( Prim::$V(v) => {
+                        let vals = Arc::make_mut(v);
+                        let mut ends = Vec::with_capacity(bounds.len());
+                        let (mut w, mut start) = (0usize, 0usize);
+                        for end in bounds.ends() {
+                            for k in start..end {
+                                if k == start || vals[k] != vals[k - 1] {
+                                    vals[w] = vals[k];
+                                    w += 1;
                                 }
                             }
-                            let mut start = 0;
-                            for c in counts.iter_mut() {
-                                let cnt = *c;
-                                *c = start;
-                                start += cnt;
-                            }
-                            if src_is_idx {
-                                for k in 0..n {
-                                    let i = idx[k];
-                                    let b = ((v[i] >> shift) & 0xff) as usize;
-                                    tmp[counts[b]] = i;
-                                    counts[b] += 1;
-                                }
-                            } else {
-                                for k in 0..n {
-                                    let i = tmp[k];
-                                    let b = ((v[i] >> shift) & 0xff) as usize;
-                                    idx[counts[b]] = i;
-                                    counts[b] += 1;
-                                }
-                            }
-                            src_is_idx = !src_is_idx;
+                            ends.push(w);
+                            start = end;
                         }
-                        if !src_is_idx {
-                            idx.copy_from_slice(&tmp[..n]);
-                        }
+                        vals.truncate(w);
+                        ends
                     } )+
                 }
             }
@@ -585,6 +626,16 @@ macro_rules! prim {
             pub(crate) fn hashes(&self) -> Vec<u64> {
                 match self {
                     $( Prim::$V(v) => v.iter().map(|&x| crate::hash::mix64(x as u64)).collect(), )+
+                }
+            }
+
+            /// order of ONE pair: `self[i]` vs `other[j]`, width-dispatched and returning the
+            /// `Ordering` directly. The scalar sibling of [`Prim::cmp_idx`], which answers the same
+            /// question for a batch — and, for a batch of one, spends a heap allocation doing it.
+            pub(crate) fn cmp_at(&self, i: usize, other: &Prim, j: usize) -> std::cmp::Ordering {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => a[i].cmp(&b[j]), )+
+                    _ => panic!("cmp_at: prim width mismatch"),
                 }
             }
 
@@ -620,10 +671,38 @@ macro_rules! prim {
             /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
             pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
                 match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
-                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u64)
-                        .collect(), )+
+                    $( (Prim::$V(a), Prim::$V(b)) => match (lt, eq, gt) {
+                        (true, false, false) => mask_zip(a, b, |x: $t, y| x < y),
+                        (false, true, false) => mask_zip(a, b, |x: $t, y| x == y),
+                        (false, false, true) => mask_zip(a, b, |x: $t, y| x > y),
+                        (true, true, false) => mask_zip(a, b, |x: $t, y| x <= y),
+                        (false, true, true) => mask_zip(a, b, |x: $t, y| x >= y),
+                        (true, false, true) => mask_zip(a, b, |x: $t, y| x != y),
+                        // no predicate is all-false or all-true, but the grid is total.
+                        (false, false, false) => vec![0u64; a.len()],
+                        (true, true, true) => vec![1u64; a.len()],
+                    }, )+
                     _ => panic!("rel: prim width mismatch"),
+                }
+            }
+
+            /// lane-wise relational compare against a CONSTANT -> a 0/1 mask, at this width. The
+            /// immediate sibling of [`Prim::rel`]: same kind-blindness (it reads stored bytes, so
+            /// it is correct for the swizzled signed and float encodings too) and the same
+            /// branchless lane body from pre-resolved order flags — but no second column to read,
+            /// where the pair form has to broadcast the constant into one first.
+            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+                match self {
+                    $( Prim::$V(v) => { let y = c as $t; match (lt, eq, gt) {
+                        (true, false, false) => mask_imm(v, y, |x: $t, y| x < y),
+                        (false, true, false) => mask_imm(v, y, |x: $t, y| x == y),
+                        (false, false, true) => mask_imm(v, y, |x: $t, y| x > y),
+                        (true, true, false) => mask_imm(v, y, |x: $t, y| x <= y),
+                        (false, true, true) => mask_imm(v, y, |x: $t, y| x >= y),
+                        (true, false, true) => mask_imm(v, y, |x: $t, y| x != y),
+                        (false, false, false) => vec![0u64; v.len()],
+                        (true, true, true) => vec![1u64; v.len()],
+                    } } )+
                 }
             }
 
@@ -658,6 +737,271 @@ prim! {
     U32 => u32,
     U64 => u64,
 }
+
+/// One 0/1 mask per lane from a concrete comparison — the lane body of [`Prim::rel`] and
+/// [`Prim::rel_imm`], monomorphized. Resolving the predicate to its three order-flags keeps the
+/// body branchless, but evaluating all three comparisons and OR-ing them is three times the work of
+/// the one that was asked for; the callers pick a single `f` here instead, above the loop.
+#[inline]
+fn mask_zip<T: Copy>(a: &[T], b: &[T], f: impl Fn(T, T) -> bool) -> Vec<u64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y) as u64).collect()
+}
+
+/// [`mask_zip`] against a constant right operand.
+#[inline]
+fn mask_imm<T: Copy>(a: &[T], y: T, f: impl Fn(T, T) -> bool) -> Vec<u64> {
+    a.iter().map(|&x| f(x, y) as u64).collect()
+}
+
+mod sorting {
+    //! The radix kernels the order ops reduce to, in the three forms a caller can need.
+    //!
+    //! [`radix_sort_slice`] moves the VALUES — for a caller with no payload to carry and no labels
+    //! to refine, which is `sort`/`dedup` on a bare leaf. [`radix_perm_by_keys`] moves a
+    //! PERMUTATION with its keys travelling alongside — for a caller that does. And
+    //! [`single_pass_perm`] is the permutation form when one digit covers the whole key, where
+    //! carrying it would cost a pass and a buffer to save nothing.
+    //!
+    //! They live here rather than in `ops::cmp::order`, where the rest of the order machinery is,
+    //! because they are the width-generic halves of `Prim` methods the `prim!` macro generates —
+    //! and `value` is below `ops`, not above it.
+
+    /// Digit width for a radix pass over `n` elements. A wide digit halves the number of passes but
+    /// pays a counter array — cleared and prefix-scanned once per pass — so it is only worth it when
+    /// the buckets are small against the block. The rule is `buckets <= n/16`, which holds the counter
+    /// work under a sixteenth of the element work; below that, the extra pass is the cheaper trade.
+    /// Above this many elements in ONE block, the `u32` bucket counters below would overflow — the
+    /// running prefix reaches `n`, and a single bucket can hold every element. The counters are `u32`
+    /// and not `usize` deliberately: at the 8 K-row anchor the array shares L1 with the data, and
+    /// doubling it costs 33% (2.7 -> 3.6 ns/row on D1), which is the size a refinement pass produces
+    /// by the million. So the sorts guard instead, and hand a block this big to a stable comparison
+    /// sort — which is the same answer, and which such a block can well afford: a permutation over
+    /// `u32::MAX` rows is already 34 GB of `usize`.
+    pub(super) const COUNTED_MAX: usize = u32::MAX as usize;
+
+    pub(super) fn digit_width(n: usize) -> u32 {
+        if n >= (1 << 20) {
+            16
+        } else if n >= (1 << 15) {
+            11
+        } else {
+            8
+        }
+    }
+
+    /// LSD radix sort of a slice, IN PLACE, at a digit width chosen from its length.
+    ///
+    /// This is the VALUE sort. Where [`Prim::sort_block_scratch`] produces a permutation — because its
+    /// caller has a payload to move alongside, or labels to refine — this moves the values themselves:
+    /// no index buffer, no indirection through one (every pass reads and writes sequentially), and no
+    /// gather afterwards. It is what `sort`/`dedup` want when the list's element is a bare leaf, which
+    /// is the majority of what they are asked to sort.
+    ///
+    /// The digit width scales with the block ([`digit_width`]) and high all-zero digits are skipped, so
+    /// a narrow key costs fewer passes. `tmp` and `counts` are caller scratch, reused across every row
+    /// of a column.
+    pub(super) fn radix_sort_slice<T: Copy + Ord + Default + Into<u64>>(
+        s: &mut [T],
+        tmp: &mut Vec<T>,
+        counts: &mut Vec<u32>,
+    ) {
+        let n = s.len();
+        if n <= 1 {
+            return;
+        }
+        // a tiny block never repays a counter array; insertion sort is also what a refinement pass
+        // hands this function most often, once the levels above have split the column into groups.
+        if n <= 32 {
+            for k in 1..n {
+                let mut j = k;
+                while j > 0 && s[j - 1] > s[j] {
+                    s.swap(j - 1, j);
+                    j -= 1;
+                }
+            }
+            return;
+        }
+        // more elements than a `u32` counter can hold (see `COUNTED_MAX`). Equal leaf values are
+        // indistinguishable, so an unstable sort is the same answer here.
+        if n > COUNTED_MAX {
+            s.sort_unstable();
+            return;
+        }
+        let max: u64 = s.iter().copied().max().unwrap_or_default().into();
+        let sig = 64 - max.leading_zeros(); // significant bits; 0 when every value is 0
+        if sig == 0 {
+            return;
+        }
+        let d = digit_width(n);
+        let buckets = 1usize << d;
+        let mask = (buckets - 1) as u64;
+        let passes = sig.div_ceil(d);
+        if tmp.len() < n {
+            tmp.resize(n, T::default());
+        }
+        if counts.len() < buckets {
+            counts.resize(buckets, 0);
+        }
+        let mut from_s = true;
+        for p in 0..passes {
+            let shift = p * d;
+            counts[..buckets].iter_mut().for_each(|c| *c = 0);
+            {
+                let src: &[T] = if from_s { &s[..n] } else { &tmp[..n] };
+                for x in src {
+                    counts[(((*x).into() >> shift) & mask) as usize] += 1;
+                }
+            }
+            let mut start = 0u32;
+            for c in counts[..buckets].iter_mut() {
+                let cnt = *c;
+                *c = start;
+                start += cnt;
+            }
+            if from_s {
+                for &x in s[..n].iter() {
+                    let b = ((x.into() >> shift) & mask) as usize;
+                    tmp[counts[b] as usize] = x;
+                    counts[b] += 1;
+                }
+            } else {
+                for &x in tmp[..n].iter() {
+                    let b = ((x.into() >> shift) & mask) as usize;
+                    s[counts[b] as usize] = x;
+                    counts[b] += 1;
+                }
+            }
+            from_s = !from_s;
+        }
+        if !from_s {
+            s.copy_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// Reusable scratch for the permutation sort: the key column materialized once, its alternate
+    /// buffer, the permutation's alternate buffer, and the digit counters. Hoisted to the caller
+    /// because a refinement pass calls the sort once per block and produces millions of tiny blocks —
+    /// per-block allocation was ~17% self of a join-heavy profile.
+    #[derive(Default)]
+    pub(crate) struct SortScratch {
+        keys: Vec<u64>,
+        keys_alt: Vec<u64>,
+        idx_alt: Vec<usize>,
+        counts: Vec<u32>,
+    }
+
+    impl SortScratch {
+        /// Materialize the keys the permutation will carry. This is the LAST indirect read the
+        /// sort does — one per element, through the index — and every pass after it is sequential.
+        pub(super) fn load_keys(&mut self, keys: impl Iterator<Item = u64>) {
+            self.keys.clear();
+            self.keys.extend(keys);
+        }
+    }
+
+    /// One counting-sort pass over a permutation, reading each key THROUGH the index.
+    ///
+    /// When the whole key fits a single digit there is nothing to carry: the key is read exactly twice
+    /// either way, so materializing it would cost a pass and a buffer to save nothing. This is the
+    /// narrow-key case — a byte column, a group id, a mask, a `Sum`'s discriminant — and it is common
+    /// enough that [`radix_perm_by_keys`] taking it would be a regression on it.
+    ///
+    /// Stable: the scatter runs in ascending source order from prefix offsets.
+    pub(super) fn single_pass_perm(idx: &mut [usize], scratch: &mut SortScratch, d: u32, key: impl Fn(usize) -> u64) {
+        let n = idx.len();
+        let buckets = 1usize << d;
+        let mask = (buckets - 1) as u64;
+        if scratch.idx_alt.len() < n {
+            scratch.idx_alt.resize(n, 0);
+        }
+        if scratch.counts.len() < buckets {
+            scratch.counts.resize(buckets, 0);
+        }
+        scratch.counts[..buckets].iter_mut().for_each(|c| *c = 0);
+        for &i in idx.iter() {
+            scratch.counts[(key(i) & mask) as usize] += 1;
+        }
+        let mut start = 0u32;
+        for c in scratch.counts[..buckets].iter_mut() {
+            let cnt = *c;
+            *c = start;
+            start += cnt;
+        }
+        for &i in idx.iter() {
+            let b = (key(i) & mask) as usize;
+            scratch.idx_alt[scratch.counts[b] as usize] = i;
+            scratch.counts[b] += 1;
+        }
+        idx.copy_from_slice(&scratch.idx_alt[..n]);
+    }
+
+    /// LSD radix over a permutation whose KEYS TRAVEL WITH IT: `scratch.keys[k]` is the key of
+    /// `idx[k]`, and every pass permutes both together.
+    ///
+    /// The point is that the key is read once, when it is materialized, and sequentially thereafter.
+    /// Reading it through the permutation instead — `v[idx[k]]`, twice per element per pass — is two
+    /// random reads into the key column, up to eight times over, which is what this replaces. Where
+    /// there is no permutation to keep (no payload to carry, no labels to refine),
+    /// [`radix_sort_slice`] moves the values themselves and is cheaper still.
+    ///
+    /// Stable: each pass scatters in ascending source order from prefix offsets, so equal keys keep
+    /// their relative order — which `sort_blocks` promises and `dedup`/`group` rely on.
+    pub(super) fn radix_perm_by_keys(idx: &mut [usize], scratch: &mut SortScratch, d: u32, sig: u32) {
+        let n = idx.len();
+        let buckets = 1usize << d;
+        let mask = (buckets - 1) as u64;
+        let passes = sig.div_ceil(d);
+        if scratch.keys_alt.len() < n {
+            scratch.keys_alt.resize(n, 0);
+        }
+        if scratch.idx_alt.len() < n {
+            scratch.idx_alt.resize(n, 0);
+        }
+        if scratch.counts.len() < buckets {
+            scratch.counts.resize(buckets, 0);
+        }
+        let mut from_idx = true;
+        for p in 0..passes {
+            let shift = p * d;
+            scratch.counts[..buckets].iter_mut().for_each(|c| *c = 0);
+            {
+                let src = if from_idx { &scratch.keys[..n] } else { &scratch.keys_alt[..n] };
+                for &k in src {
+                    scratch.counts[((k >> shift) & mask) as usize] += 1;
+                }
+            }
+            let mut start = 0u32;
+            for c in scratch.counts[..buckets].iter_mut() {
+                let cnt = *c;
+                *c = start;
+                start += cnt;
+            }
+            for j in 0..n {
+                let (key, row) = if from_idx {
+                    (scratch.keys[j], idx[j])
+                } else {
+                    (scratch.keys_alt[j], scratch.idx_alt[j])
+                };
+                let b = ((key >> shift) & mask) as usize;
+                let slot = scratch.counts[b] as usize;
+                scratch.counts[b] += 1;
+                if from_idx {
+                    scratch.keys_alt[slot] = key;
+                    scratch.idx_alt[slot] = row;
+                } else {
+                    scratch.keys[slot] = key;
+                    idx[slot] = row;
+                }
+            }
+            from_idx = !from_idx;
+        }
+        if !from_idx {
+            idx.copy_from_slice(&scratch.idx_alt[..n]);
+        }
+    }
+}
+
+pub(crate) use sorting::SortScratch;
 
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in
 /// one cursor pass. A `Sum` carries this (see [`Value::sum`]).
@@ -760,7 +1104,7 @@ impl Value {
     /// `into_u64` forces ownership, and ownership is a full column COPY whenever anyone else still
     /// holds the buffer: a graph node with fan-out 2, or a caller that keeps its input. Measured on
     /// a one-pass `fold_add` at 1M rows, that copy was 7.9x the whole operation. Reading needs none
-    /// of it; only an op that rewrites its operand in place (`AddU64`, `Shr`, `And`, `Scan`) has to
+    /// of it; only an op that rewrites its operand in place (`BinImm`, `Scan`) has to
     /// consume it.
     pub fn as_u64(&self, who: &str) -> Result<&[u64], String> {
         match self {
@@ -795,6 +1139,15 @@ impl Value {
         }
     }
 
+    /// borrow the leaf — for an op that reads a MASK or a TAG column, whose width is now the
+    /// producer's choice rather than a fixed u64 (see [`Prim::as_byte_mask`]).
+    pub fn as_prim(&self, who: &str) -> Result<&Prim, String> {
+        match self {
+            Value::Prim(p) => Ok(p),
+            other => Err(format!("{who}: expected a leaf, got {}", shape_of_value(other))),
+        }
+    }
+
     pub fn into_prim(self, who: &str) -> Result<Prim, String> {
         match self {
             Value::Prim(p) => Ok(p),
@@ -820,6 +1173,34 @@ pub fn show(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The radix overflow fallbacks ([`sorting::COUNTED_MAX`]) have to be the SAME answer as the
+    /// radix paths they stand in for — the value sort's exact result, and a STABLE permutation, not
+    /// merely something sorted. The threshold itself is unreachable in a test (it wants 4.3 G
+    /// elements in one block), so this pins the two fallback bodies against the radix on the block
+    /// sizes the radix actually runs at, with dense duplicate runs so stability is observable.
+    #[test]
+    fn the_radix_overflow_fallbacks_are_the_same_answer() {
+        for n in [33usize, 100, 5000] {
+            let xs: Vec<u64> = (0..n as u64)
+                .map(|i| (i.wrapping_mul(6364136223846793005).wrapping_add(1) >> 32) % 97)
+                .collect();
+            // `radix_sort_slice`'s fallback: `sort_unstable` on the values themselves.
+            let mut radix = Prim::U64(Arc::new(xs.clone()));
+            radix.sort_rows(&vec![n].into());
+            let mut sorted = xs.clone();
+            sorted.sort_unstable();
+            assert_eq!(radix, Prim::U64(Arc::new(sorted)), "value sort at n={n}");
+            // `sort_block_scratch`'s fallback: a stable `sort_by_key` over the permutation, which
+            // is what both permutation paths promise and what `dedup`/`group` rely on.
+            let mut idx: Vec<usize> = (0..n).collect();
+            let mut scratch = SortScratch::default();
+            Prim::U64(Arc::new(xs.clone())).sort_block_scratch(&mut idx, &mut scratch);
+            let mut expect: Vec<usize> = (0..n).collect();
+            expect.sort_by_key(|&i| xs[i]);
+            assert_eq!(idx, expect, "permutation sort at n={n}");
+        }
+    }
 
     /// `cast` to the width a leaf already has is the identity, and must not copy the column: the
     /// stored bytes ARE the result's bytes, so the result shares the buffer (an `Arc` bump).

@@ -12,11 +12,16 @@ src/
   value.rs     Value (columnar data) + show. Leaf = Prim, a width-tagged Arc<Vec<uN>>
                (u8/u16/u32/u64) via the `prim!` macro. Sum = (Tags, variants), where Tags is the
                lane assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
+               `mod sorting` holds the radix kernels the `Prim` sort methods drive: the VALUE sort
+               (no permutation), the key-carrying PERMUTATION sort, and the single-digit form.
   engine.rs    row-movement primitives: gather, concat, fill + index generators
                (filter_mask / owner_ids / resolve_indices / expand_ranges).
-  cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
-               is the diagonal case) + the linear discrimination sort (sort_blocks / run_layout /
-               segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
+  cmp.rs       the order machinery, in four modules (see ops/cmp/order.rs): `compare` (compare_idx,
+               the bulk structural order over index pairs; compare_cols is the diagonal case),
+               `discriminate` (the linear sort: sort_blocks / run_layout / segment_labels), `merge`
+               (Run / survey / find_ranges_sorted — walking two sorted runs), and `sortedness`
+               (known_sorted / sorted_signs — "is it already in order, and what are its runs").
+               compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
@@ -27,7 +32,8 @@ src/
                downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`; `is_total`
                is the syntactic query. No second evaluator: the lowered graph is pure vocabulary.
   ops/
-    core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
+    core.rs    Op<L>: structure only, organized as the KERNEL MATRIX. `mod lockstep` holds what
+               Fold/FoldScan need to run a body across rows (scatter / OutputSink / init_active).
                           intro          elim     map       capture
                    PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
@@ -45,9 +51,18 @@ src/
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
-    cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
+    cmp.rs     CmpOp: Rel(Pred) + RelImm(Pred, c) + Min/Max + SortList/DedupList/GroupKey/Find.
+               Rel/RelImm emit a U64 mask — a comparison's result is a VALUE at the host seam,
+               not only a control mask — but every CONSUMER reads any width.
+               Kind-blind comparisons. The order ops ASK whether the column is already ordered
+               (`known_sorted`/`sorted_signs`) before they sort — a dataflow's batches arrive sorted.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
-               (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+               (op × kind × width) grid, in two forms: `Bin` (eats a pair) and `BinImm` (eats one
+               column, constant right operand) — the IMMEDIATE axis. BinOp covers arithmetic plus
+               the unsigned-only bitwise family Shl/Shr/And/Or/Xor (SIMD ÷2^k / mod 2^k, and shifts
+               total via wrapping). A NARROWER unsigned operand widens to the cell's declared
+               width — the declared width is the result's. Reduce/Scan take any leaf width and
+               accumulate at u64 (a count of a byte mask is the motivating case). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
                per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
@@ -159,10 +174,10 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
   *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
-  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
+  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`BinImm` does).
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
-  *Reuse policy:* an op that is elementwise AND same-width (`AddU64`/`Shr`/`And`, `bin_into`, `neg_into`,
+  *Reuse policy:* an op that is elementwise AND same-width (`Bin`/`BinImm`, `bin_into`, `neg_into`,
   `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
   fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, `cast` = re-width, `rel`/`cmp_idx`/
@@ -184,6 +199,15 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
   the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
+- **A `Fold` whose body is a PRODUCT OF MONOIDS does not run the loop.** Each accumulator field
+  updated by an associative op from a contribution that never reads the accumulator is
+  `seed_i ⊕ reduce_i(list)` — one pass per field. Recognized at eval time in the NUMERIC layer
+  (`ops::numeric::monoid_fold`), not the core, because "is this op a monoid" is a numeric question;
+  it is a physical choice like `strided` or `known_sorted`, not an optimizer rewrite (the optimizer
+  runs on no evaluated path). Conservative: only `Add`/`Mul`/`Min`/`Max` at `Kind::U` width 64, and
+  only a `U64` seed — `Sub` is not associative and bitwise `And`/`Or` are not `All`/`Any` except on
+  0/1 columns, which nothing proves. Declining is always safe; the lockstep fold computes the same
+  thing. `(sum, count)` went 240 -> 0.44 ns/row at 1M.
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Remaining
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
@@ -217,7 +241,7 @@ accumulator itself a `Fail<B>`, so a row that errs on any round stays Err.
 ## Done (foundations in place)
 
 The byte-width-leaf migration, the (op×kind×width) numeric grid, the linear discrimination sort,
-Arc leaves + move-on-last-use + in-place `AddU64`, owned-arg `eval`, sum introduction (`Inject`),
+Arc leaves + move-on-last-use + in-place elementwise arithmetic, owned-arg `eval`, sum introduction (`Inject`),
 the `CmpOp` bucket including the `Rel(Pred)` compare-to-mask family, and consolidation to the single
 `ml` surface — all landed. The bench shows the streaming ops memory-bound and already
 NEON-vectorized; `sort_list` is the lone compute-bound op.
@@ -228,6 +252,20 @@ with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (in
 `Partition` removed as redundant with `Branch(2)`; `Find`/`Rel` check shape equality; `eval` rejects what it can't represent (`Cast` widths, sum
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
+
+Then the order and arithmetic pass. The discrimination sort stops as soon as no two rows are tied
+(the tie narrowing `compare_pairs` always did, now on the sort side too) and reads field 0 without
+gathering it through an identity permutation; a bare leaf sorts its VALUES rather than a permutation
+(`sorting::radix_sort_slice` — no index buffer, no indirection, no gather after) and `dedup` compacts
+in one pass; the permutation path materializes each key ONCE and carries it, so every radix pass
+reads sequentially. `sort`/`dedup`/`group` ASK whether the column is already ordered before sorting
+it, cheaply or not at all. `find` MERGES a needle that is itself in key order instead of searching
+per probe — the one-directional form of `arrange::survey`. The arithmetic grid grew an IMMEDIATE
+axis (`BinImm` at every kind and width, plus `CmpOp::RelImm`), which retired the four U64-only
+one-off ops that sat outside it, and a bitwise family (`Shl`/`Shr`/`And`/`Or`/`Xor`, unsigned-only)
+that gave column-by-column bit ops for the first time. `Reduce`/`Scan` take any leaf width and
+accumulate at u64, which let `Rel` produce a BYTE mask. And a `Fold` whose body is a product of
+monoids does not run the loop at all. Every number is in `perf-gaps.md`.
 
 Then the point-access factoring. `Index`/`Head` were retired in favour of one indexed-access concept
 at two strata: the atom is the **scalar `Get (U64,List<X>)->X`** (one O(1) lookup per row, the genuine
@@ -250,21 +288,37 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
    (transpose into fresh Vecs). The real fork is **align `Value` with `columnar` (DD-native, bespoke)
    vs Arrow/narrow (ecosystem interop)** — DDIR pulls toward `columnar`.
 2. **Lowering.** DDIR's `Linear`/`FieldExpr`/`Condition` → corgi `Graph` (Field/arith/Rel/tuple;
-   `And` = `Mul` of 0/1 masks). The host lowers to `Graph`; it never hand-builds.
+   `And` = `Mul` of 0/1 masks, or now the bitwise cell directly). The host lowers to `Graph`;
+   it never hand-builds.
 3. **Compute gap — DONE.** `Rel(Pred)` (the six comparators) covers `Condition`.
 
 ## Backlog
 
-- **Fusion / vector-at-a-time (the perf multiplier).** Single ops are memory-bound, so the lever is
-  fewer passes, not SIMD. Tile execution ~1024 rows to L1 (the Polars/X100 model), composing the
-  existing SIMD kernels — no per-row interpreter. Needs a slice-capable op path + a fusable-run pass.
+- **A WINDOWED LEAF — the piece three other items wait on.** `Prim::U64(Arc<Vec<u64>>)` carries no
+  offset, so there is no way to hand an op rows 4096..8192. Adding a range is ADDITIVE: the
+  whole-buffer range behaves exactly as today, and `Arc::get_mut` in-place writes still work at
+  refcount 1, because a unique owner may mutate its own sub-range. The `prim!` macro confines the
+  change to `value.rs`. Waiting on it: the tiled executor below; `bytes.rs`' zero-copy decode, whose
+  doc already says the decode memcpy is "the honest floor for this representation" and that
+  borrowing "would take a different leaf type"; and `Fold`/`FoldScan`, where a round could BORROW
+  its element rather than allocate a one-element column to gather into (see C4 in `perf-gaps.md`).
+- **Fusion / vector-at-a-time — SIZED, not built.** Single ops are memory-bound, so the lever is
+  fewer passes, not SIMD. Tile execution to L1 (the Polars/X100 model), composing the existing
+  kernels — no per-row interpreter. The gaps suite now measures the prize directly: families A and B
+  run a TILE SWEEP at 1 K/4 K/16 K, where a whole multi-pass chain stays L1-resident, so `anchor /
+  sweep floor` is what a tile executor would collect. **It is 1.6–4.0x at the design centre and
+  2.2–4.9x at the DRAM point**, the floor is 4 K–8 K rows, and per-op fixed cost puts the useful tile
+  floor near 2 K. And that is ALL of it: A2 at its floor is still 0.53 ns/row for eight ops against a
+  fused Rust loop's 0.08, so the rest of the fusion-prize column is a compiler, not a calling
+  convention — the JIT rung `hobbes-precis.md` keeps on the ladder, and a decision that can now be
+  made before building rather than after.
 - **Destination-passing style (DPS) — the intentional discipline for the fusion above (not yet built).**
   DPS (Shaikhha/Fitzgibbon/PeytonJones/Vytiniotis) is the calling convention that makes the tile fusion
   work: thread a destination buffer through a chain of ops, each writes into it, no intermediates. The
   seam is already corgi's central invariant — **DPS along the 1:1 SEQ spine** (pointwise/leaf/cast/
   select/fold-accumulator: `dest size = input size`, pre-sizable), **allocate-and-return at `List`
   introductions** (filter/group/iota/slices: data-dependent size). Relation to FBIP: corgi ALREADY does
-  opportunistic refcount reuse (`get_mut`/`make_mut` in `bin_into`/`scatter_into`/`AddU64`/move-to-last-
+  opportunistic refcount reuse (`get_mut`/`make_mut` in `bin_into`/`scatter_into`/`neg_into`/move-to-last-
   use) — that's reuse *discovered* at runtime; DPS makes it *intentional* (explicit destination →
   guaranteed in-place, AND it threads through a chain, which is what unlocks fusion; per-op reuse
   already works, so the new value is specifically cross-op intermediate elimination). The `None`
@@ -274,7 +328,49 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   spine toward a linear/owned tile buffer (giving up free `Arc`-clone fan-out there) vs staying
   `Arc`-shared (free clones, no fusion). First spike: compile ONE stratum-stable run (e.g. `iota ; add
   ; mul ; gt`) to a single-tile DPS kernel and measure vs the per-op passes — that forces the ownership
-  decision on a small surface before committing the convention.
+  decision on a small surface before committing the convention. The ownership fork is now half
+  settled by the windowed leaf above: a window into an `Arc` the caller uniquely owns IS a
+  destination, so the choice is not "linear buffer vs `Arc`" but "who holds the tile".
+- **A WRITER for data-dependent cardinality.** DPS above is scoped to the 1:1 spine, with
+  "allocate-and-return at `List` introductions". The measurements say the introductions are where a
+  third of the remaining gap is: `filter` builds a u64 index vector and gathers (B1), `dedup` on an
+  already-sorted column builds run-firsts and gathers (D5), and `find`+`slices` materialises ranges
+  (E1) — each against a Rust ceiling that pushes straight into an output. A `Sink` contract (reserve,
+  push, finish) covers all three without a new operator.
+- **A cost model for the optimizer, before more rewrites.** `optimize` runs on NO evaluated path, so
+  nothing measures it; `--optimized` on the gaps bench now can, and the answer there is "one node
+  removed out of 89", because those programs are hand-minimal by construction. Run by hand on
+  programs that do carry redundancy, `fuse_maps` pays 2.0x and `dce` 2.2x — and **`cse` COSTS 25%**,
+  because sharing a column gives it fan-out 2 and the consumer that would have rewritten it in place
+  must copy instead. So the passes need to know about move-to-last-use before more are added. Two
+  rewrites are waiting on that: `match` -> `select` for cheap total arms (the rule is already written
+  at `Op::Select`; `Branch` avoids computing the unused side, `Select` avoids the partition), and the
+  gather-composition law below. Pointing it at a corpus written for CLARITY rather than for
+  measurement — the DDIR AoC programs — is how to size it: node count before/after, time
+  before/after, and time against a hand-tuned version of the same program.
+- **Pack narrow key fields into one radix key.** A compound key now costs one radix pass per field
+  that actually discriminates, but four narrow fields still cost four: four discriminating u16 fields
+  measure 27.7 ns/row as a `Prod` against 9.5 packed into one u64. `sort_list_blocks` already has
+  exactly this trick for strided byte lists up to 8 wide; generalizing it is "pack a fixed-width
+  prefix of the structural key into one wide integer, radix once, refine only if ties remain". It
+  does NOT help DDIR's key, whose leading field is a full 64-bit hash the tie check already stops on.
+- **`ReduceKey` — the C3 decision.** `group ; map fold` is 22–74x off a bucket accumulate, and it
+  decomposes: ~3–5x is reachable inside the discrimination sort (a narrow leaf's histogram IS the
+  partition, so labels come off it with no comparison — the Henglein MSD path `discriminate`'s module
+  doc names as unbuilt), and the residual ~17x is structural, because `group` produces the grouped
+  VALUES where an accumulate materialises nothing. Closing it means one fused op in the "fused forms
+  & producers" tier, with a law program witnessing `= group ; map ((k,vs) -> (k, vs fold_r))`. That
+  is the tier's charter, and it is a decision rather than a bug fix.
+- **A carried SORTEDNESS witness (the check is built; the witness is not).** `sort`/`dedup`/`group`
+  now ASK whether a column is already ordered, cheaply, and decline when the answer is not cheap.
+  The next rung is to CARRY it — the third member of the family `Bounds::Stride` and `Tags::Const`
+  belong to: a fact that is O(1) to read, costs no columns, and propagates instead of being
+  re-derived. It is also the riskier rung, since a witness that lies is a correctness bug rather than
+  a slow path, so: default to unsorted, set it from a whitelist of producers, `debug_assert` it.
+- **`arrange::find_ranges` and `CmpOp::Find` have diverging fast paths.** `lib.rs`'s wrapper carries a
+  hand-written U64 binary search, written because structural re-dispatch was 21% of an incremental
+  round; `Find` has its own U64 merged walk. One idea, two implementations — the only place in the
+  crate where the DDIR seam and the surface disagree about a kernel.
 - **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying
@@ -306,7 +402,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
   naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
-  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1` ≡ `(x, x lit 1) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are untouched).
+  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1`), which now lowers to the grid's IMMEDIATE cell rather than to `(x, x lit 1) sub`.
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).

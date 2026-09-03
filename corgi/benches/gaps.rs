@@ -19,8 +19,8 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{
-    arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
-    Op, Value,
+    arrange, eval_graph, lower_effects, optimize, parse_ml, ArithOp, BinOp, Builder, Graph, Kind,
+    NumOp, Op, Value,
 };
 use std::env;
 use std::hint::black_box;
@@ -133,8 +133,10 @@ fn row_safety(
 
 // ----- inputs ------------------------------------------------------------
 
-/// deterministic non-sorted column via an LCG step (no rng dep). Masked to 32 bits so the byte-radix
-/// sort runs four passes, not eight, and so group/dedup keys have a realistic distinct count.
+/// deterministic non-sorted column via an LCG step (no rng dep). Shifted down to 32 SIGNIFICANT BITS,
+/// which is what a hash lane or a dense identifier carries and what gives group/dedup keys a realistic
+/// distinct count — but note that the radix skips all-zero high digits, so this column costs HALF the
+/// passes a full-width key does. `D1b` is the same sort at 64 significant bits, for that reason.
 fn scrambled(n: usize) -> Vec<u64> {
     (0..n as u64)
         .map(|i| {
@@ -155,18 +157,16 @@ fn one_list(n: usize) -> Value {
     Value::List(vec![n].into(), Box::new(Value::u64(scrambled(n))))
 }
 
-/// a SORTED big `List<U64>` (one `n`-wide row of `0..n`) — the equi-join feeds find/slices a haystack
-/// already in key order, so the measurement isolates the join primitives from a sort cost.
-fn sorted_list(n: usize) -> Value {
-    Value::List(
-        vec![n].into(),
-        Box::new(Value::u64((0..n as u64).collect())),
-    )
-}
-
 fn compile(src: &str) -> Graph<NumOp> {
     // the lowered graph is what a `Program` runs: fallible stages' downstream ops on the Ok lane.
-    lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}")))
+    // Under `--optimized`, the passes run on the SURFACE graph and lowering follows — the
+    // composition `tests/optimize.rs` checks for semantic preservation.
+    use std::sync::atomic::Ordering::Relaxed;
+    let g = parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"));
+    NODES_IN.fetch_add(g.node_count(), Relaxed);
+    let g = if OPTIMIZED.load(Relaxed) { optimize(&g) } else { g };
+    NODES_OUT.fetch_add(g.node_count(), Relaxed);
+    lower_effects(&g)
 }
 
 /// a fixed 5-letter lowercase word, base-26 of `v` — the word-count vocabulary generator (mod a vocab
@@ -216,13 +216,13 @@ fn csv_text(m: usize) -> (Value, Vec<u8>) {
     )
 }
 
-/// a chain of `k` in-place `AddU64` passes — each link its own pass over memory (interior links mutate
+/// a chain of `k` in-place immediate-add passes — each link its own pass over memory (interior links mutate
 /// the moved buffer). The pure fusion headroom: `k` passes a single fused loop collapses to one.
 fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
     let mut cur = b.input();
     for _ in 0..k {
-        cur = b.add(ArithOp::AddU64(7), vec![cur]);
+        cur = b.add(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7), vec![cur]);
     }
     b.finish(cur)
 }
@@ -491,7 +491,28 @@ fn family_d(n: usize, reps: u32) {
         v.sort_unstable();
         black_box(v);
     });
-    row("D1 sort_u64", n, c, r, "byte-radix vs pdqsort");
+    row("D1 sort_u64", n, c, r, "value radix (no permutation, no gather) vs pdqsort");
+
+    // D1b the same sort at FULL WIDTH. The radix's cost is `ceil(significant_bits / digit_width)`
+    // passes, and `scrambled` carries 32 significant bits — so D1 measures two passes where a key
+    // that fills its u64 takes four, and reading D1's ratio as "the sort" overstates it by that
+    // much. A comparison sort barely notices (its cost is comparisons, not key bits), so this row
+    // is where the radix's win is smallest and the honest floor for the claim.
+    let wide: Vec<u64> = (0..n as u64)
+        .map(|i| {
+            let x = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x ^ (x >> 31) // spread the low bits the LCG leaves regular, keeping all 64 significant
+        })
+        .collect();
+    let wl = Value::List(vec![n].into(), Box::new(Value::u64(wide.clone())));
+    let g = compile("input sort");
+    let c = corgi_t(&g, &wl, reps);
+    let r = rust_t(reps.min(10), || {
+        let mut v = black_box(&wide).to_vec();
+        v.sort_unstable();
+        black_box(v);
+    });
+    row("D1b sort_u64_full", n, c, r, "the same radix at 64 significant bits: twice the passes");
 
     // D2 dedup — sort then unique.
     let g = compile("input dedup");
@@ -502,7 +523,54 @@ fn family_d(n: usize, reps: u32) {
         v.dedup();
         black_box(v);
     });
-    row("D2 dedup", n, c, r, "sort+unique vs sort+dedup");
+    row("D2 dedup", n, c, r, "value radix + compacting pass vs sort+dedup");
+
+    // D3 sort a COMPOUND key — the shape DDIR actually sorts (after the hash-key lane a key is
+    // `Prod([hash, key])`, whose leading u64 discriminates essentially everything). D1's scalar key
+    // never exercises the field loop, so a regression or a win in `sort_prod_blocks` was invisible
+    // to this suite. The second field is deliberately NON-discriminating: it is the payload a real
+    // key carries past its identifier, and the question is what the sort pays to look at it.
+    let pairs = Value::List(
+        vec![n].into(),
+        Box::new(Value::Prod(vec![Value::u64(src.clone()), Value::u64(vec![7; n])])),
+    );
+    let g = compile("input sort");
+    let c = corgi_t(&g, &pairs, reps);
+    let r = rust_t(reps.min(10), || {
+        let mut v: Vec<(u64, u64)> = black_box(&src).iter().map(|&k| (k, 7u64)).collect();
+        v.sort_unstable();
+        black_box(v);
+    });
+    row("D3 sort_compound", n, c, r, "2-field discrimination + 2 gathers vs pdqsort on pairs");
+
+    // D4/D5 the ALREADY-SORTED input. Every arrangement batch a dataflow hands corgi is in key
+    // order, so this is the common case at the DDIR seam and it used to cost a full sort. The
+    // ceilings are what the answer actually is: confirm the order, and for dedup one pass keeping
+    // the first of each run.
+    let mut asc = src.clone();
+    asc.sort_unstable();
+    let sorted = Value::List(vec![n].into(), Box::new(Value::u64(asc.clone())));
+
+    let g = compile("input sort");
+    let c = corgi_t(&g, &sorted, reps);
+    let r = rust_t(reps, || {
+        black_box(black_box(&asc).windows(2).all(|w| w[0] <= w[1]));
+    });
+    row("D4 sort_sorted", n, c, r, "detect the order and return vs confirm it");
+
+    let g = compile("input dedup");
+    let c = corgi_t(&g, &sorted, reps);
+    let r = rust_t(reps, || {
+        let s = black_box(&asc);
+        let mut out: Vec<u64> = Vec::with_capacity(s.len());
+        for (k, &x) in s.iter().enumerate() {
+            if k == 0 || x != s[k - 1] {
+                out.push(x);
+            }
+        }
+        black_box(out);
+    });
+    row("D5 dedup_sorted", n, c, r, "run boundaries from the order check vs one unique pass");
 }
 
 /// E — relational / index generators. `gather` is fresh-allocating by necessity; the open question is
@@ -511,25 +579,33 @@ fn family_e(n: usize, reps: u32) {
     let mask = n as u64 - 1; // n is a power of two, so `& mask` is an in-bounds row-relative index
     let src = scrambled(n);
 
-    // E1 single-key equi-join (find + slices) over a SORTED haystack — the join primitives, no sort cost.
-    let g = compile(
-        "let bn = input in let build = bn map (x -> (x shr 8, x)) in \
-         let probes = bn map (x -> x shr 8) dedup in let t = build transpose in \
-         let r = (probes, t.0) find in (r, t.1) slices",
-    );
-    let sl = sorted_list(n);
-    let c = corgi_t(&g, &sl, reps);
+    // E1 single-key equi-join (find + slices) over a SORTED haystack — the join PRIMITIVES only.
+    // Both sides are built OUTSIDE the timer. The probe side used to be computed by a `dedup`
+    // inside the timed program, which is a full sort: the row then measured a sort plus a join and
+    // moved with every sort change, which is not what a join row is for.
+    let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
+    let vals: Vec<u64> = (0..n as u64).collect();
+    let probes = {
+        let mut p = keys.clone();
+        p.dedup();
+        p
+    };
+    let np = probes.len();
+    let g = compile("let r = (input.0, input.1) find in (r, input.2) slices");
+    let arg = Value::Prod(vec![
+        Value::List(vec![np].into(), Box::new(Value::u64(probes.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(keys.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(vals.clone()))),
+    ]);
+    let c = corgi_t(&g, &arg, reps);
     let r = rust_t(reps, || {
-        let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
-        let vals: Vec<u64> = (0..n as u64).collect();
-        let mut probes = keys.clone();
-        probes.dedup();
+        let (keys, vals, probes) = (black_box(&keys), black_box(&vals), black_box(&probes));
         // materialize the matched value ranges into a flat (values, bounds) list — corgi's `slices`
         // produces exactly this, so the ceiling must pay the same output copy, not reference ranges.
         let mut flat: Vec<u64> = Vec::with_capacity(n);
         let mut bounds: Vec<usize> = Vec::with_capacity(probes.len());
         let mut j = 0usize;
-        for &p in &probes {
+        for &p in probes {
             let start = j;
             while j < keys.len() && keys[j] == p {
                 j += 1;
@@ -544,7 +620,7 @@ fn family_e(n: usize, reps: u32) {
         n,
         c,
         r,
-        "find (per-probe search)+slices vs two-pointer merge, both materializing",
+        "find (merged walk when the needle is sorted) + slices vs two-pointer merge",
     );
 
     // E2 gather — random permutation. corgi: `resolve_indices` (scalar, +bounds assert) then `Prim::gather`.
@@ -749,6 +825,40 @@ fn family_arrange(n: usize, reps: u32) {
                 .collect::<Vec<i8>>(),
         );
     });
+    // R6 the SCALAR comparator — the one a merge calls once per row, and the hottest corgi
+    // function in a DDIR profile (17% of an SCC run before it stopped being a batch of one).
+    // Every other row here is a bulk kernel; this is the seam where the host asks about one pair,
+    // and the suite could not see it. Two shapes: a bare leaf, and the compound key a dataflow
+    // actually sorts by, `Prod([hash, key])`, whose leading field decides almost every pair.
+    let pairs: Vec<(usize, usize)> =
+        (0..n).map(|i| (i, (i * 2654435761) % n)).collect();
+    let compound = Value::Prod(vec![leaf(n), Value::u64(scrambled(n))]);
+    for (what, col) in [("leaf", leaf(n)), ("compound", compound)] {
+        let c = rust_t(reps, || {
+            let (col, ps) = (black_box(&col), black_box(&pairs));
+            let mut acc = 0i32;
+            for &(i, j) in ps {
+                acc += arrange::compare_at(col, i, col, j) as i32;
+            }
+            black_box(acc);
+        });
+        let r = rust_t(reps, || {
+            let (s, ps) = (black_box(&src), black_box(&pairs));
+            let mut acc = 0i32;
+            for &(i, j) in ps {
+                acc += s[i].cmp(&s[j]) as i32;
+            }
+            black_box(acc);
+        });
+        row(
+            &format!("R6 compare_at ({what})"),
+            n,
+            c,
+            r,
+            "one structural pair vs one `u64` compare",
+        );
+    }
+
     row(
         "R2 arrange_compare",
         n.saturating_sub(1).max(1),
@@ -1035,12 +1145,29 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
 #[derive(Debug)]
 struct Config {
     smoke: bool,
+    optimized: bool,
     families: Vec<String>,
 }
+
+/// Whether `compile` runs the optimizer. A process-global rather than a threaded parameter: the
+/// families are free functions and `compile` is called from every one of them, so threading a flag
+/// through would be a wider change than the question is worth.
+///
+/// The point of the flag is that `optimize` is on NO evaluated path — not `Program`, not this
+/// suite, not the corpus — so nothing measures whether the passes matter. Running the suite twice
+/// and diffing is the answer.
+static OPTIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Total graph nodes across every program the run compiled, before and after `optimize`. Reported
+/// at the end so a run that shows no time difference also says WHY — whether the passes found
+/// nothing to remove, or removed plenty and it did not matter.
+static NODES_IN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NODES_OUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Config {
     fn parse() -> Result<Self, String> {
         let mut smoke = false;
+        let mut optimized = false;
         let mut families = Vec::new();
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -1049,6 +1176,7 @@ impl Config {
                 // the harness. It carries no information for our plain `main` driver.
                 "--bench" => {}
                 "--smoke" => smoke = true,
+                "--optimized" => optimized = true,
                 "--family" | "--families" => {
                     let value = args
                         .next()
@@ -1071,16 +1199,17 @@ impl Config {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "gaps [--smoke] [--family A-I,R] \
+                        "gaps [--smoke] [--optimized] [--family A-I,R] \
                          (repeatable; comma-separated values accepted)\n\
-                         H=safety, I=pointer-chase, R=arrangement"
+                         H=safety, I=pointer-chase, R=arrangement\n\
+                         --optimized runs every program through `optimize` before lowering"
                     );
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument {arg:?}; use --help")),
             }
         }
-        Ok(Self { smoke, families })
+        Ok(Self { smoke, optimized, families })
     }
 
     fn runs(&self, family: &str) -> bool {
@@ -1096,21 +1225,42 @@ fn main() {
     if cfg.smoke {
         println!("==== smoke mode: tiny inputs, coverage only (not reportable) ====");
     }
+    OPTIMIZED.store(cfg.optimized, std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "==== programs: {} ====",
+        if cfg.optimized { "OPTIMIZED (optimize then lower)" } else { "as written (optimize is not run)" }
+    );
 
-    // (n, reps). 8 K = L1 control; 1 M = L2/SLC design center; 8 M = DRAM eye.
-    let core: Vec<(usize, u32)> = if cfg.smoke {
-        vec![(1 << 8, 1)]
+    // (n, reps, anchor). 8 K = L1 control; 1 M = L2/SLC design center; 8 M = DRAM eye — the three
+    // ANCHORS, where every family runs. The other sizes are the TILE SWEEP: A and B only, sized
+    // 1 K–16 K so a whole multi-pass chain stays L1-resident. Those rows measure what a tile
+    // executor's steady state would be, so `row at an anchor / row at the sweep minimum` is the
+    // tiling prize — the number that sizes DPS before it is built. Per-op fixed cost shows up as
+    // the rise at the small end, and it is what sets the useful tile floor.
+    let core: Vec<(usize, u32, bool)> = if cfg.smoke {
+        vec![(1 << 8, 1, true)]
     } else {
-        vec![(1 << 13, 2000), (1 << 20, 50), (1 << 23, 10)]
+        vec![
+            (1 << 10, 4000, false),
+            (1 << 12, 3000, false),
+            (1 << 13, 2000, true),
+            (1 << 14, 1500, false),
+            (1 << 20, 50, true),
+            (1 << 23, 10, true),
+        ]
     };
-    for (n, reps) in core {
+    for (n, reps, anchor) in core {
         if !(cfg.runs("A") || cfg.runs("B") || cfg.runs("C") || cfg.runs("D")) {
             break;
         }
-        println!(
-            "\n==== n = {n}  ({} MB/col) ============================================",
-            n * 8 / (1 << 20)
-        );
+        let bytes = n * 8;
+        let size = if bytes >= (1 << 20) {
+            format!("{} MB/col", bytes / (1 << 20))
+        } else {
+            format!("{} KB/col", bytes / (1 << 10))
+        };
+        let kind = if anchor { "anchor" } else { "tile sweep" };
+        println!("\n==== n = {n}  ({size}, {kind}) ====================================");
         if cfg.runs("A") {
             println!("-- A pointwise --");
             family_a(n, reps);
@@ -1119,11 +1269,11 @@ fn main() {
             println!("-- B selection --");
             family_b(n, reps);
         }
-        if cfg.runs("C") {
+        if anchor && cfg.runs("C") {
             println!("-- C aggregation --");
             family_c(n, reps);
         }
-        if cfg.runs("D") {
+        if anchor && cfg.runs("D") {
             println!("-- D order --");
             family_d(n, reps);
         }
@@ -1222,5 +1372,18 @@ fn main() {
             println!("-- n = {n} ({} MB/leaf) --", n * 8 / (1 << 20));
             family_arrange(n, reps);
         }
+    }
+
+    let (before, after) = (
+        NODES_IN.load(std::sync::atomic::Ordering::Relaxed),
+        NODES_OUT.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if cfg.optimized {
+        println!(
+            "\n==== optimize: {before} nodes -> {after} across every program compiled ({} removed) ====",
+            before.saturating_sub(after)
+        );
+    } else {
+        println!("\n==== {before} nodes across every program compiled (optimize not run) ====");
     }
 }

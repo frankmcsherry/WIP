@@ -8,7 +8,10 @@
 pub(crate) mod order;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
+use order::{
+    compare_cols, compare_idx, find_ranges_sorted, known_sorted, run_firsts, run_layout,
+    runs_per_row, segment_labels, sort_blocks, sorted_signs,
+};
 use crate::shape::{same, shape_of_value};
 use crate::value::Value;
 
@@ -40,7 +43,11 @@ impl Pred {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
-    Gt(u64),   // X -> U64 mask    (x > c) as 0/1   — the column-vs-immediate sugar form
+    RelImm(Pred, u64), // X -> U64 mask   the IMMEDIATE form of `Rel`: compare a leaf column against
+               // a constant, given in the leaf's stored form. Kind-blind and reads ANY width, where
+               // the pair form `(x, x lit c) <pred>` has to broadcast an n-element constant column
+               // and build a product to say the same thing. (This was `Gt(u64)`, a U64-only
+               // threshold — one predicate at one width.)
     Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
     Max,       // (X, X) -> X   lane-wise maximum
     SortList,  // List<X> -> List<X>   structural order
@@ -57,14 +64,24 @@ impl CmpOp {
                 same(&shape_of_value(&a), &shape_of_value(&b)).map_err(|e| format!("Rel: {e}"))?;
                 assert_eq!(a.len(), b.len(), "Rel: operands at different strata");
                 let mask = match (&a, &b) {
-                    // leaf pair: the vectorized lane compare. Resolve the predicate to its three
-                    // order-flags ONCE here (sign `-1`/`0`/`+1`), so `rel`'s lane loop is branchless.
+                    // leaf pair: the vectorized lane compare. Resolve the predicate to a single
+                    // concrete lane function ONCE here (from its three order-flags, sign
+                    // `-1`/`0`/`+1`), so `rel`'s loop is one comparison per element.
                     (Value::Prim(pa), Value::Prim(pb)) =>
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                 };
+                // A U64 mask, though the core's idiom is "nonzero is true" and every consumer
+                // (`Filter`, `Select`, `Branch`) reads any width — so a byte would do, and is worth
+                // ~1.3-1.6x on `filter`. It stays u64 because a mask is only transient INSIDE corgi.
+                // At a host seam it is a value: DDIR keeps every scalar at one width and reads a
+                // predicate's result straight back as one, so `not(x)` compares it against a literal
+                // and `(x == y) == 1` compares it against an integer. Narrowing this changes the
+                // shape of every boolean subexpression in the host's world, and `Shape::Prim` carries
+                // the width — so the host's own `Eq` lowering sees two DIFFERENT shapes and folds the
+                // comparison to a constant. Empty results, no error. See the DDIR-side note.
                 Value::u64(mask)
             }
 
@@ -79,13 +96,31 @@ impl CmpOp {
                 Value::Prim(pa.lane_pick(pb, take_max))
             }
 
-            CmpOp::Gt(c) => {
-                let xs = input.as_u64("Gt")?;
-                Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
+            CmpOp::RelImm(pred, c) => {
+                let p = input.into_prim("relational immediate")?;
+                // the constant is the leaf's STORED form, so it has to fit the leaf's width —
+                // truncating it silently would compare against a different value than written.
+                if p.bits() < 64 && *c >= (1u64 << p.bits()) {
+                    return Err(format!("{pred:?} {c}: constant does not fit a U{} leaf", p.bits()));
+                }
+                Value::u64(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
             CmpOp::SortList => {
                 let (bounds, vals) = input.into_list("SortList")?;
+                // Already ordered: the permutation is the identity, so the discrimination pass and
+                // the gather after it would together copy the column to reproduce it. See
+                // `known_sorted` for why asking is worth it — a dataflow's batches arrive sorted.
+                if known_sorted(&bounds, &vals) {
+                    return Ok(Value::List(bounds, Box::new(vals)));
+                }
+                // A bare leaf has no companion column to carry, so the VALUES can be sorted
+                // directly: no permutation to build, no indirection through one, and no gather
+                // after. Equal leaf elements are indistinguishable, so stability is unobservable.
+                if let Value::Prim(mut p) = vals {
+                    p.sort_rows(&bounds);
+                    return Ok(Value::List(bounds, Box::new(Value::Prim(p))));
+                }
                 let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
                 Value::List(bounds, Box::new(gather(&vals, &perm)))
             }
@@ -93,6 +128,21 @@ impl CmpOp {
             CmpOp::DedupList => {
                 // distinct, per row: discriminate, then keep one representative per run.
                 let (bounds, vals) = input.into_list("DedupList")?;
+                // Already ordered: the runs are the adjacent-equal spans, which the sortedness
+                // check has just computed. The permutation would be the identity, so the run
+                // firsts ARE the representatives — no discrimination pass at all.
+                if let Some(signs) = sorted_signs(&bounds, &vals) {
+                    let firsts = run_firsts(&bounds, &signs);
+                    let nb = runs_per_row(&bounds, &firsts);
+                    return Ok(Value::List(nb.into(), Box::new(gather(&vals, &firsts))));
+                }
+                // as in `SortList`: a leaf payload sorts by value, and the distinct elements are
+                // then one compacting pass over the sorted rows.
+                if let Value::Prim(mut p) = vals {
+                    p.sort_rows(&bounds);
+                    let nb = p.dedup_sorted_rows(&bounds);
+                    return Ok(Value::List(nb.into(), Box::new(Value::Prim(p))));
+                }
                 let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
                 let (_ends, firsts) = run_layout(&labels);
                 let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
@@ -106,6 +156,26 @@ impl CmpOp {
                 // K-runs are the groups, and each run's V-span is its inner list.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
+                // Keys already ordered: the permutation is the identity, so the values need no
+                // gather at all (a stable sort would leave them exactly where they are), and the
+                // key runs are the adjacent-equal spans the check just computed.
+                if let Some(signs) = sorted_signs(&bounds, &k_col) {
+                    let firsts = run_firsts(&bounds, &signs);
+                    // exclusive ends of the runs: each run ends where the next begins, and the
+                    // last at the end of the column.
+                    let mut ends: Vec<usize> = Vec::with_capacity(firsts.len());
+                    if let Some(rest) = firsts.get(1..) {
+                        ends.extend_from_slice(rest);
+                        ends.push(k_col.len());
+                    }
+                    let keys = gather(&k_col, &firsts);
+                    let inner = Value::List(ends.into(), Box::new(v_col));
+                    let no = runs_per_row(&bounds, &firsts);
+                    return Ok(Value::List(
+                        no.into(),
+                        Box::new(Value::Prod(vec![keys, inner])),
+                    ));
+                }
                 let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
                 let v_sorted = gather(&v_col, &perm);
                 let (ends, firsts) = run_layout(&klabels);
@@ -127,6 +197,18 @@ impl CmpOp {
                 let (hb, hvals) = haystack.into_list("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
+                // A needle that is ITSELF in key order can be MERGED into the haystack — one
+                // forward walk with galloping — instead of searched per probe. That is the shape a
+                // join has (both sides sorted), and it is the difference between
+                // |needle|*log|haystack| comparisons and |needle|+|haystack|.
+                if known_sorted(&nb, &nvals) {
+                    if let Some((lo_c, hi_c)) = find_ranges_sorted(&nb, &nvals, &hb, &hvals) {
+                        return Ok(Value::List(
+                            nb,
+                            Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])),
+                        ));
+                    }
+                }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
                 // row base the answer is relative to; the search moves `lo`, so the base is rewalked
@@ -202,5 +284,263 @@ fn batched_bound(
             }
         }
         active.truncate(w);
+    }
+}
+
+#[cfg(test)]
+mod sorted_fast_paths {
+    //! The `sort`/`dedup`/`group` fast paths for an already-ordered column must produce EXACTLY
+    //! what the discrimination path produces. The references below are the op bodies as they were
+    //! before the fast paths existed, so this is a direct A/B rather than a restatement of the
+    //! intent — delete a fast path and these still pass; break one and they fail.
+
+    use super::order::{run_layout, runs_per_row, segment_labels, sort_blocks};
+    use super::CmpOp;
+    use crate::engine::gather;
+    use crate::value::{Bounds, Value};
+
+    fn ref_sort(v: Value) -> Value {
+        let (bounds, vals) = v.into_list("ref").unwrap();
+        let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
+        Value::List(bounds, Box::new(gather(&vals, &perm)))
+    }
+    fn ref_dedup(v: Value) -> Value {
+        let (bounds, vals) = v.into_list("ref").unwrap();
+        let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
+        let (_ends, firsts) = run_layout(&labels);
+        let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
+        let nb = runs_per_row(&bounds, &firsts);
+        Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+    }
+    fn ref_group(v: Value) -> Value {
+        let (bounds, vals) = v.into_list("ref").unwrap();
+        let (k_col, v_col) = vals.into_pair("ref").unwrap();
+        let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
+        let v_sorted = gather(&v_col, &perm);
+        let (ends, firsts) = run_layout(&klabels);
+        let reps: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
+        let keys = gather(&k_col, &reps);
+        let inner = Value::List(ends.into(), Box::new(v_sorted));
+        let no = runs_per_row(&bounds, &firsts);
+        Value::List(no.into(), Box::new(Value::Prod(vec![keys, inner])))
+    }
+
+    fn u(xs: &[u64]) -> Value {
+        Value::u64(xs.to_vec())
+    }
+    fn list(ends: Vec<usize>, vals: Value) -> Value {
+        Value::List(ends.into(), Box::new(vals))
+    }
+
+    /// every shape the fast paths can meet, in an ALREADY SORTED state (so the fast path fires)
+    /// and in an unsorted state (so it does not, and the reference path is exercised too).
+    fn cases() -> Vec<Value> {
+        vec![
+            // one row, sorted, with duplicate runs at the start, middle and end.
+            list(vec![8], u(&[1, 1, 2, 5, 5, 5, 9, 9])),
+            // one row, unsorted.
+            list(vec![8], u(&[5, 1, 9, 2, 5, 1, 9, 5])),
+            // several rows: sorted within each, but a row's last element exceeds the next's first —
+            // the case a whole-column sortedness scan would get wrong.
+            list(vec![3, 6, 9], u(&[7, 8, 9, 1, 2, 3, 4, 4, 6])),
+            // ragged rows, including empty ones at the front, middle and end.
+            list(vec![0, 2, 2, 5, 5], u(&[3, 3, 1, 2, 2])),
+            // a compound key, sorted lexicographically (the leading field ties in places).
+            list(vec![5], Value::Prod(vec![u(&[1, 1, 1, 2, 2]), u(&[10, 10, 20, 5, 7])])),
+            // a compound key whose LEADING field is sorted but whose second is not — the cheap
+            // reject passes and the structural check has to catch it.
+            list(vec![4], Value::Prod(vec![u(&[1, 1, 2, 2]), u(&[20, 10, 5, 7])])),
+            // narrow leaves.
+            list(vec![6], Value::u8(vec![0, 0, 3, 3, 3, 255])),
+            // a sum column, sorted by tag then payload.
+            list(vec![5], Value::sum(vec![0, 0, 1, 1, 1], vec![u(&[4, 4]), u(&[1, 2, 2])])),
+            // a list-of-lists, sorted length-first.
+            list(
+                vec![4],
+                list(vec![0, 1, 3, 3], u(&[7, 2, 9])),
+            ),
+            // unit rows: all equal, so one run.
+            list(vec![4], Value::Unit(4)),
+            // Products whose LEADING FIELD is not a leaf. The cheap scan reads the leading leaf, and
+            // these have none to read at field 0 — a `Unit`, a `List`, a `Sum`, an empty `Prod`. Each
+            // appears sorted and unsorted, because the failure mode is a column reported as ordered
+            // when it is not: `AllEqual` belongs to payload-free values only.
+            //
+            // A leading `Unit` is SKIPPED (it compares equal on every pair), so the order falls
+            // through to the next field and the leaf scan still decides.
+            list(vec![3], Value::Prod(vec![Value::Unit(3), u(&[1, 2, 3])])),
+            list(vec![3], Value::Prod(vec![Value::Unit(3), u(&[3, 1, 2])])),
+            list(vec![3], Value::Prod(vec![Value::Unit(3), Value::Unit(3), u(&[3, 1, 2])])),
+            // A leading `List` or `Sum` starts the order at a length or a tag the leaf scan cannot
+            // reach, so the structural pass has to settle it.
+            list(
+                vec![3],
+                Value::Prod(vec![list(vec![1, 3, 6], u(&[9, 8, 7, 6, 5, 4])), u(&[0, 0, 0])]),
+            ),
+            list(
+                vec![3],
+                Value::Prod(vec![list(vec![3, 5, 6], u(&[4, 5, 6, 7, 8, 9])), u(&[0, 0, 0])]),
+            ),
+            list(
+                vec![3],
+                Value::Prod(vec![
+                    Value::sum(vec![0, 1, 1], vec![u(&[5]), u(&[1, 2])]),
+                    u(&[0, 0, 0]),
+                ]),
+            ),
+            list(
+                vec![3],
+                Value::Prod(vec![
+                    Value::sum(vec![1, 0, 1], vec![u(&[5]), u(&[1, 2])]),
+                    u(&[0, 0, 0]),
+                ]),
+            ),
+            // degenerate: an empty column, and a single element.
+            list(vec![0], u(&[])),
+            list(vec![1], u(&[42])),
+            // a strided partition, sorted (the `Bounds::Stride` representation, not `Offsets`).
+            Value::List(Bounds::Stride(2, 3), Box::new(u(&[1, 4, 2, 2, 5, 9]))),
+        ]
+    }
+
+    /// a deterministic LCG column, as the benches use — big enough to take the radix path (blocks
+    /// over 32 elements) at every leaf width, with a small value range so duplicate runs are dense.
+    fn scrambled(n: usize, modulus: u64) -> Vec<u64> {
+        (0..n as u64)
+            .map(|i| {
+                (i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 32)
+                    % modulus
+            })
+            .collect()
+    }
+
+    /// Leaf columns past the insertion-sort threshold, at every width and in several row layouts —
+    /// the sizes that reach the radix, which the hand-written cases above are all too small for.
+    fn radix_cases() -> Vec<Value> {
+        let mut out = Vec::new();
+        for &n in &[33usize, 100, 5000] {
+            for &modulus in &[4u64, 1000, u32::MAX as u64 + 1] {
+                let xs = scrambled(n, modulus);
+                out.push(list(vec![n], u(&xs)));
+                // the same values split across ragged rows, so each row sorts independently.
+                let ends = vec![n / 4, n / 4, n / 2, n];
+                out.push(list(ends, u(&xs)));
+                // narrower leaves take a different width arm and fewer radix passes.
+                out.push(list(vec![n], Value::u8(xs.iter().map(|&x| x as u8).collect())));
+                out.push(list(vec![n], Value::u16(xs.iter().map(|&x| x as u16).collect())));
+                out.push(list(vec![n], Value::u32(xs.iter().map(|&x| x as u32).collect())));
+            }
+        }
+        // every value equal (the all-zero-significant-bits early return) and a single element.
+        out.push(list(vec![64], u(&vec![7; 64])));
+        out.push(list(vec![64], u(&vec![0; 64])));
+        out
+    }
+
+    #[test]
+    fn sort_matches_the_discrimination_path() {
+        for v in cases().into_iter().chain(radix_cases()) {
+            assert_eq!(
+                CmpOp::SortList.eval(v.clone()).unwrap(),
+                ref_sort(v.clone()),
+                "sort disagreed on {}",
+                crate::value::show(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_matches_the_discrimination_path() {
+        for v in cases().into_iter().chain(radix_cases()) {
+            assert_eq!(
+                CmpOp::DedupList.eval(v.clone()).unwrap(),
+                ref_dedup(v.clone()),
+                "dedup disagreed on {}",
+                crate::value::show(&v)
+            );
+        }
+    }
+
+    /// The merged `find` (a sorted needle walked into the haystack) must answer exactly what the
+    /// per-probe batched search answers, including absent needles, duplicate runs on either side,
+    /// empty rows, and needles outside the haystack's range on both ends.
+    #[test]
+    fn merged_find_matches_the_per_probe_search() {
+        /// the batched-search path, verbatim: a needle whose leading element is NOT the row's
+        /// smallest cannot be established as sorted, so wrapping each needle row in a `Prod` of two
+        /// fields would still take the merge. Instead this calls the op on a haystack whose element
+        /// shape defeats the leaf dispatch — a 2-field product orders the same but is not a `Prim`.
+        fn reference(nb: Vec<usize>, needles: &[u64], hb: Vec<usize>, hay: &[u64]) -> Value {
+            let pad = |xs: &[u64]| {
+                Value::Prod(vec![u(xs), Value::u64(vec![0; xs.len()])])
+            };
+            CmpOp::Find
+                .eval(Value::Prod(vec![list(nb, pad(needles)), list(hb, pad(hay))]))
+                .unwrap()
+        }
+        fn merged(nb: Vec<usize>, needles: &[u64], hb: Vec<usize>, hay: &[u64]) -> Value {
+            CmpOp::Find
+                .eval(Value::Prod(vec![list(nb, u(needles)), list(hb, u(hay))]))
+                .unwrap()
+        }
+        /// (needle row ends, needle values, haystack row ends, haystack values)
+        type Case = (Vec<usize>, Vec<u64>, Vec<usize>, Vec<u64>);
+        let cases: Vec<Case> = vec![
+            // dense hits, misses at both ends, duplicate runs on both sides
+            (vec![6], vec![0, 1, 1, 3, 7, 9], vec![8], vec![1, 1, 2, 3, 3, 3, 5, 8]),
+            // needle entirely below / above the haystack
+            (vec![2], vec![0, 0], vec![3], vec![5, 6, 7]),
+            (vec![2], vec![9, 9], vec![3], vec![5, 6, 7]),
+            // several rows, each with its own range
+            (vec![2, 4], vec![1, 5, 2, 2], vec![3, 7], vec![1, 5, 5, 0, 2, 2, 9]),
+            // empty needle row, empty haystack row
+            (vec![0, 2], vec![3, 4], vec![2, 2], vec![3, 4]),
+            (vec![2, 2], vec![3, 4], vec![0, 2], vec![3, 4]),
+            // everything empty
+            (vec![0], vec![], vec![0], vec![]),
+            // every needle equal, every haystack element equal
+            (vec![3], vec![4, 4, 4], vec![4], vec![4, 4, 4, 4]),
+        ];
+        for (nb, needles, hb, hay) in cases {
+            assert_eq!(
+                merged(nb.clone(), &needles, hb.clone(), &hay),
+                reference(nb, &needles, hb, &hay),
+                "needles={needles:?} hay={hay:?}"
+            );
+        }
+        // at scale, against the same reference: a sorted needle over an overlapping key space.
+        let hay: Vec<u64> = (0..2000u64).map(|i| (i * 7) % 900).collect();
+        let mut hay: Vec<u64> = hay;
+        hay.sort_unstable();
+        let mut needles: Vec<u64> = (0..500u64).map(|i| (i * 13) % 1000).collect();
+        needles.sort_unstable();
+        assert_eq!(
+            merged(vec![needles.len()], &needles, vec![hay.len()], &hay),
+            reference(vec![needles.len()], &needles, vec![hay.len()], &hay),
+        );
+    }
+
+    #[test]
+    fn group_matches_the_discrimination_path() {
+        // (K, V) pairs: sorted by K with duplicate keys (so the V order within a group is the
+        // thing at risk), sorted by K in several rows, and unsorted.
+        let pairs = |ends: Vec<usize>, ks: &[u64], vs: &[u64]| {
+            list(ends, Value::Prod(vec![u(ks), u(vs)]))
+        };
+        let cases = [
+            pairs(vec![6], &[1, 1, 2, 3, 3, 3], &[10, 11, 20, 30, 31, 32]),
+            pairs(vec![3, 6], &[5, 5, 9, 1, 2, 2], &[1, 2, 3, 4, 5, 6]),
+            pairs(vec![6], &[3, 1, 2, 1, 3, 2], &[10, 11, 20, 30, 31, 32]),
+            pairs(vec![0, 3], &[7, 7, 8], &[1, 2, 3]),
+            pairs(vec![0], &[], &[]),
+        ];
+        for v in cases {
+            assert_eq!(
+                CmpOp::GroupKey.eval(v.clone()).unwrap(),
+                ref_group(v.clone()),
+                "group disagreed on {}",
+                crate::value::show(&v)
+            );
+        }
     }
 }
