@@ -61,7 +61,9 @@ pre-built owned columns plus cache eviction between build and timer.
 **Ratios below ~2×, and any ratio whose Rust side is sub-nanosecond, carry run-to-run noise of up to
 2×.** The Rust ceilings move: E1's has measured anywhere in 0.37–1.19 ns/row across runs, which alone
 swings that row between 3.1× and 7.8×. Track corgi's absolute ns/row for corgi's own progress, and
-read the ratios as an order of magnitude, not a measurement.
+read the ratios as an order of magnitude, not a measurement. **F1 is worse than noisy, it is
+BIMODAL** — 6.5–7.5 or 9.8–10.0 ns/row at 1 M, on the same build, reproducibly split across runs
+including at the pre-work baseline. Take its band, not a number.
 
 ## The gap map
 
@@ -70,51 +72,51 @@ instead. "Lever" names what would close it.
 
 | task | family | 8 K | 1 M | 8 M | mechanism | lever |
 |---|---|---|---|---|---|---|
-| A1 add_const | pointwise | 1.14× | 0.89× | 0.75× | single pass at the bandwidth ceiling (upper bound — in-place op, shared input) | — at ceiling |
-| A2 add_chain8 | pointwise | tax 0.95 / prize 7.07 | tax 0.78 / prize 2.06 | tax 0.95 / prize 2.40 | per-pass at the Rust ceiling; the gap is un-fused passes | **tiling, then fusion** |
-| A3 mixed_chain | pointwise | tax 1.02 | tax 1.33 | tax 1.08 | at the Rust ceiling — the immediate cells landed | — at ceiling |
-| A4 map_reduce | pointwise | tax 1.74 / prize 2.30 | tax 0.82 / prize 13.3 | tax 0.84 / prize 9.51 | intermediate map column, then a fold over it | **fusion — the biggest prize on the board** |
-| B1 filter_values | selection | 4.1× | 2.7× | 3.7× | u64 mask column + scalar `filter_mask` + gather vs one predicated push | narrow masks; a writer; SIMD compaction |
-| B2 cmp_select | selection | 3.6× | 3.4× | 3.1× | 4 passes vs 1 fused | tiling, then fusion |
+| A1 add_const | pointwise | 1.23× | 0.78× | 1.00× | single pass at the bandwidth ceiling (upper bound — in-place op, shared input) | — at ceiling |
+| A2 add_chain8 | pointwise | tax 0.93 / prize 6.6 | tax 1.05 / prize 3.7 | tax 0.95 / prize 2.1 | per-pass at the Rust ceiling; the gap is un-fused passes | **tiling, then fusion** |
+| A3 mixed_chain | pointwise | tax 1.07 | tax 0.99 | tax 1.00 | at the Rust ceiling — the immediate cells landed | — at ceiling |
+| A4 map_reduce | pointwise | tax 1.67 / prize 2.4 | tax 0.81 / prize 11.5 | tax 1.20 / prize 7.5 | intermediate map column, then a fold over it | **fusion — the biggest prize on the board** |
+| B1 filter_values | selection | 3.1× | 2.1× | 3.5× | u64 mask column + scalar `filter_mask` + gather vs one predicated push | narrow masks; a writer; SIMD compaction |
+| B2 cmp_select | selection | 2.9× | 2.6× | 3.4× | 4 passes vs 1 fused | tiling, then fusion |
 | C1 fold_add | aggregation | 1.10× | **1.03×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
-| **C3 group_by_sum** | aggregation | 22× | **55×** | **74×** | sort-based group where a 256-bucket accumulate is one O(n) pass | see *the group-by decomposition* |
-| **C4 scan_prefix** (general) | aggregation | **776×** | **200×** | **164×** | lockstep foldscan on ONE long row: #rounds = row length, and every round allocates | monoid body → C4k; general → a single-row interpreter |
-| C4k scan_add (kernel) | aggregation | 1.41× | 1.11× | 1.76× | the monoid prefix kernel — one in-place pass | **DONE** |
-| **C5 fold_sum_count** | aggregation | **4761×** | **3812×** | **2056×** | same lockstep degeneration, product-of-monoids accumulator | recognize the product of monoids |
-| D1 sort_u64 | order | **0.51×** | **0.45×** | **0.71×** | the value radix: no permutation, no gather | — past the ceiling |
-| D2 dedup | order | **0.64×** | **0.54×** | **0.79×** | value radix + one compacting pass | — past the ceiling |
-| D3 sort_compound | order | 1.10× | **0.98×** | 2.23× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
-| D4 sort_sorted | order | **1.14×** | **1.13×** | **1.11×** | already ordered: detect and return | — at ceiling |
-| D5 dedup_sorted | order | 5.7× | 4.0× | 3.6× | run boundaries off the order check, then a gather | a writer (as B1) |
-| E1 join_find_slices | relational | — | 3.2× | **1.40×** | `find` MERGES when the needle is sorted; what is left is the `slices` materialization | a writer (as B1) |
-| E2 gather | relational | — | **0.58×** | 1.06× | corgi at or below the Rust ceiling | — |
-| E3 gather_chain | relational | — | **0.74×** | 1.65× | two gathers, each resolve+gather | index-composition rewrite |
-| **F1 branch_match** | sum-type | — | **10.9×** | **8.7×** | columnar partition + recombine where the scalar form vectorizes to a blend | if-convert to `select`; `match` pays off on heterogeneous lanes |
-| F2 unweave_shred | sum-type | — | 2.1× | 3.8× | build sum (branch) + unweave vs one-pass partition | partly |
-| G1 word_count | text | — | 1.6× | 1.6× | structural ragged-string sort + find vs slice-sort + run-count | sort kernel; `memchr` for the split |
+| **C3 group_by_sum** | aggregation | 22× | **48×** | **74×** | sort-based group where a 256-bucket accumulate is one O(n) pass | see *the group-by decomposition* |
+| **C4 scan_prefix** (general) | aggregation | **747×** | **321×** | **163×** | lockstep foldscan on ONE long row: #rounds = row length, and every round allocates | monoid body → C4k; general → a single-row interpreter |
+| C4k scan_add (kernel) | aggregation | 1.41× | 1.17× | 0.98× | the monoid prefix kernel — one in-place pass | **DONE** |
+| **C5 fold_sum_count** | aggregation | **5169×** | **4153×** | **2290×** | same lockstep degeneration, product-of-monoids accumulator | recognize the product of monoids |
+| D1 sort_u64 | order | **0.55×** | **0.47×** | **0.81×** | the value radix: no permutation, no gather | — past the ceiling |
+| D2 dedup | order | **0.64×** | **0.52×** | **0.89×** | value radix + one compacting pass | — past the ceiling |
+| D3 sort_compound | order | 1.21× | **1.05×** | 2.22× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
+| D4 sort_sorted | order | **1.19×** | **1.13×** | **1.14×** | already ordered: detect and return | — at ceiling |
+| D5 dedup_sorted | order | 5.6× | 4.5× | 4.1× | run boundaries off the order check, then a gather | a writer (as B1) |
+| E1 join_find_slices | relational | — | 3.0× | 4.3× | `find` MERGES when the needle is sorted; what is left is the `slices` materialization | a writer (as B1) |
+| E2 gather | relational | — | **0.76×** | **0.86×** | corgi at or below the Rust ceiling | — |
+| E3 gather_chain | relational | — | **0.74×** | 1.17× | two gathers, each resolve+gather | index-composition rewrite |
+| **F1 branch_match** | sum-type | — | **12.9×** | **8.3×** | columnar partition + recombine where the scalar form vectorizes to a blend. NB this row is BIMODAL — 6.5–7.5 or 9.8–10.0 at 1 M, on the same build, including at `de0f2ac` | if-convert to `select`; `match` pays off on heterogeneous lanes |
+| F2 unweave_shred | sum-type | — | 2.8× | 4.6× | build sum (branch) + unweave vs one-pass partition | partly |
+| G1 word_count | text | — | 1.7× | 1.5× | structural ragged-string sort + find vs slice-sort + run-count | sort kernel; `memchr` for the split |
 | G2 csv_sum | text | — | 1.7× | 1.7× | total `parse_u64` (Sum) + reduce vs hand atoi | — near ceiling |
 | H gather (safe) | safety | 0.33 vs 0.67 | 1.04 vs 1.32 | 1.05 vs 1.40 ns/row | corgi's TOTAL (bounds-checked) sequential gather vs Rust `unsafe` | — **no safety tax** |
 | I pointer-chase | latency | — | 0.63 vs 4.76 | 0.80 vs 9.43 ns/step | lockstep gather extracts MLP a serial chase cannot | — **8–12× FASTER** |
-| R1 arrange_sort_perm | arrangement | — | **0.64×** | **0.96×** | stable key-carrying radix argsort | — past the ceiling |
-| R2 arrange_compare | arrangement | — | 3.9× | 3.1× | batched adjacent compare vs a direct leaf compare | — |
+| R1 arrange_sort_perm | arrangement | — | **0.69×** | **0.96×** | stable key-carrying radix argsort | — past the ceiling |
+| R2 arrange_compare | arrangement | — | 3.5× | 2.6× | batched adjacent compare vs a direct leaf compare | — |
 | R3 arrange_find | arrangement | — | 1.17× | 0.98× | the u64 fast path, at the Rust partition-point ceiling | — |
-| R4 arrange_survey | arrangement | — | **0.23×** | **0.75×** | galloping runs beat a two-pointer survey | — |
+| R4 arrange_survey | arrangement | — | **0.20×** | **0.75×** | galloping runs beat a two-pointer survey | — |
 | R5 arrange_gather2 | arrangement | — | 1.34× | 1.09× | two-source column gather vs a direct two-slice gather | — |
 
 ### The tile sweep (A and B, corgi ns/row)
 
 | row | 1 K | 4 K | 8 K | 16 K | 1 M | 8 M | prize over the floor |
 |---|---|---|---|---|---|---|---|
-| A2 add_chain8 | 0.65 | **0.52** | 0.54 | 0.62 | 1.29 | 2.06 | 2.5× / 4.0× |
-| A3 mixed_chain | 0.33 | **0.27** | 0.29 | 0.35 | 1.11 | 1.06 | 4.1× / 3.9× |
-| A4 map_reduce | 0.33 | **0.21** | 0.20 | 0.23 | 0.71 | 0.87 | 3.4× / 4.1× |
-| B1 filter_values | 1.59 | 1.22 | 1.20 | **1.14** | 1.92 | 2.76 | 1.7× / 2.4× |
-| B2 cmp_select | 1.02 | **0.81** | 0.89 | 0.85 | 1.76 | 3.32 | 2.2× / 4.1× |
+| A2 add_chain8 | 0.69 | **0.51** | 0.53 | 0.63 | 1.41 | 1.75 | 2.8× / 3.4× |
+| A3 mixed_chain | 0.33 | **0.27** | 0.29 | 0.36 | 1.11 | 1.08 | 4.1× / 4.0× |
+| A4 map_reduce | 0.29 | 0.21 | **0.20** | 0.24 | 0.68 | 0.77 | 3.4× / 3.9× |
+| B1 filter_values | 1.22 | 0.94 | **0.87** | 0.92 | 1.68 | 1.97 | 1.9× / 2.3× |
+| B2 cmp_select | 0.77 | **0.59** | 0.72 | 0.69 | 2.47 | 2.20 | 4.2× / 3.7× |
 
 The floor is 4 K–8 K rows and the rise below it is per-op fixed cost, which puts the useful tile
-floor near 2 K rows. **Tiling is worth 1.7–4.1× at the design center and 2.4–4.1× at the DRAM
-point** — and that is all of it: A2 at its floor is still 0.52 ns/row for eight ops against a fused
+floor near 2 K rows. **Tiling is worth 1.9–4.2× at the design center and 2.3–4.0× at the DRAM
+point** — and that is all of it: A2 at its floor is still 0.51 ns/row for eight ops against a fused
 Rust loop's 0.06, so the rest of the fusion-prize column is a compiler, not a calling convention.
 
 ## What this reorders
