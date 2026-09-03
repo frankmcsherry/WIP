@@ -532,6 +532,13 @@ macro_rules! prim {
                             }
                             return;
                         }
+                        // more rows than a `u32` counter can hold (see `COUNTED_MAX`). One branch
+                        // covers both permutation paths, since it sits above their dispatch;
+                        // `sort_by_key` is stable, which is what those promise.
+                        if n > sorting::COUNTED_MAX {
+                            idx.sort_by_key(|&i| v[i]);
+                            return;
+                        }
                         let max = idx.iter().map(|&i| v[i] as u64).max().unwrap_or(0);
                         let sig = 64 - max.leading_zeros();
                         if sig == 0 {
@@ -763,6 +770,15 @@ mod sorting {
     /// pays a counter array — cleared and prefix-scanned once per pass — so it is only worth it when
     /// the buckets are small against the block. The rule is `buckets <= n/16`, which holds the counter
     /// work under a sixteenth of the element work; below that, the extra pass is the cheaper trade.
+    /// Above this many elements in ONE block, the `u32` bucket counters below would overflow — the
+    /// running prefix reaches `n`, and a single bucket can hold every element. The counters are `u32`
+    /// and not `usize` deliberately: at the 8 K-row anchor the array shares L1 with the data, and
+    /// doubling it costs 33% (2.7 -> 3.6 ns/row on D1), which is the size a refinement pass produces
+    /// by the million. So the sorts guard instead, and hand a block this big to a stable comparison
+    /// sort — which is the same answer, and which such a block can well afford: a permutation over
+    /// `u32::MAX` rows is already 34 GB of `usize`.
+    pub(super) const COUNTED_MAX: usize = u32::MAX as usize;
+
     pub(super) fn digit_width(n: usize) -> u32 {
         if n >= (1 << 20) {
             16
@@ -803,6 +819,12 @@ mod sorting {
                     j -= 1;
                 }
             }
+            return;
+        }
+        // more elements than a `u32` counter can hold (see `COUNTED_MAX`). Equal leaf values are
+        // indistinguishable, so an unstable sort is the same answer here.
+        if n > COUNTED_MAX {
+            s.sort_unstable();
             return;
         }
         let max: u64 = s.iter().copied().max().unwrap_or_default().into();
@@ -1151,6 +1173,34 @@ pub fn show(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The radix overflow fallbacks ([`sorting::COUNTED_MAX`]) have to be the SAME answer as the
+    /// radix paths they stand in for — the value sort's exact result, and a STABLE permutation, not
+    /// merely something sorted. The threshold itself is unreachable in a test (it wants 4.3 G
+    /// elements in one block), so this pins the two fallback bodies against the radix on the block
+    /// sizes the radix actually runs at, with dense duplicate runs so stability is observable.
+    #[test]
+    fn the_radix_overflow_fallbacks_are_the_same_answer() {
+        for n in [33usize, 100, 5000] {
+            let xs: Vec<u64> = (0..n as u64)
+                .map(|i| (i.wrapping_mul(6364136223846793005).wrapping_add(1) >> 32) % 97)
+                .collect();
+            // `radix_sort_slice`'s fallback: `sort_unstable` on the values themselves.
+            let mut radix = Prim::U64(Arc::new(xs.clone()));
+            radix.sort_rows(&vec![n].into());
+            let mut sorted = xs.clone();
+            sorted.sort_unstable();
+            assert_eq!(radix, Prim::U64(Arc::new(sorted)), "value sort at n={n}");
+            // `sort_block_scratch`'s fallback: a stable `sort_by_key` over the permutation, which
+            // is what both permutation paths promise and what `dedup`/`group` rely on.
+            let mut idx: Vec<usize> = (0..n).collect();
+            let mut scratch = SortScratch::default();
+            Prim::U64(Arc::new(xs.clone())).sort_block_scratch(&mut idx, &mut scratch);
+            let mut expect: Vec<usize> = (0..n).collect();
+            expect.sort_by_key(|&i| xs[i]);
+            assert_eq!(idx, expect, "permutation sort at n={n}");
+        }
+    }
 
     /// `cast` to the width a leaf already has is the identity, and must not copy the column: the
     /// stored bytes ARE the result's bytes, so the result shares the buffer (an `Arc` bump).
