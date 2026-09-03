@@ -42,8 +42,8 @@ impl Pred {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum CmpOp {
-    Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
-    RelImm(Pred, u64), // X -> U64 mask   the IMMEDIATE form of `Rel`: compare a leaf column against
+    Rel(Pred), // (X, X) -> U8 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
+    RelImm(Pred, u64), // X -> U8 mask   the IMMEDIATE form of `Rel`: compare a leaf column against
                // a constant, given in the leaf's stored form. Kind-blind and reads ANY width, where
                // the pair form `(x, x lit c) <pred>` has to broadcast an n-element constant column
                // and build a product to say the same thing. (This was `Gt(u64)`, a U64-only
@@ -71,18 +71,23 @@ impl CmpOp {
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
-                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
+                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u8).collect(),
                 };
-                // A U64 mask, though the core's idiom is "nonzero is true" and every consumer
-                // (`Filter`, `Select`, `Branch`) reads any width — so a byte would do, and is worth
-                // ~1.3-1.6x on `filter`. It stays u64 because a mask is only transient INSIDE corgi.
-                // At a host seam it is a value: DDIR keeps every scalar at one width and reads a
-                // predicate's result straight back as one, so `not(x)` compares it against a literal
-                // and `(x == y) == 1` compares it against an integer. Narrowing this changes the
-                // shape of every boolean subexpression in the host's world, and `Shape::Prim` carries
-                // the width — so the host's own `Eq` lowering sees two DIFFERENT shapes and folds the
-                // comparison to a constant. Empty results, no error. See the DDIR-side note.
-                Value::u64(mask)
+                // a BYTE mask: the core's idiom is "nonzero is true", so one bit needs one byte, not
+                // eight. Every consumer reads any width — `filter_mask` and `tags_usize` dispatch it
+                // above their pass, `as_byte_mask` borrows when it already is one — and `fold_add`
+                // over a mask counts at u64, which is what makes the narrow mask affordable.
+                //
+                // It is transient INSIDE corgi, but at a HOST seam a mask is a value, and that is
+                // where narrowing it goes wrong if the host is not ready: `Shape::Prim` carries the
+                // leaf width, so a host that keeps its scalars at one width sees `(x == y) == 1` as
+                // a comparison of two DIFFERENT shapes. DDIR folded exactly that to a constant and
+                // three of its programs silently returned nothing. The rule the host needs is
+                // simple — widen a mask where it becomes a value, not where it is made — and it
+                // belongs to the host because only the host knows the KIND: `Rel` is kind-blind on
+                // stored bytes that are order-preserving at their own width, so an order-preserving
+                // widen is not something corgi can do. See DDIR's `corgi::logic::width`.
+                Value::u8(mask)
             }
 
             CmpOp::Min | CmpOp::Max => {
@@ -103,7 +108,7 @@ impl CmpOp {
                 if p.bits() < 64 && *c >= (1u64 << p.bits()) {
                     return Err(format!("{pred:?} {c}: constant does not fit a U{} leaf", p.bits()));
                 }
-                Value::u64(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
+                Value::u8(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
             CmpOp::SortList => {

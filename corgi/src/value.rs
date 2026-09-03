@@ -439,7 +439,7 @@ macro_rules! prim {
             /// it vectorizes, where reading the chosen side through an index would not. The leaf of
             /// [`crate::engine::blend`]. CONSUMES both and writes into whichever is uniquely owned
             /// (the `lane_pick` reuse policy: same width, elementwise, so the shape allows it).
-            pub(crate) fn blend(self, other: Prim, pick: &[u64]) -> Prim {
+            pub(crate) fn blend(self, other: Prim, pick: &[u8]) -> Prim {
                 match (self, other) {
                     $( (Prim::$V(mut a), Prim::$V(mut b)) => {
                         Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
@@ -557,6 +557,38 @@ macro_rules! prim {
                 }
             }
 
+            /// The column as a 0/1 BYTE mask, borrowed when it already is one.
+            ///
+            /// The second of the two ways to read a mask, for a consumer that cannot dispatch the
+            /// width above its own loop: [`crate::engine::blend`] hands the mask down a structural
+            /// recursion to one loop per leaf field, and `try_filter` reads it beside an error
+            /// column it is building in the same pass. The first way is
+            /// [`crate::engine::filter_mask`], which is generic over the width and materializes
+            /// nothing — prefer that wherever the loop is the mask's alone.
+            ///
+            /// `Rel` produces a `u8` mask, so the borrow is the common case and costs nothing; a
+            /// wider mask is narrowed here in one pass, which is still cheaper than reading it wide
+            /// once per leaf.
+            pub(crate) fn as_byte_mask(&self) -> std::borrow::Cow<'_, [u8]> {
+                match self {
+                    // already a byte mask: borrow it. The `!= 0` normalization is unnecessary
+                    // because every consumer tests nonzero, which is the idiom the core defines.
+                    Prim::U8(v) => std::borrow::Cow::Borrowed(&v[..]),
+                    Prim::U16(v) => std::borrow::Cow::Owned(v.iter().map(|&x| (x != 0) as u8).collect()),
+                    Prim::U32(v) => std::borrow::Cow::Owned(v.iter().map(|&x| (x != 0) as u8).collect()),
+                    Prim::U64(v) => std::borrow::Cow::Owned(v.iter().map(|&x| (x != 0) as u8).collect()),
+                }
+            }
+
+            /// The column as `usize` tags, dispatched once. For a DISCRIMINANT column, which is
+            /// small and read once per row — the mask sibling of [`Prim::as_byte_mask`], widening
+            /// rather than narrowing because a tag is an index, not a truth value.
+            pub(crate) fn tags_usize(&self) -> Vec<usize> {
+                match self {
+                    $( Prim::$V(v) => v.iter().map(|&x| x as usize).collect(), )+
+                }
+            }
+
             /// The order of `self[lo..hi]` in one pass: `None` at the first inversion, else
             /// whether the range is STRICTLY increasing (no two neighbours equal). Both answers
             /// carry: an inversion settles that a column is unsorted whatever follows the leading
@@ -669,7 +701,7 @@ macro_rules! prim {
             /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
             /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
             /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
-            pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+            pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
                 match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) => match (lt, eq, gt) {
                         (true, false, false) => mask_zip(a, b, |x: $t, y| x < y),
@@ -679,8 +711,8 @@ macro_rules! prim {
                         (false, true, true) => mask_zip(a, b, |x: $t, y| x >= y),
                         (true, false, true) => mask_zip(a, b, |x: $t, y| x != y),
                         // no predicate is all-false or all-true, but the grid is total.
-                        (false, false, false) => vec![0u64; a.len()],
-                        (true, true, true) => vec![1u64; a.len()],
+                        (false, false, false) => vec![0; a.len()],
+                        (true, true, true) => vec![1; a.len()],
                     }, )+
                     _ => panic!("rel: prim width mismatch"),
                 }
@@ -691,7 +723,7 @@ macro_rules! prim {
             /// it is correct for the swizzled signed and float encodings too) and the same
             /// branchless lane body from pre-resolved order flags — but no second column to read,
             /// where the pair form has to broadcast the constant into one first.
-            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
                 match self {
                     $( Prim::$V(v) => { let y = c as $t; match (lt, eq, gt) {
                         (true, false, false) => mask_imm(v, y, |x: $t, y| x < y),
@@ -700,8 +732,8 @@ macro_rules! prim {
                         (true, true, false) => mask_imm(v, y, |x: $t, y| x <= y),
                         (false, true, true) => mask_imm(v, y, |x: $t, y| x >= y),
                         (true, false, true) => mask_imm(v, y, |x: $t, y| x != y),
-                        (false, false, false) => vec![0u64; v.len()],
-                        (true, true, true) => vec![1u64; v.len()],
+                        (false, false, false) => vec![0; v.len()],
+                        (true, true, true) => vec![1; v.len()],
                     } } )+
                 }
             }
@@ -743,14 +775,14 @@ prim! {
 /// body branchless, but evaluating all three comparisons and OR-ing them is three times the work of
 /// the one that was asked for; the callers pick a single `f` here instead, above the loop.
 #[inline]
-fn mask_zip<T: Copy>(a: &[T], b: &[T], f: impl Fn(T, T) -> bool) -> Vec<u64> {
-    a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y) as u64).collect()
+fn mask_zip<T: Copy>(a: &[T], b: &[T], f: impl Fn(T, T) -> bool) -> Vec<u8> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y) as u8).collect()
 }
 
 /// [`mask_zip`] against a constant right operand.
 #[inline]
-fn mask_imm<T: Copy>(a: &[T], y: T, f: impl Fn(T, T) -> bool) -> Vec<u64> {
-    a.iter().map(|&x| f(x, y) as u64).collect()
+fn mask_imm<T: Copy>(a: &[T], y: T, f: impl Fn(T, T) -> bool) -> Vec<u8> {
+    a.iter().map(|&x| f(x, y) as u8).collect()
 }
 
 mod sorting {

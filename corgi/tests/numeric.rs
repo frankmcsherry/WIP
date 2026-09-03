@@ -75,8 +75,8 @@ fn arith_shape_errors_are_caught() {
 
 #[test]
 fn relational_compare_to_mask() {
-    // two leaf columns -> a 0/1 U64 mask. The op is the leaf compare DDIR's `Condition` needs, and
-    // its result is a VALUE in the host's world, not just a control mask — see `CmpOp::Rel`.
+    // two leaf columns -> a 0/1 BYTE mask. The op is the leaf compare DDIR's `Condition` needs;
+    // the core's mask idiom is "nonzero is true", so one bit is stored in one byte.
     let rel = |pred| {
         let mut b = Builder::<NumOp>::default();
         let inp = b.input();
@@ -86,13 +86,13 @@ fn relational_compare_to_mask() {
     let pair = |a, b| Value::Prod(vec![a, b]);
 
     // unsigned: 1<2, 5<5 (no), 3<1 (no)
-    assert_eq!(eval_graph(&rel(Pred::Lt), pair(u64(&[1, 5, 3]), u64(&[2, 5, 1]))), u64(&[1, 0, 0]));
+    assert_eq!(eval_graph(&rel(Pred::Lt), pair(u64(&[1, 5, 3]), u64(&[2, 5, 1]))), Value::u8(vec![1, 0, 0]));
     // equality / ge over the same columns
-    assert_eq!(eval_graph(&rel(Pred::Ge), pair(u64(&[1, 5, 3]), u64(&[2, 5, 1]))), u64(&[0, 1, 1]));
+    assert_eq!(eval_graph(&rel(Pred::Ge), pair(u64(&[1, 5, 3]), u64(&[2, 5, 1]))), Value::u8(vec![0, 1, 1]));
 
     // kind-blind: i64 columns stored order-preserving compare by VALUE under a plain (unsigned) lane
     // compare — -3 < 1 holds, 2 < -5 does not — exactly as for SortList.
-    assert_eq!(eval_graph(&rel(Pred::Lt), pair(i64col(&[-3, 2]), i64col(&[1, -5]))), u64(&[1, 0]));
+    assert_eq!(eval_graph(&rel(Pred::Lt), pair(i64col(&[-3, 2]), i64col(&[1, -5]))), Value::u8(vec![1, 0]));
 }
 
 /// run a binary grid cell on two leaf columns.
@@ -329,7 +329,7 @@ fn relational_immediate_rejects_a_constant_it_cannot_hold() {
     assert!(shape_of(&g, &Shape::Prim(8)).unwrap_err().contains("does not fit"));
     // at a width that holds it, every predicate answers as the pair form would.
     for (pred, want) in [
-        (Pred::Gt, vec![0u64, 0, 1]),
+        (Pred::Gt, vec![0u8, 0, 1]),
         (Pred::Lt, vec![1, 0, 0]),
         (Pred::Eq, vec![0, 1, 0]),
         (Pred::Ne, vec![1, 0, 1]),
@@ -340,7 +340,8 @@ fn relational_immediate_rejects_a_constant_it_cannot_hold() {
         let inp = bld.input();
         let out = bld.add(CmpOp::RelImm(pred, 300), vec![inp]);
         let g = bld.finish(out);
-        assert_eq!(eval_graph(&g, Value::u16(vec![7, 300, 900])), u64(&want), "{pred:?}");
+        // a mask is a BYTE column: one bit needs one byte, not eight.
+        assert_eq!(eval_graph(&g, Value::u16(vec![7, 300, 900])), Value::u8(want), "{pred:?}");
     }
 }
 

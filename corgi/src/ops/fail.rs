@@ -322,7 +322,7 @@ pub(crate) fn try_filter(input: Value) -> Result<Value, String> {
     let (db, dvals) = data.into_list("TryFilter data")?;
     let (mb, mvals) = mask.into_list("TryFilter mask")?;
     assert_eq!(db.len(), mb.len(), "TryFilter: row count");
-    let m = mvals.as_u64("TryFilter mask")?;
+    let m = mvals.as_prim("TryFilter mask")?.as_byte_mask();
     let mut err = Vec::with_capacity(db.len());
     let mut idx = Vec::new();
     let mut bounds = Vec::new();
@@ -373,7 +373,7 @@ pub(crate) fn try_chunk(k: usize, input: Value) -> Result<Value, String> {
 /// width is the producer's choice, as a mask's is: a `branch 2` is routinely fed a `Rel` mask.
 pub(crate) fn try_branch(n: usize, input: Value) -> Result<Value, String> {
     let (data, tags_v) = input.into_pair("TryBranch")?;
-    let tags = tags_v.as_u64("TryBranch tags")?;
+    let tags = tags_v.as_prim("TryBranch tags")?.tags_usize();
     assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
     if n > 256 {
         return Err(format!("TryBranch: arity {n} exceeds the u8 tag width"));
@@ -382,7 +382,6 @@ pub(crate) fn try_branch(n: usize, input: Value) -> Result<Value, String> {
     let (mut ok_tags, mut ok_off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, &t) in tags.iter().enumerate() {
-        let t = t as usize;
         if t < n {
             err.push(false);
             ok_tags.push(t as u8);

@@ -52,8 +52,11 @@ src/
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + RelImm(Pred, c) + Min/Max + SortList/DedupList/GroupKey/Find.
-               Rel/RelImm emit a U64 mask — a comparison's result is a VALUE at the host seam,
-               not only a control mask — but every CONSUMER reads any width.
+               Rel/RelImm emit a BYTE mask (nonzero is true, so a bit needs a byte not eight);
+               every CONSUMER reads any width — filter_mask/tags_usize dispatch it above their
+               pass, as_byte_mask borrows when it already is one. At a HOST seam a mask is a
+               VALUE, so the host must widen it where it becomes one (only the host knows the
+               KIND, and Rel is kind-blind on bytes order-preserving at their own width).
                Kind-blind comparisons. The order ops ASK whether the column is already ordered
                (`known_sorted`/`sorted_signs`) before they sort — a dataflow's batches arrive sorted.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
