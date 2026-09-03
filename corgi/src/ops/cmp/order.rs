@@ -465,12 +465,32 @@ mod sortedness {
 
     use super::*;
 
-    /// The first leaf a structural order reads, when the order starts at one: a `Prim`, or the leading
-    /// field of a `Prod`, recursively.
+    /// Does this value compare EQUAL on every pair of rows — no payload anywhere? Only a `Unit` and a
+    /// product built from those: a `Prim` has a value, and a `List` or `Sum` has a length or a tag,
+    /// which the order reads even when the payload below is itself payload-free.
+    ///
+    /// This is the one thing that licenses [`Leading::AllEqual`], and it is checked on the SHAPE — a
+    /// walk of the type, not of the data.
+    fn payload_free(v: &Value) -> bool {
+        match v {
+            Value::Unit(_) => true,
+            Value::Prod(cols) => cols.iter().all(payload_free),
+            _ => false,
+        }
+    }
+
+    /// The first leaf a structural order reads, when the order starts at one: a `Prim`, or a `Prod`'s
+    /// first field that carries a payload at all, recursively. `None` when the order starts somewhere
+    /// this cannot express — a leading `List`'s length, a leading `Sum`'s tag — and the caller then has
+    /// to decide the question the expensive way.
+    ///
+    /// Payload-free leading fields are SKIPPED, not fatal: a `Unit` field compares equal on every pair,
+    /// so the order falls straight through it to the next field. `(Unit, key)` is the padded tuple a
+    /// host builds when a field is absent, and its leading component is the key.
     fn leading_leaf(v: &Value) -> Option<&Prim> {
         match v {
             Value::Prim(p) => Some(p),
-            Value::Prod(cols) => cols.first().and_then(leading_leaf),
+            Value::Prod(cols) => cols.iter().find(|c| !payload_free(c)).and_then(leading_leaf),
             _ => None,
         }
     }
@@ -512,12 +532,19 @@ mod sortedness {
 
     fn leading_order(bounds: &Bounds, vals: &Value) -> Leading {
         match vals {
-            // no payload to compare: every row is equal to every other.
-            Value::Unit(_) => Leading::AllEqual,
-            Value::Prod(cols) if cols.is_empty() => Leading::AllEqual,
+            // no payload to compare: every row is equal to every other. This is the ONLY thing that
+            // may claim `AllEqual`, and it is why `payload_free` exists rather than "`leading_leaf`
+            // found nothing" — a product whose leading field is a `List` also has no leading LEAF, and
+            // it very much does not compare equal on every pair.
+            v if payload_free(v) => Leading::AllEqual,
             // the leaf scan is width-dispatched once, above the loop.
             Value::Prim(_) | Value::Prod(_) => {
-                let Some(p) = leading_leaf(vals) else { return Leading::AllEqual };
+                // A leading `List` or `Sum` inside the product: the order starts at a length or a tag
+                // that this scan cannot reach, so nothing is established yet and the `Ties` path below
+                // settles it structurally. Declining outright would be cheaper and is what a bare
+                // `List`/`Sum` gets — but a product's `Ties` arm already runs that pass, and the
+                // shapes that land here are the ones where it is the whole answer.
+                let Some(p) = leading_leaf(vals) else { return Leading::Ties };
                 let mut strict = true;
                 let mut start = 0;
                 for end in bounds.ends() {
@@ -536,6 +563,9 @@ mod sortedness {
             }),
             // tag-first.
             Value::Sum(tags, _) => scan_key(bounds, |i| tags.tag_at(i) as u64),
+            // the payload-free guard above takes every `Unit`; this arm is what the exhaustiveness
+            // check needs, since it does not read guards.
+            Value::Unit(_) => Leading::AllEqual,
         }
     }
 

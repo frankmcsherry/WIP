@@ -355,6 +355,40 @@ mod sorted_fast_paths {
             ),
             // unit rows: all equal, so one run.
             list(vec![4], Value::Unit(4)),
+            // Products whose LEADING FIELD is not a leaf. The cheap scan reads the leading leaf, and
+            // these have none to read at field 0 — a `Unit`, a `List`, a `Sum`, an empty `Prod`. Each
+            // appears sorted and unsorted, because the failure mode is a column reported as ordered
+            // when it is not: `AllEqual` belongs to payload-free values only.
+            //
+            // A leading `Unit` is SKIPPED (it compares equal on every pair), so the order falls
+            // through to the next field and the leaf scan still decides.
+            list(vec![3], Value::Prod(vec![Value::Unit(3), u(&[1, 2, 3])])),
+            list(vec![3], Value::Prod(vec![Value::Unit(3), u(&[3, 1, 2])])),
+            list(vec![3], Value::Prod(vec![Value::Unit(3), Value::Unit(3), u(&[3, 1, 2])])),
+            // A leading `List` or `Sum` starts the order at a length or a tag the leaf scan cannot
+            // reach, so the structural pass has to settle it.
+            list(
+                vec![3],
+                Value::Prod(vec![list(vec![1, 3, 6], u(&[9, 8, 7, 6, 5, 4])), u(&[0, 0, 0])]),
+            ),
+            list(
+                vec![3],
+                Value::Prod(vec![list(vec![3, 5, 6], u(&[4, 5, 6, 7, 8, 9])), u(&[0, 0, 0])]),
+            ),
+            list(
+                vec![3],
+                Value::Prod(vec![
+                    Value::sum(vec![0, 1, 1], vec![u(&[5]), u(&[1, 2])]),
+                    u(&[0, 0, 0]),
+                ]),
+            ),
+            list(
+                vec![3],
+                Value::Prod(vec![
+                    Value::sum(vec![1, 0, 1], vec![u(&[5]), u(&[1, 2])]),
+                    u(&[0, 0, 0]),
+                ]),
+            ),
             // degenerate: an empty column, and a single element.
             list(vec![0], u(&[])),
             list(vec![1], u(&[42])),
