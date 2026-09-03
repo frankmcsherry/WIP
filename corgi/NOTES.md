@@ -49,7 +49,7 @@ src/
                Rel/RelImm emit a BYTE mask (one bit needs one byte, not eight); every consumer
                reads any width, and `fold_add` over a mask counts at u64.
                Kind-blind comparisons. The order ops ASK whether the column is already ordered
-               (`rows_sorted`/`sorted_signs`) before they sort — a dataflow's batches arrive sorted.
+               (`known_sorted`/`sorted_signs`) before they sort — a dataflow's batches arrive sorted.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid, in two forms: `Bin` (eats a pair) and `BinImm` (eats one
                column, constant right operand) — the IMMEDIATE axis. BinOp covers arithmetic plus
@@ -247,6 +247,20 @@ with `CapSum` closing the matrix and `Broadcast` renamed `CapList`; `Gather` (in
 arities > 256). The law-program pattern (corpus 27–34) witnesses every embellishment's reduction to
 kernel+isos, so the kernel's sufficiency is suite-checked.
 
+Then the order and arithmetic pass. The discrimination sort stops as soon as no two rows are tied
+(the tie narrowing `compare_pairs` always did, now on the sort side too) and reads field 0 without
+gathering it through an identity permutation; a bare leaf sorts its VALUES rather than a permutation
+(`sorting::radix_sort_slice` — no index buffer, no indirection, no gather after) and `dedup` compacts
+in one pass; the permutation path materializes each key ONCE and carries it, so every radix pass
+reads sequentially. `sort`/`dedup`/`group` ASK whether the column is already ordered before sorting
+it, cheaply or not at all. `find` MERGES a needle that is itself in key order instead of searching
+per probe — the one-directional form of `arrange::survey`. The arithmetic grid grew an IMMEDIATE
+axis (`BinImm` at every kind and width, plus `CmpOp::RelImm`), which retired the four U64-only
+one-off ops that sat outside it, and a bitwise family (`Shl`/`Shr`/`And`/`Or`/`Xor`, unsigned-only)
+that gave column-by-column bit ops for the first time. `Reduce`/`Scan` take any leaf width and
+accumulate at u64, which let `Rel` produce a BYTE mask. And a `Fold` whose body is a product of
+monoids does not run the loop at all. Every number is in `perf-gaps.md`.
+
 Then the point-access factoring. `Index`/`Head` were retired in favour of one indexed-access concept
 at two strata: the atom is the **scalar `Get (U64,List<X>)->X`** (one O(1) lookup per row, the genuine
 list eliminator), `Gather` is its **vectorization** (the index arrives as a list), and `head` is **sugar
@@ -274,9 +288,24 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 
 ## Backlog
 
-- **Fusion / vector-at-a-time (the perf multiplier).** Single ops are memory-bound, so the lever is
-  fewer passes, not SIMD. Tile execution ~1024 rows to L1 (the Polars/X100 model), composing the
-  existing SIMD kernels — no per-row interpreter. Needs a slice-capable op path + a fusable-run pass.
+- **A WINDOWED LEAF — the piece three other items wait on.** `Prim::U64(Arc<Vec<u64>>)` carries no
+  offset, so there is no way to hand an op rows 4096..8192. Adding a range is ADDITIVE: the
+  whole-buffer range behaves exactly as today, and `Arc::get_mut` in-place writes still work at
+  refcount 1, because a unique owner may mutate its own sub-range. The `prim!` macro confines the
+  change to `value.rs`. Waiting on it: the tiled executor below; `bytes.rs`' zero-copy decode, whose
+  doc already says the decode memcpy is "the honest floor for this representation" and that
+  borrowing "would take a different leaf type"; and `Fold`/`FoldScan`, where a round could BORROW
+  its element rather than allocate a one-element column to gather into (see C4 in `perf-gaps.md`).
+- **Fusion / vector-at-a-time — SIZED, not built.** Single ops are memory-bound, so the lever is
+  fewer passes, not SIMD. Tile execution to L1 (the Polars/X100 model), composing the existing
+  kernels — no per-row interpreter. The gaps suite now measures the prize directly: families A and B
+  run a TILE SWEEP at 1 K/4 K/16 K, where a whole multi-pass chain stays L1-resident, so `anchor /
+  sweep floor` is what a tile executor would collect. **It is 1.6–4.0x at the design centre and
+  2.2–4.9x at the DRAM point**, the floor is 4 K–8 K rows, and per-op fixed cost puts the useful tile
+  floor near 2 K. And that is ALL of it: A2 at its floor is still 0.53 ns/row for eight ops against a
+  fused Rust loop's 0.08, so the rest of the fusion-prize column is a compiler, not a calling
+  convention — the JIT rung `hobbes-precis.md` keeps on the ladder, and a decision that can now be
+  made before building rather than after.
 - **Destination-passing style (DPS) — the intentional discipline for the fusion above (not yet built).**
   DPS (Shaikhha/Fitzgibbon/PeytonJones/Vytiniotis) is the calling convention that makes the tile fusion
   work: thread a destination buffer through a chain of ops, each writes into it, no intermediates. The
@@ -293,7 +322,49 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   spine toward a linear/owned tile buffer (giving up free `Arc`-clone fan-out there) vs staying
   `Arc`-shared (free clones, no fusion). First spike: compile ONE stratum-stable run (e.g. `iota ; add
   ; mul ; gt`) to a single-tile DPS kernel and measure vs the per-op passes — that forces the ownership
-  decision on a small surface before committing the convention.
+  decision on a small surface before committing the convention. The ownership fork is now half
+  settled by the windowed leaf above: a window into an `Arc` the caller uniquely owns IS a
+  destination, so the choice is not "linear buffer vs `Arc`" but "who holds the tile".
+- **A WRITER for data-dependent cardinality.** DPS above is scoped to the 1:1 spine, with
+  "allocate-and-return at `List` introductions". The measurements say the introductions are where a
+  third of the remaining gap is: `filter` builds a u64 index vector and gathers (B1), `dedup` on an
+  already-sorted column builds run-firsts and gathers (D5), and `find`+`slices` materialises ranges
+  (E1) — each against a Rust ceiling that pushes straight into an output. A `Sink` contract (reserve,
+  push, finish) covers all three without a new operator.
+- **A cost model for the optimizer, before more rewrites.** `optimize` runs on NO evaluated path, so
+  nothing measures it; `--optimized` on the gaps bench now can, and the answer there is "one node
+  removed out of 89", because those programs are hand-minimal by construction. Run by hand on
+  programs that do carry redundancy, `fuse_maps` pays 2.0x and `dce` 2.2x — and **`cse` COSTS 25%**,
+  because sharing a column gives it fan-out 2 and the consumer that would have rewritten it in place
+  must copy instead. So the passes need to know about move-to-last-use before more are added. Two
+  rewrites are waiting on that: `match` -> `select` for cheap total arms (the rule is already written
+  at `Op::Select`; `Branch` avoids computing the unused side, `Select` avoids the partition), and the
+  gather-composition law below. Pointing it at a corpus written for CLARITY rather than for
+  measurement — the DDIR AoC programs — is how to size it: node count before/after, time
+  before/after, and time against a hand-tuned version of the same program.
+- **Pack narrow key fields into one radix key.** A compound key now costs one radix pass per field
+  that actually discriminates, but four narrow fields still cost four: four discriminating u16 fields
+  measure 27.7 ns/row as a `Prod` against 9.5 packed into one u64. `sort_list_blocks` already has
+  exactly this trick for strided byte lists up to 8 wide; generalizing it is "pack a fixed-width
+  prefix of the structural key into one wide integer, radix once, refine only if ties remain". It
+  does NOT help DDIR's key, whose leading field is a full 64-bit hash the tie check already stops on.
+- **`ReduceKey` — the C3 decision.** `group ; map fold` is 22–74x off a bucket accumulate, and it
+  decomposes: ~3–5x is reachable inside the discrimination sort (a narrow leaf's histogram IS the
+  partition, so labels come off it with no comparison — the Henglein MSD path `discriminate`'s module
+  doc names as unbuilt), and the residual ~17x is structural, because `group` produces the grouped
+  VALUES where an accumulate materialises nothing. Closing it means one fused op in the "fused forms
+  & producers" tier, with a law program witnessing `= group ; map ((k,vs) -> (k, vs fold_r))`. That
+  is the tier's charter, and it is a decision rather than a bug fix.
+- **A carried SORTEDNESS witness (the check is built; the witness is not).** `sort`/`dedup`/`group`
+  now ASK whether a column is already ordered, cheaply, and decline when the answer is not cheap.
+  The next rung is to CARRY it — the third member of the family `Bounds::Stride` and `Tags::Const`
+  belong to: a fact that is O(1) to read, costs no columns, and propagates instead of being
+  re-derived. It is also the riskier rung, since a witness that lies is a correctness bug rather than
+  a slow path, so: default to unsorted, set it from a whitelist of producers, `debug_assert` it.
+- **`arrange::find_ranges` and `CmpOp::Find` have diverging fast paths.** `lib.rs`'s wrapper carries a
+  hand-written U64 binary search, written because structural re-dispatch was 21% of an incremental
+  round; `Find` has its own U64 merged walk. One idea, two implementations — the only place in the
+  crate where the DDIR seam and the surface disagree about a kernel.
 - **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying

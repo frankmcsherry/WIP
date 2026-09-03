@@ -51,7 +51,7 @@ fn graph(op: impl Into<NumOp>) -> Graph<NumOp> {
     b.finish(out)
 }
 
-/// a chain of `k` AddU64 ops — each link is its own pass over memory; interior links operate in
+/// a chain of `k` immediate-add ops — each link is its own pass over memory; interior links operate in
 /// place on the moved buffer (move-on-last-use), so the per-link cost is the headroom an
 /// arithmetic-fusion pass would collapse into a single pass.
 fn add_chain(k: usize) -> Graph<NumOp> {

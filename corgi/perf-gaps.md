@@ -1,8 +1,9 @@
 # Corgi performance gaps
 
-> **Status:** current. Measured 2026-09-02 on an Apple M4 mini (16 GB) by `cargo bench --bench gaps`,
-> after the sort, sortedness and immediate-axis work. This replaces the `b9bb413` baseline, which
-> predated all three and is wrong about the A3, D and F rows — see *What this reorders*.
+> **Status:** current. Measured 2026-09-03 on an Apple M4 mini (16 GB) by `cargo bench --bench gaps`.
+> This replaces the `b9bb413` baseline, which predates the sort, sortedness, immediate-axis,
+> merged-find, byte-mask and monoid-fold work and is wrong about the A3, B, C5, D, E1 and F rows —
+> see *What this reorders*.
 
 To exercise the definition without producing reportable measurements, run
 `cargo bench --bench gaps -- --smoke`. Reportable runs can select one or more families with
@@ -108,16 +109,16 @@ instead. "Lever" names what would close it.
 
 | row | 1 K | 4 K | 8 K | 16 K | 1 M | 8 M | prize over the floor |
 |---|---|---|---|---|---|---|---|
-| A2 add_chain8 | 0.69 | **0.51** | 0.53 | 0.63 | 1.41 | 1.75 | 2.8× / 3.4× |
-| A3 mixed_chain | 0.33 | **0.27** | 0.29 | 0.36 | 1.11 | 1.08 | 4.1× / 4.0× |
-| A4 map_reduce | 0.29 | 0.21 | **0.20** | 0.24 | 0.68 | 0.77 | 3.4× / 3.9× |
-| B1 filter_values | 1.22 | 0.94 | **0.87** | 0.92 | 1.68 | 1.97 | 1.9× / 2.3× |
-| B2 cmp_select | 0.77 | **0.59** | 0.72 | 0.69 | 2.47 | 2.20 | 4.2× / 3.7× |
+| A2 add_chain8 | 0.69 | 0.59 | **0.53** | 0.63 | 1.07 | 2.09 | 2.0× / 3.9× |
+| A3 mixed_chain | 0.69 | **0.27** | 0.31 | 0.36 | 0.91 | 1.00 | 3.4× / 3.7× |
+| A4 map_reduce | 0.49 | **0.20** | 0.20 | 0.24 | 0.72 | 0.87 | 3.6× / 4.4× |
+| B1 filter_values | 1.71 | 0.87 | **0.80** | 0.84 | 1.26 | 1.72 | 1.6× / 2.2× |
+| B2 cmp_select | 1.02 | **0.53** | 0.64 | 0.63 | 2.13 | 2.62 | 4.0× / 4.9× |
 
 The floor is 4 K–8 K rows and the rise below it is per-op fixed cost, which puts the useful tile
-floor near 2 K rows. **Tiling is worth 1.9–4.2× at the design center and 2.3–4.0× at the DRAM
-point** — and that is all of it: A2 at its floor is still 0.51 ns/row for eight ops against a fused
-Rust loop's 0.06, so the rest of the fusion-prize column is a compiler, not a calling convention.
+floor near 2 K rows. **Tiling is worth 1.6–4.0× at the design center and 2.2–4.9× at the DRAM
+point** — and that is all of it: A2 at its floor is still 0.53 ns/row for eight ops against a fused
+Rust loop's 0.08, so the rest of the fusion-prize column is a compiler, not a calling convention.
 
 ## What this reorders
 
@@ -130,17 +131,15 @@ Three contributors have been removed and a fourth named. The body's graph is PRE
 the round loop (consumer counts and evaluation buffers computed per graph, not per call — see
 `graph::Prepared`); `FoldScan` SCATTERS a fixed-width output straight into one column instead of
 keeping a `Value` and two `usize` per element and stitching at the end; and a `Fold` whose body is a
-product of monoids does not run the loop at all. Together: C4 255 → 170 ns/row at 1 M (1.5×) and
-C5 291 → 0.44 (660×).
+product of monoids does not run the loop at all. Together: C4 244 → 175 ns/row at 1 M (1.4×) and
+C5 308 → 0.4–1.0 (300–700×).
 
 **What is left is allocation, and it is most of what remains.** With one long row, a round processes
 ONE element, and it still allocates a one-element gather result, a two-element `Prod` for the body's
 argument, and — in `Fold` — the accumulator gather and scatter. Those are per-element allocations
-around a per-element scalar op. Removing them is the single-row interpreter (register/stack scratch,
-no heap per step), or the windowed leaf that would let a round borrow its element instead of
-gathering it. The earlier reading of this — "most of the two worst rows is evaluator setup" — was
-half right: setup was worth 1.2–1.5×, not the 3× it looked like, because the setup is only one of
-about five allocations a round makes.
+around a per-element scalar op, and preparing the graph removed only one of about five. Removing the
+rest is the single-row interpreter (register/stack scratch, no heap per step), or the windowed leaf
+that would let a round BORROW its element instead of gathering it.
 
 The cases still stratify by fixability:
 
@@ -150,7 +149,7 @@ The cases still stratify by fixability:
   of per-field monoid updates, each from a contribution that never reads the accumulator, is
   `seed_i ⊕ reduce_i(list)` — one pass per field. Recognized at eval time in the NUMERIC layer
   (`ops::numeric::monoid_fold`), since "is this op a monoid" is a numeric question and the core is
-  blind to it. C5 went 240 → 0.44 ns/row at 1 M, from the worst row on the board by two orders of
+  blind to it. C5 went 240 → 0.4–1.0 ns/row at 1 M, from the worst row on the board by two orders of
   magnitude to a single-digit multiple of a fused loop.
 - **fixed-width non-monoid body** — inherently sequential, so the lever is the per-step constant, and
   what is left of that constant is per-round allocation. **One subcase is not inherently sequential:**
@@ -172,7 +171,7 @@ The bounds-checked sequential `gather` runs at 0.33/1.04/1.05 ns/row against Rus
 0.67/1.32/1.40, winning at every size. The vectorized all-or-nothing check is cheaper than Rust's
 per-element bounds check, and competitive with eliding the check entirely.
 
-**Four rows the old baseline called gaps are closed.**
+**Six rows the old baseline called gaps are closed or much smaller.**
 
 1. **A3 mixed_chain was tax 1.6–2.8×, and is now 1.0–1.3×.** Its mechanism line used to read
    "`mul`/`sub` by a constant lack immediate kernels, so `Lit` broadcasts a column and builds a
@@ -180,18 +179,25 @@ per-element bounds check, and competitive with eliding the check entirely.
    `CmpOp::RelImm`), and the four U64-only one-off ops that used to sit outside it are gone.
 2. **D4 sort_sorted, a row that did not exist, is at the ceiling.** `sort`, `dedup` and `group` now
    ask whether the column is already ordered before they sort it, and answer cheaply or decline.
-   An already-ordered 1 M column sorts in 0.26 ns/row against 24 for the old path.
+   An already-ordered 1 M column sorts in 0.26 ns/row against 24.0 for the old path.
 3. **The sort is now past its ceiling.** Three changes: the discrimination stops once no two rows
    are tied (as `compare_pairs` next door always has) and reads field 0 directly instead of
    gathering it through an identity permutation; a bare leaf sorts its VALUES, with no permutation
    to build and no gather after; and the permutation path materializes each key once and carries it,
    so every radix pass reads sequentially instead of twice-per-element through the index. D1 went
-   24.3 → 4.4 ns/row at 1 M and 48.4 → 8.2 at 8 M, D2 28.3 → 5.7 and 52.4 → 9.1, D3 25.6 → 14.7 and
-   54.5 → 39.9, R1 23.1 → 13.9 and 44.4 → 31.8. corgi now sorts a u64 column faster than
+   24.0 → 5.2 ns/row at 1 M and 50.0 → 9.6 at 8 M, D2 26.8 → 6.1 and 54.4 → 9.1, D3 25.6 → 15.1 and
+   54.5 → 41.2, R1 24.5 → 15.0 and 44.9 → 32.1. corgi now sorts a u64 column faster than
    `sort_unstable`. The one cost is at the 8 K L1 control, where D3 is ~10% slower: carrying the key
    is extra traffic that an L1-resident indirect read does not repay. That point is a control, not a
    target.
-4. **F1 branch_match was 16×/15×** at `b9bb413` and is 8.7–10.9× now (PR #18's copies work).
+4. **C5 fold_sum_count was the worst row on the board and is now single-digit.** A `Fold` whose
+   body is a product of monoids becomes one reduce per field: 308 → 0.4–1.0 ns/row at 1 M.
+5. **B1 and B2 came down with the mask.** `Rel` produces a BYTE mask now — the core's idiom is
+   "nonzero is true" and leaves are width-tagged, so one bit was being stored in eight bytes — and
+   `rel`'s lane body resolves its predicate to ONE comparison rather than evaluating all three
+   order-flags. B1 1.72 → 1.26 ns/row at 1 M, B2 2.81 → 2.13.
+6. **F1 branch_match was 16×/15×** at `b9bb413`; it now measures 8.3–20×, and the spread is the row
+   itself (see the bimodality note above), not a change.
 
 **E1's number was wrong, not just stale.** Its probe side was built by a `dedup` — a full sort —
 *inside* the timed program, so the row measured a sort plus a join and moved with every sort change.
@@ -207,7 +213,7 @@ Both sides are now built outside the timer.
    (`ReduceKey`), which is a decision, not a bug fix.
 2. **prefix search inside a ragged `List` column.** The single-key join is fixed: `find` now merges
    when the needle is itself in key order, which is what a join has, and E1 went 2.90 → 1.58 ns/row
-   at 1 M and 3.69 → 1.62 at 8 M — flat in n, where the per-probe search was `n log n`.
+   at 1 M and 3.69 → 1.62 at 8 M, flat in n where the per-probe search was `n log n`.
    NOTE the scope, which is the whole of the remaining problem: a merge replaces a search only for a
    scalar or hashed key. Seeking a PREFIX in a ragged `List` column is different, because corgi's
    list order is LENGTH-FIRST and length-first is exactly the order that lacks prefix contiguity —

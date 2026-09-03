@@ -103,7 +103,7 @@ impl CmpOp {
                 let (bounds, vals) = input.into_list("SortList")?;
                 // Already ordered: the permutation is the identity, so the discrimination pass and
                 // the gather after it would together copy the column to reproduce it. See
-                // `sorted_signs` for why asking is worth it — a dataflow's batches arrive sorted.
+                // `known_sorted` for why asking is worth it — a dataflow's batches arrive sorted.
                 if known_sorted(&bounds, &vals) {
                     return Ok(Value::List(bounds, Box::new(vals)));
                 }

@@ -214,7 +214,7 @@ fn csv_text(m: usize) -> (Value, Vec<u8>) {
     )
 }
 
-/// a chain of `k` in-place `AddU64` passes — each link its own pass over memory (interior links mutate
+/// a chain of `k` in-place immediate-add passes — each link its own pass over memory (interior links mutate
 /// the moved buffer). The pure fusion headroom: `k` passes a single fused loop collapses to one.
 fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
