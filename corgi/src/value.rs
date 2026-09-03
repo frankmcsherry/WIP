@@ -595,6 +595,47 @@ macro_rules! prim {
                 }
             }
 
+            /// Sort every row of `bounds` ascending, IN PLACE — the value sort (see
+            /// [`radix_sort_slice`]). One scratch buffer and one counter array serve every row.
+            pub(crate) fn sort_rows(&mut self, bounds: &Bounds) {
+                match self {
+                    $( Prim::$V(v) => {
+                        let vals = Arc::make_mut(v);
+                        let (mut tmp, mut counts): (Vec<$t>, Vec<u32>) = (Vec::new(), Vec::new());
+                        let mut start = 0;
+                        for end in bounds.ends() {
+                            radix_sort_slice(&mut vals[start..end], &mut tmp, &mut counts);
+                            start = end;
+                        }
+                    } )+
+                }
+            }
+
+            /// Keep the first element of each equal run of every row of an ALREADY SORTED column,
+            /// compacting in place, and return the new row ends. The `dedup` half of the value
+            /// sort: one pass, no index column, no gather.
+            pub(crate) fn dedup_sorted_rows(&mut self, bounds: &Bounds) -> Vec<usize> {
+                match self {
+                    $( Prim::$V(v) => {
+                        let vals = Arc::make_mut(v);
+                        let mut ends = Vec::with_capacity(bounds.len());
+                        let (mut w, mut start) = (0usize, 0usize);
+                        for end in bounds.ends() {
+                            for k in start..end {
+                                if k == start || vals[k] != vals[k - 1] {
+                                    vals[w] = vals[k];
+                                    w += 1;
+                                }
+                            }
+                            ends.push(w);
+                            start = end;
+                        }
+                        vals.truncate(w);
+                        ends
+                    } )+
+                }
+            }
+
             /// stable per-element hash: each element WIDENED to u64 (zero-extend) and mixed (splitmix64
             /// finalizer). The leaf of [`crate::hash::hash`]; reads the stored bytes only, so it is
             /// KIND-BLIND and — for the raw/unsigned reading — WIDTH-BLIND: `u8` 5 and `u64` 5 both
@@ -689,6 +730,96 @@ prim! {
     U16 => u16,
     U32 => u32,
     U64 => u64,
+}
+
+/// LSD radix sort of a slice, IN PLACE, at a digit width chosen from its length.
+///
+/// This is the VALUE sort. Where [`Prim::sort_block_scratch`] produces a permutation — because its
+/// caller has a payload to move alongside, or labels to refine — this moves the values themselves:
+/// no index buffer, no indirection through one (every pass reads and writes sequentially), and no
+/// gather afterwards. It is what `sort`/`dedup` want when the list's element is a bare leaf, which
+/// is the majority of what they are asked to sort.
+///
+/// The digit width scales with the block: a wide digit halves the number of passes but pays a
+/// counter array per pass, so 256 buckets for a small block and up to 65536 for a large one. High
+/// all-zero digits are skipped, so a narrow key costs fewer passes. `tmp` and `counts` are caller
+/// scratch, reused across every row of a column.
+fn radix_sort_slice<T: Copy + Ord + Default + Into<u64>>(
+    s: &mut [T],
+    tmp: &mut Vec<T>,
+    counts: &mut Vec<u32>,
+) {
+    let n = s.len();
+    if n <= 1 {
+        return;
+    }
+    // a tiny block never repays a counter array; insertion sort is also what a refinement pass
+    // hands this function most often, once the levels above have split the column into groups.
+    if n <= 32 {
+        for k in 1..n {
+            let mut j = k;
+            while j > 0 && s[j - 1] > s[j] {
+                s.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        return;
+    }
+    let max: u64 = s.iter().copied().max().unwrap_or_default().into();
+    let sig = 64 - max.leading_zeros(); // significant bits; 0 when every value is 0
+    if sig == 0 {
+        return;
+    }
+    let d: u32 = if n < 4096 {
+        8
+    } else if n < (1 << 18) {
+        11
+    } else {
+        16
+    };
+    let buckets = 1usize << d;
+    let mask = (buckets - 1) as u64;
+    let passes = sig.div_ceil(d);
+    if tmp.len() < n {
+        tmp.resize(n, T::default());
+    }
+    if counts.len() < buckets {
+        counts.resize(buckets, 0);
+    }
+    let mut from_s = true;
+    for p in 0..passes {
+        let shift = p * d;
+        counts[..buckets].iter_mut().for_each(|c| *c = 0);
+        {
+            let src: &[T] = if from_s { &s[..n] } else { &tmp[..n] };
+            for x in src {
+                counts[(((*x).into() >> shift) & mask) as usize] += 1;
+            }
+        }
+        let mut start = 0u32;
+        for c in counts[..buckets].iter_mut() {
+            let cnt = *c;
+            *c = start;
+            start += cnt;
+        }
+        if from_s {
+            for &x in s[..n].iter() {
+                let b = ((x.into() >> shift) & mask) as usize;
+                tmp[counts[b] as usize] = x;
+                counts[b] += 1;
+            }
+        } else {
+            for &x in tmp[..n].iter() {
+                let b = ((x.into() >> shift) & mask) as usize;
+                s[counts[b] as usize] = x;
+                counts[b] += 1;
+            }
+        }
+        from_s = !from_s;
+    }
+    if !from_s {
+        s.copy_from_slice(&tmp[..n]);
+    }
 }
 
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in

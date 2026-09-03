@@ -489,7 +489,7 @@ fn family_d(n: usize, reps: u32) {
         v.sort_unstable();
         black_box(v);
     });
-    row("D1 sort_u64", n, c, r, "byte-radix vs pdqsort");
+    row("D1 sort_u64", n, c, r, "value radix (no permutation, no gather) vs pdqsort");
 
     // D2 dedup — sort then unique.
     let g = compile("input dedup");
@@ -500,7 +500,7 @@ fn family_d(n: usize, reps: u32) {
         v.dedup();
         black_box(v);
     });
-    row("D2 dedup", n, c, r, "sort+unique vs sort+dedup");
+    row("D2 dedup", n, c, r, "value radix + compacting pass vs sort+dedup");
 
     // D3 sort a COMPOUND key — the shape DDIR actually sorts (after the hash-key lane a key is
     // `Prod([hash, key])`, whose leading u64 discriminates essentially everything). D1's scalar key

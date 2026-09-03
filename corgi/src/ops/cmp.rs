@@ -103,6 +103,13 @@ impl CmpOp {
                 if known_sorted(&bounds, &vals) {
                     return Ok(Value::List(bounds, Box::new(vals)));
                 }
+                // A bare leaf has no companion column to carry, so the VALUES can be sorted
+                // directly: no permutation to build, no indirection through one, and no gather
+                // after. Equal leaf elements are indistinguishable, so stability is unobservable.
+                if let Value::Prim(mut p) = vals {
+                    p.sort_rows(&bounds);
+                    return Ok(Value::List(bounds, Box::new(Value::Prim(p))));
+                }
                 let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
                 Value::List(bounds, Box::new(gather(&vals, &perm)))
             }
@@ -117,6 +124,13 @@ impl CmpOp {
                     let firsts = run_firsts(&bounds, &signs);
                     let nb = runs_per_row(&bounds, &firsts);
                     return Ok(Value::List(nb.into(), Box::new(gather(&vals, &firsts))));
+                }
+                // as in `SortList`: a leaf payload sorts by value, and the distinct elements are
+                // then one compacting pass over the sorted rows.
+                if let Value::Prim(mut p) = vals {
+                    p.sort_rows(&bounds);
+                    let nb = p.dedup_sorted_rows(&bounds);
+                    return Ok(Value::List(nb.into(), Box::new(Value::Prim(p))));
                 }
                 let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
                 let (_ends, firsts) = run_layout(&labels);
@@ -332,9 +346,43 @@ mod sorted_fast_paths {
         ]
     }
 
+    /// a deterministic LCG column, as the benches use — big enough to take the radix path (blocks
+    /// over 32 elements) at every leaf width, with a small value range so duplicate runs are dense.
+    fn scrambled(n: usize, modulus: u64) -> Vec<u64> {
+        (0..n as u64)
+            .map(|i| {
+                (i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 32)
+                    % modulus
+            })
+            .collect()
+    }
+
+    /// Leaf columns past the insertion-sort threshold, at every width and in several row layouts —
+    /// the sizes that reach the radix, which the hand-written cases above are all too small for.
+    fn radix_cases() -> Vec<Value> {
+        let mut out = Vec::new();
+        for &n in &[33usize, 100, 5000] {
+            for &modulus in &[4u64, 1000, u32::MAX as u64 + 1] {
+                let xs = scrambled(n, modulus);
+                out.push(list(vec![n], u(&xs)));
+                // the same values split across ragged rows, so each row sorts independently.
+                let ends = vec![n / 4, n / 4, n / 2, n];
+                out.push(list(ends, u(&xs)));
+                // narrower leaves take a different width arm and fewer radix passes.
+                out.push(list(vec![n], Value::u8(xs.iter().map(|&x| x as u8).collect())));
+                out.push(list(vec![n], Value::u16(xs.iter().map(|&x| x as u16).collect())));
+                out.push(list(vec![n], Value::u32(xs.iter().map(|&x| x as u32).collect())));
+            }
+        }
+        // every value equal (the all-zero-significant-bits early return) and a single element.
+        out.push(list(vec![64], u(&vec![7; 64])));
+        out.push(list(vec![64], u(&vec![0; 64])));
+        out
+    }
+
     #[test]
     fn sort_matches_the_discrimination_path() {
-        for v in cases() {
+        for v in cases().into_iter().chain(radix_cases()) {
             assert_eq!(
                 CmpOp::SortList.eval(v.clone()).unwrap(),
                 ref_sort(v.clone()),
@@ -346,7 +394,7 @@ mod sorted_fast_paths {
 
     #[test]
     fn dedup_matches_the_discrimination_path() {
-        for v in cases() {
+        for v in cases().into_iter().chain(radix_cases()) {
             assert_eq!(
                 CmpOp::DedupList.eval(v.clone()).unwrap(),
                 ref_dedup(v.clone()),
