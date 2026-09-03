@@ -118,7 +118,9 @@ pub enum ArithOp {
                            // column and `Tuple` builds a product, so `x mul 3` allocated and wrote a
                            // whole extra column per use. Only add/shr/and/gt had escaped that, as
                            // U64-only one-off ops outside the grid.
-    Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
+    Reduce(Red),           // List<X> -> U64 (X for min/max)   per-row monoid reduction. Any leaf width
+                           // in; the ACCUMULATING monoids (add/mul/all/any) come out at u64, the ORDER
+                           // ones (min/max) at the element's width, since the answer IS an element.
     Scan(Red),             // List<U64> -> List<U64>  per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
                            // general `FoldScan` re-evals the body per element (catastrophic on one long
@@ -396,11 +398,14 @@ mod monoid {
     //! The named monoid reductions and scans — the one-pass kernels for the associative case, which
     //! a general `Fold` over the same monoid is ~20x slower than.
     //!
-    //! Both take ANY leaf width and accumulate at `u64`, because a reduction of a narrow column
-    //! routinely exceeds it: counting a byte mask is the motivating case, and it is what lets `Rel`
-    //! produce a byte mask at all. The widen is the leaf's UNSIGNED reading, so a narrow `Kind::I`
-    //! or `Kind::F` column — whose encoding is width-dependent — must be `cast` first, the caveat
-    //! `crate::hash` already carries for the same reason.
+    //! Both take ANY leaf width and fold at `u64`, because a reduction of a narrow column routinely
+    //! exceeds it: summing a mask is the motivating case. The widen is the leaf's UNSIGNED reading,
+    //! so a narrow `Kind::I` or `Kind::F` column — whose encoding is width-dependent — must be `cast`
+    //! first, the caveat `crate::hash` already carries for the same reason.
+    //!
+    //! `u64` is where they FOLD, not necessarily what they return: the caller narrows `Min`/`Max`
+    //! back to the element width, because those are order reductions and the answer is an element.
+    //! `Red::Min`'s `u64::MAX` identity is the right identity at every width once narrowed.
     //!
     //! Width and monoid are both dispatched ABOVE the loop, so each row folds through one concrete
     //! body — the discipline [`super::grid`] follows for arithmetic.
@@ -529,31 +534,50 @@ impl ArithOp {
                 let p = widen_to(input.into_prim("immediate arith")?, *op, *kind, *w)?;
                 Value::Prim(bin_imm_eval(*op, *kind, p, *c))
             }
-            // ANY leaf width in, U64 out. The accumulator is u64 whatever the elements are,
-            // because a reduction of a narrow column routinely exceeds it: counting a byte mask
-            // (`xs map (e -> e gt 5) fold_add`) is the motivating case, and it is the reason `Rel`
-            // can afford to produce a byte mask at all.
+            // ANY leaf width in. `Add`/`Mul`/`All`/`Any` come out at U64 — the accumulator is u64
+            // whatever the elements are, because a reduction of a narrow column routinely exceeds
+            // it: summing a mask (`xs map (e -> e gt 5) fold_add`) is the motivating case.
             //
-            // The widen is the leaf's UNSIGNED reading, which is what the leaf stores. `Kind::I`
-            // and `Kind::F` encode order-preservingly at their own WIDTH, so a narrow signed or
-            // float column must be `cast` to the accumulator's width before it is reduced —
-            // the same caveat `crate::hash` carries, and for the same reason.
+            // `Min`/`Max` come out at the ELEMENT's width, because they are ORDER reductions rather
+            // than accumulations: the answer is one of the elements, so it is a value of their type,
+            // and `CmpOp::Min`/`Max` are `(X, X) -> X` everywhere else. Widening them would also be
+            // the one place the accumulator rule is unsound rather than merely wide: `Kind::I` and
+            // `Kind::F` encode order-preservingly at their own WIDTH, so an 8-bit signed encoding
+            // sitting in a 64-bit slot is misread by any later deswizzle. (`Red::Min`'s `u64::MAX`
+            // identity narrows to the right identity at every width, so an empty row still reduces
+            // to "no constraint".)
+            //
+            // For the widening reductions the same caveat stands as before, and as `crate::hash`
+            // carries: the widen is the leaf's UNSIGNED reading, so a narrow signed or float column
+            // must be `cast` to the accumulator's width before it is summed.
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
                 let p = vals.into_prim("reduce values")?;
-                Value::u64(reduce_rows(&bounds, *r, &p))
+                let out = Prim::U64(Arc::new(reduce_rows(&bounds, *r, &p)));
+                // one pass over ROWS, not elements, and the identity when the widths agree.
+                Value::Prim(match r {
+                    Red::Min | Red::Max => out.cast(p.bits()),
+                    _ => out,
+                })
             }
-            // ANY leaf width in, `List<U64>` out — the accumulator rule of `Reduce`, applied to
-            // every prefix. A U64 operand is rewritten in place; a narrower one widens as it goes,
-            // which it must, since a prefix of a byte column is not a byte.
+            // `Reduce`'s rule applied to every prefix, so the same split: a running sum of a byte
+            // column is not a byte, and a running MINIMUM of one is. A U64 operand is rewritten in
+            // place; a narrower one widens as it goes and, for the order ops, narrows back.
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
-                let mut xs = match vals.into_prim("scan values")? {
+                let p = vals.into_prim("scan values")?;
+                let bits = p.bits();
+                let mut xs = match p {
                     Prim::U64(v) => Arc::try_unwrap(v).unwrap_or_else(|a| (*a).clone()),
                     narrow => monoid::widen_u64(&narrow),
                 };
                 scan_rows(&bounds, *r, &mut xs);
-                Value::List(bounds, Box::new(Value::u64(xs)))
+                let out = Prim::U64(Arc::new(xs));
+                let out = match r {
+                    Red::Min | Red::Max => out.cast(bits),
+                    _ => out,
+                };
+                Value::List(bounds, Box::new(Value::Prim(out)))
             }
         })
     }
@@ -970,6 +994,50 @@ mod monoid_fold_tests {
                 let rows = list.len();
                 let seed = u(&vec![if src.contains("lit 1") { 1 } else { 0 }; rows]);
                 agree(src, recognized, seed, list.clone());
+            }
+        }
+    }
+
+    /// NARROW ELEMENTS, against a `U64` accumulator. The two paths must agree on ACCEPTANCE as well
+    /// as on the answer: which physical plan runs is corgi's choice, and it must not decide whether
+    /// the program is a type error.
+    ///
+    /// The two buckets differ here, and both are right. `Add`/`Mul` come from the arithmetic grid,
+    /// which widens a narrower unsigned operand to the cell's declared width — so `acc + x` over a
+    /// `List<U8>` is legal, and `Reduce(Add)`'s accumulate-at-u64 rule matches it. `Min`/`Max` are
+    /// ORDER ops: `(X, X) -> X`, equal widths, kind-blind on the leaf's own stored bytes. So the
+    /// same fold is a width error under `min`, and both paths have to say so.
+    #[test]
+    fn narrow_elements_agree_with_the_lockstep_fold() {
+        let narrow = |xs: &[u64]| {
+            [
+                Value::u8(xs.iter().map(|&x| x as u8).collect()),
+                Value::u16(xs.iter().map(|&x| x as u16).collect()),
+                Value::u32(xs.iter().map(|&x| x as u32).collect()),
+                u(xs),
+            ]
+        };
+        let cases = [
+            // the grid widens: legal on every element width.
+            "let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) add)",
+            "let s = input lit 1 in (s, input) fold ((acc, x) -> (acc, x) mul)",
+            // an order op: legal only when the element is as wide as the accumulator.
+            "let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) min)",
+            "let s = input lit 0 in (s, input) fold ((acc, x) -> (acc, x) max)",
+            // the element width is irrelevant to a constant contribution.
+            "let s = input lit 0 in (s, input) fold ((acc, x) -> acc add_u64 1)",
+            // ...and to a product accumulator whose OTHER field is fine.
+            "let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) min, acc.1 add_u64 1))",
+        ];
+        for src in cases {
+            let pair = src.contains("seed = (");
+            for elems in narrow(&[3, 1, 4, 1, 5, 9]) {
+                for ends in [vec![6], vec![2, 2, 6], vec![0, 6, 6]] {
+                    let rows = ends.len();
+                    let one = u(&vec![if src.contains("lit 1") { 1 } else { 0 }; rows]);
+                    let seed = if pair { Value::Prod(vec![one.clone(), one]) } else { one };
+                    agree(src, true, seed, Value::List(ends.into(), Box::new(elems.clone())));
+                }
             }
         }
     }
