@@ -115,6 +115,11 @@ mod compare {
         Explicit(&'a [usize], &'a [usize]),
         Diagonal(usize), // (i, i) for i in 0..n
         Adjacent(usize), // (k, k+1) for k in 0..n — `n` is the PAIR count, one less than the rows
+        /// An implicit pattern NARROWED to surviving positions: pair `t` is `(ks[t], ks[t] + skew)`.
+        /// A product's later fields see this when the comparison entered implicitly, because
+        /// `(k, k + skew)` is still a function of one index after narrowing — materialising the two
+        /// index columns it describes is exactly what the implicit forms exist to avoid.
+        Strided(&'a [usize], usize),
     }
 
     impl Pairs<'_> {
@@ -122,6 +127,7 @@ mod compare {
             match self {
                 Pairs::Explicit(ia, _) => ia.len(),
                 Pairs::Diagonal(n) | Pairs::Adjacent(n) => *n,
+                Pairs::Strided(ks, _) => ks.len(),
             }
         }
         #[inline]
@@ -129,6 +135,7 @@ mod compare {
             match self {
                 Pairs::Explicit(ia, _) => ia[k],
                 Pairs::Diagonal(_) | Pairs::Adjacent(_) => k,
+                Pairs::Strided(ks, _) => ks[k],
             }
         }
         #[inline]
@@ -137,6 +144,19 @@ mod compare {
                 Pairs::Explicit(_, ib) => ib[k],
                 Pairs::Diagonal(_) => k,
                 Pairs::Adjacent(_) => k + 1,
+                Pairs::Strided(ks, skew) => ks[k] + skew,
+            }
+        }
+        /// The skew of a pattern that is a FUNCTION OF ONE INDEX — `Some(d)` when pair `k` is
+        /// `(k, k + d)`. Such a pattern survives being narrowed to a subset of its indices, which is
+        /// what lets a product descend into its later fields without building both index columns.
+        #[inline]
+        fn skew(&self) -> Option<usize> {
+            match self {
+                Pairs::Explicit(..) => None,
+                Pairs::Diagonal(_) => Some(0),
+                Pairs::Adjacent(_) => Some(1),
+                Pairs::Strided(_, skew) => Some(*skew),
             }
         }
     }
@@ -152,6 +172,7 @@ mod compare {
                 Pairs::Explicit(ia, ib) => pa.cmp_idx(ia, ib, pb),
                 Pairs::Diagonal(n) => pa.cmp_dense(pb, n, 0),
                 Pairs::Adjacent(n) => pa.cmp_dense(pb, n, 1),
+                Pairs::Strided(ks, skew) => pa.cmp_strided(pb, ks, skew),
             },
 
             // single-field product: the field's order IS the order — skip the fold + tie vec.
@@ -165,30 +186,52 @@ mod compare {
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
                 let mut ord = compare_pairs(&ca[0], &cb[0], pairs);
+                // NB going DENSE on the next field while most pairs are still tied — same pattern,
+                // no index columns, no scatter — measures WORSE than narrowing even at 74% ties
+                // (19.1 ms against 17.2 on a 3.7 M-row adjacent compare). The extra 35% of subtree
+                // work costs more than the two index columns it saves, so narrowing is right at
+                // every fraction and there is no crossover to detect.
+                let fields = ca[1..].iter().zip(&cb[1..]);
                 if ca.len() > 1 {
-                    let mut tie_k: Vec<usize> = (0..m).filter(|&k| ord[k] == 0).collect();
-                    let mut tia: Vec<usize> = tie_k.iter().map(|&k| pairs.left(k)).collect();
-                    let mut tib: Vec<usize> = tie_k.iter().map(|&k| pairs.right(k)).collect();
-                    for (x, y) in ca[1..].iter().zip(&cb[1..]) {
-                        if tie_k.is_empty() {
+                    // The surviving ties, carried down as POSITIONS. `at[t]` is the tie's slot in
+                    // `ord`; `ks[t]` is what the next field must read.
+                    //
+                    // When the pattern is a function of one index (`Diagonal`, `Adjacent`, and any
+                    // narrowing of them) the next field can be told the pattern rather than two
+                    // index columns describing it: one vector to carry instead of two, and the leaf
+                    // reads both sides from one ascending list instead of gathering each side
+                    // independently. Only an `Explicit` entry, whose two sides are unrelated, has to
+                    // materialise both.
+                    let (mut at, mut ks): (Vec<usize>, Vec<usize>) =
+                        (0..m).filter(|&k| ord[k] == 0).map(|k| (k, pairs.left(k))).unzip();
+                    let mut ib: Vec<usize> = match pairs.skew() {
+                        Some(_) => Vec::new(),
+                        None => at.iter().map(|&k| pairs.right(k)).collect(),
+                    };
+                    for (x, y) in fields {
+                        if at.is_empty() {
                             break;
                         }
-                        let sub = compare_pairs(x, y, Pairs::Explicit(&tia, &tib));
+                        let sub = match pairs.skew() {
+                            Some(skew) => compare_pairs(x, y, Pairs::Strided(&ks, skew)),
+                            None => compare_pairs(x, y, Pairs::Explicit(&ks, &ib)),
+                        };
                         let mut w = 0usize;
-                        for t in 0..tie_k.len() {
-                            let k = tie_k[t];
+                        for t in 0..at.len() {
                             if sub[t] != 0 {
-                                ord[k] = sub[t];
+                                ord[at[t]] = sub[t];
                             } else {
-                                tie_k[w] = k;
-                                tia[w] = tia[t];
-                                tib[w] = tib[t];
+                                at[w] = at[t];
+                                ks[w] = ks[t];
+                                if !ib.is_empty() {
+                                    ib[w] = ib[t];
+                                }
                                 w += 1;
                             }
                         }
-                        tie_k.truncate(w);
-                        tia.truncate(w);
-                        tib.truncate(w);
+                        at.truncate(w);
+                        ks.truncate(w);
+                        ib.truncate(w.min(ib.len()));
                     }
                 }
                 ord

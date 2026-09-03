@@ -686,6 +686,20 @@ macro_rules! prim {
             /// for `n` pairs. The implicit-index leaf compare — `skew` 0 is the diagonal (row i vs
             /// row i) and `skew` 1 the adjacent (row k vs row k+1). Both sides are read
             /// sequentially, so this vectorizes where [`Prim::cmp_idx`] is two gathers per lane.
+            /// structural order of a STRIDED SUBSET: `out[t]` = sign of `self[ks[t]]` vs
+            /// `other[ks[t] + skew]`. What a product's later fields read once an implicitly-entered
+            /// comparison has been narrowed to its surviving ties: ONE index column rather than two,
+            /// and `ks` is ascending, so both sides are still read in order instead of becoming two
+            /// arbitrary gathers. The middle ground between [`Prim::cmp_dense`] and [`Prim::cmp_idx`].
+            pub(crate) fn cmp_strided(&self, other: &Prim, ks: &[usize], skew: usize) -> Vec<i8> {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => ks.iter()
+                        .map(|&k| { let (x, y) = (a[k], b[k + skew]); (x > y) as i8 - (x < y) as i8 })
+                        .collect(), )+
+                    _ => panic!("cmp_strided: prim width mismatch"),
+                }
+            }
+
             pub(crate) fn cmp_dense(&self, other: &Prim, n: usize, skew: usize) -> Vec<i8> {
                 match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) => (0..n)
