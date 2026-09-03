@@ -749,6 +749,40 @@ fn family_arrange(n: usize, reps: u32) {
                 .collect::<Vec<i8>>(),
         );
     });
+    // R6 the SCALAR comparator — the one a merge calls once per row, and the hottest corgi
+    // function in a DDIR profile (17% of an SCC run before it stopped being a batch of one).
+    // Every other row here is a bulk kernel; this is the seam where the host asks about one pair,
+    // and the suite could not see it. Two shapes: a bare leaf, and the compound key a dataflow
+    // actually sorts by, `Prod([hash, key])`, whose leading field decides almost every pair.
+    let pairs: Vec<(usize, usize)> =
+        (0..n).map(|i| (i, (i * 2654435761) % n)).collect();
+    let compound = Value::Prod(vec![leaf(n), Value::u64(scrambled(n))]);
+    for (what, col) in [("leaf", leaf(n)), ("compound", compound)] {
+        let c = rust_t(reps, || {
+            let (col, ps) = (black_box(&col), black_box(&pairs));
+            let mut acc = 0i32;
+            for &(i, j) in ps {
+                acc += arrange::compare_at(col, i, col, j) as i32;
+            }
+            black_box(acc);
+        });
+        let r = rust_t(reps, || {
+            let (s, ps) = (black_box(&src), black_box(&pairs));
+            let mut acc = 0i32;
+            for &(i, j) in ps {
+                acc += s[i].cmp(&s[j]) as i32;
+            }
+            black_box(acc);
+        });
+        row(
+            &format!("R6 compare_at ({what})"),
+            n,
+            c,
+            r,
+            "one structural pair vs one `u64` compare",
+        );
+    }
+
     row(
         "R2 arrange_compare",
         n.saturating_sub(1).max(1),
