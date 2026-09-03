@@ -357,9 +357,7 @@ impl ArithOp {
                 check_cell(*op, *kind, *w)?;
                 let (a, b) = input.into_pair("binary arith")?;
                 let (pa, pb) = (a.into_prim("binary arith lhs")?, b.into_prim("binary arith rhs")?);
-                if pa.bits() != *w || pb.bits() != *w {
-                    return Err(format!("binary arith expects (U{w}, U{w}), got (U{}, U{})", pa.bits(), pb.bits()));
-                }
+                let (pa, pb) = (widen_to(pa, *op, *kind, *w)?, widen_to(pb, *op, *kind, *w)?);
                 assert_eq!(pa.len(), pb.len(), "binary arith: operands at different strata");
                 Value::Prim(bin_eval(*op, *kind, pa, pb))
             }
@@ -383,37 +381,32 @@ impl ArithOp {
             // `check_cell` so the two forms cannot disagree about which cells exist.
             ArithOp::BinImm(op, kind, w, c) => {
                 check_cell(*op, *kind, *w)?;
-                let p = input.into_prim("immediate arith")?;
-                if p.bits() != *w {
-                    return Err(format!("immediate arith expects U{w}, got U{}", p.bits()));
-                }
+                let p = widen_to(input.into_prim("immediate arith")?, *op, *kind, *w)?;
                 Value::Prim(bin_imm_eval(*op, *kind, p, *c))
             }
+            // ANY leaf width in, U64 out. The accumulator is u64 whatever the elements are,
+            // because a reduction of a narrow column routinely exceeds it: counting a byte mask
+            // (`xs map (e -> e gt 5) fold_add`) is the motivating case, and it is the reason `Rel`
+            // can afford to produce a byte mask at all.
+            //
+            // The widen is the leaf's UNSIGNED reading, which is what the leaf stores. `Kind::I`
+            // and `Kind::F` encode order-preservingly at their own WIDTH, so a narrow signed or
+            // float column must be `cast` to the accumulator's width before it is reduced —
+            // the same caveat `crate::hash` carries, and for the same reason.
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
-                let xs = vals.as_u64("reduce values")?;
-                let mut out = Vec::with_capacity(bounds.len());
-                let mut start = 0;
-                for end in bounds.ends() {
-                    let s = &xs[start..end]; // empty row -> the monoid identity
-                    out.push(match r {
-                        // Wrapping, to match the Scan sibling (prefix!) and the Kind::U BinOp add — so
-                        // reducing raw two's-complement diffs (a negative diff is a large u64) yields
-                        // the correct i64 sum instead of a checked-overflow panic in debug.
-                        Red::Add => s.iter().fold(0u64, |a, &x| a.wrapping_add(x)),
-                        Red::Mul => s.iter().fold(1u64, |a, &x| a.wrapping_mul(x)),
-                        Red::Min => s.iter().copied().min().unwrap_or(u64::MAX),
-                        Red::Max => s.iter().copied().max().unwrap_or(0),
-                        Red::All => s.iter().all(|&x| x != 0) as u64,
-                        Red::Any => s.iter().any(|&x| x != 0) as u64,
-                    });
-                    start = end;
-                }
-                Value::u64(out)
+                let p = vals.into_prim("reduce values")?;
+                Value::u64(reduce_rows(&bounds, *r, &p))
             }
+            // ANY leaf width in, `List<U64>` out — the accumulator rule of `Reduce`, applied to
+            // every prefix. A U64 operand is rewritten in place; a narrower one widens as it goes,
+            // which it must, since a prefix of a byte column is not a byte.
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
-                let mut xs = vals.into_u64("scan values")?; // owned -> inclusive prefix written in place
+                let mut xs = match vals.into_prim("scan values")? {
+                    Prim::U64(v) => Arc::try_unwrap(v).unwrap_or_else(|a| (*a).clone()),
+                    narrow => widen_u64(&narrow),
+                }; // owned -> inclusive prefix written in place
                 // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
                 // sequential within a row, so this is a single memory pass, not a vectorizable one.
                 macro_rules! prefix {
@@ -444,6 +437,85 @@ impl ArithOp {
         })
     }
 
+}
+
+/// Bring an operand to the cell's declared width.
+///
+/// The declared width is the RESULT's, and a NARROWER unsigned operand widens into it — the rule
+/// `Reduce` follows, applied to the grid. It is what lets a byte mask meet a `u64` cell: `x mul m`
+/// where `m` came from a comparison is a mask AND, and it should not stop typing because the mask
+/// got cheaper. Widening is the unsigned reading of the stored bytes, so `Kind::I` and `Kind::F` —
+/// which encode order-preservingly at their own width — must already match, and say so.
+fn widen_to(p: Prim, op: BinOp, kind: Kind, w: u32) -> Result<Prim, String> {
+    if p.bits() == w {
+        return Ok(p);
+    }
+    if p.bits() > w {
+        return Err(format!("{} arith at width {w}: operand is U{}, which does not fit",
+            if op.is_bitwise() { "bitwise" } else { "binary" }, p.bits()));
+    }
+    if !matches!(kind, Kind::U) {
+        return Err(format!(
+            "arith at width {w}: a U{} operand cannot widen under a signed or float kind, whose \
+             encoding is width-dependent — `cast {w}` it first",
+            p.bits()
+        ));
+    }
+    Ok(p.cast(w))
+}
+
+/// every element widened to `u64` — the unsigned reading of the stored bytes, dispatched once.
+fn widen_u64(p: &Prim) -> Vec<u64> {
+    match p {
+        Prim::U8(v) => v.iter().map(|&x| x as u64).collect(),
+        Prim::U16(v) => v.iter().map(|&x| x as u64).collect(),
+        Prim::U32(v) => v.iter().map(|&x| x as u64).collect(),
+        Prim::U64(v) => v.to_vec(),
+    }
+}
+
+/// per-row monoid reduction at any leaf width, accumulating at `u64`. Both the width and the
+/// monoid are dispatched ABOVE the loop, so each row folds through one concrete body — the same
+/// discipline the arithmetic grid and `Scan`'s `prefix!` follow.
+fn reduce_rows(bounds: &crate::value::Bounds, r: Red, p: &Prim) -> Vec<u64> {
+    macro_rules! rows {
+        ($xs:expr, $id:expr, $a:ident, $x:ident => $comb:expr) => {{
+            let xs = $xs;
+            let mut out = Vec::with_capacity(bounds.len());
+            let mut start = 0;
+            for end in bounds.ends() {
+                let mut $a = $id;
+                for &e in &xs[start..end] {
+                    let $x = e as u64;
+                    $a = $comb;
+                }
+                out.push($a);
+                start = end;
+            }
+            out
+        }};
+    }
+    macro_rules! per_width {
+        ($id:expr, $a:ident, $x:ident => $comb:expr) => {
+            match p {
+                Prim::U8(v) => rows!(v, $id, $a, $x => $comb),
+                Prim::U16(v) => rows!(v, $id, $a, $x => $comb),
+                Prim::U32(v) => rows!(v, $id, $a, $x => $comb),
+                Prim::U64(v) => rows!(v, $id, $a, $x => $comb),
+            }
+        };
+    }
+    match r {
+        // Wrapping, to match the `Scan` sibling and the `Kind::U` `BinOp` add — so reducing raw
+        // two's-complement diffs (a negative diff is a large u64) yields the correct i64 sum
+        // instead of a checked-overflow panic in debug.
+        Red::Add => per_width!(0u64, a, x => a.wrapping_add(x)),
+        Red::Mul => per_width!(1u64, a, x => a.wrapping_mul(x)),
+        Red::Min => per_width!(u64::MAX, a, x => a.min(x)),
+        Red::Max => per_width!(0u64, a, x => a.max(x)),
+        Red::All => per_width!(1u64, a, x => a & (x != 0) as u64),
+        Red::Any => per_width!(0u64, a, x => a | (x != 0) as u64),
+    }
 }
 
 /// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),

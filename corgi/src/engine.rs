@@ -40,7 +40,7 @@ mod generators {
 
     /// the mask family: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
     /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`.
-    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u8]) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut nb = Vec::with_capacity(bounds.len());
         let mut start = 0;
@@ -260,7 +260,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
 /// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`]
 /// — the same split `scatter` makes, and for the same reason. The split is per LEVEL, not per value:
 /// a product blends each leaf field directly and only gathers the fields that need it.
-pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
+pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
     match (then, els) {
         (Value::Prim(t), Value::Prim(e)) => Value::Prim(t.blend(e, mask)),
         (Value::Prod(ts), Value::Prod(es)) => {
@@ -378,12 +378,12 @@ mod tests {
     #[test]
     fn blend_matches_the_gather_lanes_path() {
         // the general path, written out: row i from lane `mask[i] != 0`, at its own position.
-        fn oracle(mask: &[u64], then: &Value, els: &Value) -> Value {
+        fn oracle(mask: &[u8], then: &Value, els: &Value) -> Value {
             let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
             let off: Vec<usize> = (0..tags.len()).collect();
             gather_lanes(&[Some(els), Some(then)], &tags, &off)
         }
-        let mask = [1u64, 0, 0, 1];
+        let mask = [1u8, 0, 0, 1];
         let list = |ends: Vec<usize>, xs: &[u64]| Value::List(ends.into(), Box::new(u(xs)));
 
         // leaf, product of leaves, unit — the lane-wise path.

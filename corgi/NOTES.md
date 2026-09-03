@@ -46,13 +46,17 @@ src/
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + RelImm(Pred, c) + Min/Max + SortList/DedupList/GroupKey/Find.
+               Rel/RelImm emit a BYTE mask (one bit needs one byte, not eight); every consumer
+               reads any width, and `fold_add` over a mask counts at u64.
                Kind-blind comparisons. The order ops ASK whether the column is already ordered
                (`rows_sorted`/`sorted_signs`) before they sort — a dataflow's batches arrive sorted.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid, in two forms: `Bin` (eats a pair) and `BinImm` (eats one
                column, constant right operand) — the IMMEDIATE axis. BinOp covers arithmetic plus
                the unsigned-only bitwise family Shl/Shr/And/Or/Xor (SIMD ÷2^k / mod 2^k, and shifts
-               total via wrapping). Reduce/Scan + enc_i64/dec_i64.
+               total via wrapping). A NARROWER unsigned operand widens to the cell's declared
+               width — the declared width is the result's. Reduce/Scan take any leaf width and
+               accumulate at u64 (a count of a byte mask is the motivating case). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
                per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each

@@ -63,15 +63,19 @@ impl CmpOp {
                 same(&shape_of_value(&a), &shape_of_value(&b)).map_err(|e| format!("Rel: {e}"))?;
                 assert_eq!(a.len(), b.len(), "Rel: operands at different strata");
                 let mask = match (&a, &b) {
-                    // leaf pair: the vectorized lane compare. Resolve the predicate to its three
-                    // order-flags ONCE here (sign `-1`/`0`/`+1`), so `rel`'s lane loop is branchless.
+                    // leaf pair: the vectorized lane compare. Resolve the predicate to a single
+                    // concrete lane function ONCE here (from its three order-flags, sign
+                    // `-1`/`0`/`+1`), so `rel`'s loop is one comparison per element.
                     (Value::Prim(pa), Value::Prim(pb)) =>
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
-                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
+                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u8).collect(),
                 };
-                Value::u64(mask)
+                // a BYTE mask: the core's mask idiom is "nonzero is true", so one bit needs one
+                // byte, not eight. Every consumer (`Filter`, `Select`, `Branch`) reads any width,
+                // and `fold_add` over a mask counts at u64 — which is what made this affordable.
+                Value::u8(mask)
             }
 
             CmpOp::Min | CmpOp::Max => {
@@ -92,7 +96,7 @@ impl CmpOp {
                 if p.bits() < 64 && *c >= (1u64 << p.bits()) {
                     return Err(format!("{pred:?} {c}: constant does not fit a U{} leaf", p.bits()));
                 }
-                Value::u64(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
+                Value::u8(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
             CmpOp::SortList => {

@@ -354,7 +354,7 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
                 }
                 let (tb, tv) = cols.pop().ok_or("Weave expects (List<U64> tags, List<A>, ..)")?.into_list("Weave tags")?;
-                let tags = tv.as_u64("Weave tags")?;
+                let tags = tv.as_prim("Weave tags")?.tags_usize();
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
@@ -370,10 +370,10 @@ impl<L: OpLike> Op<L> {
                 let mut start = 0;
                 for (r, end) in tb.ends().enumerate() {
                     for &t in &tags[start..end] {
-                        assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
+                        assert!(t < lanes.len(), "Weave: tag {t} out of range");
                         tag8.push(t as u8);
-                        off.push(counts[t as usize]);
-                        counts[t as usize] += 1;
+                        off.push(counts[t]);
+                        counts[t] += 1;
                     }
                     for (t, (lb, &c)) in lane_bounds.iter().zip(&counts).enumerate() {
                         assert_eq!(lb.end(r), c, "Weave: row {r} lane {t} length/tag-count mismatch");
@@ -428,8 +428,10 @@ impl<L: OpLike> Op<L> {
                 let (bounds, vals) = data.into_list("Filter data")?;
                 let (mb, mv) = mask.into_list("Filter mask")?;
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
-                let m = mv.as_u64("Filter mask")?;
-                let (idx, nb) = filter_mask(&bounds, m);
+                // the mask's WIDTH is the producer's choice: `Rel` makes a byte mask, but any
+                // nonzero-is-true leaf reads the same. One dispatch, above the pass.
+                let m = mv.as_prim("Filter mask")?.as_byte_mask();
+                let (idx, nb) = filter_mask(&bounds, &m);
                 Value::List(nb.into(), Box::new(gather(&vals, &idx)))
             }
 
@@ -491,7 +493,9 @@ impl<L: OpLike> Op<L> {
             // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch")?;
-                let tags = tags_v.as_u64("Branch tags")?;
+                // the discriminant's WIDTH is the producer's choice, as a mask's is: a `Branch(2)`
+                // is routinely fed a `Rel` mask, which is a byte column.
+                let tags = tags_v.as_prim("Branch tags")?.tags_usize();
                 assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
                 if *n > 256 {
                     return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
@@ -502,7 +506,6 @@ impl<L: OpLike> Op<L> {
                 let mut tag8 = Vec::with_capacity(tags.len());
                 let mut off = Vec::with_capacity(tags.len());
                 for (i, &t) in tags.iter().enumerate() {
-                    let t = t as usize;
                     assert!(t < *n, "Branch: tag {t} out of range (n={n})");
                     tag8.push(t as u8);
                     off.push(groups[t].len());
@@ -888,9 +891,9 @@ impl<L: OpLike> Op<L> {
                 let els = cols.pop().unwrap();
                 let then = cols.pop().unwrap();
                 let mask_col = cols.pop().unwrap();
-                let mask = mask_col.as_u64("Select mask")?;
+                let mask = mask_col.as_prim("Select mask")?.as_byte_mask();
                 same(&shape_of_value(&then), &shape_of_value(&els)).map_err(|e| format!("Select: {e}"))?;
-                blend(mask, then, els)
+                blend(&mask, then, els)
             }
         })
     }
