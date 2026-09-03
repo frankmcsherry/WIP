@@ -19,7 +19,7 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{
-    arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
+    arrange, eval_graph, lower_effects, optimize, parse_ml, ArithOp, Builder, Graph, NumOp,
     Op, Value,
 };
 use std::env;
@@ -155,18 +155,16 @@ fn one_list(n: usize) -> Value {
     Value::List(vec![n].into(), Box::new(Value::u64(scrambled(n))))
 }
 
-/// a SORTED big `List<U64>` (one `n`-wide row of `0..n`) — the equi-join feeds find/slices a haystack
-/// already in key order, so the measurement isolates the join primitives from a sort cost.
-fn sorted_list(n: usize) -> Value {
-    Value::List(
-        vec![n].into(),
-        Box::new(Value::u64((0..n as u64).collect())),
-    )
-}
-
 fn compile(src: &str) -> Graph<NumOp> {
     // the lowered graph is what a `Program` runs: fallible stages' downstream ops on the Ok lane.
-    lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}")))
+    // Under `--optimized`, the passes run on the SURFACE graph and lowering follows — the
+    // composition `tests/optimize.rs` checks for semantic preservation.
+    use std::sync::atomic::Ordering::Relaxed;
+    let g = parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"));
+    NODES_IN.fetch_add(g.node_count(), Relaxed);
+    let g = if OPTIMIZED.load(Relaxed) { optimize(&g) } else { g };
+    NODES_OUT.fetch_add(g.node_count(), Relaxed);
+    lower_effects(&g)
 }
 
 /// a fixed 5-letter lowercase word, base-26 of `v` — the word-count vocabulary generator (mod a vocab
@@ -511,25 +509,33 @@ fn family_e(n: usize, reps: u32) {
     let mask = n as u64 - 1; // n is a power of two, so `& mask` is an in-bounds row-relative index
     let src = scrambled(n);
 
-    // E1 single-key equi-join (find + slices) over a SORTED haystack — the join primitives, no sort cost.
-    let g = compile(
-        "let bn = input in let build = bn map (x -> (x shr 8, x)) in \
-         let probes = bn map (x -> x shr 8) dedup in let t = build transpose in \
-         let r = (probes, t.0) find in (r, t.1) slices",
-    );
-    let sl = sorted_list(n);
-    let c = corgi_t(&g, &sl, reps);
+    // E1 single-key equi-join (find + slices) over a SORTED haystack — the join PRIMITIVES only.
+    // Both sides are built OUTSIDE the timer. The probe side used to be computed by a `dedup`
+    // inside the timed program, which is a full sort: the row then measured a sort plus a join and
+    // moved with every sort change, which is not what a join row is for.
+    let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
+    let vals: Vec<u64> = (0..n as u64).collect();
+    let probes = {
+        let mut p = keys.clone();
+        p.dedup();
+        p
+    };
+    let np = probes.len();
+    let g = compile("let r = (input.0, input.1) find in (r, input.2) slices");
+    let arg = Value::Prod(vec![
+        Value::List(vec![np].into(), Box::new(Value::u64(probes.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(keys.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(vals.clone()))),
+    ]);
+    let c = corgi_t(&g, &arg, reps);
     let r = rust_t(reps, || {
-        let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
-        let vals: Vec<u64> = (0..n as u64).collect();
-        let mut probes = keys.clone();
-        probes.dedup();
+        let (keys, vals, probes) = (black_box(&keys), black_box(&vals), black_box(&probes));
         // materialize the matched value ranges into a flat (values, bounds) list — corgi's `slices`
         // produces exactly this, so the ceiling must pay the same output copy, not reference ranges.
         let mut flat: Vec<u64> = Vec::with_capacity(n);
         let mut bounds: Vec<usize> = Vec::with_capacity(probes.len());
         let mut j = 0usize;
-        for &p in &probes {
+        for &p in probes {
             let start = j;
             while j < keys.len() && keys[j] == p {
                 j += 1;
@@ -1035,12 +1041,29 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
 #[derive(Debug)]
 struct Config {
     smoke: bool,
+    optimized: bool,
     families: Vec<String>,
 }
+
+/// Whether `compile` runs the optimizer. A process-global rather than a threaded parameter: the
+/// families are free functions and `compile` is called from every one of them, so threading a flag
+/// through would be a wider change than the question is worth.
+///
+/// The point of the flag is that `optimize` is on NO evaluated path — not `Program`, not this
+/// suite, not the corpus — so nothing measures whether the passes matter. Running the suite twice
+/// and diffing is the answer.
+static OPTIMIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Total graph nodes across every program the run compiled, before and after `optimize`. Reported
+/// at the end so a run that shows no time difference also says WHY — whether the passes found
+/// nothing to remove, or removed plenty and it did not matter.
+static NODES_IN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NODES_OUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Config {
     fn parse() -> Result<Self, String> {
         let mut smoke = false;
+        let mut optimized = false;
         let mut families = Vec::new();
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -1049,6 +1072,7 @@ impl Config {
                 // the harness. It carries no information for our plain `main` driver.
                 "--bench" => {}
                 "--smoke" => smoke = true,
+                "--optimized" => optimized = true,
                 "--family" | "--families" => {
                     let value = args
                         .next()
@@ -1071,16 +1095,17 @@ impl Config {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "gaps [--smoke] [--family A-I,R] \
+                        "gaps [--smoke] [--optimized] [--family A-I,R] \
                          (repeatable; comma-separated values accepted)\n\
-                         H=safety, I=pointer-chase, R=arrangement"
+                         H=safety, I=pointer-chase, R=arrangement\n\
+                         --optimized runs every program through `optimize` before lowering"
                     );
                     std::process::exit(0);
                 }
                 _ => return Err(format!("unknown argument {arg:?}; use --help")),
             }
         }
-        Ok(Self { smoke, families })
+        Ok(Self { smoke, optimized, families })
     }
 
     fn runs(&self, family: &str) -> bool {
@@ -1096,21 +1121,42 @@ fn main() {
     if cfg.smoke {
         println!("==== smoke mode: tiny inputs, coverage only (not reportable) ====");
     }
+    OPTIMIZED.store(cfg.optimized, std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "==== programs: {} ====",
+        if cfg.optimized { "OPTIMIZED (optimize then lower)" } else { "as written (optimize is not run)" }
+    );
 
-    // (n, reps). 8 K = L1 control; 1 M = L2/SLC design center; 8 M = DRAM eye.
-    let core: Vec<(usize, u32)> = if cfg.smoke {
-        vec![(1 << 8, 1)]
+    // (n, reps, anchor). 8 K = L1 control; 1 M = L2/SLC design center; 8 M = DRAM eye — the three
+    // ANCHORS, where every family runs. The other sizes are the TILE SWEEP: A and B only, sized
+    // 1 K–16 K so a whole multi-pass chain stays L1-resident. Those rows measure what a tile
+    // executor's steady state would be, so `row at an anchor / row at the sweep minimum` is the
+    // tiling prize — the number that sizes DPS before it is built. Per-op fixed cost shows up as
+    // the rise at the small end, and it is what sets the useful tile floor.
+    let core: Vec<(usize, u32, bool)> = if cfg.smoke {
+        vec![(1 << 8, 1, true)]
     } else {
-        vec![(1 << 13, 2000), (1 << 20, 50), (1 << 23, 10)]
+        vec![
+            (1 << 10, 4000, false),
+            (1 << 12, 3000, false),
+            (1 << 13, 2000, true),
+            (1 << 14, 1500, false),
+            (1 << 20, 50, true),
+            (1 << 23, 10, true),
+        ]
     };
-    for (n, reps) in core {
+    for (n, reps, anchor) in core {
         if !(cfg.runs("A") || cfg.runs("B") || cfg.runs("C") || cfg.runs("D")) {
             break;
         }
-        println!(
-            "\n==== n = {n}  ({} MB/col) ============================================",
-            n * 8 / (1 << 20)
-        );
+        let bytes = n * 8;
+        let size = if bytes >= (1 << 20) {
+            format!("{} MB/col", bytes / (1 << 20))
+        } else {
+            format!("{} KB/col", bytes / (1 << 10))
+        };
+        let kind = if anchor { "anchor" } else { "tile sweep" };
+        println!("\n==== n = {n}  ({size}, {kind}) ====================================");
         if cfg.runs("A") {
             println!("-- A pointwise --");
             family_a(n, reps);
@@ -1119,11 +1165,11 @@ fn main() {
             println!("-- B selection --");
             family_b(n, reps);
         }
-        if cfg.runs("C") {
+        if anchor && cfg.runs("C") {
             println!("-- C aggregation --");
             family_c(n, reps);
         }
-        if cfg.runs("D") {
+        if anchor && cfg.runs("D") {
             println!("-- D order --");
             family_d(n, reps);
         }
@@ -1222,5 +1268,18 @@ fn main() {
             println!("-- n = {n} ({} MB/leaf) --", n * 8 / (1 << 20));
             family_arrange(n, reps);
         }
+    }
+
+    let (before, after) = (
+        NODES_IN.load(std::sync::atomic::Ordering::Relaxed),
+        NODES_OUT.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if cfg.optimized {
+        println!(
+            "\n==== optimize: {before} nodes -> {after} across every program compiled ({} removed) ====",
+            before.saturating_sub(after)
+        );
+    } else {
+        println!("\n==== {before} nodes across every program compiled (optimize not run) ====");
     }
 }
