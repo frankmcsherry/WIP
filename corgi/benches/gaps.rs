@@ -133,8 +133,10 @@ fn row_safety(
 
 // ----- inputs ------------------------------------------------------------
 
-/// deterministic non-sorted column via an LCG step (no rng dep). Masked to 32 bits so the byte-radix
-/// sort runs four passes, not eight, and so group/dedup keys have a realistic distinct count.
+/// deterministic non-sorted column via an LCG step (no rng dep). Shifted down to 32 SIGNIFICANT BITS,
+/// which is what a hash lane or a dense identifier carries and what gives group/dedup keys a realistic
+/// distinct count — but note that the radix skips all-zero high digits, so this column costs HALF the
+/// passes a full-width key does. `D1b` is the same sort at 64 significant bits, for that reason.
 fn scrambled(n: usize) -> Vec<u64> {
     (0..n as u64)
         .map(|i| {
@@ -490,6 +492,27 @@ fn family_d(n: usize, reps: u32) {
         black_box(v);
     });
     row("D1 sort_u64", n, c, r, "value radix (no permutation, no gather) vs pdqsort");
+
+    // D1b the same sort at FULL WIDTH. The radix's cost is `ceil(significant_bits / digit_width)`
+    // passes, and `scrambled` carries 32 significant bits — so D1 measures two passes where a key
+    // that fills its u64 takes four, and reading D1's ratio as "the sort" overstates it by that
+    // much. A comparison sort barely notices (its cost is comparisons, not key bits), so this row
+    // is where the radix's win is smallest and the honest floor for the claim.
+    let wide: Vec<u64> = (0..n as u64)
+        .map(|i| {
+            let x = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x ^ (x >> 31) // spread the low bits the LCG leaves regular, keeping all 64 significant
+        })
+        .collect();
+    let wl = Value::List(vec![n].into(), Box::new(Value::u64(wide.clone())));
+    let g = compile("input sort");
+    let c = corgi_t(&g, &wl, reps);
+    let r = rust_t(reps.min(10), || {
+        let mut v = black_box(&wide).to_vec();
+        v.sort_unstable();
+        black_box(v);
+    });
+    row("D1b sort_u64_full", n, c, r, "the same radix at 64 significant bits: twice the passes");
 
     // D2 dedup — sort then unique.
     let g = compile("input dedup");

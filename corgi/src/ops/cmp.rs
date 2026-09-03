@@ -73,9 +73,15 @@ impl CmpOp {
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                 };
-                // a BYTE mask: the core's mask idiom is "nonzero is true", so one bit needs one
-                // byte, not eight. Every consumer (`Filter`, `Select`, `Branch`) reads any width,
-                // and `fold_add` over a mask counts at u64 — which is what made this affordable.
+                // A U64 mask, though the core's idiom is "nonzero is true" and every consumer
+                // (`Filter`, `Select`, `Branch`) reads any width — so a byte would do, and is worth
+                // ~1.3-1.6x on `filter`. It stays u64 because a mask is only transient INSIDE corgi.
+                // At a host seam it is a value: DDIR keeps every scalar at one width and reads a
+                // predicate's result straight back as one, so `not(x)` compares it against a literal
+                // and `(x == y) == 1` compares it against an integer. Narrowing this changes the
+                // shape of every boolean subexpression in the host's world, and `Shape::Prim` carries
+                // the width — so the host's own `Eq` lowering sees two DIFFERENT shapes and folds the
+                // comparison to a constant. Empty results, no error. See the DDIR-side note.
                 Value::u64(mask)
             }
 

@@ -85,8 +85,9 @@ instead. "Lever" names what would close it.
 | **C4 scan_prefix** (general) | aggregation | **757×** | **192×** | **153×** | lockstep foldscan on ONE long row: #rounds = row length, and every round allocates | monoid body → C4k; general → a single-row interpreter |
 | C4k scan_add (kernel) | aggregation | 1.41× | 1.17× | 0.98× | the monoid prefix kernel — one in-place pass | **DONE** |
 | C5 fold_sum_count | aggregation | 6.9× | 6.8× | 9.9× | recognized as a product of monoids: one reduce per field. What is left is the ordinary un-fused-passes gap | tiling, then fusion |
-| D1 sort_u64 | order | **0.55×** | **0.47×** | **0.81×** | the value radix: no permutation, no gather | — past the ceiling |
-| D2 dedup | order | **0.64×** | **0.52×** | **0.89×** | value radix + one compacting pass | — past the ceiling |
+| D1 sort_u64 | order | **0.55×** | **0.43×** | **0.85×** | the value radix: no permutation, no gather. NB the input carries **32 significant bits**, so this is two radix passes | — past the ceiling |
+| D1b sort_u64_full | order | 1.05× | **0.81×** | 1.00× | the same sort at 64 significant bits: FOUR passes. The radix's win over pdqsort is key entropy, and this is its floor | — at ceiling |
+| D2 dedup | order | **0.64×** | **0.52×** | **0.89×** | value radix + one compacting pass (same 32-bit input as D1) | — past the ceiling |
 | D3 sort_compound | order | 1.21× | **1.05×** | 2.22× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
 | D4 sort_sorted | order | **1.19×** | **1.13×** | **1.14×** | already ordered: detect and return | — at ceiling |
 | D5 dedup_sorted | order | 5.6× | 4.5× | 4.1× | run boundaries off the order check, then a gather | a writer (as B1) |
@@ -190,6 +191,15 @@ per-element bounds check, and competitive with eliding the check entirely.
    `sort_unstable`. The one cost is at the 8 K L1 control, where D3 is ~10% slower: carrying the key
    is extra traffic that an L1-resident indirect read does not repay. That point is a control, not a
    target.
+
+   **How much of that is key entropy.** A radix costs `ceil(significant_bits / digit_width)` passes
+   and skips all-zero high digits, so its win over a comparison sort is a function of the key, not
+   just of the kernel. The suite's input carries 32 significant bits — a hash lane or a dense
+   identifier, which is the realistic case — and that is two passes at the 16-bit digit. D1b is the
+   same sort at 64 significant bits, which is four: 0.81× at 1 M and 1.00× at 8 M, against D1's 0.43×
+   and 0.85×. So "corgi sorts faster than `sort_unstable`" holds for keys with headroom and becomes
+   a wash for keys that fill their u64. The comparison sort barely moves between the two (its cost is
+   comparisons, not key bits), which is what makes the row a clean read of the pass count.
 4. **C5 fold_sum_count was the worst row on the board and is now single-digit.** A `Fold` whose
    body is a product of monoids becomes one reduce per field: 308 → 0.4–1.0 ns/row at 1 M.
 5. **B1 and B2 came down with the lane body.** `rel` resolves its predicate to ONE comparison
