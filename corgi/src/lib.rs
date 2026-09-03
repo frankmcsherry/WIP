@@ -105,6 +105,19 @@ pub mod arrange {
         }
     }
 
+    /// The positions a 0/1 MASK column keeps, at any leaf width — `Rel` produces a byte mask, but
+    /// the core's idiom is "nonzero is true", so any leaf reads. `None` if the column is not a leaf.
+    ///
+    /// This is what `Op::Filter` does internally, exposed because a host filtering its OWN parallel
+    /// columns (times, diffs, a row id) alongside corgi's needs the same index list — and reaching
+    /// for the leaf directly makes the host care about a width that is corgi's business.
+    pub fn mask_positions(v: &Value) -> Option<Vec<usize>> {
+        let crate::value::Value::Prim(p) = v else { return None };
+        // one row spanning the whole column: `filter_mask`'s row loop then runs once.
+        let (idx, _ends) = crate::engine::filter_mask(&Bounds::Stride(v.len(), 1), p);
+        Some(idx)
+    }
+
     /// Select/reorder rows of a single columnar `Value` by index.
     pub fn gather(v: &Value, idx: &[usize]) -> Value { crate::engine::gather(v, idx) }
     /// Multi-source gather: output row `i` = row `off[i]` of source `srcs[tags[i]]` (all same shape).

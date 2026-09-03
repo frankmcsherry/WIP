@@ -78,7 +78,7 @@ instead. "Lever" names what would close it.
 | A3 mixed_chain | pointwise | tax 1.07 | tax 0.99 | tax 1.00 | at the Rust ceiling — the immediate cells landed | — at ceiling |
 | A4 map_reduce | pointwise | tax 1.67 / prize 2.4 | tax 0.81 / prize 11.5 | tax 1.20 / prize 7.5 | intermediate map column, then a fold over it | **fusion — the biggest prize on the board** |
 | B1 filter_values | selection | 3.3× | 1.9× | 2.7× | u64 mask column + scalar `filter_mask` + gather vs one predicated push | narrow masks; a writer; SIMD compaction |
-| B2 cmp_select | selection | 2.6× | 2.7× | 2.0× | 4 passes vs 1 fused | tiling, then fusion |
+| B2 cmp_select | selection | 2.6× | 2.4× | 4.6× | 4 passes vs 1 fused | tiling, then fusion |
 | C1 fold_add | aggregation | 1.10× | **1.03×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | **C3 group_by_sum** | aggregation | 22× | **48×** | **74×** | sort-based group where a 256-bucket accumulate is one O(n) pass | see *the group-by decomposition* |
@@ -192,10 +192,12 @@ per-element bounds check, and competitive with eliding the check entirely.
    target.
 4. **C5 fold_sum_count was the worst row on the board and is now single-digit.** A `Fold` whose
    body is a product of monoids becomes one reduce per field: 308 → 0.4–1.0 ns/row at 1 M.
-5. **B1 and B2 came down with the mask.** `Rel` produces a BYTE mask now — the core's idiom is
-   "nonzero is true" and leaves are width-tagged, so one bit was being stored in eight bytes — and
-   `rel`'s lane body resolves its predicate to ONE comparison rather than evaluating all three
-   order-flags. B1 1.72 → 1.26 ns/row at 1 M, B2 2.81 → 2.13.
+5. **B1 and B2 came down with the lane body.** `rel` resolves its predicate to ONE comparison
+   above the loop rather than evaluating all three order-flags per element. B1 1.72 → 1.65 ns/row at
+   1 M, B2 2.81 → 2.13. A BYTE mask on top of that measured 1.26 / 1.78 — but a comparison's result
+   is a VALUE at the DDIR seam, not only a control mask, and narrowing it made three of DDIR's 33
+   AoC programs return nothing. The mask stays u64; the consumers still read any width, which is the
+   half of that idea that was free.
 6. **F1 branch_match was 16×/15×** at `b9bb413`; it now measures 8.3–20×, and the spread is the row
    itself (see the bimodality note above), not a change.
 

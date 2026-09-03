@@ -52,8 +52,8 @@ src/
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + RelImm(Pred, c) + Min/Max + SortList/DedupList/GroupKey/Find.
-               Rel/RelImm emit a BYTE mask (one bit needs one byte, not eight); every consumer
-               reads any width, and `fold_add` over a mask counts at u64.
+               Rel/RelImm emit a U64 mask — a comparison's result is a VALUE at the host seam,
+               not only a control mask — but every CONSUMER reads any width.
                Kind-blind comparisons. The order ops ASK whether the column is already ordered
                (`known_sorted`/`sorted_signs`) before they sort — a dataflow's batches arrive sorted.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
