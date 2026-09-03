@@ -87,7 +87,7 @@ instead. "Lever" names what would close it.
 | D3 sort_compound | order | 1.10× | **0.98×** | 2.23× | key-carrying permutation radix + 2 payload gathers | pack narrow fields into one key |
 | D4 sort_sorted | order | **1.14×** | **1.13×** | **1.11×** | already ordered: detect and return | — at ceiling |
 | D5 dedup_sorted | order | 5.7× | 4.0× | 3.6× | run boundaries off the order check, then a gather | a writer (as B1) |
-| **E1 join_find_slices** | relational | — | 3.1–7.8× | 3.1× | `find` searches per probe instead of merging two sorted runs | merge-join path |
+| E1 join_find_slices | relational | — | 3.2× | **1.40×** | `find` MERGES when the needle is sorted; what is left is the `slices` materialization | a writer (as B1) |
 | E2 gather | relational | — | **0.58×** | 1.06× | corgi at or below the Rust ceiling | — |
 | E3 gather_chain | relational | — | **0.74×** | 1.65× | two gathers, each resolve+gather | index-composition rewrite |
 | **F1 branch_match** | sum-type | — | **10.9×** | **8.7×** | columnar partition + recombine where the scalar form vectorizes to a blend | if-convert to `select`; `match` pays off on heterogeneous lanes |
@@ -199,14 +199,17 @@ Both sides are now built outside the timer.
    ~17× is structural: `group` produces the grouped VALUES, where a bucket accumulate materializes
    nothing. Closing that means one fused op in the "fused forms & producers" tier
    (`ReduceKey`), which is a decision, not a bug fix.
-2. **the single-key join, 3.1×.** With both sides sorted the Rust ceiling is a two-pointer merge;
-   corgi's `find` does an independent search per probe and then `slices` materializes.
-   `arrange::survey` already IS that merge kernel — it measures 0.23×/0.75× of a Rust two-pointer —
-   and it is the surface `join` that does not reach it. NOTE the scope: a merge replaces a search
-   only for a scalar or hashed key. Prefix search inside a ragged `List` column is a different
-   problem, because corgi's list order is LENGTH-FIRST and length-first is exactly the order that
-   lacks prefix contiguity (the extensions of a prefix scatter across one range per length class,
-   where plain lexicographic order would make them one contiguous range).
+2. **prefix search inside a ragged `List` column.** The single-key join is fixed: `find` now merges
+   when the needle is itself in key order, which is what a join has, and E1 went 2.90 → 1.58 ns/row
+   at 1 M and 3.69 → 1.62 at 8 M — flat in n, where the per-probe search was `n log n`.
+   NOTE the scope, which is the whole of the remaining problem: a merge replaces a search only for a
+   scalar or hashed key. Seeking a PREFIX in a ragged `List` column is different, because corgi's
+   list order is LENGTH-FIRST and length-first is exactly the order that lacks prefix contiguity —
+   the extensions of a prefix scatter across one range per length class, where plain lexicographic
+   order (end-of-list sorting below every element) would make them one contiguous range. Fixed-arity
+   tuples do not have the problem (equal lengths order the same either way), so encoding a k-ary key
+   as a `Prod` sidesteps it entirely; ragged data is where it bites, and changing `List`'s order is a
+   seam decision, since the order is wire-visible.
 3. **narrow compound keys still radix once per field.** The sort now stops as soon as no two rows
    are tied and carries each key with its permutation, so a compound key costs one pass per field
    that actually discriminates. When several fields are narrow, one packed key would do instead of

@@ -597,7 +597,7 @@ fn family_e(n: usize, reps: u32) {
         n,
         c,
         r,
-        "find (per-probe search)+slices vs two-pointer merge, both materializing",
+        "find (merged walk when the needle is sorted) + slices vs two-pointer merge",
     );
 
     // E2 gather — random permutation. corgi: `resolve_indices` (scalar, +bounds assert) then `Prim::gather`.

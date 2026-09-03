@@ -129,6 +129,56 @@ pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
     }
 }
 
+/// Equal-range of every element of a SORTED needle in its haystack row: one forward walk with
+/// galloping, instead of an independent binary search per probe.
+///
+/// This is the one-directional form of [`survey`] — same kernel, same gallop — for the shape the
+/// surface join has: both sides in key order, and the question "where does each needle sit". A
+/// per-probe search costs `|needle| * log|haystack|` comparisons and cannot use the fact that the
+/// probes are ordered; a merged walk costs `|needle| + |haystack|` in the worst case and much less
+/// when the needle is dense, because the cursor never goes backwards.
+///
+/// LEAF ONLY (`None` otherwise), and deliberately: the generic comparator allocates per call, which
+/// a per-element gallop cannot afford, and the shape this exists for is the scalar or hashed key.
+/// Everything else keeps the batched search, which is batched precisely so it does not pay that.
+pub(crate) fn find_ranges_sorted(
+    nb: &Bounds,
+    nvals: &Value,
+    hb: &Bounds,
+    hvals: &Value,
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    fn walk<T: Ord + Copy>(nb: &Bounds, hb: &Bounds, needles: &[T], hay: &[T]) -> (Vec<u64>, Vec<u64>) {
+        let n = needles.len();
+        let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let (mut ns, mut hs) = (0usize, 0usize);
+        for r in 0..nb.len() {
+            let (ne, he) = (nb.end(r), hb.end(r));
+            let mut cursor = hs; // monotone within the row: the needles are ordered
+            for &want in &needles[ns..ne] {
+                let mut lo = cursor;
+                gallop_lt_by(&mut lo, he, |j| hay[j] < want);
+                let mut hi = lo;
+                gallop_lt_by(&mut hi, he, |j| hay[j] <= want);
+                lo_c.push((lo - hs) as u64);
+                hi_c.push((hi - hs) as u64);
+                // resume from `lo`, not `hi`: a repeated needle must find the same range, and the
+                // gallop from `lo` then costs nothing.
+                cursor = lo;
+            }
+            ns = ne;
+            hs = he;
+        }
+        (lo_c, hi_c)
+    }
+    match (nvals, hvals) {
+        (Value::Prim(Prim::U8(nv)), Value::Prim(Prim::U8(hv))) => Some(walk(nb, hb, nv, hv)),
+        (Value::Prim(Prim::U16(nv)), Value::Prim(Prim::U16(hv))) => Some(walk(nb, hb, nv, hv)),
+        (Value::Prim(Prim::U32(nv)), Value::Prim(Prim::U32(hv))) => Some(walk(nb, hb, nv, hv)),
+        (Value::Prim(Prim::U64(nv)), Value::Prim(Prim::U64(hv))) => Some(walk(nb, hb, nv, hv)),
+        _ => None,
+    }
+}
+
 /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
 /// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
 /// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
