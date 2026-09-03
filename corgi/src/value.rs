@@ -532,10 +532,21 @@ macro_rules! prim {
                             }
                             return;
                         }
+                        let max = idx.iter().map(|&i| v[i] as u64).max().unwrap_or(0);
+                        let sig = 64 - max.leading_zeros();
+                        if sig == 0 {
+                            return; // every key equal: the identity is already the stable answer
+                        }
+                        let d = digit_width(n);
+                        if sig <= d {
+                            // one digit covers the key: nothing to carry (see `single_pass_perm`).
+                            single_pass_perm(idx, scratch, d, |i| v[i] as u64);
+                            return;
+                        }
                         // the one indirect read; widened to u64 so the radix itself is written once.
                         scratch.keys.clear();
                         scratch.keys.extend(idx.iter().map(|&i| v[i] as u64));
-                        radix_perm_by_keys(idx, scratch);
+                        radix_perm_by_keys(idx, scratch, d, sig);
                     } )+
                 }
             }
@@ -644,9 +655,17 @@ macro_rules! prim {
             /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
             pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
                 match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
-                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u64)
-                        .collect(), )+
+                    $( (Prim::$V(a), Prim::$V(b)) => match (lt, eq, gt) {
+                        (true, false, false) => mask_zip(a, b, |x: $t, y| x < y),
+                        (false, true, false) => mask_zip(a, b, |x: $t, y| x == y),
+                        (false, false, true) => mask_zip(a, b, |x: $t, y| x > y),
+                        (true, true, false) => mask_zip(a, b, |x: $t, y| x <= y),
+                        (false, true, true) => mask_zip(a, b, |x: $t, y| x >= y),
+                        (true, false, true) => mask_zip(a, b, |x: $t, y| x != y),
+                        // no predicate is all-false or all-true, but the grid is total.
+                        (false, false, false) => vec![0; a.len()],
+                        (true, true, true) => vec![1; a.len()],
+                    }, )+
                     _ => panic!("rel: prim width mismatch"),
                 }
             }
@@ -658,9 +677,16 @@ macro_rules! prim {
             /// where the pair form has to broadcast the constant into one first.
             pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
                 match self {
-                    $( Prim::$V(v) => { let y = c as $t; v.iter()
-                        .map(|x| ((lt & (*x < y)) | (eq & (*x == y)) | (gt & (*x > y))) as u64)
-                        .collect() } )+
+                    $( Prim::$V(v) => { let y = c as $t; match (lt, eq, gt) {
+                        (true, false, false) => mask_imm(v, y, |x: $t, y| x < y),
+                        (false, true, false) => mask_imm(v, y, |x: $t, y| x == y),
+                        (false, false, true) => mask_imm(v, y, |x: $t, y| x > y),
+                        (true, true, false) => mask_imm(v, y, |x: $t, y| x <= y),
+                        (false, true, true) => mask_imm(v, y, |x: $t, y| x >= y),
+                        (true, false, true) => mask_imm(v, y, |x: $t, y| x != y),
+                        (false, false, false) => vec![0; v.len()],
+                        (true, true, true) => vec![1; v.len()],
+                    } } )+
                 }
             }
 
@@ -694,6 +720,21 @@ prim! {
     U16 => u16,
     U32 => u32,
     U64 => u64,
+}
+
+/// One 0/1 mask per lane from a concrete comparison — the lane body of [`Prim::rel`] and
+/// [`Prim::rel_imm`], monomorphized. Resolving the predicate to its three order-flags keeps the
+/// body branchless, but evaluating all three comparisons and OR-ing them is three times the work of
+/// the one that was asked for; the callers pick a single `f` here instead, above the loop.
+#[inline]
+fn mask_zip<T: Copy>(a: &[T], b: &[T], f: impl Fn(T, T) -> bool) -> Vec<u64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y) as u64).collect()
+}
+
+/// [`mask_zip`] against a constant right operand.
+#[inline]
+fn mask_imm<T: Copy>(a: &[T], y: T, f: impl Fn(T, T) -> bool) -> Vec<u64> {
+    a.iter().map(|&x| f(x, y) as u64).collect()
 }
 
 /// Digit width for a radix pass over `n` elements. A wide digit halves the number of passes but
@@ -805,6 +846,42 @@ pub(crate) struct SortScratch {
     counts: Vec<u32>,
 }
 
+/// One counting-sort pass over a permutation, reading each key THROUGH the index.
+///
+/// When the whole key fits a single digit there is nothing to carry: the key is read exactly twice
+/// either way, so materializing it would cost a pass and a buffer to save nothing. This is the
+/// narrow-key case — a byte column, a group id, a mask, a `Sum`'s discriminant — and it is common
+/// enough that [`radix_perm_by_keys`] taking it would be a regression on it.
+///
+/// Stable: the scatter runs in ascending source order from prefix offsets.
+fn single_pass_perm(idx: &mut [usize], scratch: &mut SortScratch, d: u32, key: impl Fn(usize) -> u64) {
+    let n = idx.len();
+    let buckets = 1usize << d;
+    let mask = (buckets - 1) as u64;
+    if scratch.idx_alt.len() < n {
+        scratch.idx_alt.resize(n, 0);
+    }
+    if scratch.counts.len() < buckets {
+        scratch.counts.resize(buckets, 0);
+    }
+    scratch.counts[..buckets].iter_mut().for_each(|c| *c = 0);
+    for &i in idx.iter() {
+        scratch.counts[(key(i) & mask) as usize] += 1;
+    }
+    let mut start = 0u32;
+    for c in scratch.counts[..buckets].iter_mut() {
+        let cnt = *c;
+        *c = start;
+        start += cnt;
+    }
+    for &i in idx.iter() {
+        let b = (key(i) & mask) as usize;
+        scratch.idx_alt[scratch.counts[b] as usize] = i;
+        scratch.counts[b] += 1;
+    }
+    idx.copy_from_slice(&scratch.idx_alt[..n]);
+}
+
 /// LSD radix over a permutation whose KEYS TRAVEL WITH IT: `scratch.keys[k]` is the key of
 /// `idx[k]`, and every pass permutes both together.
 ///
@@ -816,14 +893,8 @@ pub(crate) struct SortScratch {
 ///
 /// Stable: each pass scatters in ascending source order from prefix offsets, so equal keys keep
 /// their relative order — which `sort_blocks` promises and `dedup`/`group` rely on.
-fn radix_perm_by_keys(idx: &mut [usize], scratch: &mut SortScratch) {
+fn radix_perm_by_keys(idx: &mut [usize], scratch: &mut SortScratch, d: u32, sig: u32) {
     let n = idx.len();
-    let max = scratch.keys[..n].iter().copied().max().unwrap_or(0);
-    let sig = 64 - max.leading_zeros();
-    if sig == 0 {
-        return; // every key equal: the permutation is already the stable answer
-    }
-    let d = digit_width(n);
     let buckets = 1usize << d;
     let mask = (buckets - 1) as u64;
     let passes = sig.div_ceil(d);
