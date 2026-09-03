@@ -62,8 +62,26 @@ pub enum BinOp {
     Rem, // INTEGER-ONLY (the float remainder has no caller). `x % 0 = x`: a total definition, so the
          // lane body needs no branch out and callers that guard the divisor pay nothing. It is the
          // "no reduction" reading of a zero modulus, which is what DDIR's `hash(0, ..)` means.
+    // The bitwise family. UNSIGNED-ONLY: `Kind::I` and `Kind::F` store an order-preserving swizzle,
+    // so a bit op on those bytes is not the bit op on the value; `eval` rejects them. Shifts are
+    // TOTAL — the shift amount wraps modulo the width (`wrapping_shl`/`shr`), as `Rem` is total on
+    // a zero divisor, so no lane body needs a branch out. `Shr` is the SIMD divide by 2^k (USHR)
+    // and `And` the SIMD modulo (2^k - 1); both existed as U64-only one-off ops before the grid
+    // grew an immediate axis, and they are now the (op, kind, width) cells they always were.
+    Shl,
+    Shr,
+    And,
+    Or,
+    Xor,
     // NB: lane-wise min/max are NOT here — they're kind-blind order ops (byte min/max on the
     // order-preserving leaf needs no deswizzle), so they live in `cmp` as `CmpOp::Min`/`Max`.
+}
+
+impl BinOp {
+    /// the bitwise cells, which read stored bytes and so are unsigned-only.
+    fn is_bitwise(self) -> bool {
+        matches!(self, BinOp::Shl | BinOp::Shr | BinOp::And | BinOp::Or | BinOp::Xor)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,9 +119,18 @@ pub enum ArithOp {
                            // the kind-conversion `signed` (an involution; how a column enters Kind::I)
     ToFloat(u32),          // U-int leaf -> float leaf (w in {32,64}): each unsigned int -> the float of
                            // the same width, total-order encoded. `to_f32`/`to_f64`: how iota becomes floats.
-    AddU64(u64),           // U64 -> U64   x + c   (sugar)
-    Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
-    And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
+    BinImm(BinOp, Kind, u32, u64), // leaf -> leaf   the IMMEDIATE column of the grid: `x <op> c` at a
+                           // bit-width, for a constant right operand given in its STORED form (raw for
+                           // `U`, sign-swizzled for `I`, total-order-encoded for `F` — what `lit_value`
+                           // builds). One cell per (op, kind, width) exactly as `Bin`, and the reason
+                           // it is a separate variant rather than a field of `Bin` is that it consumes
+                           // a different shape: `Bin` eats a pair, this eats one column.
+                           //
+                           // The pair form `(x, x lit c) <op>` is semantically identical and was the
+                           // only way to say most of these: `Lit` broadcasts an n-element constant
+                           // column and `Tuple` builds a product, so `x mul 3` allocated and wrote a
+                           // whole extra column per use. Only add/shr/and/gt had escaped that, as
+                           // U64-only one-off ops outside the grid.
     Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
     Scan(Red),             // List<U64> -> List<U64>  per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
@@ -164,6 +191,16 @@ macro_rules! grid {
                     (Kind::I, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
                     (Kind::I, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
                     (Kind::U, BinOp::Rem) => bin_into(av, bv, |x: $u, y: $u| if y == 0 { x } else { x % y }),
+                    // bitwise: unsigned only (eval rejects I/F), shifts total via `wrapping_*`.
+                    (Kind::U, BinOp::Shl) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_shl(y as u32)),
+                    (Kind::U, BinOp::Shr) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_shr(y as u32)),
+                    (Kind::U, BinOp::And) => bin_into(av, bv, |x: $u, y: $u| x & y),
+                    (Kind::U, BinOp::Or) => bin_into(av, bv, |x: $u, y: $u| x | y),
+                    (Kind::U, BinOp::Xor) => bin_into(av, bv, |x: $u, y: $u| x ^ y),
+                    (Kind::I, BinOp::Shl) | (Kind::I, BinOp::Shr) | (Kind::I, BinOp::And)
+                    | (Kind::I, BinOp::Or) | (Kind::I, BinOp::Xor) => {
+                        unreachable!("bitwise ops are unsigned-only and rejected before dispatch")
+                    }
                     // `wrapping_rem` for the MIN % -1 overflow; the zero divisor is the total `x % 0 = x`.
                     (Kind::I, BinOp::Rem) => bin_into(av, bv, |x: $u, y: $u| {
                         let m = !(<$u>::MAX >> 1);
@@ -177,6 +214,45 @@ macro_rules! grid {
                     (Kind::F, _) => unreachable!("int_bin: float dispatched by bin_eval"),
                 }), )+
                 _ => panic!("arith: operand width mismatch"),
+            }
+        }
+
+        /// the IMMEDIATE column of the grid: `x <op> c` in one in-place pass, with `c` given in the
+        /// leaf's stored form. Same (kind × op) dispatch as `int_bin`, hoisted above the lane loop,
+        /// and no operand column at all — where the pair form builds an n-element `Lit` and a
+        /// `Prod` before it can start.
+        fn int_bin_imm(op: BinOp, kind: Kind, a: Prim, c: u64) -> Prim {
+            match a {
+                $( Prim::$V(av) => { let y = c as $u; Prim::$V(match (kind, op) {
+                    (Kind::U, BinOp::Add) => neg_into(av, |x: $u| x.wrapping_add(y)),
+                    (Kind::U, BinOp::Sub) => neg_into(av, |x: $u| x.wrapping_sub(y)),
+                    (Kind::U, BinOp::Mul) => neg_into(av, |x: $u| x.wrapping_mul(y)),
+                    (Kind::I, BinOp::Add) => neg_into(av, |x: $u| swiz!($u, $i, x, y, wrapping_add)),
+                    (Kind::I, BinOp::Sub) => neg_into(av, |x: $u| swiz!($u, $i, x, y, wrapping_sub)),
+                    (Kind::I, BinOp::Mul) => neg_into(av, |x: $u| swiz!($u, $i, x, y, wrapping_mul)),
+                    (Kind::U, BinOp::Rem) => neg_into(av, |x: $u| if y == 0 { x } else { x % y }),
+                    (Kind::I, BinOp::Rem) => {
+                        let m = !(<$u>::MAX >> 1);
+                        if (y ^ m) as $i == 0 {
+                            av
+                        } else {
+                            neg_into(av, |x: $u| swiz!($u, $i, x, y, wrapping_rem))
+                        }
+                    }
+                    (Kind::U, BinOp::Shl) => neg_into(av, |x: $u| x.wrapping_shl(y as u32)),
+                    (Kind::U, BinOp::Shr) => neg_into(av, |x: $u| x.wrapping_shr(y as u32)),
+                    (Kind::U, BinOp::And) => neg_into(av, |x: $u| x & y),
+                    (Kind::U, BinOp::Or) => neg_into(av, |x: $u| x | y),
+                    (Kind::U, BinOp::Xor) => neg_into(av, |x: $u| x ^ y),
+                    (Kind::I, BinOp::Shl) | (Kind::I, BinOp::Shr) | (Kind::I, BinOp::And)
+                    | (Kind::I, BinOp::Or) | (Kind::I, BinOp::Xor) => {
+                        unreachable!("bitwise ops are unsigned-only and rejected before dispatch")
+                    }
+                    (Kind::U, BinOp::Div) | (Kind::I, BinOp::Div) => {
+                        unreachable!("integer Div is rejected before dispatch")
+                    }
+                    (Kind::F, _) => unreachable!("int_bin_imm: float dispatched by bin_imm_eval"),
+                })} )+
             }
         }
 
@@ -205,6 +281,46 @@ fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
     }
 }
 
+/// the immediate leaf op, dispatching `Kind::F` to the float path and `U`/`I` to the macro grid.
+fn bin_imm_eval(op: BinOp, kind: Kind, a: Prim, c: u64) -> Prim {
+    match kind {
+        // one-element operand columns are the honest float path here: the float lane bodies live in
+        // `float_bin`, and duplicating them for a constant would be a second definition of IEEE
+        // semantics to keep in step. `Prim::repeat` is one fill, no index column.
+        Kind::F => {
+            let n = a.len();
+            let rhs = match a.bits() {
+                32 => Prim::U32(Arc::new(vec![c as u32; n])),
+                _ => Prim::U64(Arc::new(vec![c; n])),
+            };
+            float_bin(op, a, rhs)
+        }
+        _ => int_bin_imm(op, kind, a, c),
+    }
+}
+
+/// the (op, kind, width) cells that are not defined, shared by the pair and immediate forms so the
+/// two cannot drift. `Err` is the shape error the typer reports.
+fn check_cell(op: BinOp, kind: Kind, w: u32) -> Result<(), String> {
+    if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
+        return Err(format!("float arith only at width 32/64, got {w}"));
+    }
+    if matches!(op, BinOp::Div) && !matches!(kind, Kind::F) {
+        return Err("integer div is deferred — div is float-only (use div_f32/div_f64)".into());
+    }
+    if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
+        return Err("rem is integer-only".into());
+    }
+    if op.is_bitwise() && !matches!(kind, Kind::U) {
+        return Err(
+            "bitwise ops are unsigned-only: signed and float leaves store an order-preserving \
+             swizzle, so a bit op on those bytes is not the bit op on the value"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn neg_eval(kind: Kind, a: Prim) -> Prim {
     match kind {
         Kind::F => match a {
@@ -224,6 +340,7 @@ fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
         Prim::$V(bin_into($av, $bv, |x, y| { let (x, y) = ($dec(x), $dec(y)); $enc(match op {
             BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
             BinOp::Rem => unreachable!("float Rem is rejected before dispatch"),
+            _ => unreachable!("bitwise ops are unsigned-only and rejected before dispatch"),
         })}))
     }}
     match (a, b) {
@@ -237,15 +354,7 @@ impl ArithOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
         Ok(match self {
             ArithOp::Bin(op, kind, w) => {
-                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
-                    return Err(format!("float arith only at width 32/64, got {w}"));
-                }
-                if matches!(op, BinOp::Div) && !matches!(kind, Kind::F) {
-                    return Err("integer div is deferred — div is float-only (use div_f32/div_f64)".into());
-                }
-                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
-                    return Err("rem is integer-only".into());
-                }
+                check_cell(*op, *kind, *w)?;
                 let (a, b) = input.into_pair("binary arith")?;
                 let (pa, pb) = (a.into_prim("binary arith lhs")?, b.into_prim("binary arith rhs")?);
                 if pa.bits() != *w || pb.bits() != *w {
@@ -270,23 +379,15 @@ impl ArithOp {
                 (64, Prim::U64(v)) => Prim::U64(neg_into(v, |x| enc_f64(x as f64))),
                 (w, p) => return Err(format!("to_float expects a U{w} leaf (w in 32/64), got U{}", p.bits())),
             }),
-            ArithOp::AddU64(c) => {
-                // in place when uniquely owned: `into_u64` moves the buffer out at refcount 1, else clones.
-                let mut xs = input.into_u64("AddU64")?;
-                xs.iter_mut().for_each(|x| *x = x.wrapping_add(*c));
-                Value::u64(xs)
-            }
-            // in place, like AddU64. Both vectorize (vector shift / vector AND) — the SIMD forms of
-            // divide / modulo by a power of two, which general integer div/mod lack on NEON.
-            ArithOp::Shr(k) => {
-                let mut xs = input.into_u64("Shr")?;
-                xs.iter_mut().for_each(|x| *x >>= *k);
-                Value::u64(xs)
-            }
-            ArithOp::And(m) => {
-                let mut xs = input.into_u64("And")?;
-                xs.iter_mut().for_each(|x| *x &= *m);
-                Value::u64(xs)
+            // the immediate cell: one in-place pass, no operand column. `Bin` and this share
+            // `check_cell` so the two forms cannot disagree about which cells exist.
+            ArithOp::BinImm(op, kind, w, c) => {
+                check_cell(*op, *kind, *w)?;
+                let p = input.into_prim("immediate arith")?;
+                if p.bits() != *w {
+                    return Err(format!("immediate arith expects U{w}, got U{}", p.bits()));
+                }
+                Value::Prim(bin_imm_eval(*op, *kind, p, *c))
             }
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;

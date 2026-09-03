@@ -29,7 +29,7 @@
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
 //!       enum Opt = None () | Some u64 in xs inject Some  -- tag xs into Some; None is an empty unit lane
 
-use super::{pair_imm, resolve, str_value, takes_num};
+use super::{pair_imm, resolve, resolve_imm, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::{NumOp, Op};
 use crate::shape::Shape;
@@ -552,11 +552,16 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
-                Apply::BinImm(name, n) => {
-                    let lit = b.add(Op::Lit(Value::u64(vec![*n])), vec![id]);
-                    let pair = b.tuple(vec![id, lit]);
-                    Ok(b.add(resolve(name, None)?, vec![pair]))
-                }
+                Apply::BinImm(name, n) => match resolve_imm(name, *n) {
+                    // the grid's immediate cell: one in-place pass over the column.
+                    Some(op) => Ok(b.add(op, vec![id])),
+                    // no immediate cell (min/max) — broadcast the constant and eat the pair.
+                    None => {
+                        let lit = b.add(Op::Lit(Value::u64(vec![*n])), vec![id]);
+                        let pair = b.tuple(vec![id, lit]);
+                        Ok(b.add(resolve(name, None)?, vec![pair]))
+                    }
+                },
                 Apply::Str(bytes) => Ok(b.add(Op::Lit(str_value(bytes.clone())), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
                 Apply::Fold(x, body) => Ok(b.add(Op::Fold(Box::new(lower_body(x, body)?)), vec![id])),

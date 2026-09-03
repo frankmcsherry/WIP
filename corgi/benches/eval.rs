@@ -4,7 +4,7 @@
 //! (run the bench binary under perf → pollard). Kept deliberately small and factored: it touches no
 //! `src`, and criterion is the upgrade path if statistical rigor is ever wanted.
 
-use corgi::{eval_graph, ArithOp, Builder, CmpOp, Graph, NumOp, Value};
+use corgi::{eval_graph, ArithOp, BinOp, Builder, CmpOp, Graph, Kind, NumOp, Value};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -58,7 +58,7 @@ fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
     let mut cur = b.input();
     for _ in 0..k {
-        cur = b.add(ArithOp::AddU64(7), vec![cur]);
+        cur = b.add(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7), vec![cur]);
     }
     b.finish(cur)
 }
@@ -68,7 +68,7 @@ fn main() {
     // sweep two sizes: 8 MB (fits the M2 P-cluster's ~16 MB L2) vs 64 MB (streams from DRAM). The
     // arithmetic workloads' per-pass cost should jump across that cliff; sort shouldn't care.
     for n in [1usize << 20, 1 << 23] {
-        report("add_const", n, bench(&graph(ArithOp::AddU64(7)), &Value::u64(scrambled(n)), reps));
+        report("add_const", n, bench(&graph(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7)), &Value::u64(scrambled(n)), reps));
         report("add_chain8", n, bench(&add_chain(8), &Value::u64(scrambled(n)), reps));
     }
     let n = 1 << 20;

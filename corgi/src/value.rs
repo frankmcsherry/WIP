@@ -646,6 +646,19 @@ macro_rules! prim {
                 }
             }
 
+            /// lane-wise relational compare against a CONSTANT -> a 0/1 mask, at this width. The
+            /// immediate sibling of [`Prim::rel`]: same kind-blindness (it reads stored bytes, so
+            /// it is correct for the swizzled signed and float encodings too) and the same
+            /// branchless lane body from pre-resolved order flags — but no second column to read,
+            /// where the pair form has to broadcast the constant into one first.
+            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+                match self {
+                    $( Prim::$V(v) => { let y = c as $t; v.iter()
+                        .map(|x| ((lt & (*x < y)) | (eq & (*x == y)) | (gt & (*x > y))) as u64)
+                        .collect() } )+
+                }
+            }
+
             /// append same-width leaves end to end. Test-only: the leaf of `engine::concat`, the
             /// `gather_lanes` reference oracle (no production path concatenates leaves).
             #[cfg(test)]

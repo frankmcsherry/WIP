@@ -19,8 +19,8 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{
-    arrange, eval_graph, lower_effects, optimize, parse_ml, ArithOp, Builder, Graph, NumOp,
-    Op, Value,
+    arrange, eval_graph, lower_effects, optimize, parse_ml, ArithOp, BinOp, Builder, Graph, Kind,
+    NumOp, Op, Value,
 };
 use std::env;
 use std::hint::black_box;
@@ -220,7 +220,7 @@ fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
     let mut cur = b.input();
     for _ in 0..k {
-        cur = b.add(ArithOp::AddU64(7), vec![cur]);
+        cur = b.add(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7), vec![cur]);
     }
     b.finish(cur)
 }

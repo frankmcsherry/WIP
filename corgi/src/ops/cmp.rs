@@ -43,7 +43,10 @@ impl Pred {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
-    Gt(u64),   // X -> U64 mask    (x > c) as 0/1   — the column-vs-immediate sugar form
+    RelImm(Pred, u64), // X -> U64 mask   the IMMEDIATE form of `Rel`: compare a leaf column against
+               // a constant, given in the leaf's stored form. Kind-blind and any width, where the
+               // pair form `(x, x lit c) <pred>` has to broadcast an n-element constant column and
+               // build a product to say the same thing. (This was `Gt(u64)`, a U64-only threshold.)
     Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
     Max,       // (X, X) -> X   lane-wise maximum
     SortList,  // List<X> -> List<X>   structural order
@@ -82,9 +85,14 @@ impl CmpOp {
                 Value::Prim(pa.lane_pick(pb, take_max))
             }
 
-            CmpOp::Gt(c) => {
-                let xs = input.as_u64("Gt")?;
-                Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
+            CmpOp::RelImm(pred, c) => {
+                let p = input.into_prim("relational immediate")?;
+                // the constant is the leaf's STORED form, so it has to fit the leaf's width —
+                // truncating it silently would compare against a different value than written.
+                if p.bits() < 64 && *c >= (1u64 << p.bits()) {
+                    return Err(format!("{pred:?} {c}: constant does not fit a U{} leaf", p.bits()));
+                }
+                Value::u64(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
             CmpOp::SortList => {
