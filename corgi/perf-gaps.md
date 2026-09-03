@@ -77,8 +77,8 @@ instead. "Lever" names what would close it.
 | A2 add_chain8 | pointwise | tax 0.93 / prize 6.6 | tax 1.05 / prize 3.7 | tax 0.95 / prize 2.1 | per-pass at the Rust ceiling; the gap is un-fused passes | **tiling, then fusion** |
 | A3 mixed_chain | pointwise | tax 1.07 | tax 0.99 | tax 1.00 | at the Rust ceiling — the immediate cells landed | — at ceiling |
 | A4 map_reduce | pointwise | tax 1.67 / prize 2.4 | tax 0.81 / prize 11.5 | tax 1.20 / prize 7.5 | intermediate map column, then a fold over it | **fusion — the biggest prize on the board** |
-| B1 filter_values | selection | 3.3× | 1.9× | 2.7× | u64 mask column + scalar `filter_mask` + gather vs one predicated push | narrow masks; a writer; SIMD compaction |
-| B2 cmp_select | selection | 2.6× | 2.4× | 4.6× | 4 passes vs 1 fused | tiling, then fusion |
+| B1 filter_values | selection | 3.0× | 2.4× | 2.4× | BYTE mask column + scalar `filter_mask` + gather vs one predicated push | a writer; SIMD compaction |
+| B2 cmp_select | selection | 2.3× | 1.9× | 1.9× | 4 passes vs 1 fused | tiling, then fusion |
 | C1 fold_add | aggregation | 1.10× | **1.03×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | **C3 group_by_sum** | aggregation | 22× | **48×** | **74×** | sort-based group where a 256-bucket accumulate is one O(n) pass | see *the group-by decomposition* |
@@ -113,8 +113,26 @@ instead. "Lever" names what would close it.
 | A2 add_chain8 | 0.69 | 0.59 | **0.53** | 0.63 | 1.07 | 2.09 | 2.0× / 3.9× |
 | A3 mixed_chain | 0.69 | **0.27** | 0.31 | 0.36 | 0.91 | 1.00 | 3.4× / 3.7× |
 | A4 map_reduce | 0.49 | **0.20** | 0.20 | 0.24 | 0.72 | 0.87 | 3.6× / 4.4× |
-| B1 filter_values | 1.71 | 0.87 | **0.80** | 0.84 | 1.26 | 1.72 | 1.6× / 2.2× |
-| B2 cmp_select | 1.02 | **0.53** | 0.64 | 0.63 | 2.13 | 2.62 | 4.0× / 4.9× |
+| B1 filter_values | 1.22 | 1.27 | **0.86** | 0.89 | 1.48 | 1.74 | 1.7× / 2.0× |
+| B2 cmp_select | 0.77 | 0.61 | **0.63** | 0.63 | 1.80 | 2.06 | 2.9× / 3.3× |
+
+The two large anchors in the B rows are 3-run medians; everything else is one run. B is worth
+measuring that way and A is not — see the mask note below.
+
+**The byte mask, measured.** `Rel` producing a `u8` mask rather than a `u64` one is worth, against
+the same suite on the same machine, 3 runs each: B1 1.66 → 1.48 ns/row at 1 M and 1.87 → 1.68 at
+8 M; B2 1.94 → 1.80 and 2.22 → 2.06. So **1.08–1.14×**, on the two rows that read a mask at all —
+not the 1.3–1.6× a single run of each side suggested when the mask first landed, and not the
+regression a single run suggested when it came back. Single runs of B are worth little: the u64 side
+is tight (B1 at 1 M was 1.656 / 1.664 / 1.664) and the byte side is not (B2 at 1 M was 1.18 / 1.80 /
+1.84), so any one pairing can say almost anything. The DDIR workload set does not move at all,
+because it barely filters — see the integration note in `dd-corgi-dist`.
+
+One thing that looked obvious and is not: `Select`'s `blend` reads a byte selector against 64-bit
+data, which costs lane-unpacking that a same-width selector would not. Widening the mask once
+inside `Select` to get a uniform blend measured WORSE than paying the unpack (B2 at 1 M: 1.80 with
+the byte selector, 2.22 with the widen), so the widen is not there. `filter_mask` has no such
+problem — it reads the mask alone, generic over its width.
 
 The floor is 4 K–8 K rows and the rise below it is per-op fixed cost, which puts the useful tile
 floor near 2 K rows. **Tiling is worth 1.6–4.0× at the design center and 2.2–4.9× at the DRAM
