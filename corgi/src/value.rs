@@ -576,6 +576,25 @@ macro_rules! prim {
                 }
             }
 
+            /// The order of `self[lo..hi]` in one pass: `None` at the first inversion, else
+            /// whether the range is STRICTLY increasing (no two neighbours equal). Both answers
+            /// carry: an inversion settles that a column is unsorted whatever follows the leading
+            /// leaf, and strict increase settles that it IS sorted, since a lexicographic order
+            /// whose leading component already separates every pair never consults the rest.
+            /// The scan exits at the first inversion, so an unsorted column costs a few loads.
+            pub(crate) fn order_of_range(&self, lo: usize, hi: usize) -> Option<bool> {
+                match self {
+                    $( Prim::$V(v) => {
+                        let mut strict = true;
+                        for w in v[lo..hi].windows(2) {
+                            if w[0] > w[1] { return None; }
+                            strict &= w[0] != w[1];
+                        }
+                        Some(strict)
+                    } )+
+                }
+            }
+
             /// stable per-element hash: each element WIDENED to u64 (zero-extend) and mixed (splitmix64
             /// finalizer). The leaf of [`crate::hash::hash`]; reads the stored bytes only, so it is
             /// KIND-BLIND and — for the raw/unsigned reading — WIDTH-BLIND: `u8` 5 and `u64` 5 both

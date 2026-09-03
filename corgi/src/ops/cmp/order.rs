@@ -352,6 +352,105 @@ mod compare {
     }
 }
 
+/// The first leaf a structural order reads, when the order starts at one: a `Prim`, or the leading
+/// field of a `Prod`, recursively. `List` and `Sum` order by length and by tag first, so they
+/// answer `None` and the caller has to do the structural pass.
+fn leading_leaf(v: &Value) -> Option<&Prim> {
+    match v {
+        Value::Prim(p) => Some(p),
+        Value::Prod(cols) => cols.first().and_then(leading_leaf),
+        _ => None,
+    }
+}
+
+/// What one pass over the leading leaf settles about a column's order.
+enum Leading {
+    /// A row's leading leaf decreases: the column is NOT in order, whatever the later fields say.
+    Inversion,
+    /// Every row's leading leaf strictly increases, so it already separates every adjacent pair:
+    /// the column IS in order, and no later field is consulted (a lexicographic order stops at the
+    /// first component that decides). This is the compound key whose leading field is an
+    /// identifier or a hash — the shape DDIR sorts.
+    Strict,
+    /// Non-decreasing with equal neighbours: the later fields decide, so the structural pass runs.
+    Ties,
+    /// No leading leaf to read.
+    Unknown,
+}
+
+fn leading_order(bounds: &Bounds, vals: &Value) -> Leading {
+    let Some(p) = leading_leaf(vals) else { return Leading::Unknown };
+    let mut strict = true;
+    let mut start = 0;
+    for end in bounds.ends() {
+        match p.order_of_range(start, end) {
+            None => return Leading::Inversion,
+            Some(s) => strict &= s,
+        }
+        start = end;
+    }
+    if strict { Leading::Strict } else { Leading::Ties }
+}
+
+/// Is every row of `bounds` already in non-decreasing structural order?
+///
+/// This is the question `sort`/`dedup`/`group` should ask before they sort. The answer is usually
+/// yes for the data a dataflow hands them (an arrangement batch is in key order by construction),
+/// a sort is 20-40x the cost of asking, and a wrong guess is impossible: this checks, it does not
+/// assume. An unsorted column exits at its first inversion, so the sort it was going to get anyway
+/// pays a few loads for the question.
+pub(crate) fn rows_sorted(bounds: &Bounds, vals: &Value) -> bool {
+    match leading_order(bounds, vals) {
+        Leading::Inversion => false,
+        // the leading leaf decided every pair — and for a bare leaf it IS the order.
+        Leading::Strict => true,
+        Leading::Ties if matches!(vals, Value::Prim(_)) => true,
+        Leading::Ties | Leading::Unknown => signs_sorted(bounds, &compare_adjacent(vals)),
+    }
+}
+
+/// The adjacent-order signs of `vals` when every row is already in order — `None` when some row is
+/// not. The signs come back rather than a bool because they ARE what the sorted path needs next:
+/// `out[k]` compares flattened row `k` with row `k+1`, so a zero marks a duplicate and a nonzero a
+/// run boundary — the run structure `dedup` and `group` would otherwise sort to discover.
+pub(crate) fn sorted_signs(bounds: &Bounds, vals: &Value) -> Option<Vec<i8>> {
+    if matches!(leading_order(bounds, vals), Leading::Inversion) {
+        return None;
+    }
+    let signs = compare_adjacent(vals);
+    signs_sorted(bounds, &signs).then_some(signs)
+}
+
+/// Do the adjacent signs describe rows that are each non-decreasing? Row boundaries are skipped: a
+/// row's last element may exceed the next row's first without the column being out of order.
+fn signs_sorted(bounds: &Bounds, signs: &[i8]) -> bool {
+    let mut start = 0;
+    for end in bounds.ends() {
+        if end > start && signs[start..end - 1].iter().any(|&o| o > 0) {
+            return false;
+        }
+        start = end;
+    }
+    true
+}
+
+/// First index of each maximal equal-value run, given per-row `bounds` and the adjacent signs of an
+/// already-sorted column ([`sorted_signs`]). A row boundary always starts a run, since runs never
+/// cross rows — the same partition [`run_layout`] reads off a sorted column's refined labels.
+pub(crate) fn run_firsts(bounds: &Bounds, signs: &[i8]) -> Vec<usize> {
+    let mut firsts = Vec::new();
+    let mut start = 0;
+    for end in bounds.ends() {
+        for k in start..end {
+            if k == start || signs[k - 1] != 0 {
+                firsts.push(k);
+            }
+        }
+        start = end;
+    }
+    firsts
+}
+
 mod discriminate {
     //! The discrimination sort, `sort_blocks(labels, v) -> (perm, new_labels)`: reorder `v`'s rows WITHIN each
     //! equal-`labels` block, returning the permutation and a REFINED partition — two rows share a `new_labels`

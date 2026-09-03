@@ -519,6 +519,35 @@ fn family_d(n: usize, reps: u32) {
         black_box(v);
     });
     row("D3 sort_compound", n, c, r, "2-field discrimination + 2 gathers vs pdqsort on pairs");
+
+    // D4/D5 the ALREADY-SORTED input. Every arrangement batch a dataflow hands corgi is in key
+    // order, so this is the common case at the DDIR seam and it used to cost a full sort. The
+    // ceilings are what the answer actually is: confirm the order, and for dedup one pass keeping
+    // the first of each run.
+    let mut asc = src.clone();
+    asc.sort_unstable();
+    let sorted = Value::List(vec![n].into(), Box::new(Value::u64(asc.clone())));
+
+    let g = compile("input sort");
+    let c = corgi_t(&g, &sorted, reps);
+    let r = rust_t(reps, || {
+        black_box(black_box(&asc).windows(2).all(|w| w[0] <= w[1]));
+    });
+    row("D4 sort_sorted", n, c, r, "detect the order and return vs confirm it");
+
+    let g = compile("input dedup");
+    let c = corgi_t(&g, &sorted, reps);
+    let r = rust_t(reps, || {
+        let s = black_box(&asc);
+        let mut out: Vec<u64> = Vec::with_capacity(s.len());
+        for (k, &x) in s.iter().enumerate() {
+            if k == 0 || x != s[k - 1] {
+                out.push(x);
+            }
+        }
+        black_box(out);
+    });
+    row("D5 dedup_sorted", n, c, r, "run boundaries from the order check vs one unique pass");
 }
 
 /// E — relational / index generators. `gather` is fresh-allocating by necessity; the open question is

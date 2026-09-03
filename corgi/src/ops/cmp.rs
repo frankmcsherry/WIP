@@ -8,7 +8,10 @@
 pub(crate) mod order;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
+use order::{
+    compare_cols, compare_idx, run_firsts, run_layout, rows_sorted, runs_per_row, segment_labels,
+    sort_blocks, sorted_signs,
+};
 use crate::shape::{same, shape_of_value};
 use crate::value::Value;
 
@@ -86,6 +89,12 @@ impl CmpOp {
 
             CmpOp::SortList => {
                 let (bounds, vals) = input.into_list("SortList")?;
+                // Already ordered: the permutation is the identity, so the discrimination pass and
+                // the gather after it would together copy the column to reproduce it. See
+                // `sorted_signs` for why asking is worth it — a dataflow's batches arrive sorted.
+                if rows_sorted(&bounds, &vals) {
+                    return Ok(Value::List(bounds, Box::new(vals)));
+                }
                 let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
                 Value::List(bounds, Box::new(gather(&vals, &perm)))
             }
@@ -93,6 +102,14 @@ impl CmpOp {
             CmpOp::DedupList => {
                 // distinct, per row: discriminate, then keep one representative per run.
                 let (bounds, vals) = input.into_list("DedupList")?;
+                // Already ordered: the runs are the adjacent-equal spans, which the sortedness
+                // check has just computed. The permutation would be the identity, so the run
+                // firsts ARE the representatives — no discrimination pass at all.
+                if let Some(signs) = sorted_signs(&bounds, &vals) {
+                    let firsts = run_firsts(&bounds, &signs);
+                    let nb = runs_per_row(&bounds, &firsts);
+                    return Ok(Value::List(nb.into(), Box::new(gather(&vals, &firsts))));
+                }
                 let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
                 let (_ends, firsts) = run_layout(&labels);
                 let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
@@ -106,6 +123,26 @@ impl CmpOp {
                 // K-runs are the groups, and each run's V-span is its inner list.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
+                // Keys already ordered: the permutation is the identity, so the values need no
+                // gather at all (a stable sort would leave them exactly where they are), and the
+                // key runs are the adjacent-equal spans the check just computed.
+                if let Some(signs) = sorted_signs(&bounds, &k_col) {
+                    let firsts = run_firsts(&bounds, &signs);
+                    // exclusive ends of the runs: each run ends where the next begins, and the
+                    // last at the end of the column.
+                    let mut ends: Vec<usize> = Vec::with_capacity(firsts.len());
+                    if let Some(rest) = firsts.get(1..) {
+                        ends.extend_from_slice(rest);
+                        ends.push(k_col.len());
+                    }
+                    let keys = gather(&k_col, &firsts);
+                    let inner = Value::List(ends.into(), Box::new(v_col));
+                    let no = runs_per_row(&bounds, &firsts);
+                    return Ok(Value::List(
+                        no.into(),
+                        Box::new(Value::Prod(vec![keys, inner])),
+                    ));
+                }
                 let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
                 let v_sorted = gather(&v_col, &perm);
                 let (ends, firsts) = run_layout(&klabels);
@@ -202,5 +239,136 @@ fn batched_bound(
             }
         }
         active.truncate(w);
+    }
+}
+
+#[cfg(test)]
+mod sorted_fast_paths {
+    //! The `sort`/`dedup`/`group` fast paths for an already-ordered column must produce EXACTLY
+    //! what the discrimination path produces. The references below are the op bodies as they were
+    //! before the fast paths existed, so this is a direct A/B rather than a restatement of the
+    //! intent — delete a fast path and these still pass; break one and they fail.
+
+    use super::order::{run_layout, runs_per_row, segment_labels, sort_blocks};
+    use super::CmpOp;
+    use crate::engine::gather;
+    use crate::value::{Bounds, Value};
+
+    fn ref_sort(v: Value) -> Value {
+        let (bounds, vals) = v.into_list("ref").unwrap();
+        let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
+        Value::List(bounds, Box::new(gather(&vals, &perm)))
+    }
+    fn ref_dedup(v: Value) -> Value {
+        let (bounds, vals) = v.into_list("ref").unwrap();
+        let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
+        let (_ends, firsts) = run_layout(&labels);
+        let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
+        let nb = runs_per_row(&bounds, &firsts);
+        Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+    }
+    fn ref_group(v: Value) -> Value {
+        let (bounds, vals) = v.into_list("ref").unwrap();
+        let (k_col, v_col) = vals.into_pair("ref").unwrap();
+        let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
+        let v_sorted = gather(&v_col, &perm);
+        let (ends, firsts) = run_layout(&klabels);
+        let reps: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
+        let keys = gather(&k_col, &reps);
+        let inner = Value::List(ends.into(), Box::new(v_sorted));
+        let no = runs_per_row(&bounds, &firsts);
+        Value::List(no.into(), Box::new(Value::Prod(vec![keys, inner])))
+    }
+
+    fn u(xs: &[u64]) -> Value {
+        Value::u64(xs.to_vec())
+    }
+    fn list(ends: Vec<usize>, vals: Value) -> Value {
+        Value::List(ends.into(), Box::new(vals))
+    }
+
+    /// every shape the fast paths can meet, in an ALREADY SORTED state (so the fast path fires)
+    /// and in an unsorted state (so it does not, and the reference path is exercised too).
+    fn cases() -> Vec<Value> {
+        vec![
+            // one row, sorted, with duplicate runs at the start, middle and end.
+            list(vec![8], u(&[1, 1, 2, 5, 5, 5, 9, 9])),
+            // one row, unsorted.
+            list(vec![8], u(&[5, 1, 9, 2, 5, 1, 9, 5])),
+            // several rows: sorted within each, but a row's last element exceeds the next's first —
+            // the case a whole-column sortedness scan would get wrong.
+            list(vec![3, 6, 9], u(&[7, 8, 9, 1, 2, 3, 4, 4, 6])),
+            // ragged rows, including empty ones at the front, middle and end.
+            list(vec![0, 2, 2, 5, 5], u(&[3, 3, 1, 2, 2])),
+            // a compound key, sorted lexicographically (the leading field ties in places).
+            list(vec![5], Value::Prod(vec![u(&[1, 1, 1, 2, 2]), u(&[10, 10, 20, 5, 7])])),
+            // a compound key whose LEADING field is sorted but whose second is not — the cheap
+            // reject passes and the structural check has to catch it.
+            list(vec![4], Value::Prod(vec![u(&[1, 1, 2, 2]), u(&[20, 10, 5, 7])])),
+            // narrow leaves.
+            list(vec![6], Value::u8(vec![0, 0, 3, 3, 3, 255])),
+            // a sum column, sorted by tag then payload.
+            list(vec![5], Value::sum(vec![0, 0, 1, 1, 1], vec![u(&[4, 4]), u(&[1, 2, 2])])),
+            // a list-of-lists, sorted length-first.
+            list(
+                vec![4],
+                list(vec![0, 1, 3, 3], u(&[7, 2, 9])),
+            ),
+            // unit rows: all equal, so one run.
+            list(vec![4], Value::Unit(4)),
+            // degenerate: an empty column, and a single element.
+            list(vec![0], u(&[])),
+            list(vec![1], u(&[42])),
+            // a strided partition, sorted (the `Bounds::Stride` representation, not `Offsets`).
+            Value::List(Bounds::Stride(2, 3), Box::new(u(&[1, 4, 2, 2, 5, 9]))),
+        ]
+    }
+
+    #[test]
+    fn sort_matches_the_discrimination_path() {
+        for v in cases() {
+            assert_eq!(
+                CmpOp::SortList.eval(v.clone()).unwrap(),
+                ref_sort(v.clone()),
+                "sort disagreed on {}",
+                crate::value::show(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_matches_the_discrimination_path() {
+        for v in cases() {
+            assert_eq!(
+                CmpOp::DedupList.eval(v.clone()).unwrap(),
+                ref_dedup(v.clone()),
+                "dedup disagreed on {}",
+                crate::value::show(&v)
+            );
+        }
+    }
+
+    #[test]
+    fn group_matches_the_discrimination_path() {
+        // (K, V) pairs: sorted by K with duplicate keys (so the V order within a group is the
+        // thing at risk), sorted by K in several rows, and unsorted.
+        let pairs = |ends: Vec<usize>, ks: &[u64], vs: &[u64]| {
+            list(ends, Value::Prod(vec![u(ks), u(vs)]))
+        };
+        let cases = [
+            pairs(vec![6], &[1, 1, 2, 3, 3, 3], &[10, 11, 20, 30, 31, 32]),
+            pairs(vec![3, 6], &[5, 5, 9, 1, 2, 2], &[1, 2, 3, 4, 5, 6]),
+            pairs(vec![6], &[3, 1, 2, 1, 3, 2], &[10, 11, 20, 30, 31, 32]),
+            pairs(vec![0, 3], &[7, 7, 8], &[1, 2, 3]),
+            pairs(vec![0], &[], &[]),
+        ];
+        for v in cases {
+            assert_eq!(
+                CmpOp::GroupKey.eval(v.clone()).unwrap(),
+                ref_group(v.clone()),
+                "group disagreed on {}",
+                crate::value::show(&v)
+            );
+        }
     }
 }
