@@ -501,6 +501,24 @@ fn family_d(n: usize, reps: u32) {
         black_box(v);
     });
     row("D2 dedup", n, c, r, "sort+unique vs sort+dedup");
+
+    // D3 sort a COMPOUND key — the shape DDIR actually sorts (after the hash-key lane a key is
+    // `Prod([hash, key])`, whose leading u64 discriminates essentially everything). D1's scalar key
+    // never exercises the field loop, so a regression or a win in `sort_prod_blocks` was invisible
+    // to this suite. The second field is deliberately NON-discriminating: it is the payload a real
+    // key carries past its identifier, and the question is what the sort pays to look at it.
+    let pairs = Value::List(
+        vec![n].into(),
+        Box::new(Value::Prod(vec![Value::u64(src.clone()), Value::u64(vec![7; n])])),
+    );
+    let g = compile("input sort");
+    let c = corgi_t(&g, &pairs, reps);
+    let r = rust_t(reps.min(10), || {
+        let mut v: Vec<(u64, u64)> = black_box(&src).iter().map(|&k| (k, 7u64)).collect();
+        v.sort_unstable();
+        black_box(v);
+    });
+    row("D3 sort_compound", n, c, r, "2-field discrimination + 2 gathers vs pdqsort on pairs");
 }
 
 /// E — relational / index generators. `gather` is fresh-allocating by necessity; the open question is

@@ -503,15 +503,34 @@ mod discriminate {
         (perm, new_labels)
     }
 
+    /// Is every row already in a class of its own? A refined label vector is non-decreasing, so
+    /// "all distinct" is "no two adjacent are equal", and the scan stops at the first tie — a key
+    /// that genuinely needs its later fields pays one comparison for the question.
+    fn fully_discriminated(labels: &[u64]) -> bool {
+        labels.windows(2).all(|w| w[0] != w[1])
+    }
+
     fn sort_prod_blocks(labels: &[u64], cols: &[Value]) -> (Vec<usize>, Vec<u64>) {
         let n = labels.len();
-        if cols.is_empty() {
+        let Some((first, rest)) = cols.split_first() else {
             return ((0..n).collect(), labels.to_vec());
-        }
+        };
         // lexicographic = sort by field 0, then refine within ties by field 1, ...
-        let mut perm: Vec<usize> = (0..n).collect();
-        let mut cur = labels.to_vec();
-        for c in cols {
+        //
+        // Field 0 reads its column DIRECTLY: the permutation is still the identity there, so the
+        // gather every later field needs would copy the column only to reproduce it. That also
+        // makes a one-field product exactly the sort of the field it wraps, which is the peel
+        // `compare_pairs` performs for the same shape.
+        let (mut perm, mut cur) = sort_blocks(labels, first);
+        for c in rest {
+            // Nothing is tied any more, so no later field can move a row or split a class: the
+            // remaining fields would be gathered and radixed to reproduce `perm` and `cur` exactly.
+            // This is the sort's half of the tie narrowing `compare_pairs` already does — the
+            // comparator stops descending once no pair is equal, and the sort now stops too. It is
+            // the common case for a compound key whose leading field is an identifier or a hash.
+            if fully_discriminated(&cur) {
+                break;
+            }
             let reordered = gather(c, &perm);
             let (sub_perm, sub_labels) = sort_blocks(&cur, &reordered);
             perm = sub_perm.iter().map(|&k| perm[k]).collect();
@@ -604,6 +623,12 @@ mod discriminate {
             let mut local_perm: Vec<usize> = (0..block_size).collect();
             let mut local_labels = vec![0u64; block_size];
             for pos in 0..len {
+                // as in `sort_prod_blocks`: once no two rows of the block are tied, the remaining
+                // positions cannot reorder or split anything. A wide uniform record whose first
+                // element discriminates stops after one position instead of `len` of them.
+                if fully_discriminated(&local_labels) {
+                    break;
+                }
                 let positions: Vec<usize> =
                     local_perm.iter().map(|&k| bounds.span(perm[lo + k]).0 + pos).collect();
                 let elem = gather(vals, &positions);
@@ -815,6 +840,61 @@ mod tests {
     #[test]
     fn leaf() {
         agree(&u(&[5, 3, 8, 1, 3, 9, 2, 3]));
+    }
+
+    /// Refined labels must be non-decreasing and mark exactly the structural-equality classes of the
+    /// sorted rows. `agree` only checks the sorted VALUES, and `dedup`/`group` read the labels, so
+    /// the two fast paths that stop a refinement early (`sort_prod_blocks`' all-distinct break and
+    /// `sort_list_blocks`' per-position break) need this to pin them.
+    fn agree_labels(v: &Value) {
+        let n = v.len();
+        let (perm, labels) = sort_blocks(&vec![0u64; n], v);
+        assert_eq!(labels.len(), n);
+        for k in 1..n {
+            assert!(labels[k - 1] <= labels[k], "labels not non-decreasing at {k}");
+            let equal = compare2(v, perm[k - 1], v, perm[k]) == Ordering::Equal;
+            assert_eq!(
+                labels[k - 1] == labels[k],
+                equal,
+                "label class at {k} disagrees with structural equality"
+            );
+        }
+    }
+
+    /// A refinement that has already separated every row must stop: no later product field and no
+    /// later list position can reorder or re-split anything. The results have to be identical to
+    /// running every field/position, which is what these shapes check — the leading component
+    /// discriminates fully, so the fast path fires, and the trailing components are chosen so that
+    /// honouring them would produce a DIFFERENT order if the break were wrong.
+    #[test]
+    fn stopping_once_nothing_is_tied_changes_nothing() {
+        // leading field unique, trailing fields anti-sorted: field 1 alone would reverse the order.
+        let anti = Value::Prod(vec![u(&[1, 2, 3, 4]), u(&[40, 30, 20, 10]), u(&[9, 9, 9, 9])]);
+        agree(&anti);
+        agree_labels(&anti);
+        // leading field NOT unique: the break must not fire early, and field 1 must still refine.
+        let tied = Value::Prod(vec![u(&[1, 1, 2, 2]), u(&[40, 30, 20, 10])]);
+        agree(&tied);
+        agree_labels(&tied);
+        // the single-field peel: a 1-tuple orders exactly as the field it wraps.
+        let one = Value::Prod(vec![u(&[5, 3, 5, 1])]);
+        agree(&one);
+        agree_labels(&one);
+        assert_eq!(sort_perm(&one), sort_perm(&u(&[5, 3, 5, 1])));
+        // uniform (strided) rows whose FIRST element discriminates, later elements anti-sorted.
+        let wide = Value::List(
+            Bounds::Stride(3, 4),
+            Box::new(Value::u64(vec![1, 40, 9, 2, 30, 9, 3, 20, 9, 4, 10, 9])),
+        );
+        agree(&wide);
+        agree_labels(&wide);
+        // ...and the same rows where the first element ties, so the loop must continue.
+        let wide_tied = Value::List(
+            Bounds::Stride(3, 4),
+            Box::new(Value::u64(vec![1, 40, 9, 1, 30, 8, 2, 20, 9, 2, 10, 8])),
+        );
+        agree(&wide_tied);
+        agree_labels(&wide_tied);
     }
 
     #[test]
