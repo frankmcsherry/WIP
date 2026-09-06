@@ -18,7 +18,7 @@
 //! eye; 8 K rows (64 KB) is a control that proves dispatch is amortized — NOT a target. Run:
 //! `cargo bench --bench gaps`.
 
-use corgi::{
+use corgi::{Bounds,
     arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
     Op, Value,
 };
@@ -734,6 +734,98 @@ fn family_arrange(n: usize, reps: u32) {
         r,
         "stable radix argsort vs stable cached-key Rust sort",
     );
+
+    // R7/R8 the structured sorts — a Sum of four u64 lanes and a List of u64 of lengths 0..=4 —
+    // against a stable typed Rust sort with the same order (tag then payload; length then elements).
+    // The R1 row is the leaf ceiling; these say what the Sum and List arms of the discrimination
+    // sort cost on top of it.
+    {
+        let tags: Vec<usize> = src.iter().map(|&x| (x % 4) as usize).collect();
+        let payload: Vec<u64> = scrambled(n).into_iter().map(|x| x ^ 0x5bd1e995).collect();
+        let mut lanes: Vec<Vec<u64>> = vec![Vec::new(); 4];
+        for (i, &t) in tags.iter().enumerate() { lanes[t].push(payload[i]); }
+        let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::u64).collect());
+        let c = rust_t(reps, || {
+            black_box(arrange::sort_perm(black_box(&col)));
+        });
+        let r = rust_t(reps, || {
+            let (tags, payload) = (black_box(&tags), black_box(&payload));
+            let mut perm: Vec<usize> = (0..tags.len()).collect();
+            perm.sort_by_cached_key(|&i| (tags[i] as u8, payload[i]));
+            black_box(perm);
+        });
+        row("R7 arrange_sort_sum", n, c, r, "Sum arm (tag radix, per-lane refinement) vs stable cached-key Rust sort on (tag, payload)");
+    }
+    {
+        let lens: Vec<usize> = src.iter().map(|&x| ((x >> 8) % 5) as usize).collect();
+        let mut ends = Vec::with_capacity(n);
+        let mut total = 0;
+        for &l in &lens { total += l; ends.push(total); }
+        let elems: Vec<u64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
+        let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u64(elems.clone())));
+        let c = rust_t(reps, || {
+            black_box(arrange::sort_perm(black_box(&col)));
+        });
+        let r = rust_t(reps, || {
+            let (ends, elems) = (black_box(&ends), black_box(&elems));
+            let span = |i: usize| -> &[u64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
+            let mut perm: Vec<usize> = (0..ends.len()).collect();
+            perm.sort_by(|&a, &b| (span(a).len(), span(a)).cmp(&(span(b).len(), span(b))));
+            black_box(perm);
+        });
+        row("R8 arrange_sort_list", n, c, r, "List arm (length radix, per-position refinement) vs stable Rust sort on (len, elements)");
+    }
+
+    // R9/R10 the SEGMENTED structured sorts: the same Sum and List columns sorted within outer rows
+    // of ~4 elements (`segment_labels`), i.e. `SortList` over a list of sums / a list of lists. A
+    // sort under fine labels is one tiny block per row, which is where a per-block recursion pays
+    // its allocations n/4 times; the Rust side sorts each row's slice in place.
+    {
+        let tags: Vec<usize> = src.iter().map(|&x| (x % 4) as usize).collect();
+        let payload: Vec<u64> = scrambled(n).into_iter().map(|x| x ^ 0x5bd1e995).collect();
+        let mut lanes: Vec<Vec<u64>> = vec![Vec::new(); 4];
+        for (i, &t) in tags.iter().enumerate() { lanes[t].push(payload[i]); }
+        let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::u64).collect());
+        let rows = n / 4;
+        let outer = Bounds::offsets((1..=rows).map(|r| r * 4).collect());
+        let labels = arrange::segment_labels(&outer);
+        let c = rust_t(reps, || {
+            black_box(arrange::sort_blocks(black_box(&labels), black_box(&col)));
+        });
+        let r = rust_t(reps, || {
+            let (tags, payload) = (black_box(&tags), black_box(&payload));
+            let mut perm: Vec<usize> = (0..rows * 4).collect();
+            for chunk in perm.chunks_mut(4) {
+                chunk.sort_by_key(|&i| (tags[i] as u8, payload[i]));
+            }
+            black_box(perm);
+        });
+        row("R9 arrange_sort_sum_seg", rows * 4, c, r, "Sum arm under per-row labels (a block per row) vs a stable Rust sort per row");
+    }
+    {
+        let lens: Vec<usize> = src.iter().map(|&x| ((x >> 8) % 5) as usize).collect();
+        let mut ends = Vec::with_capacity(n);
+        let mut total = 0;
+        for &l in &lens { total += l; ends.push(total); }
+        let elems: Vec<u64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
+        let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u64(elems.clone())));
+        let rows = n / 4;
+        let outer = Bounds::offsets((1..=rows).map(|r| r * 4).collect());
+        let labels = arrange::segment_labels(&outer);
+        let c = rust_t(reps, || {
+            black_box(arrange::sort_blocks(black_box(&labels), black_box(&col)));
+        });
+        let r = rust_t(reps, || {
+            let (ends, elems) = (black_box(&ends), black_box(&elems));
+            let span = |i: usize| -> &[u64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
+            let mut perm: Vec<usize> = (0..rows * 4).collect();
+            for chunk in perm.chunks_mut(4) {
+                chunk.sort_by(|&a, &b| (span(a).len(), span(a)).cmp(&(span(b).len(), span(b))));
+            }
+            black_box(perm);
+        });
+        row("R10 arrange_sort_list_seg", rows * 4, c, r, "List arm under per-row labels (a block per row) vs a stable Rust sort per row");
+    }
 
     let mut sorted = src.clone();
     sorted.sort_unstable();
