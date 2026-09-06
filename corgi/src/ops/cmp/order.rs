@@ -503,6 +503,15 @@ mod discriminate {
         (perm, new_labels)
     }
 
+    /// `out[k]`: does row `k` share its label with a neighbour — i.e. sit in a block of more than
+    /// one row, the only rows a refinement can reorder or split.
+    fn multi_row_blocks(labels: &[u64]) -> Vec<bool> {
+        let n = labels.len();
+        (0..n)
+            .map(|k| (k > 0 && labels[k - 1] == labels[k]) || (k + 1 < n && labels[k + 1] == labels[k]))
+            .collect()
+    }
+
     fn sort_prod_blocks(labels: &[u64], cols: &[Value]) -> (Vec<usize>, Vec<u64>) {
         let n = labels.len();
         if cols.is_empty() {
@@ -535,19 +544,28 @@ mod discriminate {
         //    lane needs no gather, only the block labels threaded through it, and ONE `sort_blocks`
         //    per tag refines every block at once. (Per block, this was a gather, a seed vector and
         //    a recursive sort each — for a sort under per-row labels, once per row.)
+        // A block of one row is already sorted and already its own label; in an arrangement keyed
+        // by a leaf (most keys unique) nearly every block is one row, and the per-block form was
+        // O(1) on them. Only rows of multi-row blocks refine.
+        let multi = multi_row_blocks(&labels_disc);
         let mut counts = vec![0usize; variants.len()];
         for k in 0..n {
-            counts[tags.tag_at(perm_disc[k])] += 1;
+            if multi[k] {
+                counts[tags.tag_at(perm_disc[k])] += 1;
+            }
         }
-        // output slots per tag, in output order, and the block labels those slots carry
+        // output slots per tag (multi-row blocks only), in output order, and their block labels
         let mut slots: Vec<Vec<usize>> = counts.iter().map(|&c| Vec::with_capacity(c)).collect();
         let mut lane_labels: Vec<Vec<u64>> = counts.iter().map(|&c| Vec::with_capacity(c)).collect();
         for k in 0..n {
-            let t = tags.tag_at(perm_disc[k]);
-            slots[t].push(k);
-            lane_labels[t].push(labels_disc[k]);
+            if multi[k] {
+                let t = tags.tag_at(perm_disc[k]);
+                slots[t].push(k);
+                lane_labels[t].push(labels_disc[k]);
+            }
         }
-        let mut perm = vec![0usize; n];
+        let Tags::Column(_, within) = tags else { unreachable!("const handled above") };
+        let mut perm = perm_disc.clone();
         let mut refined: Vec<Vec<u64>> = Vec::with_capacity(variants.len());
         for (t, lane) in variants.iter().enumerate() {
             let ks = &slots[t];
@@ -555,24 +573,37 @@ mod discriminate {
                 refined.push(Vec::new());
                 continue;
             }
-            debug_assert_eq!(ks.len(), lane.len(), "a lane holds exactly its tag's rows");
-            let (sub_perm, sub_labels) = sort_blocks(&lane_labels[t], lane);
+            // Every tag-t row refining: the lane in its stored order IS those rows in output order
+            // (stable radix, blocks in row order), so it needs no gather. Otherwise gather the
+            // refining rows' lane positions — the carried within-lane offsets.
+            let (sub_perm, sub_labels) = if ks.len() == lane.len() {
+                sort_blocks(&lane_labels[t], lane)
+            } else {
+                let positions: Vec<usize> = ks.iter().map(|&k| within[perm_disc[k]]).collect();
+                sort_blocks(&lane_labels[t], &gather(lane, &positions))
+            };
             for (j, &k) in ks.iter().enumerate() {
                 perm[k] = perm_disc[ks[sub_perm[j]]];
             }
             refined.push(sub_labels);
         }
-        // 3. Labels: over the output, (block-and-tag label, the lane's refined label) is
-        //    non-decreasing — the first component orders the slots, and within a tag's
-        //    consecutive slots the second does — so one pass with a cursor per tag densifies it.
+        // 3. Labels: over the output, (block-and-tag label, the refined label within the tag) is
+        //    non-decreasing — the first component orders the slots; within a tag's consecutive
+        //    refining slots the second does; a one-row block is its own label — so one pass with
+        //    a cursor per tag densifies it.
         let mut cursor = vec![0usize; variants.len()];
         let mut new_labels = Vec::with_capacity(n);
         let mut next = 0u64;
         let mut prev = (u64::MAX, u64::MAX);
         for k in 0..n {
-            let t = tags.tag_at(perm_disc[k]);
-            let cur = (labels_disc[k], refined[t][cursor[t]]);
-            cursor[t] += 1;
+            let cur = if multi[k] {
+                let t = tags.tag_at(perm_disc[k]);
+                let r = refined[t][cursor[t]];
+                cursor[t] += 1;
+                (labels_disc[k], r)
+            } else {
+                (labels_disc[k], 0)
+            };
             if k > 0 && cur != prev {
                 next += 1;
             }
@@ -617,9 +648,13 @@ mod discriminate {
         // positions). Under per-row labels that was one recursion per row.
         let lens_out: Vec<usize> = perm.iter().map(|&r| { let (s, e) = bounds.span(r); e - s }).collect();
         let max_len = lens_out.iter().copied().max().unwrap_or(0);
+        // Only rows of multi-row blocks refine (see the Sum arm); empty rows are all equal.
+        let multi = multi_row_blocks(&cur_labels);
         let mut slots: Vec<Vec<usize>> = vec![Vec::new(); max_len + 1];
         for (k, &l) in lens_out.iter().enumerate() {
-            slots[l].push(k);
+            if multi[k] && l > 0 {
+                slots[l].push(k);
+            }
         }
         let mut new_perm = perm.clone();
         let mut refined: Vec<Vec<u64>> = vec![Vec::new(); max_len + 1];
@@ -628,11 +663,6 @@ mod discriminate {
                 continue;
             }
             let mut local_labels: Vec<u64> = ks.iter().map(|&k| cur_labels[k]).collect();
-            if len == 0 {
-                // empty rows are all equal: nothing to refine
-                refined[len] = local_labels;
-                continue;
-            }
             let mut local_perm: Vec<usize> = (0..ks.len()).collect();
             for pos in 0..len {
                 let positions: Vec<usize> =
@@ -655,8 +685,13 @@ mod discriminate {
         let mut prev = (u64::MAX, u64::MAX);
         for k in 0..n {
             let l = lens_out[k];
-            let cur = (cur_labels[k], refined[l][cursor[l]]);
-            cursor[l] += 1;
+            let cur = if multi[k] && l > 0 {
+                let r = refined[l][cursor[l]];
+                cursor[l] += 1;
+                (cur_labels[k], r)
+            } else {
+                (cur_labels[k], 0)
+            };
             if k > 0 && cur != prev {
                 next += 1;
             }
