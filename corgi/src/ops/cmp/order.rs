@@ -125,8 +125,38 @@ pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
         (Value::Prim(Prim::U64(a)), Value::Prim(Prim::U64(b))) => {
             survey_by(a.len(), b.len(), |i, j| a[i].cmp(&b[j]))
         }
+        // A product of `u64` lanes (nested products flattened, unit fields skipped): structural
+        // order is lexicographic over the lanes, so the gallop compares lane by lane with direct
+        // reads and never walks the shape per step. The `(key, val)` column of an arrangement.
+        (Value::Prod(_), Value::Prod(_)) if u64_lanes(a).zip(u64_lanes(b)).is_some_and(|(x, y)| x.len() == y.len()) => {
+            let (la, lb) = (u64_lanes(a).unwrap(), u64_lanes(b).unwrap());
+            survey_by(a.len(), b.len(), |i, j| {
+                for (x, y) in la.iter().zip(&lb) {
+                    match x[i].cmp(&y[j]) {
+                        Ordering::Equal => continue,
+                        o => return o,
+                    }
+                }
+                Ordering::Equal
+            })
+        }
         _ => survey_by(a.len(), b.len(), |i, j| compare_at(a, i, b, j)),
     }
+}
+
+/// The `u64` leaf lanes of a column that is nothing but nested products of `u64` leaves and
+/// units, in structural order; `None` for any other shape.
+fn u64_lanes(v: &Value) -> Option<Vec<&[u64]>> {
+    fn walk<'a>(v: &'a Value, out: &mut Vec<&'a [u64]>) -> bool {
+        match v {
+            Value::Prim(Prim::U64(xs)) => { out.push(&xs[..]); true }
+            Value::Prod(fields) => fields.iter().all(|f| walk(f, out)),
+            Value::Unit(_) => true,
+            _ => false,
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut out).then_some(out)
 }
 
 /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is

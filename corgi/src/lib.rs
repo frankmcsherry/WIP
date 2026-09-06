@@ -444,6 +444,21 @@ pub mod arrange {
             assert_eq!(both, vec![&Run::Both(1, 0), &Run::Both(2, 1)]);
         }
 
+        /// The lane-wise arm: nested products of `u64` leaves and unit fields gallop on the lanes and
+        /// must agree with the structural walk; a product with a non-`u64` field takes the walk.
+        #[test]
+        fn survey_over_lane_products_matches_the_walk() {
+            let kv = |keys: &[u64], vals: &[u64]| {
+                Value::Prod(vec![Value::Prod(vec![Value::u64(keys.to_vec())]), Value::u64(vals.to_vec())])
+            };
+            check_survey(&kv(&[1, 1, 2, 5, 5, 5], &[0, 3, 0, 1, 2, 9]), &kv(&[1, 2, 2, 5, 7], &[3, 0, 4, 2, 0]));
+            check_survey(&kv(&[], &[]), &kv(&[1, 2], &[0, 0]));
+            let with_unit = |keys: &[u64]| Value::Prod(vec![Value::u64(keys.to_vec()), Value::Unit(keys.len())]);
+            check_survey(&with_unit(&[1, 2, 2, 9]), &with_unit(&[2, 3, 9, 9]));
+            let mixed = |keys: &[u64], vals: &[u8]| Value::Prod(vec![Value::u64(keys.to_vec()), Value::u8(vals.to_vec())]);
+            check_survey(&mixed(&[1, 2, 2], &[0, 1, 2]), &mixed(&[2, 2, 3], &[1, 1, 0]));
+        }
+
         #[test]
         fn survey_at_scale_matches_oracle() {
             // two sorted runs drawn from an overlapping key space (deterministic LCG, no rng dep),
