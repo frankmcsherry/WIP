@@ -52,11 +52,16 @@ pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
     Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), vec![ok, Value::Unit(n_err)])
 }
 
+/// Does this value have the `Fail<T> = Sum{T | Unit}` shape?
+fn is_fail(v: &Value) -> bool {
+    matches!(v, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)))
+}
+
 /// did NO row fail? O(1) — the Err lane is a length-carrying `Unit`, so the failure count is a
 /// field read, not a mask to materialise and scan. Every consumer below asks this first, because
 /// "nothing has failed yet" is the state a fallible pipeline spends most of its time in.
 pub(crate) fn no_errors(v: &Value) -> bool {
-    matches!(v, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(0)))
+    is_fail(v) && matches!(v, Value::Sum(_, lanes) if lanes[1].is_empty())
 }
 
 /// destructure a `Fail<T>` into its error mask and packed Ok lane; anything else is the shape error.
@@ -69,9 +74,11 @@ pub(crate) fn into_fail(v: Value, who: &str) -> Result<(Vec<bool>, Value), Strin
 /// need the Ok payload, or can retain an existing assignment, use this instead of `into_fail`.
 fn fail_parts(v: Value, who: &str) -> Result<(Tags, Value, usize), String> {
     match v {
-        Value::Sum(tags, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_)) => {
+        Value::Sum(tags, lanes) if is_fail(&v) => {
             let Value::Unit(errors) = lanes[1] else { unreachable!() };
-            Ok((tags, lanes.into_iter().next().unwrap(), errors))
+            let ok = lanes.into_iter().next().unwrap();
+            debug_assert_eq!(ok.len() + errors, tags.len(), "Fail: lane lengths disagree with the assignment");
+            Ok((tags, ok, errors))
         }
         other => Err(format!("{who}: expected a Fail (Sum{{T | Unit}}), got {}", shape_of_value(&other))),
     }
@@ -109,12 +116,10 @@ pub(crate) fn lift(v: Value) -> Value {
 pub(crate) fn squash(v: Value) -> Result<Value, String> {
     let (tags, inner, errors) = fail_parts(v, "Squash")?;
     // nothing failed at the outer level: the inner `Fail<T>` already IS the answer, mask and all.
-    if errors == 0 {
-        if matches!(&inner, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(_))) {
-            return Ok(inner);
-        }
-        // Preserve shape validation even on an empty/all-Ok input.
-        return Err(format!("Squash inner: expected a Fail (Sum{{T | Unit}}), got {}", shape_of_value(&inner)));
+    // Keep even a noncanonical all-Ok column assignment as-is; compaction belongs to producers.
+    // A malformed inner shape falls through to `into_fail` for the shared shape error.
+    if errors == 0 && is_fail(&inner) {
+        return Ok(inner);
     }
     // nothing failed at the inner level: the result's mask is the outer's, unchanged.
     if no_errors(&inner) {
@@ -508,6 +513,38 @@ mod tests {
         let empty = Value::sum(vec![], vec![lift(Value::u64(vec![])), Value::Unit(0)]);
         let expected = lift(Value::sum(vec![], vec![Value::u64(vec![]), Value::Unit(0)]));
         assert_eq!(hoist_sum(&[0], empty).unwrap(), expected);
+    }
+
+    #[test]
+    fn squash_retains_a_noncanonical_all_ok_assignment() {
+        for n in [0, 3] {
+            // Bypass producer compaction: an all-Ok Column is valid too. Preserve
+            // its representation and buffers, but require the same value as Lift.
+            let tags = Arc::new(vec![0; n]);
+            let offsets = Arc::new((0..n).collect::<Vec<_>>());
+            let values = Arc::new((0..n).map(|i| 10 + i as u64).collect::<Vec<_>>());
+            let ok = Value::Prim(Prim::U64(values.clone()));
+            let inner = Value::sum_tagged(
+                Tags::Column(Prim::U8(tags.clone()), offsets.clone()),
+                vec![ok.clone(), Value::Unit(0)],
+            );
+            assert!(no_errors(&inner));
+            let result = squash(lift(inner)).unwrap();
+            assert_eq!(result, lift(ok));
+            let Value::Sum(Tags::Column(Prim::U8(t), o), lanes) = result else { panic!("retained assignment") };
+            assert!(Arc::ptr_eq(&t, &tags));
+            assert!(Arc::ptr_eq(&o, &offsets));
+            let Value::Prim(Prim::U64(v)) = &lanes[0] else { panic!("retained payload") };
+            assert!(Arc::ptr_eq(v, &values));
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Fail: lane lengths disagree with the assignment")]
+    fn fail_parts_checks_lane_lengths() {
+        let bad = Value::sum_tagged(Tags::constant(0, 3), vec![Value::Unit(2), Value::Unit(0)]);
+        let _ = fail_parts(bad, "test");
     }
 
     #[test]
