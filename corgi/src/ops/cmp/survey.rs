@@ -63,6 +63,26 @@ pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
         }
         go!(U8, U16, U32, U64)
     }
+    let mut lanes = Vec::new();
+    if leaves(a, b, &mut lanes) && (1..=4).contains(&lanes.len()) {
+        let (na, nb) = (a.len(), b.len());
+        if let Some(w) = wide(&lanes) {
+            return match w.len() {
+                1 => merge_pairs(|i| w[0].0[i], |j| w[0].1[j], na, nb),
+                2 => merge_pairs(|i| (w[0].0[i], w[1].0[i]), |j| (w[0].1[j], w[1].1[j]), na, nb),
+                3 => merge_pairs(|i| (w[0].0[i], w[1].0[i], w[2].0[i]), |j| (w[0].1[j], w[1].1[j], w[2].1[j]), na, nb),
+                _ => merge_pairs(|i| (w[0].0[i], w[1].0[i], w[2].0[i], w[3].0[i]), |j| (w[0].1[j], w[1].1[j], w[2].1[j], w[3].1[j]), na, nb),
+            };
+        }
+        let at = |x: usize, i: usize| lanes[x].0.usize_at(i);
+        let bt = |x: usize, j: usize| lanes[x].1.usize_at(j);
+        return match lanes.len() {
+            1 => merge_pairs(|i| at(0, i), |j| bt(0, j), na, nb),
+            2 => merge_pairs(|i| (at(0, i), at(1, i)), |j| (bt(0, j), bt(1, j)), na, nb),
+            3 => merge_pairs(|i| (at(0, i), at(1, i), at(2, i)), |j| (bt(0, j), bt(1, j), bt(2, j)), na, nb),
+            _ => merge_pairs(|i| (at(0, i), at(1, i), at(2, i), at(3, i)), |j| (bt(0, j), bt(1, j), bt(2, j), bt(3, j)), na, nb),
+        };
+    }
     let mut out: Vec<Run> = Vec::new();
     let mut push = |r: Run| match (out.last_mut(), r) {
         (Some(Run::A(_, hi)), Run::A(lo, nhi)) if *hi == lo => *hi = nhi,
@@ -120,20 +140,29 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
         (Value::Unit(_), Value::Unit(_)) => merge(|_| 0u8, |_| 0u8, open, tree),
         (Value::Prod(ca), Value::Prod(cb)) => {
             assert_eq!(ca.len(), cb.len(), "survey: product arity");
-            let mut fields = ca.iter().zip(cb);
-            let Some((x0, y0)) = fields.next() else {
-                return merge(|_| 0u8, |_| 0u8, open, tree);
-            };
-            // the first field reads the level's own lists; each later field, the rows of the
-            // classes the field before left equal.
-            level(x0, y0, ia, ib, open, tree);
-            let (mut cur, mut sa, mut sb) = tree.refined(open, ia, ib);
-            for (x, y) in fields {
-                if cur.is_empty() {
-                    break;
+            // a run of leaf lanes is one level keyed by their tuple, as a structural compare
+            // reads them; the first level reads the level's own lists, each later one the rows
+            // of the classes the level before left equal.
+            let mut cur: Vec<usize> = open.to_vec();
+            let (mut sa, mut sb): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+            let mut first = true;
+            let mut f = 0;
+            while f < ca.len() && !cur.is_empty() {
+                let (lanes, g) = leaf_run(ca, cb, f);
+                let next = if g > f { g } else { f + 1 };
+                if g > f && lanes.is_empty() {
+                    f = next; // units only: nothing to decide
+                    continue;
                 }
-                level(x, y, &sa[..], &sb[..], &cur, tree);
-                (cur, sa, sb) = tree.refined(&cur, &sa[..], &sb[..]);
+                if first {
+                    if g > f { lanes_level(&lanes, ia, ib, &cur, tree) } else { level(&ca[f], &cb[f], ia, ib, &cur, tree) }
+                    (cur, sa, sb) = tree.refined(&cur, ia, ib);
+                    first = false;
+                } else {
+                    if g > f { lanes_level(&lanes, &sa[..], &sb[..], &cur, tree) } else { level(&ca[f], &cb[f], &sa[..], &sb[..], &cur, tree) }
+                    (cur, sa, sb) = tree.refined(&cur, &sa[..], &sb[..]);
+                }
+                f = next;
             }
         }
         (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
@@ -214,6 +243,69 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
         };
     }
     go!(U8, U16, U32, U64)
+}
+
+/// The leaf lanes of `a` and `b`, in structural order, when the shape is nothing but leaves,
+/// units and products of those; `false` otherwise.
+fn leaves<'a>(a: &'a Value, b: &'a Value, out: &mut Vec<(&'a Prim, &'a Prim)>) -> bool {
+    match (a, b) {
+        (Value::Prim(pa), Value::Prim(pb)) => {
+            out.push((pa, pb));
+            true
+        }
+        (Value::Unit(_), Value::Unit(_)) => true,
+        (Value::Prod(xa), Value::Prod(xb)) => xa.len() == xb.len() && xa.iter().zip(xb).all(|(x, y)| leaves(x, y, out)),
+        _ => false,
+    }
+}
+
+/// From field `f` on, the run of fields that are leaves, units, or products of those, as their
+/// lanes in order, at most four; returns the lanes and the first field not taken. A field whose
+/// lanes would not fit ends the run, so an empty run with `g == f` means the field is structured.
+fn leaf_run<'a>(ca: &'a [Value], cb: &'a [Value], f: usize) -> (Vec<(&'a Prim, &'a Prim)>, usize) {
+    let mut lanes = Vec::new();
+    let mut g = f;
+    while g < ca.len() {
+        let mut more = Vec::new();
+        if !leaves(&ca[g], &cb[g], &mut more) || lanes.len() + more.len() > 4 {
+            break;
+        }
+        lanes.extend(more);
+        g += 1;
+    }
+    (lanes, g)
+}
+
+/// A level keyed by a run of leaf lanes, compared as a tuple: what a structural comparison of
+/// those fields does, in one gallop. Every lane `u64` reads the leaves directly.
+/// The lanes as `u64` slices, when every one is a `u64` leaf: the common shape, read directly.
+fn wide<'a>(lanes: &[(&'a Prim, &'a Prim)]) -> Option<Vec<(&'a [u64], &'a [u64])>> {
+    lanes
+        .iter()
+        .map(|(pa, pb)| match (pa, pb) {
+            (Prim::U64(va), Prim::U64(vb)) => Some((&va[..], &vb[..])),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lanes_level<IA: Rows, IB: Rows>(lanes: &[(&Prim, &Prim)], ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
+    if let Some(w) = wide(lanes) {
+        return match w.len() {
+            1 => merge(|j| w[0].0[ia.row(j)], |j| w[0].1[ib.row(j)], open, tree),
+            2 => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r]) }, open, tree),
+            3 => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r], w[2].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r], w[2].1[r]) }, open, tree),
+            _ => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r], w[2].0[r], w[3].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r], w[2].1[r], w[3].1[r]) }, open, tree),
+        };
+    }
+    let at = |x: usize, j: usize| lanes[x].0.usize_at(ia.row(j));
+    let bt = |x: usize, j: usize| lanes[x].1.usize_at(ib.row(j));
+    match lanes.len() {
+        1 => leaf(lanes[0].0, lanes[0].1, ia, ib, open, tree),
+        2 => merge(|j| (at(0, j), at(1, j)), |j| (bt(0, j), bt(1, j)), open, tree),
+        3 => merge(|j| (at(0, j), at(1, j), at(2, j)), |j| (bt(0, j), bt(1, j), bt(2, j)), open, tree),
+        _ => merge(|j| (at(0, j), at(1, j), at(2, j), at(3, j)), |j| (bt(0, j), bt(1, j), bt(2, j), bt(3, j)), open, tree),
+    }
 }
 
 /// Merge every open class on one key: `ka(j)` and `kb(j)` are the keys at local positions `j`
