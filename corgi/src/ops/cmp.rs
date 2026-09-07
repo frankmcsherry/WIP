@@ -7,6 +7,7 @@
 
 pub(crate) mod order;
 pub(crate) mod sort;
+pub(crate) mod survey;
 
 use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};

@@ -935,6 +935,99 @@ fn family_arrange(n: usize, reps: u32) {
         "256-row galloping runs vs two-pointer run survey",
     );
 
+    // R11/R12 the structured surveys: two sorted columns of (u64 key with ~5 rows per key, u64)
+    // and of (u64 key, a Sum of two u64 lanes), against a typed Rust two-pointer over tuples.
+    // R4 is the leaf ceiling; these say what the level-wise descent costs on top of it.
+    {
+        let sorted_pairs = |seed: u64| -> Vec<(u64, u64)> {
+            let mut v: Vec<(u64, u64)> = (0..n as u64)
+                .map(|i| {
+                    let x = (i ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    ((x >> 40) % 200_000, (x >> 8) % 1000)
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let (av, bv) = (sorted_pairs(1), sorted_pairs(2));
+        let col = |v: &[(u64, u64)]| Value::Prod(vec![Value::u64(v.iter().map(|p| p.0).collect()), Value::u64(v.iter().map(|p| p.1).collect())]);
+        let (ac, bc) = (col(&av), col(&bv));
+        let c = rust_t(reps, || {
+            black_box(arrange::survey(black_box(&ac), black_box(&bc)));
+        });
+        let r = rust_t(reps, || {
+            let (a, b) = (black_box(&av), black_box(&bv));
+            let (mut i, mut j) = (0usize, 0usize);
+            let mut runs = Vec::new();
+            while i < a.len() && j < b.len() {
+                if a[i] < b[j] {
+                    let start = i;
+                    while i < a.len() && a[i] < b[j] { i += 1; }
+                    runs.push(arrange::Run::A(start, i));
+                } else if b[j] < a[i] {
+                    let start = j;
+                    while j < b.len() && b[j] < a[i] { j += 1; }
+                    runs.push(arrange::Run::B(start, j));
+                } else {
+                    runs.push(arrange::Run::Both(i, j));
+                    i += 1;
+                    j += 1;
+                }
+            }
+            if i < a.len() { runs.push(arrange::Run::A(i, a.len())); }
+            if j < b.len() { runs.push(arrange::Run::B(j, b.len())); }
+            black_box(runs);
+        });
+        row("R11 arrange_survey_prod", n * 2, c, r, "survey of (u64, u64) columns vs a two-pointer over tuples");
+    }
+    {
+        let sorted_rows = |seed: u64| -> Vec<(u64, u8, u64)> {
+            let mut v: Vec<(u64, u8, u64)> = (0..n as u64)
+                .map(|i| {
+                    let x = (i ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    ((x >> 40) % 100_000, ((x >> 4) & 1) as u8, (x >> 8) % 1000)
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let (av, bv) = (sorted_rows(3), sorted_rows(4));
+        let col = |v: &[(u64, u8, u64)]| {
+            let tags: Vec<usize> = v.iter().map(|r| r.1 as usize).collect();
+            let mut lanes = vec![Vec::new(); 2];
+            for r in v { lanes[r.1 as usize].push(r.2); }
+            Value::Prod(vec![Value::u64(v.iter().map(|r| r.0).collect()), Value::sum(tags, lanes.into_iter().map(Value::u64).collect())])
+        };
+        let (ac, bc) = (col(&av), col(&bv));
+        let c = rust_t(reps, || {
+            black_box(arrange::survey(black_box(&ac), black_box(&bc)));
+        });
+        let r = rust_t(reps, || {
+            let (a, b) = (black_box(&av), black_box(&bv));
+            let (mut i, mut j) = (0usize, 0usize);
+            let mut runs = Vec::new();
+            while i < a.len() && j < b.len() {
+                if a[i] < b[j] {
+                    let start = i;
+                    while i < a.len() && a[i] < b[j] { i += 1; }
+                    runs.push(arrange::Run::A(start, i));
+                } else if b[j] < a[i] {
+                    let start = j;
+                    while j < b.len() && b[j] < a[i] { j += 1; }
+                    runs.push(arrange::Run::B(start, j));
+                } else {
+                    runs.push(arrange::Run::Both(i, j));
+                    i += 1;
+                    j += 1;
+                }
+            }
+            if i < a.len() { runs.push(arrange::Run::A(i, a.len())); }
+            if j < b.len() { runs.push(arrange::Run::B(j, b.len())); }
+            black_box(runs);
+        });
+        row("R12 arrange_survey_sum", n * 2, c, r, "survey of (u64, Sum of two u64 lanes) columns vs a two-pointer over tuples");
+    }
+
     let left: Vec<u64> = (0..n.div_ceil(2) as u64).map(|x| x * 2).collect();
     let right: Vec<u64> = (0..(n / 2) as u64).map(|x| x * 2 + 1).collect();
     let tags: Vec<usize> = (0..n).map(|i| i & 1).collect();
