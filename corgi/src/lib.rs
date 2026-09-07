@@ -122,7 +122,7 @@ pub mod arrange {
     /// one columnar discrimination pass — the batched replacement for driving `sort_by(compare_at)`
     /// per pair.
     pub fn sort_perm(v: &Value) -> Vec<usize> {
-        crate::ops::cmp::sort::sort_blocks(&vec![0u64; v.len()], v).0
+        crate::ops::cmp::sort::sort_blocks(&[], v).0
     }
 
     /// Batched structural compare: `out[k]` = sign of row `ia[k]` of `a` vs row `ib[k]` of `b` (all
@@ -142,7 +142,7 @@ pub mod arrange {
 
     /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given
     /// per-row `labels` marking segments (non-decreasing — segment `s` is the maximal run of rows
-    /// sharing a label), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
+    /// sharing a label; empty for one segment), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
     /// label block by corgi structural order (stable, so ties keep input order), and `refined_labels`
     /// further splits each block by equal value (two rows share a refined label iff they shared a
     /// `labels` value AND are structurally equal). `sort_perm(v)` is exactly the single-block case
@@ -164,15 +164,15 @@ pub mod arrange {
     }
 
     /// The indexed sort: order the rows `index[..]` of `v` within the blocks of `labels`
-    /// (`labels[k]` is position `k`'s block; non-decreasing). On return `index` is in sorted
+    /// (`labels[k]` is position `k`'s block; non-decreasing, or empty for one block). On return `index` is in sorted
     /// order — block-stable, stable within a block — and `labels` is the dense refined partition
     /// in that order. Returns the permutation applied, `new_index[k] == old_index[perm[k]]`, so
     /// a parallel array can be moved the same way, and with `emit` the sorted rows as a column.
     /// The subset never has to be gathered out first: this is the form a caller with a subset in
     /// hand wants.
-    pub fn sort_indexed(v: &Value, labels: &mut [u64], index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
+    pub fn sort_indexed(v: &Value, labels: &mut Vec<u64>, index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
         let mut scratch = crate::ops::cmp::sort::SortScratch::default();
-        let emit = if emit { crate::ops::cmp::sort::Emit::Values } else { crate::ops::cmp::sort::Emit::Index };
+        let emit = if emit { crate::ops::cmp::sort::Emit::Both } else { crate::ops::cmp::sort::Emit::Groups };
         crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch)
     }
 

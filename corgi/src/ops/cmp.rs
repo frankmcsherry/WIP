@@ -12,7 +12,7 @@ use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
-use crate::value::Value;
+use crate::value::{Bounds, Value};
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -89,14 +89,14 @@ impl CmpOp {
             // the sort produces the sorted column itself; nothing is gathered afterwards.
             CmpOp::SortList => {
                 let (bounds, vals) = input.into_list("SortList")?;
-                let (_, sorted) = sort_values_only(&segment_labels(&bounds), &vals);
+                let (_, sorted) = sort_values_only(&row_labels(&bounds), &vals);
                 Value::List(bounds, Box::new(sorted))
             }
 
             CmpOp::DedupList => {
                 // distinct, per row: sort, then keep one representative per run.
                 let (bounds, vals) = input.into_list("DedupList")?;
-                let (kept, _ends, firsts, _perm) = representatives(&segment_labels(&bounds), &vals, false);
+                let (kept, _ends, firsts, _perm) = representatives(&row_labels(&bounds), &vals, false);
                 // outer bounds: cumulative distinct count per row (runs never cross rows).
                 let nb = runs_per_row(&bounds, &firsts);
                 Value::List(nb.into(), Box::new(kept))
@@ -108,7 +108,7 @@ impl CmpOp {
                 // permutation; the keys are one representative per run.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
-                let (keys, ends, firsts, perm) = representatives(&segment_labels(&bounds), &k_col, true);
+                let (keys, ends, firsts, perm) = representatives(&row_labels(&bounds), &k_col, true);
                 let v_sorted = gather(&v_col, &perm);
                 let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
@@ -162,6 +162,11 @@ impl CmpOp {
         })
     }
 
+}
+
+/// The labels for a per-row sort: each element its row, or none at all when there is one row.
+fn row_labels(bounds: &Bounds) -> Vec<u64> {
+    if bounds.len() == 1 { Vec::new() } else { segment_labels(bounds) }
 }
 
 /// Sort within `labels`' blocks and keep one row per run of equal rows: `(kept, run ends, run

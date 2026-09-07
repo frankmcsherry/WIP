@@ -8,7 +8,7 @@ copies it made per level are in this file's history (commit 9c32786).
 
     sort_indexed(v, labels: &mut [u64], index: &mut [usize], emit: bool, scratch) -> (perm, Option<Value>)
 
-Requires `labels.len() == index.len()`, `labels` non-decreasing (position `k` is row `index[k]`
+Requires `labels` empty or of `index`'s length and non-decreasing (position `k` is row `index[k]`
 in block `labels[k]`; checked in debug builds), and every `index[k]` a row of `v`. Ensures:
 
 - `index` is permuted so that each block holds its rows in structural order; blocks keep their
@@ -22,11 +22,12 @@ in block `labels[k]`; checked in debug builds), and every `index[k]` a row of `v
 Structural order: leaf by stored unsigned bytes; `Prod` lexicographic by field; `Sum` by tag
 then payload; `List` length first, then element by element; `Unit` all equal.
 
-`emit` is `Index` (the permuted index and `perm`), `Values` (those and the column), or `ValuesOnly`
-(the column and the labels; `index` and `perm` unspecified, so a leaf sorts its keys without
-carrying positions). `sort_blocks(labels, v) -> (perm, labels)` is `Index` at the identity index
-(`perm[k]` the input row at output position `k`); `sort_values(labels, v)` adds the sorted column;
-`sort_values_only(labels, v)` is `ValuesOnly`. `arrange` exposes
+`labels` may arrive empty, meaning every position is one block, which is the first rank of any
+sort and the whole of a primitive column's; the refined labels always come back. `emit` is
+`Groups` (the permuted index and `perm`), `Values` (the column; `index` and `perm` unspecified,
+so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(labels, v) ->
+(perm, labels)` is `Groups` at the identity index (`perm[k]` the input row at output position
+`k`); `sort_values(labels, v)` is `Both`; `sort_values_only(labels, v)` is `Values`. `arrange` exposes
 `sort_perm`, `sort_blocks`, `sort_values` and `sort_indexed`.
 
 ## Design
@@ -61,8 +62,9 @@ carrying positions). `sort_blocks(labels, v) -> (perm, labels)` is `Index` at th
 - **Values only.** `sort` and `dedup` never read the permutation, so their last leaf sorts its
   keys alone: half the bytes through every pass, no permute of the index. Only the last segment
   of a product, and a leaf, take the mode; a sum's lanes and a list's elements are read through
-  the index afterwards and keep it. D1 sort_u64 12.1 → 8.6 ns per row at 1M (pdqsort 10.2) and
-  29.0 → 12.2 at 8M (11.5); D2 dedup 16.2 → 10.3 and 37.1 → 17.6.
+  the index afterwards and keep it. With the first rank's labels left absent rather than
+  materialized as zeros: D1 sort_u64 7.1 ns per row at 1M (pdqsort 10.1) and 11.1 at 8M (11.6);
+  D2 dedup 9.4 and 15.5 (10.6, 11.6).
 - **Digits.** One sweep counts every digit of a block at once, and a digit on which every key
   agrees is skipped, as are the leading all-zero ones (datatoad's `lsb_range`). Neutral on the
   leaf rows, and what makes a packed `(u32, u32)` cost two passes rather than three.
@@ -76,10 +78,10 @@ carrying positions). `sort_blocks(labels, v) -> (perm, labels)` is `Index` at th
 
 ## Measurements (2026-09-06, M4, ns per row)
 
-Gap rows at 1M, master → here, Rust in parentheses: D1 sort_u64 24.1 → 8.6 (10.2); D2 dedup 28.7 → 10.3 (10.6); R1
+Gap rows at 1M, master → here, Rust in parentheses: D1 sort_u64 24.1 → 7.1 (10.1); D2 dedup 28.7 → 9.4 (10.6); R1
 arrange_sort_perm 24.3 → 10.8 (21.8); R7 Sum in one block 27.3 → 27.3 (36.7); R8 List in one
 block 43.1 → 42.8 (89.6); R9 Sum under a block per four rows 37.0 → 12.6 (2.5); R10 List
-likewise 72.0 → 13.4 (3.9). At 8M: D1 48.3 → 12.2 (11.5), D2 53.6 → 17.6 (11.8), R1 44.5 → 26.4 (31.9).
+likewise 72.0 → 13.4 (3.9). At 8M: D1 48.3 → 11.1 (11.6), D2 53.6 → 15.5 (11.6), R1 44.5 → 26.4 (31.9).
 
 A probe over `Prod([key, value])` at 1M rows, the key unique or with some rows in pairs, the
 value a `Sum` of four `u64` lanes, a ragged `List<u64>`, or `List<Sum<Prod<u64,u64> | List<u64>>>`:
