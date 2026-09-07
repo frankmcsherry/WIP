@@ -22,6 +22,7 @@ pub(crate) struct SortScratch {
     counts: Vec<u32>,    // digit counters
     rows: Vec<usize>,    // a sub-call's rows, while its permutation is applied
     old: Vec<usize>,     // and the positions they came from
+    pull: Vec<u64>,      // a field's keys before they are packed into the segment's
 }
 
 // ---- entry points ---------------------------------------------------------------------------
@@ -111,10 +112,11 @@ fn sort_leaf(
     (perm, out)
 }
 
-/// A product: each field in turn, at the same positions, under the labels the previous field
-/// refined. A field's output is final when emitted, since later fields permute only within its
-/// classes, on which it is constant. Once nothing is tied the remaining fields are read out by
-/// the index.
+/// A product: its fields in turn, at the same positions, under the labels the fields before
+/// refined. Consecutive leaf fields whose significant bits fit one `u64` sort as one packed key
+/// ([`sort_packed`]). A field's output is final when emitted, since later fields permute only
+/// within its classes, on which it is constant; once nothing is tied the remaining fields are
+/// read out by the index.
 fn sort_prod(
     cols: &[Value],
     labels: &mut [u64],
@@ -127,17 +129,25 @@ fn sort_prod(
         refine(labels, |_| false);
         return ((0..m).collect(), emit.then_some(Value::Prod(Vec::new())));
     }
-    let mut perm: Option<Vec<usize>> = None; // the first field's step is the running permutation
-    let mut outs = Vec::with_capacity(cols.len());
+    let mut perm: Option<Vec<usize>> = None; // the first segment's step is the running permutation
+    let mut outs: Vec<Value> = Vec::with_capacity(cols.len());
     let mut settled = false;
-    for c in cols {
+    let mut f = 0;
+    while f < cols.len() {
         if settled {
             if emit {
-                outs.push(gather(c, index));
+                outs.push(gather(&cols[f], index));
             }
+            f += 1;
             continue;
         }
-        let (step, out) = sort_indexed(c, labels, index, emit, scratch);
+        let (step, out, next) = match &cols[f] {
+            Value::Prim(_) => sort_packed(cols, f, labels, index, emit, scratch),
+            c => {
+                let (step, out) = sort_indexed(c, labels, index, emit, scratch);
+                (step, out.into_iter().collect(), f + 1)
+            }
+        };
         perm = Some(match perm {
             None => step,
             Some(mut running) => {
@@ -147,8 +157,67 @@ fn sort_prod(
         });
         outs.extend(out);
         settled = fully_discriminated(labels);
+        f = next;
     }
     (perm.expect("at least one field"), emit.then_some(Value::Prod(outs)))
+}
+
+/// The leaf fields of `cols` from `f` on, as many as pack into one `u64` by their significant
+/// bits, sorted as one key: one set of passes and one refinement for the run, and a field every
+/// row agrees on costs no bits at all. Returns the permutation, one column per field with
+/// `emit`, and the index of the first field not taken. A field declared wider than the room
+/// left is pulled to learn its width, and pulled again by the next segment if it did not fit.
+fn sort_packed(
+    cols: &[Value],
+    f: usize,
+    labels: &mut [u64],
+    index: &mut [usize],
+    emit: bool,
+    scratch: &mut SortScratch,
+) -> (Vec<usize>, Vec<Value>, usize) {
+    let m = index.len();
+    let leaf = |c: &Value| match c {
+        Value::Prim(p) => p.clone(),
+        _ => unreachable!("sort_packed: a leaf field"),
+    };
+    let mut keys = std::mem::take(&mut scratch.keys);
+    let mut pull = std::mem::take(&mut scratch.pull);
+    let mut widths: Vec<u32> = Vec::new();
+    let mut used = 0u32;
+    let mut g = f;
+    while g < cols.len() && used < 64 {
+        let Value::Prim(p) = &cols[g] else { break };
+        pull.clear();
+        p.pull_u64(index, &mut pull);
+        let sig = 64 - pull.iter().copied().max().unwrap_or(0).leading_zeros();
+        if used + sig > 64 {
+            break;
+        }
+        if used == 0 {
+            std::mem::swap(&mut keys, &mut pull);
+        } else if sig > 0 {
+            for (k, &x) in keys.iter_mut().zip(&pull) {
+                *k = (*k << sig) | x;
+            }
+        }
+        widths.push(sig);
+        used += sig;
+        g += 1;
+    }
+    let perm = sort_keys(&mut keys, labels, index, scratch);
+    let mut outs = Vec::new();
+    if emit {
+        let mut shift = used;
+        for (x, &sig) in widths.iter().enumerate() {
+            shift -= sig;
+            let mask = if sig == 64 { u64::MAX } else { (1u64 << sig) - 1 };
+            outs.push(Value::Prim(leaf(&cols[f + x]).like_from(keys.iter().map(|&k| (k >> shift) & mask))));
+        }
+    }
+    debug_assert_eq!(m, keys.len());
+    scratch.keys = keys;
+    scratch.pull = pull;
+    (perm, outs, g)
 }
 
 /// A sum: the tag as a virtual leaf, then each lane at the positions that carry its tag and are

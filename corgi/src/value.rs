@@ -515,9 +515,14 @@ macro_rules! prim {
             }
 
             /// a leaf of this width holding `keys`, narrowed: the sorted keys are the sorted column.
-            #[allow(clippy::unnecessary_cast)]
             pub(crate) fn like(&self, keys: &[u64]) -> Prim {
-                match self { $( Prim::$V(_) => Prim::$V(Arc::new(keys.iter().map(|&k| k as $t).collect())), )+ }
+                self.like_from(keys.iter().copied())
+            }
+
+            /// a leaf of this width holding the keys `it` yields, narrowed.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn like_from(&self, it: impl Iterator<Item = u64>) -> Prim {
+                match self { $( Prim::$V(_) => Prim::$V(Arc::new(it.map(|k| k as $t).collect())), )+ }
             }
             /// stable per-element hash: each element WIDENED to u64 (zero-extend) and mixed (splitmix64
             /// finalizer). The leaf of [`crate::hash::hash`]; reads the stored bytes only, so it is
