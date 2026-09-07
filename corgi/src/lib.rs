@@ -172,6 +172,7 @@ pub mod arrange {
     /// hand wants.
     pub fn sort_indexed(v: &Value, labels: &mut [u64], index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
         let mut scratch = crate::ops::cmp::sort::SortScratch::default();
+        let emit = if emit { crate::ops::cmp::sort::Emit::Values } else { crate::ops::cmp::sort::Emit::Index };
         crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch)
     }
 

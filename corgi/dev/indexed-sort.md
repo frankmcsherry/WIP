@@ -22,8 +22,11 @@ in block `labels[k]`; checked in debug builds), and every `index[k]` a row of `v
 Structural order: leaf by stored unsigned bytes; `Prod` lexicographic by field; `Sum` by tag
 then payload; `List` length first, then element by element; `Unit` all equal.
 
-`sort_blocks(labels, v) -> (perm, labels)` is the same at the identity index (`perm[k]` the input
-row at output position `k`); `sort_values(labels, v)` adds the sorted column. `arrange` exposes
+`emit` is `Index` (the permuted index and `perm`), `Values` (those and the column), or `ValuesOnly`
+(the column and the labels; `index` and `perm` unspecified, so a leaf sorts its keys without
+carrying positions). `sort_blocks(labels, v) -> (perm, labels)` is `Index` at the identity index
+(`perm[k]` the input row at output position `k`); `sort_values(labels, v)` adds the sorted column;
+`sort_values_only(labels, v)` is `ValuesOnly`. `arrange` exposes
 `sort_perm`, `sort_blocks`, `sort_values` and `sort_indexed`.
 
 ## Design
@@ -55,6 +58,11 @@ row at output position `k`); `sort_values(labels, v)` adds the sorted column. `a
   field by field, as the `Sum` and `List` arms do, loses 15–40% on every product shape: the leaf
   already passes a singleton block in O(1), and the subset bookkeeping costs more than the
   sequential passes it saves.
+- **Values only.** `sort` and `dedup` never read the permutation, so their last leaf sorts its
+  keys alone: half the bytes through every pass, no permute of the index. Only the last segment
+  of a product, and a leaf, take the mode; a sum's lanes and a list's elements are read through
+  the index afterwards and keep it. D1 sort_u64 12.1 → 8.6 ns per row at 1M (pdqsort 10.2) and
+  29.0 → 12.2 at 8M (11.5); D2 dedup 16.2 → 10.3 and 37.1 → 17.6.
 - **Digits.** One sweep counts every digit of a block at once, and a digit on which every key
   agrees is skipped, as are the leading all-zero ones (datatoad's `lsb_range`). Neutral on the
   leaf rows, and what makes a packed `(u32, u32)` cost two passes rather than three.
@@ -68,10 +76,10 @@ row at output position `k`); `sort_values(labels, v)` adds the sorted column. `a
 
 ## Measurements (2026-09-06, M4, ns per row)
 
-Gap rows at 1M, master → here, Rust in parentheses: D1 sort_u64 24.1 → 11.9 (9.8); R1
+Gap rows at 1M, master → here, Rust in parentheses: D1 sort_u64 24.1 → 8.6 (10.2); D2 dedup 28.7 → 10.3 (10.6); R1
 arrange_sort_perm 24.3 → 10.8 (21.8); R7 Sum in one block 27.3 → 27.3 (36.7); R8 List in one
 block 43.1 → 42.8 (89.6); R9 Sum under a block per four rows 37.0 → 12.6 (2.5); R10 List
-likewise 72.0 → 13.4 (3.9). At 8M: D1 48.3 → 28.2 (11.0), R1 44.5 → 26.4 (31.9).
+likewise 72.0 → 13.4 (3.9). At 8M: D1 48.3 → 12.2 (11.5), D2 53.6 → 17.6 (11.8), R1 44.5 → 26.4 (31.9).
 
 A probe over `Prod([key, value])` at 1M rows, the key unique or with some rows in pairs, the
 value a `Sum` of four `u64` lanes, a ragged `List<u64>`, or `List<Sum<Prod<u64,u64> | List<u64>>>`:
@@ -102,13 +110,9 @@ churn unchanged; its test suite passes against this crate unchanged.
 
 ## Follow-ups
 
-1. A values-only leaf mode: `sort` and `dedup` on a bare leaf carry a permutation they never
-   use; the value radix on `corgi-opportunities` is 2.5x faster there (4.9 ns at 1M, 8.6 at 8M
-   against this leaf's 28). The digit width is not the cause: capping it at 11 or 8 bits costs
-   more passes and measures worse at both 1M and 8M (D1 at 8M: 28.7 / 33.0 / 36.2 for 16 / 11 /
-   8 bits). What the 8M row pays for is the permutation carried through every pass and the
-   full-column passes around the radix — the labels copy, the identity index, the refine, the
-   permute of the index, the narrowing copy — none of which a values-only sort needs.
+1. The 8M `sort_perm` row still carries its permutation through 16-bit-digit passes and sits
+   at 26 against the Rust stable sort's 32; a two-level radix for blocks past a few million rows
+   is the next thing to try there.
 2. Range copies for the `List` arm's final gather, corgi's `extend_from_self`; `gather` on a
    `List` is element-wise today (`engine.rs:119-130`).
 3. Dedup as you go: one position per class per level, expanding from the runs at the end.

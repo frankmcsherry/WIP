@@ -10,7 +10,7 @@ pub(crate) mod sort;
 
 use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
-use sort::{contains_list, sort_blocks, sort_values};
+use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::Value;
 
@@ -89,14 +89,14 @@ impl CmpOp {
             // the sort produces the sorted column itself; nothing is gathered afterwards.
             CmpOp::SortList => {
                 let (bounds, vals) = input.into_list("SortList")?;
-                let (_, _, sorted) = sort_values(&segment_labels(&bounds), &vals);
+                let (_, sorted) = sort_values_only(&segment_labels(&bounds), &vals);
                 Value::List(bounds, Box::new(sorted))
             }
 
             CmpOp::DedupList => {
                 // distinct, per row: sort, then keep one representative per run.
                 let (bounds, vals) = input.into_list("DedupList")?;
-                let (kept, _ends, firsts, _perm) = representatives(&segment_labels(&bounds), &vals);
+                let (kept, _ends, firsts, _perm) = representatives(&segment_labels(&bounds), &vals, false);
                 // outer bounds: cumulative distinct count per row (runs never cross rows).
                 let nb = runs_per_row(&bounds, &firsts);
                 Value::List(nb.into(), Box::new(kept))
@@ -108,7 +108,7 @@ impl CmpOp {
                 // permutation; the keys are one representative per run.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
-                let (keys, ends, firsts, perm) = representatives(&segment_labels(&bounds), &k_col);
+                let (keys, ends, firsts, perm) = representatives(&segment_labels(&bounds), &k_col, true);
                 let v_sorted = gather(&v_col, &perm);
                 let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
@@ -165,20 +165,24 @@ impl CmpOp {
 }
 
 /// Sort within `labels`' blocks and keep one row per run of equal rows: `(kept, run ends, run
-/// starts, the sort's permutation)`. A leaf or a product of leaves comes straight out of the sort,
-/// sorted, and the runs are read off it in ascending order; a shape with a `List` in it has a
-/// sorted form that is itself a gather of every element, so there the kept rows alone are
-/// gathered from the source.
-fn representatives(labels: &[u64], v: &Value) -> (Value, Vec<usize>, Vec<usize>, Vec<usize>) {
+/// starts, the sort's permutation)`, the permutation empty unless `with_perm`. A leaf or a
+/// product of leaves comes straight out of the sort, sorted, and the runs are read off it in
+/// ascending order; a shape with a `List` in it has a sorted form that is itself a gather of
+/// every element, so there the kept rows alone are gathered from the source.
+fn representatives(labels: &[u64], v: &Value, with_perm: bool) -> (Value, Vec<usize>, Vec<usize>, Vec<usize>) {
     if contains_list(v) {
         let (perm, refined) = sort_blocks(labels, v);
         let (ends, firsts) = run_layout(&refined);
         let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
         (gather(v, &idx), ends, firsts, perm)
-    } else {
+    } else if with_perm {
         let (perm, refined, sorted) = sort_values(labels, v);
         let (ends, firsts) = run_layout(&refined);
         (gather(&sorted, &firsts), ends, firsts, perm)
+    } else {
+        let (refined, sorted) = sort_values_only(labels, v);
+        let (ends, firsts) = run_layout(&refined);
+        (gather(&sorted, &firsts), ends, firsts, Vec::new())
     }
 }
 

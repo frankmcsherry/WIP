@@ -24,6 +24,28 @@ pub(crate) struct SortScratch {
     old: Vec<usize>,     // and the positions they came from
 }
 
+/// What a sort hands back besides the refined labels.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Emit {
+    /// the permuted index and the permutation
+    Index,
+    /// those, and the sorted rows as a column
+    Values,
+    /// the sorted rows only: `index` and the returned permutation are unspecified afterwards,
+    /// which lets a leaf sort its keys without carrying positions
+    ValuesOnly,
+}
+
+impl Emit {
+    fn values(self) -> bool {
+        self != Emit::Index
+    }
+    /// the mode for a level whose index a later level still reads
+    fn keeping_index(self) -> Emit {
+        if self == Emit::ValuesOnly { Emit::Values } else { self }
+    }
+}
+
 // ---- entry points ---------------------------------------------------------------------------
 
 /// Sort the rows `index[..]` of `v` within the blocks of `labels`.
@@ -35,13 +57,15 @@ pub(crate) struct SortScratch {
 /// keep their places and equal rows keep their order; `labels` is rewritten as the dense run
 /// index of the refined partition in that order, two positions sharing a label iff they did
 /// before and their rows are structurally equal; the returned `perm` has
-/// `new_index[k] == old_index[perm[k]]`; with `emit`, the returned column is
-/// `gather(v, &new_index)`, produced by the sort rather than by a gather.
+/// `new_index[k] == old_index[perm[k]]`; with `Emit::Values` the returned column is
+/// `gather(v, &new_index)`, produced by the sort rather than by a gather. Under
+/// `Emit::ValuesOnly` the column and the labels are as above and `index` and `perm` are
+/// unspecified.
 pub(crate) fn sort_indexed(
     v: &Value,
     labels: &mut [u64],
     index: &mut [usize],
-    emit: bool,
+    emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     debug_assert_eq!(labels.len(), index.len(), "sort_indexed: one label per position");
@@ -51,21 +75,22 @@ pub(crate) fn sort_indexed(
         if m == 1 {
             labels[0] = 0;
         }
-        return ((0..m).collect(), emit.then(|| gather(v, index)));
+        return ((0..m).collect(), emit.values().then(|| gather(v, index)));
     }
     // nothing tied: no row can move and no class can split, at any depth.
     if fully_discriminated(labels) {
         refine(labels, |_| false);
-        return ((0..m).collect(), emit.then(|| gather(v, index)));
+        return ((0..m).collect(), emit.values().then(|| gather(v, index)));
     }
     match v {
         Value::Prim(p) => sort_leaf(p, labels, index, emit, scratch),
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
-        Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit, scratch),
-        Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit, scratch),
+        // a sum's lanes and a list's elements are read through the index after their sorts.
+        Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit.keeping_index(), scratch),
+        Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit.keeping_index(), scratch),
         Value::Unit(_) => {
             refine(labels, |_| false);
-            ((0..m).collect(), emit.then_some(Value::Unit(m)))
+            ((0..m).collect(), emit.values().then_some(Value::Unit(m)))
         }
     }
 }
@@ -77,7 +102,7 @@ pub(crate) fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
     let mut labels = labels.to_vec();
     let mut index: Vec<usize> = (0..v.len()).collect();
     let mut scratch = SortScratch::default();
-    let (perm, _) = sort_indexed(v, &mut labels, &mut index, false, &mut scratch);
+    let (perm, _) = sort_indexed(v, &mut labels, &mut index, Emit::Index, &mut scratch);
     debug_assert_eq!(perm, index, "from the identity index the permutation is the index");
     (index, labels)
 }
@@ -87,8 +112,18 @@ pub(crate) fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, V
     let mut labels = labels.to_vec();
     let mut index: Vec<usize> = (0..v.len()).collect();
     let mut scratch = SortScratch::default();
-    let (_, out) = sort_indexed(v, &mut labels, &mut index, true, &mut scratch);
+    let (_, out) = sort_indexed(v, &mut labels, &mut index, Emit::Values, &mut scratch);
     (index, labels, out.expect("emit was requested"))
+}
+
+/// The sorted rows and the refined labels, and nothing else: a leaf sorts its keys without
+/// carrying positions.
+pub(crate) fn sort_values_only(labels: &[u64], v: &Value) -> (Vec<u64>, Value) {
+    let mut labels = labels.to_vec();
+    let mut index: Vec<usize> = (0..v.len()).collect();
+    let mut scratch = SortScratch::default();
+    let (_, out) = sort_indexed(v, &mut labels, &mut index, Emit::ValuesOnly, &mut scratch);
+    (labels, out.expect("emit was requested"))
 }
 
 // ---- the arms -------------------------------------------------------------------------------
@@ -99,14 +134,19 @@ fn sort_leaf(
     p: &Prim,
     labels: &mut [u64],
     index: &mut [usize],
-    emit: bool,
+    emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     let mut keys = std::mem::take(&mut scratch.keys);
     keys.clear();
     p.pull_u64(index, &mut keys);
-    let perm = sort_keys(&mut keys, labels, index, scratch);
-    let out = emit.then(|| Value::Prim(p.like(&keys)));
+    let perm = if emit == Emit::ValuesOnly {
+        sort_keys_only(&mut keys, labels, scratch);
+        Vec::new()
+    } else {
+        sort_keys(&mut keys, labels, index, scratch)
+    };
+    let out = emit.values().then(|| Value::Prim(p.like(&keys)));
     scratch.keys = keys;
     (perm, out)
 }
@@ -120,13 +160,13 @@ fn sort_prod(
     cols: &[Value],
     labels: &mut [u64],
     index: &mut [usize],
-    emit: bool,
+    emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     let m = index.len();
     if cols.is_empty() {
         refine(labels, |_| false);
-        return ((0..m).collect(), emit.then_some(Value::Prod(Vec::new())));
+        return ((0..m).collect(), emit.values().then_some(Value::Prod(Vec::new())));
     }
     let mut perm: Option<Vec<usize>> = None; // the first segment's step is the running permutation
     let mut outs: Vec<Value> = Vec::with_capacity(cols.len());
@@ -134,7 +174,7 @@ fn sort_prod(
     let mut f = 0;
     while f < cols.len() {
         if settled {
-            if emit {
+            if emit.values() {
                 outs.push(gather(&cols[f], index));
             }
             f += 1;
@@ -143,22 +183,26 @@ fn sort_prod(
         let (step, out, next) = match &cols[f] {
             Value::Prim(_) => sort_packed(cols, f, labels, index, emit, scratch),
             c => {
-                let (step, out) = sort_indexed(c, labels, index, emit, scratch);
+                // only the last segment may leave the index behind
+                let mode = if f + 1 == cols.len() { emit } else { emit.keeping_index() };
+                let (step, out) = sort_indexed(c, labels, index, mode, scratch);
                 (step, out.into_iter().collect(), f + 1)
             }
         };
-        perm = Some(match perm {
-            None => step,
-            Some(mut running) => {
-                permute(&mut running, &step, &mut scratch.index_alt);
-                running
-            }
-        });
+        if emit != Emit::ValuesOnly {
+            perm = Some(match perm {
+                None => step,
+                Some(mut running) => {
+                    permute(&mut running, &step, &mut scratch.index_alt);
+                    running
+                }
+            });
+        }
         outs.extend(out);
         settled = fully_discriminated(labels);
         f = next;
     }
-    (perm.expect("at least one field"), emit.then_some(Value::Prod(outs)))
+    (perm.unwrap_or_default(), emit.values().then_some(Value::Prod(outs)))
 }
 
 /// The leaf fields of `cols` from `f` on, as many as fit one `u64` by their declared widths,
@@ -170,7 +214,7 @@ fn sort_packed(
     f: usize,
     labels: &mut [u64],
     index: &mut [usize],
-    emit: bool,
+    emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Vec<Value>, usize) {
     let leaf = |c: &Value| match c {
@@ -193,9 +237,14 @@ fn sort_packed(
     for c in &cols[f + 1..g] {
         leaf(c).pack_u64(index, &mut keys);
     }
-    let perm = sort_keys(&mut keys, labels, index, scratch);
+    let perm = if emit == Emit::ValuesOnly && g == cols.len() {
+        sort_keys_only(&mut keys, labels, scratch);
+        Vec::new()
+    } else {
+        sort_keys(&mut keys, labels, index, scratch)
+    };
     let mut outs = Vec::new();
-    if emit {
+    if emit.values() {
         let mut shift = used;
         for c in &cols[f..g] {
             let p = leaf(c);
@@ -217,7 +266,7 @@ fn sort_sum(
     lanes: &[Value],
     labels: &mut [u64],
     index: &mut [usize],
-    emit: bool,
+    emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     let m = index.len();
@@ -259,7 +308,7 @@ fn sort_sum(
             write_starts(labels, qs, &labels_t);
             sorted = out;
         }
-        if emit {
+        if emit.values() {
             lanes_out.push(match sorted {
                 Some(o) if qs.len() == all[t].len() => o,
                 _ => gather(lane, &all[t].iter().map(|&q| within[index[q]]).collect::<Vec<_>>()),
@@ -267,7 +316,7 @@ fn sort_sum(
         }
     }
     refine(labels, |_| false);
-    (perm, emit.then(|| Value::sum_tagged(Tags::from_tags(tags_out, lanes.len()), lanes_out)))
+    (perm, emit.values().then(|| Value::sum_tagged(Tags::from_tags(tags_out, lanes.len()), lanes_out)))
 }
 
 /// A list: the length as a virtual leaf, then one refining pass per element position over the
@@ -279,7 +328,7 @@ fn sort_list(
     vals: &Value,
     labels: &mut [u64],
     index: &mut [usize],
-    emit: bool,
+    emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     let m = index.len();
@@ -289,7 +338,7 @@ fn sort_list(
             keys.clear();
             keys.extend(index.iter().map(|&r| (0..k).fold(0u64, |key, p| (key << 8) | bytes[r * k + p] as u64)));
             let perm = sort_keys(&mut keys, labels, index, scratch);
-            let out = emit.then(|| {
+            let out = emit.values().then(|| {
                 let mut o = Vec::with_capacity(m * k);
                 for &key in keys.iter() {
                     for p in (0..k).rev() {
@@ -324,14 +373,14 @@ fn sort_list(
         elem.extend(live.iter().map(|&q| bounds.span(index[q]).0 + pos));
         labels_j.clear();
         labels_j.extend(live.iter().map(|&q| labels[q]));
-        let (step, _) = sort_indexed(vals, &mut labels_j, &mut elem, false, scratch);
+        let (step, _) = sort_indexed(vals, &mut labels_j, &mut elem, Emit::Index, scratch);
         apply(index, &mut perm, &live, &step, scratch);
         write_starts(labels, &live, &labels_j);
         pos += 1;
         live.retain(|&q| len_of(index[q]) > pos && in_tie(labels, q));
     }
     refine(labels, |_| false);
-    let out = emit.then(|| {
+    let out = emit.values().then(|| {
         let mut elems = Vec::new();
         let mut ends = Vec::with_capacity(m);
         for &r in index.iter() {
@@ -370,29 +419,58 @@ fn sort_keys(keys: &mut [u64], labels: &mut [u64], index: &mut [usize], scratch:
     perm
 }
 
+/// [`sort_keys`] without positions: `keys` sorted within each run and `labels` refined, for a
+/// caller that will not read the index again.
+fn sort_keys_only(keys: &mut [u64], labels: &mut [u64], scratch: &mut SortScratch) {
+    let m = keys.len();
+    let mut lo = 0;
+    while lo < m {
+        let mut hi = lo + 1;
+        while hi < m && labels[hi] == labels[lo] {
+            hi += 1;
+        }
+        if hi - lo > 1 {
+            sort_block_impl::<false>(&mut keys[lo..hi], &mut [], scratch);
+        }
+        lo = hi;
+    }
+    refine(labels, |q| keys[q] != keys[q - 1]);
+}
+
 /// Stable sort of one block by `keys`, `perm` moving with them. Blocks of 32 or fewer take an
 /// insertion sort; the rest an LSD radix with every pass sequential, a digit widening with the
 /// block ([`digit_width`]). One sweep counts every digit at once; a digit on which every key
 /// agrees is skipped, as are the leading all-zero digits.
 fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
+    sort_block_impl::<true>(keys, perm, scratch)
+}
+
+/// [`sort_block`], with (`PERM`) or without the positions travelling alongside.
+fn sort_block_impl<const PERM: bool>(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     let n = keys.len();
     if n <= 32 {
         for k in 1..n {
             let mut j = k;
             while j > 0 && keys[j - 1] > keys[j] {
                 keys.swap(j - 1, j);
-                perm.swap(j - 1, j);
+                if PERM {
+                    perm.swap(j - 1, j);
+                }
                 j -= 1;
             }
         }
         return;
     }
     if n > COUNTED_MAX {
-        let mut pairs: Vec<(u64, usize)> = keys.iter().copied().zip(perm.iter().copied()).collect();
-        pairs.sort_by_key(|p| p.0);
-        for (i, (k, q)) in pairs.into_iter().enumerate() {
-            keys[i] = k;
-            perm[i] = q;
+        if PERM {
+            let mut pairs: Vec<(u64, usize)> = keys.iter().copied().zip(perm.iter().copied()).collect();
+            pairs.sort_by_key(|p| p.0);
+            for (i, (k, q)) in pairs.into_iter().enumerate() {
+                keys[i] = k;
+                perm[i] = q;
+            }
+        } else {
+            keys.sort_unstable(); // equal keys are indistinguishable
         }
         return;
     }
@@ -407,7 +485,9 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     let passes = sig.div_ceil(d) as usize;
     let SortScratch { keys_alt, perm_alt, counts, .. } = scratch;
     keys_alt.resize(keys_alt.len().max(n), 0);
-    perm_alt.resize(perm_alt.len().max(n), 0);
+    if PERM {
+        perm_alt.resize(perm_alt.len().max(n), 0);
+    }
     counts.resize(counts.len().max(passes * buckets), 0);
     let counts = &mut counts[..passes * buckets];
     counts.iter_mut().for_each(|c| *c = 0);
@@ -416,7 +496,8 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
             counts[p * buckets + ((k >> (p as u32 * d)) & mask) as usize] += 1;
         }
     }
-    let (keys_alt, perm_alt) = (&mut keys_alt[..n], &mut perm_alt[..n]);
+    let keys_alt = &mut keys_alt[..n];
+    let perm_alt = if PERM { &mut perm_alt[..n] } else { &mut perm_alt[..0] };
     let mut primary = true;
     for p in 0..passes {
         let counts = &mut counts[p * buckets..(p + 1) * buckets];
@@ -432,28 +513,34 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
         }
         if primary {
             for j in 0..n {
-                let (k, q) = (keys[j], perm[j]);
+                let k = keys[j];
                 let b = ((k >> shift) & mask) as usize;
                 let slot = counts[b] as usize;
                 counts[b] += 1;
                 keys_alt[slot] = k;
-                perm_alt[slot] = q;
+                if PERM {
+                    perm_alt[slot] = perm[j];
+                }
             }
         } else {
             for j in 0..n {
-                let (k, q) = (keys_alt[j], perm_alt[j]);
+                let k = keys_alt[j];
                 let b = ((k >> shift) & mask) as usize;
                 let slot = counts[b] as usize;
                 counts[b] += 1;
                 keys[slot] = k;
-                perm[slot] = q;
+                if PERM {
+                    perm[slot] = perm_alt[j];
+                }
             }
         }
         primary = !primary;
     }
     if !primary {
         keys.copy_from_slice(keys_alt);
-        perm.copy_from_slice(perm_alt);
+        if PERM {
+            perm.copy_from_slice(perm_alt);
+        }
     }
 }
 
@@ -644,7 +731,7 @@ mod tests {
     /// (stability makes it unique), same labels, and the emitted column is the rows gathered.
     fn check(v: &Value, labels: &[u64], index: &[usize]) {
         let (perm_ref, rows_ref, labels_ref) = reference(v, labels, index);
-        for emit in [false, true] {
+        for emit in [Emit::Index, Emit::Values] {
             let (mut l, mut i) = (labels.to_vec(), index.to_vec());
             let mut scratch = SortScratch::default();
             let (perm, out) = sort_indexed(v, &mut l, &mut i, emit, &mut scratch);
@@ -653,9 +740,15 @@ mod tests {
             assert_eq!(l, labels_ref, "labels\n{}", crate::value::show(v));
             match out {
                 Some(o) => assert_eq!(o, gather(v, &i), "values\n{}", crate::value::show(v)),
-                None => assert!(!emit),
+                None => assert!(emit == Emit::Index),
             }
         }
+        // values only: the column and the labels, nothing promised of the index
+        let (mut l, mut i) = (labels.to_vec(), index.to_vec());
+        let mut scratch = SortScratch::default();
+        let (_, out) = sort_indexed(v, &mut l, &mut i, Emit::ValuesOnly, &mut scratch);
+        assert_eq!(out.unwrap(), gather(v, &rows_ref), "values only\n{}", crate::value::show(v));
+        assert_eq!(l, labels_ref, "values-only labels\n{}", crate::value::show(v));
     }
 
     /// dense non-decreasing labels over `n` positions: one block, blocks of random size, or a
