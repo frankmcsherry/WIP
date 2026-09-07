@@ -1,13 +1,14 @@
-//! Structural comparison and discrimination — the order machinery `sort`/`dedup`/`group`/`find` reduce to.
-//! Two coherent pieces: `mod compare` (the bulk structural comparator `compare_idx`, which `Rel` and `find`
-//! reduce to) and `mod discriminate` (the discrimination sort `sort` uses); both re-exported at this level.
+//! Structural comparison — the order machinery `sort`/`dedup`/`group`/`find` reduce to, minus the sort
+//! itself, which is `super::sort`. Here: `mod compare` (the bulk structural comparator `compare_idx`,
+//! which `Rel` and `find` reduce to), `mod labels` (the block-label vocabulary the sort speaks and
+//! `dedup`/`group` read), and the merge kernel `survey`; all re-exported at this level.
 
-use crate::engine::{gather, row_span};
-use crate::value::{Bounds, Prim, Tags, Value};
+use crate::engine::row_span;
+use crate::value::{Bounds, Prim, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
-pub(crate) use discriminate::*;
+pub(crate) use labels::*;
 
 /// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
 /// scalar form of [`compare_idx`]; exposed (via `crate::arrange`) for using corgi columns as a
@@ -352,71 +353,16 @@ mod compare {
     }
 }
 
-mod discriminate {
-    //! The discrimination sort, `sort_blocks(labels, v) -> (perm, new_labels)`: reorder `v`'s rows WITHIN each
-    //! equal-`labels` block, returning the permutation and a REFINED partition — two rows share a `new_labels`
-    //! value iff they shared a `labels` value AND are equal.
-    //!
-    //! `labels` (a non-decreasing block partition) is the whole trick. Discrimination is top-down partition-
-    //! refinement, and the "most-significant digit first" order lives in the TYPE STRUCTURE, not in leaf bytes.
-    //! Prod refines by field 0, then field 1 within field-0's buckets, then field 2, … (`sort_prod_blocks`
-    //! threads `labels` through the field loop); Sum refines by tag first, then by the chosen lane's payload
-    //! (`sort_sum_blocks`, computing each row's within-lane offset once); List refines by length first, then by
-    //! element at position 0, 1, … (`sort_list_blocks`) — a variable length can't be a radix key, so it MUST
-    //! decompose this way. Each level only reorders within the buckets the levels above already separated.
-    //! Because it never compares whole rows, the Sum arm never hits a scalar comparator's per-call prefix scan
-    //! (the old O(n²)); every stage is linear, so the kernel is O(total input size).
-    //!
-    //! The leaf (`sort_leaf_blocks`) is the terminal: sort a fixed-width column within each block via
-    //! `Prim::sort_block` (a stable LSD byte-radix) plus an O(n) `cmp_idx` scan for the label boundaries. That
-    //! scan is the one spot that isn't top-down — pure (Henglein) discrimination would MSB-byte-partition the
-    //! leaf too and read labels straight off the partition, with early-out; both are linear, so an MSD leaf is a
-    //! constant-factor win that drops `cmp_idx` from the sort path, not a linearity change.
+mod labels {
+    //! The label vocabulary the discrimination sort (`super::super::sort`) speaks: a non-decreasing
+    //! `labels` vector partitions positions into blocks — runs of one label — and a sort returns a
+    //! refinement of it, two positions sharing a label iff they did before AND their rows are equal.
+    //! Nothing here sorts; these seed the labels for a per-row sort and read the runs back out.
 
     use super::*;
 
-    /// half-open `[lo,hi)` intervals of equal-label runs in a non-decreasing `labels`.
-    fn find_blocks(labels: &[u64]) -> Vec<(usize, usize)> {
-        let n = labels.len();
-        if n == 0 {
-            return Vec::new();
-        }
-        let mut blocks = Vec::new();
-        let mut lo = 0;
-        for i in 1..n {
-            if labels[i] != labels[i - 1] {
-                blocks.push((lo, i));
-                lo = i;
-            }
-        }
-        blocks.push((lo, n));
-        blocks
-    }
-
-    /// sort `v`'s rows within each `labels` block, returning `(perm, refined labels)`. See the module doc for
-    /// the algorithm; this is just the dispatch.
-    pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-        debug_assert_eq!(labels.len(), v.len());
-        match v {
-            Value::Prim(p) => sort_leaf_blocks(labels, p),
-            Value::Prod(cols) => sort_prod_blocks(labels, cols),
-            Value::Sum(tags, variants) => sort_sum_blocks(labels, tags, variants),
-            Value::List(bounds, vals) => sort_list_blocks(labels, bounds, vals),
-            // unit rows are all equal: stable identity perm, no label refinement.
-            Value::Unit(n) => ((0..*n).collect(), labels.to_vec()),
-        }
-    }
-
-    /// single-block sort of `v`'s rows → the permutation. Test-only: only the
-    /// reference-check test consumes it; the ops reach the sort through `sort_blocks`.
-    #[cfg(test)]
-    pub(crate) fn sort_perm(v: &Value) -> Vec<usize> {
-        let labels = vec![0u64; v.len()];
-        sort_blocks(&labels, v).0
-    }
-
     /// per-element labels seeding a SEGMENTED sort: each element of outer row `r` gets label `r`, so
-    /// `sort_blocks` sorts within each row and rows stay contiguous and in order.
+    /// the sort orders within each row and rows stay contiguous and in order.
     pub fn segment_labels(bounds: &Bounds) -> Vec<u64> {
         let mut labels = Vec::with_capacity(bounds.total());
         let mut start = 0;
@@ -429,10 +375,10 @@ mod discriminate {
         labels
     }
 
-    /// the run structure of non-decreasing `labels` (e.g. `sort_blocks`' output): `ends[i]` is the exclusive
-    /// end of run `i`, `firsts[i]` its first index. Runs are maximal equal-label spans — equal value within a
-    /// block. `group` reads `ends` as inner bounds and the representatives at `firsts`; `dedup` keeps `firsts`;
-    /// `uniq -c` reads the run lengths.
+    /// the run structure of non-decreasing `labels` (e.g. a sort's refined labels): `ends[i]` is the
+    /// exclusive end of run `i`, `firsts[i]` its first index. Runs are maximal equal-label spans — equal
+    /// value within a block. `group` reads `ends` as inner bounds and the representatives at `firsts`;
+    /// `dedup` keeps `firsts`; `uniq -c` reads the run lengths.
     pub fn run_layout(labels: &[u64]) -> (Vec<usize>, Vec<usize>) {
         let n = labels.len();
         let mut ends = Vec::new();
@@ -463,171 +409,21 @@ mod discriminate {
         }
         out
     }
-
-    fn sort_leaf_blocks(labels: &[u64], p: &Prim) -> (Vec<usize>, Vec<u64>) {
-        // Per-block: stable byte-radix (or tiny-block insertion sort) IN PLACE over the perm
-        // slice, with one shared scratch — a refinement pass produces millions of tiny blocks,
-        // and per-block allocations (index collect + sort output + adjacent-compare vec) were
-        // ~17% self of a join-heavy profile. The adjacent compare runs ONCE over the whole
-        // column afterwards (one width dispatch), with block boundaries forcing label breaks.
-        let n = p.len();
-        let mut perm: Vec<usize> = Vec::with_capacity(n);
-        let mut ends: Vec<usize> = Vec::new();
-        let mut tmp: Vec<usize> = Vec::new();
-        for (lo, hi) in find_blocks(labels) {
-            let start = perm.len();
-            perm.extend(lo..hi);
-            if hi - lo > 1 {
-                p.sort_block_scratch(&mut perm[start..], &mut tmp);
-            }
-            ends.push(perm.len());
-        }
-        let mut new_labels = Vec::with_capacity(n);
-        if n > 0 {
-            let adj = if n > 1 { p.cmp_idx(&perm[1..], &perm[..n - 1], p) } else { Vec::new() };
-            let mut next = 0u64;
-            let mut b = 0usize;
-            for k in 0..n {
-                if k > 0 {
-                    let boundary = ends[b] == k;
-                    if boundary {
-                        b += 1;
-                    }
-                    if boundary || adj[k - 1] != 0 {
-                        next += 1;
-                    }
-                }
-                new_labels.push(next);
-            }
-        }
-        (perm, new_labels)
-    }
-
-    fn sort_prod_blocks(labels: &[u64], cols: &[Value]) -> (Vec<usize>, Vec<u64>) {
-        let n = labels.len();
-        if cols.is_empty() {
-            return ((0..n).collect(), labels.to_vec());
-        }
-        // lexicographic = sort by field 0, then refine within ties by field 1, ...
-        let mut perm: Vec<usize> = (0..n).collect();
-        let mut cur = labels.to_vec();
-        for c in cols {
-            let reordered = gather(c, &perm);
-            let (sub_perm, sub_labels) = sort_blocks(&cur, &reordered);
-            perm = sub_perm.iter().map(|&k| perm[k]).collect();
-            cur = sub_labels;
-        }
-        (perm, cur)
-    }
-
-    fn sort_sum_blocks(labels: &[u64], tags: &Tags, variants: &[Value]) -> (Vec<usize>, Vec<u64>) {
-        let n = labels.len();
-        // One lane throughout: the tag discriminates nothing and row i is that lane's row i, so
-        // sorting the sum IS sorting the lane — no discrimination pass, no gather, no remap.
-        if let Some(t) = tags.const_tag() {
-            return sort_blocks(labels, &variants[t]);
-        }
-        // 1. discriminate by the tag column directly — a u8 leaf, so a single-pass radix.
-        let Tags::Column(tag_col, within) = tags else { unreachable!("const handled above") };
-        let (perm_disc, labels_disc) = sort_leaf_blocks(labels, tag_col);
-        // 2. within each tag-block, recurse into that lane's gathered rows, at each row's position
-        //    within its lane — read from the carried offset (no recompute).
-        let mut perm = perm_disc.clone();
-        let mut new_labels = vec![0u64; n];
-        let mut next = 0u64;
-        for (lo, hi) in find_blocks(&labels_disc) {
-            if hi - lo == 1 {
-                new_labels[lo] = next;
-                next += 1;
-                continue;
-            }
-            // the whole block shares a tag, so this reads ONE tag per block — decoding the whole
-            // column for it (as this did) is O(column) work for O(blocks) reads.
-            let t = tags.tag_at(perm_disc[lo]);
-            let lane_pos: Vec<usize> = (lo..hi).map(|i| within[perm_disc[i]]).collect();
-            let lane = gather(&variants[t], &lane_pos);
-            let seed = vec![0u64; hi - lo];
-            let (sub_perm, sub_labels) = sort_blocks(&seed, &lane);
-            let span = sub_labels.iter().copied().max().unwrap_or(0);
-            for (i, (&sp, &sl)) in sub_perm.iter().zip(&sub_labels).enumerate() {
-                perm[lo + i] = perm_disc[lo + sp];
-                new_labels[lo + i] = next + sl;
-            }
-            next += span + 1;
-        }
-        (perm, new_labels)
-    }
-
-    fn sort_list_blocks(labels: &[u64], bounds: &Bounds, vals: &Value) -> (Vec<usize>, Vec<u64>) {
-        let n = labels.len();
-        // STRIDE FAST PATH (the array-language special case): equal-width byte records — a uniform
-        // inner list — packable into a u64 sort as ONE wide leaf, because for equal lengths the
-        // lexicographic byte order IS big-endian numeric order. O(1) stride detection diverts to the
-        // dense leaf radix instead of the length-first + position-by-position structural sort below
-        // (the `stride_sort_matches_offsets` test pins the two to the same result). Records wider than
-        // 8 bytes, or non-byte leaves, fall through to the general path.
-        if let (Some(k), Value::Prim(Prim::U8(bytes))) = (bounds.strided(), vals) {
-            if (1..=8).contains(&k) {
-                let keys: Vec<u64> = (0..n)
-                    .map(|r| (0..k).fold(0u64, |key, p| (key << 8) | bytes[r * k + p] as u64))
-                    .collect();
-                return sort_leaf_blocks(labels, &Prim::U64(std::sync::Arc::new(keys)));
-            }
-        }
-        // length-first: refine rows by length, then (below) position by position. A UNIFORM
-        // partition has one length, so that refinement cannot split anything — skip it, rather
-        // than build a constant column and sort it to learn so. (The stride fast path above only
-        // covers byte leaves up to 8 wide; a wider or non-byte strided list lands here.)
-        let (perm, cur_labels) = match bounds.strided() {
-            Some(_) => ((0..n).collect::<Vec<usize>>(), labels.to_vec()),
-            None => {
-                let lengths: Vec<u64> =
-                    (0..n).map(|r| { let (s, e) = bounds.span(r); (e - s) as u64 }).collect();
-                sort_blocks(labels, &Value::u64(lengths))
-            }
-        };
-
-        let mut new_perm = perm.clone();
-        let mut new_labels = vec![0u64; n];
-        let mut next_offset = 0u64;
-        for (lo, hi) in find_blocks(&cur_labels) {
-            let block_size = hi - lo;
-            if block_size == 1 {
-                new_labels[lo] = next_offset;
-                next_offset += 1;
-                continue;
-            }
-            let sample = perm[lo]; // the whole block shares a length
-            let (sample_start, sample_end) = bounds.span(sample);
-            let len = sample_end - sample_start;
-            // sort the block by element 0, then 1, … len-1 — each a structural recursion.
-            let mut local_perm: Vec<usize> = (0..block_size).collect();
-            let mut local_labels = vec![0u64; block_size];
-            for pos in 0..len {
-                let positions: Vec<usize> =
-                    local_perm.iter().map(|&k| bounds.span(perm[lo + k]).0 + pos).collect();
-                let elem = gather(vals, &positions);
-                let (sub_perm, sub_labels) = sort_blocks(&local_labels, &elem);
-                local_perm = sub_perm.iter().map(|&k| local_perm[k]).collect();
-                local_labels = sub_labels;
-            }
-            let block_max = local_labels.iter().copied().max().unwrap_or(0);
-            for (i, (&lp, &ll)) in local_perm.iter().zip(&local_labels).enumerate() {
-                new_perm[lo + i] = perm[lo + lp];
-                new_labels[lo + i] = next_offset + ll;
-            }
-            next_offset += block_max + 1;
-        }
-        (new_perm, new_labels)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::gather;
+    use crate::ops::cmp::sort::sort_blocks;
 
     fn u(xs: &[u64]) -> Value {
         Value::u64(xs.to_vec())
+    }
+
+    /// single-block sort of `v`'s rows → the permutation.
+    fn sort_perm(v: &Value) -> Vec<usize> {
+        sort_blocks(&vec![0u64; v.len()], v).0
     }
 
     /// the obviously-correct scalar reference: structural order of row `i` of `a` vs row `j` of `b`,

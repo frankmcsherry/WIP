@@ -6,9 +6,11 @@
 //! The structural-order engine these ops reduce to is the private [`order`] submodule.
 
 pub(crate) mod order;
+pub(crate) mod sort;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels, sort_blocks};
+use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
+use sort::sort_values;
 use crate::shape::{same, shape_of_value};
 use crate::value::Value;
 
@@ -84,35 +86,34 @@ impl CmpOp {
                 Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
             }
 
+            // the sort produces the sorted column itself; nothing is gathered afterwards.
             CmpOp::SortList => {
                 let (bounds, vals) = input.into_list("SortList")?;
-                let (perm, _) = sort_blocks(&segment_labels(&bounds), &vals);
-                Value::List(bounds, Box::new(gather(&vals, &perm)))
+                let (_, _, sorted) = sort_values(&segment_labels(&bounds), &vals);
+                Value::List(bounds, Box::new(sorted))
             }
 
             CmpOp::DedupList => {
-                // distinct, per row: discriminate, then keep one representative per run.
+                // distinct, per row: sort, then keep one representative per run — read off the
+                // SORTED column at the run starts, an ascending gather.
                 let (bounds, vals) = input.into_list("DedupList")?;
-                let (perm, labels) = sort_blocks(&segment_labels(&bounds), &vals);
+                let (_, labels, sorted) = sort_values(&segment_labels(&bounds), &vals);
                 let (_ends, firsts) = run_layout(&labels);
-                let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
                 // outer bounds: cumulative distinct count per row (runs never cross rows).
                 let nb = runs_per_row(&bounds, &firsts);
-                Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+                Value::List(nb.into(), Box::new(gather(&sorted, &firsts)))
             }
 
             CmpOp::GroupKey => {
-                // group by key, per row: discriminate by K (stable → V keeps order); the
-                // K-runs are the groups, and each run's V-span is its inner list.
+                // group by key, per row: sort by K (stable → V keeps order); the K-runs are the
+                // groups, and each run's V-span is its inner list. The payload follows the
+                // permutation; the keys come out sorted and are read at the run starts.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
-                let (perm, klabels) = sort_blocks(&segment_labels(&bounds), &k_col);
+                let (perm, klabels, k_sorted) = sort_values(&segment_labels(&bounds), &k_col);
                 let v_sorted = gather(&v_col, &perm);
                 let (ends, firsts) = run_layout(&klabels);
-                // the representatives compose: reading `perm` at the run starts is the same index
-                // as sorting the whole key column and then subsetting it (as `DedupList` does).
-                let reps: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
-                let keys = gather(&k_col, &reps);
+                let keys = gather(&k_sorted, &firsts);
                 let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
                 let no = runs_per_row(&bounds, &firsts);

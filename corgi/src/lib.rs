@@ -122,7 +122,7 @@ pub mod arrange {
     /// one columnar discrimination pass — the batched replacement for driving `sort_by(compare_at)`
     /// per pair.
     pub fn sort_perm(v: &Value) -> Vec<usize> {
-        crate::ops::cmp::order::sort_blocks(&vec![0u64; v.len()], v).0
+        crate::ops::cmp::sort::sort_blocks(&vec![0u64; v.len()], v).0
     }
 
     /// Batched structural compare: `out[k]` = sign of row `ia[k]` of `a` vs row `ib[k]` of `b` (all
@@ -154,7 +154,23 @@ pub mod arrange {
     /// so argmin/argmax/first-per-segment and per-segment sorted order fall out while keeping the row
     /// positions the caller indexed by.
     pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-        crate::ops::cmp::order::sort_blocks(labels, v)
+        crate::ops::cmp::sort::sort_blocks(labels, v)
+    }
+
+    /// [`sort_blocks`], and the sorted rows as a column: `(perm, refined labels, sorted)`, with
+    /// `sorted == gather(v, &perm)` — produced by the sort itself, not by a gather after it.
+    pub fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, Value) {
+        crate::ops::cmp::sort::sort_values(labels, v)
+    }
+
+    /// The indexed sort: order the rows `index[..]` of `v` within the blocks of `labels`
+    /// (`labels[k]` is position `k`'s block; non-decreasing). On return `index` is in sorted
+    /// order — block-stable, stable within a block — and `labels` is the refined partition in
+    /// that order; with `emit` the sorted rows come back as a column. The subset never has to be
+    /// gathered out first: this is the form a caller with a subset in hand wants.
+    pub fn sort_indexed(v: &Value, labels: &mut [u64], index: &mut [usize], emit: bool) -> Option<Value> {
+        let mut scratch = crate::ops::cmp::sort::SortScratch::default();
+        crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch).1
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.

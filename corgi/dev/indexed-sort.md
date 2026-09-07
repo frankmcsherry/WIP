@@ -125,3 +125,45 @@ permute within its classes. Sum sorts the tag as a virtual leaf, then one call p
 offsets. List sorts the length, then one refine-only call per element position, and forms the output by
 one gather of the elements, the one place a permutation legitimately survives (collie's note,
 `collie/dev/BACKLOG.md:92-110`). Multiplicity is kept; distinctness is a mode.
+
+## 6. Status (2026-09-06, second commit)
+
+Built, on this branch, as `corgi/src/ops/cmp/sort.rs`:
+
+    sort_indexed(v, labels: &mut [u64], index: &mut [usize], emit: bool, scratch) -> (perm, Option<Value>)
+    sort_blocks(labels, v) -> (perm, labels)                     // the old form, at the identity index
+    sort_values(labels, v) -> (perm, labels, sorted Value)       // the old form, with the data
+
+`order.rs`'s `mod discriminate` is gone; what remains of it is `mod labels` (`segment_labels`,
+`run_layout`, `runs_per_row`), which sorts nothing. `SortList`, `DedupList` and `GroupKey` take the
+data from the sort (`cmp.rs`); `arrange` exposes `sort_values` and `sort_indexed` for DDIR. The
+leaf reads each key once through the index into a packed `(key, position)` buffer and every radix
+pass after that is sequential (`sort_block`); the sorted keys are the output column. The arms
+gather nothing: `Prod` re-sorts each field at the same positions, `Sum` sorts the tag as a virtual
+leaf then each lane at its carried offsets, `List` sorts the length then refines position by
+position over the rows still long enough, gathering the elements once at the end. Contract
+checked by `sort.rs`'s tests against the scalar comparator on random nested shapes, with the
+identity index and with scrambled subsets.
+
+Gap rows, this branch against master, ns per row (the R7–R10 rows are the ones from
+`corgi-sort-bfs`, added here):
+
+| row | n | master | this branch | Rust |
+|---|---|---|---|---|
+| D1 sort_u64 | 1M | 24.1 | 12.4 | 10.0 |
+| D1 sort_u64 | 8M | 48.3 | 31.0 | 11.7 |
+| D2 dedup | 1M | 28.7 | 16.4 | 10.4 |
+| R1 arrange_sort_perm | 1M | 24.3 | 11.4 | 24.2 |
+| R1 arrange_sort_perm | 8M | 44.5 | 28.7 | 32.8 |
+| R7 sort_sum, one block | 1M / 8M | 27.3 / 34.5 | 27.5 / 36.0 | 37.9 / 47.1 |
+| R8 sort_list, one block | 1M / 8M | 43.1 / 58.5 | 43.4 / 62.5 | 94.7 / 244.8 |
+| R9 sort_sum, a block per row | 1M / 8M | 37.0 / 38.6 | 16.4 / 21.6 | 2.4 / 3.1 |
+| R10 sort_list, a block per row | 1M / 8M | 72.0 / 74.5 | 18.0 / 20.4 | 4.0 / 4.5 |
+
+So the per-row-label regime (`corgi-sort-bfs`'s 2–2.6x) is 2.3x on Sum and 4x on List here, and
+the one-big-block regime that branch lost 15–25% on is flat. The leaf carries its permutation
+through every pass, which is what a value-only sort (D1) does not need: `corgi-opportunities`'
+value radix reaches 4.9 ns at 1M by not carrying it, so a values-only mode of `sort_block` is the
+next leaf step. After that: DDIR's `from_columns` taking `sort_values` instead of `sort_perm` plus
+a gather, the reduce taking `sort_indexed` on its candidate subset instead of gathering it out,
+and collie's packed `(label, key)` single radix for the few-big-blocks case.
