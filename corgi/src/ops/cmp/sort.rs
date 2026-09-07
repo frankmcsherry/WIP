@@ -1,49 +1,42 @@
-//! The discrimination sort, in datatoad's shape: `(labels, index)` in, sorted data out.
+//! The discrimination sort: `(labels, index)` in, sorted data out.
 //!
-//! [`sort_indexed`] sorts the rows `index[..]` of a column within the blocks `labels` describes,
+//! [`sort_indexed`] orders the rows `index[..]` of a column within the blocks `labels` describes,
 //! by structural order: a leaf by its stored unsigned bytes, `Prod` lexicographically by field,
 //! `Sum` by tag then payload, `List` length first and then element by element, `Unit` all equal.
-//! Position `k` of the problem is row `index[k]`, in block `labels[k]`.
-//!
-//! Contract. `labels` is one `u64` per position and non-decreasing (checked in debug builds;
-//! blocks are runs of equal adjacent labels, so a non-monotone vector would be mis-sorted, not
-//! rejected). Label values mean nothing beyond equality. On return `index` is permuted into
-//! sorted order — block-stable, and stable within a block — and `labels` is rewritten in place
-//! as the refined partition in that order: two positions share a label iff they shared one before
-//! and their rows are structurally equal; the values are the dense run index. The returned
-//! permutation `perm` says where each position came from (`new_index[k] == old_index[perm[k]]`),
-//! so a caller can move any parallel array the same way. With `emit` the sorted rows come back as
-//! a column.
-//!
-//! Nothing is gathered before a level sorts. A leaf pulls its keys through `index` once, into a
-//! packed `(key, position)` buffer, and every radix pass after that is sequential; the sorted keys
-//! ARE the output column, so no gather reforms the data afterwards. A `Prod` sorts each field at
-//! the same positions with the labels the previous field refined; a field's output is final the
-//! moment it is emitted, because later fields only permute within its classes, on which it is
-//! constant. A `Sum` sorts the tag as a virtual leaf and then each lane at the carried offsets.
-//! A `List` sorts the length, refines element by element without emitting, and gathers the
-//! elements once at the end: row-major output of variable-length rows is a scatter, so this is
-//! the one place a permutation is applied to data. [`sort_blocks`] is the labels form, this
-//! kernel at the identity index.
+//! Nothing is gathered before a level sorts. A leaf pulls its keys through the index once and
+//! radixes them with the positions alongside, every pass sequential, and the sorted keys are the
+//! output column. Layout, top down: the entry points, the four arms, the leaf kernel, the label
+//! and position helpers.
 
 use crate::engine::gather;
 use crate::value::{Bounds, Prim, Tags, Value};
 
-/// Buffers the sort reuses across every block and level of one call: the pulled keys of the
-/// level in progress, the alternate key and permutation buffers the radix ping-pongs against,
-/// a spare index buffer for applying a permutation, and the digit counters. Hoisted because a
-/// refinement pass produces millions of tiny blocks and must not allocate per block.
+/// Buffers reused across every block and level of one call, so that a refinement pass producing
+/// millions of tiny blocks allocates nothing per block.
 #[derive(Default)]
 pub(crate) struct SortScratch {
-    keys: Vec<u64>,
-    keys_alt: Vec<u64>,
-    perm_alt: Vec<usize>,
-    index_alt: Vec<usize>,
-    counts: Vec<u32>,
+    keys: Vec<u64>,      // the level's pulled keys, taken while in use
+    keys_alt: Vec<u64>,  // the radix's alternate key buffer
+    perm_alt: Vec<usize>, // the radix's alternate position buffer
+    index_alt: Vec<usize>, // a spare index for applying a permutation
+    counts: Vec<u32>,    // digit counters
+    rows: Vec<usize>,    // a sub-call's rows, while its permutation is applied
+    old: Vec<usize>,     // and the positions they came from
 }
 
-/// Sort the rows `index[..]` of `v` within the blocks of `labels`. See the module doc for the
-/// contract. Returns the permutation applied to the positions and, with `emit`, the sorted rows.
+// ---- entry points ---------------------------------------------------------------------------
+
+/// Sort the rows `index[..]` of `v` within the blocks of `labels`.
+///
+/// Requires: `labels.len() == index.len()`; `labels` non-decreasing, position `k` being row
+/// `index[k]` in block `labels[k]` (checked in debug builds); every `index[k]` a row of `v`.
+///
+/// Ensures: `index` is permuted so that each block holds its rows in structural order, blocks
+/// keep their places and equal rows keep their order; `labels` is rewritten as the dense run
+/// index of the refined partition in that order, two positions sharing a label iff they did
+/// before and their rows are structurally equal; the returned `perm` has
+/// `new_index[k] == old_index[perm[k]]`; with `emit`, the returned column is
+/// `gather(v, &new_index)`, produced by the sort rather than by a gather.
 pub(crate) fn sort_indexed(
     v: &Value,
     labels: &mut [u64],
@@ -60,8 +53,7 @@ pub(crate) fn sort_indexed(
         }
         return ((0..m).collect(), emit.then(|| gather(v, index)));
     }
-    // no two positions tied: no row can move and no class can split, at any depth. The labels
-    // are still renumbered densely, as every arm's are.
+    // nothing tied: no row can move and no class can split, at any depth.
     if fully_discriminated(labels) {
         refine(labels, |_| false);
         return ((0..m).collect(), emit.then(|| gather(v, index)));
@@ -71,8 +63,6 @@ pub(crate) fn sort_indexed(
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
         Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit, scratch),
         Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit, scratch),
-        // every unit row is equal: the order is already the answer and no block splits, but the
-        // labels are renumbered densely like every other arm's.
         Value::Unit(_) => {
             refine(labels, |_| false);
             ((0..m).collect(), emit.then_some(Value::Unit(m)))
@@ -80,8 +70,9 @@ pub(crate) fn sort_indexed(
     }
 }
 
-/// The labels form: sort all of `v`'s rows, in stored order, within the blocks of `labels`.
-/// `perm[k]` is the input row at output position `k`; the refined labels are aligned with `perm`.
+/// The labels form: every row of `v`, in stored order. Requires `labels` non-decreasing over
+/// `v`'s rows. Returns `(perm, labels)`: `perm[k]` is the input row at output position `k`, and
+/// the refined labels are aligned with `perm`.
 pub(crate) fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
     let mut labels = labels.to_vec();
     let mut index: Vec<usize> = (0..v.len()).collect();
@@ -91,7 +82,7 @@ pub(crate) fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
     (index, labels)
 }
 
-/// The labels form with the data: `(perm, refined labels, the sorted rows)`.
+/// [`sort_blocks`] and the sorted rows: `(perm, labels, sorted)` with `sorted == gather(v, &perm)`.
 pub(crate) fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, Value) {
     let mut labels = labels.to_vec();
     let mut index: Vec<usize> = (0..v.len()).collect();
@@ -102,6 +93,8 @@ pub(crate) fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, V
 
 // ---- the arms -------------------------------------------------------------------------------
 
+/// A leaf: one indirect read per position, then sequential passes; the sorted keys, narrowed
+/// back to the leaf's width, are the column.
 fn sort_leaf(
     p: &Prim,
     labels: &mut [u64],
@@ -109,18 +102,19 @@ fn sort_leaf(
     emit: bool,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
-    // the one indirect read: each position's key, widened to u64, in position order.
     let mut keys = std::mem::take(&mut scratch.keys);
     keys.clear();
     p.pull_u64(index, &mut keys);
-    let perm = sort_keys(&mut keys, labels, scratch);
-    permute(index, &perm, &mut scratch.index_alt);
-    // the keys are now in sorted order: narrowed back to the leaf's width they are the column.
+    let perm = sort_keys(&mut keys, labels, index, scratch);
     let out = emit.then(|| Value::Prim(p.like(&keys)));
     scratch.keys = keys;
     (perm, out)
 }
 
+/// A product: each field in turn, at the same positions, under the labels the previous field
+/// refined. A field's output is final when emitted, since later fields permute only within its
+/// classes, on which it is constant. Once nothing is tied the remaining fields are read out by
+/// the index.
 fn sort_prod(
     cols: &[Value],
     labels: &mut [u64],
@@ -138,8 +132,6 @@ fn sort_prod(
     let mut settled = false;
     for c in cols {
         if settled {
-            // no two positions are tied, so this field cannot move a row or split a class; its
-            // sorted form is its rows in the order the index already has.
             if emit {
                 outs.push(gather(c, index));
             }
@@ -147,14 +139,16 @@ fn sort_prod(
         }
         let (step, out) = sort_indexed(c, labels, index, emit, scratch);
         permute(&mut perm, &step, &mut scratch.index_alt);
-        if let Some(o) = out {
-            outs.push(o);
-        }
+        outs.extend(out);
         settled = fully_discriminated(labels);
     }
     (perm, emit.then_some(Value::Prod(outs)))
 }
 
+/// A sum: the tag as a virtual leaf, then each lane at the positions that carry its tag and are
+/// still tied, through the carried within-lane offsets. While the lanes refine subsets, a label
+/// is its run's starting position (see [`run_starts`]); dense afterwards. A lane whose rows were
+/// all sorted is emitted by the sort; otherwise it is read once at its final offsets.
 fn sort_sum(
     tags: &Tags,
     lanes: &[Value],
@@ -175,22 +169,13 @@ fn sort_sum(
         return (perm, out);
     }
     let Tags::Column(tag_col, within) = tags else { unreachable!("const handled above") };
-    // 1. the tag, as a virtual leaf read through the index.
     let mut keys = std::mem::take(&mut scratch.keys);
     keys.clear();
     keys.extend(index.iter().map(|&r| tag_col.usize_at(r) as u64));
-    let mut perm = sort_keys(&mut keys, labels, scratch);
-    permute(index, &perm, &mut scratch.index_alt);
+    let mut perm = sort_keys(&mut keys, labels, index, scratch);
     let tags_out: Vec<usize> = keys.iter().map(|&k| k as usize).collect();
     scratch.keys = keys;
-    // While the lanes refine subsets of the positions, a label is the position its run starts
-    // at: unique per class across the whole problem, so a class one lane splits can never be
-    // confused with a class another lane, or no lane, left alone.
     run_starts(labels);
-    // 2. each lane, at the positions that carry its tag and are still tied — a row alone in its
-    //    block cannot move, and under a key that separates almost everything that is nearly every
-    //    row. Within a block the positions of one tag are now contiguous, so a lane's sub-problem
-    //    is a subset in increasing position order with monotone labels.
     let mut all: Vec<Vec<usize>> = vec![Vec::new(); lanes.len()];
     let mut tied: Vec<Vec<usize>> = vec![Vec::new(); lanes.len()];
     for (q, &t) in tags_out.iter().enumerate() {
@@ -200,7 +185,6 @@ fn sort_sum(
         }
     }
     let mut lanes_out = Vec::with_capacity(lanes.len());
-    let (mut rows, mut old_perm) = (Vec::new(), Vec::new());
     for (t, lane) in lanes.iter().enumerate() {
         let qs = &tied[t];
         let mut sorted = None;
@@ -208,35 +192,25 @@ fn sort_sum(
             let mut index_t: Vec<usize> = qs.iter().map(|&q| within[index[q]]).collect();
             let mut labels_t: Vec<u64> = qs.iter().map(|&q| labels[q]).collect();
             let (step, out) = sort_indexed(lane, &mut labels_t, &mut index_t, emit, scratch);
-            rows.clear();
-            rows.extend(qs.iter().map(|&q| index[q]));
-            old_perm.clear();
-            old_perm.extend(qs.iter().map(|&q| perm[q]));
-            for (i, &q) in qs.iter().enumerate() {
-                index[q] = rows[step[i]];
-                perm[q] = old_perm[step[i]];
-            }
+            apply(index, &mut perm, qs, &step, scratch);
             write_starts(labels, qs, &labels_t);
             sorted = out;
         }
         if emit {
-            // every row of the tag was sorted: the sorted lane IS the output lane. Otherwise the
-            // lane's rows in output order, read once each at their (now final) offsets.
             lanes_out.push(match sorted {
                 Some(o) if qs.len() == all[t].len() => o,
-                _ => {
-                    let offsets: Vec<usize> = all[t].iter().map(|&q| within[index[q]]).collect();
-                    gather(lane, &offsets)
-                }
+                _ => gather(lane, &all[t].iter().map(|&q| within[index[q]]).collect::<Vec<_>>()),
             });
         }
     }
-    // 3. run starts are monotone over the output; one pass makes them dense.
     refine(labels, |_| false);
-    let out = emit.then(|| Value::sum_tagged(Tags::from_tags(tags_out, lanes.len()), lanes_out));
-    (perm, out)
+    (perm, emit.then(|| Value::sum_tagged(Tags::from_tags(tags_out, lanes.len()), lanes_out)))
 }
 
+/// A list: the length as a virtual leaf, then one refining pass per element position over the
+/// rows still tied and still that long, then one gather of the elements in final order, the
+/// only gather this sort makes. Equal-width byte records up to 8 wide pack into one `u64` key
+/// and unpack from the sorted keys.
 fn sort_list(
     bounds: &Bounds,
     vals: &Value,
@@ -246,16 +220,12 @@ fn sort_list(
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     let m = index.len();
-    // Equal-width byte records up to 8 wide pack into one u64 key: for equal lengths the
-    // lexicographic byte order IS big-endian numeric order, so this is one leaf sort, and the
-    // sorted keys unpack straight back into the sorted records.
     if let (Some(k), Value::Prim(Prim::U8(bytes))) = (bounds.strided(), vals) {
         if (1..=8).contains(&k) {
             let mut keys = std::mem::take(&mut scratch.keys);
             keys.clear();
             keys.extend(index.iter().map(|&r| (0..k).fold(0u64, |key, p| (key << 8) | bytes[r * k + p] as u64)));
-            let perm = sort_keys(&mut keys, labels, scratch);
-            permute(index, &perm, &mut scratch.index_alt);
+            let perm = sort_keys(&mut keys, labels, index, scratch);
             let out = emit.then(|| {
                 let mut o = Vec::with_capacity(m * k);
                 for &key in keys.iter() {
@@ -273,44 +243,31 @@ fn sort_list(
         let (s, e) = bounds.span(r);
         e - s
     };
-    // 1. length first — unless every row has the same length, when it cannot split anything.
     let mut perm: Vec<usize> = (0..m).collect();
     if bounds.strided().is_none() {
         let mut keys = std::mem::take(&mut scratch.keys);
         keys.clear();
         keys.extend(index.iter().map(|&r| len_of(r) as u64));
-        perm = sort_keys(&mut keys, labels, scratch);
-        permute(index, &perm, &mut scratch.index_alt);
+        perm = sort_keys(&mut keys, labels, index, scratch);
         scratch.keys = keys;
     }
     run_starts(labels);
-    // 2. element by element, over the rows still tied and still long enough, refining only. A
-    //    block holds rows of one length, so it is live or not as a whole and the live positions
-    //    keep their order; a row whose block has split down to itself drops out at once.
+    // a block holds rows of one length, so it is live or not as a whole.
     let mut live: Vec<usize> = (0..m).filter(|&q| len_of(index[q]) > 0 && in_tie(labels, q)).collect();
     let mut pos = 0;
-    let (mut elem, mut labels_j, mut rows, mut old_perm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut elem, mut labels_j) = (Vec::new(), Vec::new());
     while !live.is_empty() {
         elem.clear();
         elem.extend(live.iter().map(|&q| bounds.span(index[q]).0 + pos));
         labels_j.clear();
         labels_j.extend(live.iter().map(|&q| labels[q]));
         let (step, _) = sort_indexed(vals, &mut labels_j, &mut elem, false, scratch);
-        rows.clear();
-        rows.extend(live.iter().map(|&q| index[q]));
-        old_perm.clear();
-        old_perm.extend(live.iter().map(|&q| perm[q]));
-        for (i, &q) in live.iter().enumerate() {
-            index[q] = rows[step[i]];
-            perm[q] = old_perm[step[i]];
-        }
+        apply(index, &mut perm, &live, &step, scratch);
         write_starts(labels, &live, &labels_j);
         pos += 1;
         live.retain(|&q| len_of(index[q]) > pos && in_tie(labels, q));
     }
-    // 3. run starts are monotone over the output; one pass makes them dense.
     refine(labels, |_| false);
-    // 4. the data: the rows' elements in their final order, the one gather this sort makes.
     let out = emit.then(|| {
         let mut elems = Vec::new();
         let mut ends = Vec::with_capacity(m);
@@ -324,28 +281,14 @@ fn sort_list(
     (perm, out)
 }
 
-/// Does position `q` share its block with a neighbour? Labels are non-decreasing, so a block of
-/// more than one row is visible from any of its members as an equal label next door.
-fn in_tie(labels: &[u64], q: usize) -> bool {
-    (q > 0 && labels[q - 1] == labels[q]) || (q + 1 < labels.len() && labels[q + 1] == labels[q])
-}
+// ---- the leaf kernel ------------------------------------------------------------------------
 
-/// Does the shape hold a `List` anywhere? A `List`'s sorted form is a gather of every element,
-/// so a caller that keeps only some rows (`dedup`, `group`'s keys) gathers those rows itself.
-pub(crate) fn contains_list(v: &Value) -> bool {
-    match v {
-        Value::List(..) => true,
-        Value::Prod(cols) => cols.iter().any(contains_list),
-        Value::Sum(_, lanes) => lanes.iter().any(contains_list),
-        Value::Prim(_) | Value::Unit(_) => false,
-    }
-}
-
-// ---- the kernel -----------------------------------------------------------------------------
-
-/// Sort positions by `keys` within the runs of equal `labels`, stably. `keys` comes back in
-/// sorted order, `labels` refined in place, and the permutation is returned.
-fn sort_keys(keys: &mut [u64], labels: &mut [u64], scratch: &mut SortScratch) -> Vec<usize> {
+/// Sort positions by `keys` within the runs of equal `labels`, stably, and apply the result.
+///
+/// Requires `keys`, `labels` and `index` of one length, `labels` non-decreasing. Ensures `keys`
+/// sorted within each run, `labels` the dense run index of the refined partition, `index`
+/// permuted alike; returns the permutation.
+fn sort_keys(keys: &mut [u64], labels: &mut [u64], index: &mut [usize], scratch: &mut SortScratch) -> Vec<usize> {
     let m = keys.len();
     let mut perm: Vec<usize> = (0..m).collect();
     let mut lo = 0;
@@ -360,13 +303,13 @@ fn sort_keys(keys: &mut [u64], labels: &mut [u64], scratch: &mut SortScratch) ->
         lo = hi;
     }
     refine(labels, |q| keys[q] != keys[q - 1]);
+    permute(index, &perm, &mut scratch.index_alt);
     perm
 }
 
-/// Stable LSD radix of one block, the keys and the positions travelling together, every pass
-/// sequential in and out. A block of 32 or fewer takes an insertion sort, which is what a
-/// refinement pass hands this most often. The digit widens with the block, so a wide digit's
-/// counter array is only paid where it halves the passes; high all-zero digits are skipped.
+/// Stable sort of one block by `keys`, `perm` moving with them. Blocks of 32 or fewer take an
+/// insertion sort; the rest an LSD radix with every pass sequential, a digit widening with the
+/// block ([`digit_width`]) and high all-zero digits skipped.
 fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     let n = keys.len();
     if n <= 32 {
@@ -380,8 +323,6 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
         }
         return;
     }
-    // more rows than a `u32` counter can hold: a stable comparison sort is the same answer, and a
-    // block this big can afford it.
     if n > COUNTED_MAX {
         let mut pairs: Vec<(u64, usize)> = keys.iter().copied().zip(perm.iter().copied()).collect();
         pairs.sort_by_key(|p| p.0);
@@ -394,33 +335,25 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     let max = keys.iter().copied().max().unwrap_or(0);
     let sig = 64 - max.leading_zeros();
     if sig == 0 {
-        return; // every key equal: the identity is already the stable answer
+        return;
     }
     let d = digit_width(n);
     let buckets = 1usize << d;
     let mask = (buckets - 1) as u64;
     let passes = sig.div_ceil(d);
     let SortScratch { keys_alt, perm_alt, counts, .. } = scratch;
-    if keys_alt.len() < n {
-        keys_alt.resize(n, 0);
-    }
-    if perm_alt.len() < n {
-        perm_alt.resize(n, 0);
-    }
-    if counts.len() < buckets {
-        counts.resize(buckets, 0);
-    }
+    keys_alt.resize(keys_alt.len().max(n), 0);
+    perm_alt.resize(perm_alt.len().max(n), 0);
+    counts.resize(counts.len().max(buckets), 0);
     let counts = &mut counts[..buckets];
     let (keys_alt, perm_alt) = (&mut keys_alt[..n], &mut perm_alt[..n]);
     let mut primary = true;
     for p in 0..passes {
         let shift = p * d;
         counts.iter_mut().for_each(|c| *c = 0);
-        {
-            let src: &[u64] = if primary { keys } else { keys_alt };
-            for &k in src {
-                counts[((k >> shift) & mask) as usize] += 1;
-            }
+        let src: &[u64] = if primary { keys } else { keys_alt };
+        for &k in src {
+            counts[((k >> shift) & mask) as usize] += 1;
         }
         let mut start = 0u32;
         for c in counts.iter_mut() {
@@ -455,12 +388,12 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     }
 }
 
-/// Above this many rows in one block the `u32` bucket counters would overflow. They are `u32`
-/// and not `usize` because at small blocks the counter array shares L1 with the data.
+/// Above this many rows in one block the `u32` digit counters would overflow; such a block takes
+/// a stable comparison sort instead. `u32`, not `usize`, so the counters share L1 with a small block.
 const COUNTED_MAX: usize = u32::MAX as usize;
 
-/// Digit width for a radix pass over `n` rows: buckets stay at or under `n / 16`, so the counter
-/// clear and prefix scan stay under a sixteenth of the element work.
+/// Digit width for a radix pass over `n` rows: at most `n / 16` buckets, so the counter clear and
+/// prefix scan stay under a sixteenth of the element work.
 fn digit_width(n: usize) -> u32 {
     if n >= (1 << 20) {
         16
@@ -471,9 +404,10 @@ fn digit_width(n: usize) -> u32 {
     }
 }
 
-/// Rewrite `labels` in place as the dense run index of the refined partition, in the order the
-/// positions now stand: a run starts where the old label changes, or where `split(q)` says the
-/// rows at `q - 1` and `q` differ.
+// ---- labels and positions -------------------------------------------------------------------
+
+/// Renumber `labels` in place as the dense run index, a run ending where the label changes or
+/// where `split(q)` says positions `q - 1` and `q` differ.
 fn refine(labels: &mut [u64], split: impl Fn(usize) -> bool) {
     let mut next = 0u64;
     let mut prev_old = labels.first().copied().unwrap_or(0);
@@ -487,9 +421,9 @@ fn refine(labels: &mut [u64], split: impl Fn(usize) -> bool) {
     }
 }
 
-/// Rewrite `labels` in place so that each position carries the position its run starts at — a
-/// labelling unique per class over the whole problem, which the `Sum` and `List` arms keep while
-/// sub-calls refine subsets of the positions and hand back locally numbered classes.
+/// Relabel each run by the position it starts at. Unique per class over the whole problem, so
+/// a class one sub-call splits can never be confused with one another sub-call, or none, left
+/// alone; the `Sum` and `List` arms keep this form while sub-calls refine subsets.
 fn run_starts(labels: &mut [u64]) {
     let mut start = 0u64;
     let mut prev = labels.first().copied().unwrap_or(0);
@@ -502,8 +436,8 @@ fn run_starts(labels: &mut [u64]) {
     }
 }
 
-/// Write a sub-call's refined labels for the positions `at` back as run starts: a run begins where
-/// the sub-call's numbering changes, and the run's members are consecutive positions.
+/// Write a sub-call's `refined` labels for the positions `at` back as run starts. Requires the
+/// members of each refined class to be consecutive positions.
 fn write_starts(labels: &mut [u64], at: &[usize], refined: &[u64]) {
     let mut start = 0u64;
     for (i, &q) in at.iter().enumerate() {
@@ -521,10 +455,39 @@ fn permute(xs: &mut [usize], perm: &[usize], tmp: &mut Vec<usize>) {
     xs.copy_from_slice(tmp);
 }
 
-/// Is every position in a class of its own? Labels are non-decreasing, so this is one scan that
-/// stops at the first tie.
+/// Apply a sub-call's permutation `step` over the positions `at` to `index` and `perm`:
+/// position `at[i]` takes what position `at[step[i]]` held.
+fn apply(index: &mut [usize], perm: &mut [usize], at: &[usize], step: &[usize], scratch: &mut SortScratch) {
+    let SortScratch { rows, old, .. } = scratch;
+    rows.clear();
+    rows.extend(at.iter().map(|&q| index[q]));
+    old.clear();
+    old.extend(at.iter().map(|&q| perm[q]));
+    for (i, &q) in at.iter().enumerate() {
+        index[q] = rows[step[i]];
+        perm[q] = old[step[i]];
+    }
+}
+
+/// No two positions share a label. One scan, stopping at the first tie.
 fn fully_discriminated(labels: &[u64]) -> bool {
     labels.windows(2).all(|w| w[0] != w[1])
+}
+
+/// Position `q` shares its label with a neighbour, i.e. sits in a block of more than one row.
+fn in_tie(labels: &[u64], q: usize) -> bool {
+    (q > 0 && labels[q - 1] == labels[q]) || (q + 1 < labels.len() && labels[q + 1] == labels[q])
+}
+
+/// Whether the shape holds a `List` anywhere; a `List`'s sorted form is a gather of every
+/// element, which a caller keeping only some rows would rather do itself.
+pub(crate) fn contains_list(v: &Value) -> bool {
+    match v {
+        Value::List(..) => true,
+        Value::Prod(cols) => cols.iter().any(contains_list),
+        Value::Sum(_, lanes) => lanes.iter().any(contains_list),
+        Value::Prim(_) | Value::Unit(_) => false,
+    }
 }
 
 #[cfg(test)]
