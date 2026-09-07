@@ -60,6 +60,12 @@ pub(crate) fn sort_indexed(
         }
         return ((0..m).collect(), emit.then(|| gather(v, index)));
     }
+    // no two positions tied: no row can move and no class can split, at any depth. The labels
+    // are still renumbered densely, as every arm's are.
+    if fully_discriminated(labels) {
+        refine(labels, |_| false);
+        return ((0..m).collect(), emit.then(|| gather(v, index)));
+    }
     match v {
         Value::Prim(p) => sort_leaf(p, labels, index, emit, scratch),
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
@@ -177,44 +183,56 @@ fn sort_sum(
     permute(index, &perm, &mut scratch.index_alt);
     let tags_out: Vec<usize> = keys.iter().map(|&k| k as usize).collect();
     scratch.keys = keys;
-    let after_tags: Vec<u64> = labels.to_vec();
-    // 2. each lane, at the positions that carry its tag, reading the lane at the carried offsets.
-    //    Within a block the positions of one tag are now contiguous, so a lane's sub-problem is a
-    //    subset in increasing position order with monotone labels.
-    let mut by_tag: Vec<Vec<usize>> = vec![Vec::new(); lanes.len()];
+    // While the lanes refine subsets of the positions, a label is the position its run starts
+    // at: unique per class across the whole problem, so a class one lane splits can never be
+    // confused with a class another lane, or no lane, left alone.
+    run_starts(labels);
+    // 2. each lane, at the positions that carry its tag and are still tied — a row alone in its
+    //    block cannot move, and under a key that separates almost everything that is nearly every
+    //    row. Within a block the positions of one tag are now contiguous, so a lane's sub-problem
+    //    is a subset in increasing position order with monotone labels.
+    let mut all: Vec<Vec<usize>> = vec![Vec::new(); lanes.len()];
+    let mut tied: Vec<Vec<usize>> = vec![Vec::new(); lanes.len()];
     for (q, &t) in tags_out.iter().enumerate() {
-        by_tag[t].push(q);
+        all[t].push(q);
+        if in_tie(labels, q) {
+            tied[t].push(q);
+        }
     }
     let mut lanes_out = Vec::with_capacity(lanes.len());
     let (mut rows, mut old_perm) = (Vec::new(), Vec::new());
     for (t, lane) in lanes.iter().enumerate() {
-        let qs = &by_tag[t];
-        if qs.is_empty() {
-            if emit {
-                lanes_out.push(gather(lane, &[]));
+        let qs = &tied[t];
+        let mut sorted = None;
+        if !qs.is_empty() {
+            let mut index_t: Vec<usize> = qs.iter().map(|&q| within[index[q]]).collect();
+            let mut labels_t: Vec<u64> = qs.iter().map(|&q| labels[q]).collect();
+            let (step, out) = sort_indexed(lane, &mut labels_t, &mut index_t, emit, scratch);
+            rows.clear();
+            rows.extend(qs.iter().map(|&q| index[q]));
+            old_perm.clear();
+            old_perm.extend(qs.iter().map(|&q| perm[q]));
+            for (i, &q) in qs.iter().enumerate() {
+                index[q] = rows[step[i]];
+                perm[q] = old_perm[step[i]];
             }
-            continue;
+            write_starts(labels, qs, &labels_t);
+            sorted = out;
         }
-        let mut index_t: Vec<usize> = qs.iter().map(|&q| within[index[q]]).collect();
-        let mut labels_t: Vec<u64> = qs.iter().map(|&q| labels[q]).collect();
-        let (step, out) = sort_indexed(lane, &mut labels_t, &mut index_t, emit, scratch);
-        rows.clear();
-        rows.extend(qs.iter().map(|&q| index[q]));
-        old_perm.clear();
-        old_perm.extend(qs.iter().map(|&q| perm[q]));
-        for (i, &q) in qs.iter().enumerate() {
-            index[q] = rows[step[i]];
-            perm[q] = old_perm[step[i]];
-            labels[q] = labels_t[i];
-        }
-        if let Some(o) = out {
-            lanes_out.push(o);
+        if emit {
+            // every row of the tag was sorted: the sorted lane IS the output lane. Otherwise the
+            // lane's rows in output order, read once each at their (now final) offsets.
+            lanes_out.push(match sorted {
+                Some(o) if qs.len() == all[t].len() => o,
+                _ => {
+                    let offsets: Vec<usize> = all[t].iter().map(|&q| within[index[q]]).collect();
+                    gather(lane, &offsets)
+                }
+            });
         }
     }
-    // 3. the lanes numbered their classes locally; (block-and-tag class, lane class) is monotone
-    //    over the output, so one pass makes it dense.
-    densify(&after_tags, labels);
-    // the emitted lanes hold each tag's rows in output order, which is lane storage order.
+    // 3. run starts are monotone over the output; one pass makes them dense.
+    refine(labels, |_| false);
     let out = emit.then(|| Value::sum_tagged(Tags::from_tags(tags_out, lanes.len()), lanes_out));
     (perm, out)
 }
@@ -265,17 +283,14 @@ fn sort_list(
         permute(index, &perm, &mut scratch.index_alt);
         scratch.keys = keys;
     }
-    let after_len: Vec<u64> = labels.to_vec();
-    // 2. element by element, over the rows still long enough, refining only. A block holds rows
-    //    of one length, so it is live or not as a whole and the live positions keep their order.
-    let mut live: Vec<usize> = (0..m).filter(|&q| len_of(index[q]) > 0).collect();
+    run_starts(labels);
+    // 2. element by element, over the rows still tied and still long enough, refining only. A
+    //    block holds rows of one length, so it is live or not as a whole and the live positions
+    //    keep their order; a row whose block has split down to itself drops out at once.
+    let mut live: Vec<usize> = (0..m).filter(|&q| len_of(index[q]) > 0 && in_tie(labels, q)).collect();
     let mut pos = 0;
     let (mut elem, mut labels_j, mut rows, mut old_perm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     while !live.is_empty() {
-        // no two live positions tied: the remaining elements cannot move a row or split a class.
-        if !live.windows(2).any(|w| labels[w[0]] == labels[w[1]]) {
-            break;
-        }
         elem.clear();
         elem.extend(live.iter().map(|&q| bounds.span(index[q]).0 + pos));
         labels_j.clear();
@@ -288,14 +303,13 @@ fn sort_list(
         for (i, &q) in live.iter().enumerate() {
             index[q] = rows[step[i]];
             perm[q] = old_perm[step[i]];
-            labels[q] = labels_j[i];
         }
+        write_starts(labels, &live, &labels_j);
         pos += 1;
-        live.retain(|&q| len_of(index[q]) > pos);
+        live.retain(|&q| len_of(index[q]) > pos && in_tie(labels, q));
     }
-    // 3. each length class numbered its classes over its own last refinement; (length class,
-    //    that numbering) is monotone over the output.
-    densify(&after_len, labels);
+    // 3. run starts are monotone over the output; one pass makes them dense.
+    refine(labels, |_| false);
     // 4. the data: the rows' elements in their final order, the one gather this sort makes.
     let out = emit.then(|| {
         let mut elems = Vec::new();
@@ -308,6 +322,23 @@ fn sort_list(
         Value::List(ends.into(), Box::new(gather(vals, &elems)))
     });
     (perm, out)
+}
+
+/// Does position `q` share its block with a neighbour? Labels are non-decreasing, so a block of
+/// more than one row is visible from any of its members as an equal label next door.
+fn in_tie(labels: &[u64], q: usize) -> bool {
+    (q > 0 && labels[q - 1] == labels[q]) || (q + 1 < labels.len() && labels[q + 1] == labels[q])
+}
+
+/// Does the shape hold a `List` anywhere? A `List`'s sorted form is a gather of every element,
+/// so a caller that keeps only some rows (`dedup`, `group`'s keys) gathers those rows itself.
+pub(crate) fn contains_list(v: &Value) -> bool {
+    match v {
+        Value::List(..) => true,
+        Value::Prod(cols) => cols.iter().any(contains_list),
+        Value::Sum(_, lanes) => lanes.iter().any(contains_list),
+        Value::Prim(_) | Value::Unit(_) => false,
+    }
 }
 
 // ---- the kernel -----------------------------------------------------------------------------
@@ -456,18 +487,30 @@ fn refine(labels: &mut [u64], split: impl Fn(usize) -> bool) {
     }
 }
 
-/// Rewrite `labels` in place as the dense run index of the pairs `(coarse[q], labels[q])`, which
-/// the arms build so that a coarser partition's classes are each numbered locally.
-fn densify(coarse: &[u64], labels: &mut [u64]) {
-    let mut next = 0u64;
-    let mut prev = (coarse[0], labels[0]);
+/// Rewrite `labels` in place so that each position carries the position its run starts at — a
+/// labelling unique per class over the whole problem, which the `Sum` and `List` arms keep while
+/// sub-calls refine subsets of the positions and hand back locally numbered classes.
+fn run_starts(labels: &mut [u64]) {
+    let mut start = 0u64;
+    let mut prev = labels.first().copied().unwrap_or(0);
     for (q, label) in labels.iter_mut().enumerate() {
-        let cur = (coarse[q], *label);
-        if q > 0 && cur != prev {
-            next += 1;
+        if *label != prev {
+            start = q as u64;
         }
-        prev = cur;
-        *label = next;
+        prev = *label;
+        *label = start;
+    }
+}
+
+/// Write a sub-call's refined labels for the positions `at` back as run starts: a run begins where
+/// the sub-call's numbering changes, and the run's members are consecutive positions.
+fn write_starts(labels: &mut [u64], at: &[usize], refined: &[u64]) {
+    let mut start = 0u64;
+    for (i, &q) in at.iter().enumerate() {
+        if i == 0 || refined[i] != refined[i - 1] {
+            start = q as u64;
+        }
+        labels[q] = start;
     }
 }
 

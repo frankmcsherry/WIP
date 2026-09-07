@@ -167,3 +167,45 @@ value radix reaches 4.9 ns at 1M by not carrying it, so a values-only mode of `s
 next leaf step. After that: DDIR's `from_columns` taking `sort_values` instead of `sort_perm` plus
 a gather, the reduce taking `sort_indexed` on its candidate subset instead of gathering it out,
 and collie's packed `(label, key)` single radix for the few-big-blocks case.
+
+## 7. Where it was markedly worse, and what fixed it (third commit)
+
+Asked whether the first cut was uniformly better, a probe (`$SCRATCH/probe-{master,branch}`,
+`arrange::sort_perm` over `Prod([key, value])` at 1M rows with the key unique, 1% of rows in
+pairs, 10%, or all in pairs, and the value a `Sum` of four `u64` lanes, a ragged `List<u64>`, or
+`List<Sum<Prod<u64,u64> | List<u64>>>`; plus `dedup`/`sort` over 1M lists) found two:
+
+1. **`dedup` over lists with heavy duplication: 40.5 → 58.3 ns/row.** The sorted form of a
+   `List` is a gather of every element, and `dedup` then gathered its few survivors again. Fixed
+   in `cmp.rs::representatives`: a shape containing a `List` sorts without emitting and gathers
+   the kept rows from the source, as before; a leaf or product of leaves takes the sort's output
+   and reads the run starts off it. Now 40.7, and `dedup` over all-distinct lists 58.8 → 44.0.
+2. **A nearly separated key over a deep value: flat, not better** (1% pairs, deep value: 92 →
+   91). The `Sum` and `List` arms recursed over every position, singletons included, so the value
+   paid full linear passes at every level for the 1% of rows that could move; master's per-block
+   loop skipped singletons in O(1). Fixed: both arms now sort only the positions that are tied
+   (`in_tie`), a row dropping out the moment its block has split down to itself. While subsets
+   refine, a label is the position its run starts at (`run_starts`, `write_starts`), unique per
+   class over the whole problem, so a class one sub-call splits can never collide with a class
+   another sub-call, or none, left alone; one pass makes them dense at the end. A `Sum` lane whose
+   rows were all sorted emits from the sort; otherwise the lane is read once at its final offsets.
+   `sort_indexed` also returns at once when no two positions are tied. Now 29 ns/row at 1% and
+   10% pairs for all three value shapes, against master's 63–101.
+
+Probe rows, ns/row, master → this branch:
+
+| case | master | branch |
+|---|---|---|
+| key unique, Sum / List / deep value | 65.6 / 74.9 / 94.0 | 20.2 / 20.0 / 20.4 |
+| key 1% pairs, Sum / List / deep | 63.0 / 76.6 / 92.4 | 26.0 / 29.4 / 29.2 |
+| key 10% pairs, Sum / List / deep | 66.7 / 80.4 / 101.0 | 25.7 / 29.6 / 31.3 |
+| key all pairs, Sum / List / deep | 75.5 / 97.4 / 165.9 | 30.9 / 33.3 / 37.2 |
+| dedup 1M lists, 50 distinct / all distinct | 40.5 / 58.8 | 40.7 / 44.0 |
+| sort 1M lists, 50 distinct | 49.5 | 50.1 |
+| sort deep nested, 200k | 129.7 | 86.5 |
+| sort_perm, Sum / List of 64 rows, ×20k | 32.1 / 55.7 | 34.2 / 29.8 |
+
+Gap rows after this: R9 12.6, R10 13.4 (master 37.0, 72.0), R7/R8 unchanged, R1 10.8, D1 11.9.
+The one number not better is the 64-row `Sum` at 34.2 against 32.1, the fixed cost of a call
+(the per-lane position lists, the run-start and dense passes) on a column too small to amortize
+it; worth a look if tiny sums are ever hot, not a regression the workloads see.
