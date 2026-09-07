@@ -122,7 +122,7 @@ pub mod arrange {
     /// one columnar discrimination pass — the batched replacement for driving `sort_by(compare_at)`
     /// per pair.
     pub fn sort_perm(v: &Value) -> Vec<usize> {
-        crate::ops::cmp::order::sort_blocks(&vec![0u64; v.len()], v).0
+        crate::ops::cmp::sort::sort_blocks(&[], v).0
     }
 
     /// Batched structural compare: `out[k]` = sign of row `ia[k]` of `a` vs row `ib[k]` of `b` (all
@@ -142,7 +142,7 @@ pub mod arrange {
 
     /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given
     /// per-row `labels` marking segments (non-decreasing — segment `s` is the maximal run of rows
-    /// sharing a label), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
+    /// sharing a label; empty for one segment), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
     /// label block by corgi structural order (stable, so ties keep input order), and `refined_labels`
     /// further splits each block by equal value (two rows share a refined label iff they shared a
     /// `labels` value AND are structurally equal). `sort_perm(v)` is exactly the single-block case
@@ -154,7 +154,26 @@ pub mod arrange {
     /// so argmin/argmax/first-per-segment and per-segment sorted order fall out while keeping the row
     /// positions the caller indexed by.
     pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-        crate::ops::cmp::order::sort_blocks(labels, v)
+        crate::ops::cmp::sort::sort_blocks(labels, v)
+    }
+
+    /// [`sort_blocks`], and the sorted rows as a column: `(perm, refined labels, sorted)`, with
+    /// `sorted == gather(v, &perm)` — produced by the sort itself, not by a gather after it.
+    pub fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, Value) {
+        crate::ops::cmp::sort::sort_values(labels, v)
+    }
+
+    /// The indexed sort: order the rows `index[..]` of `v` within the blocks of `labels`
+    /// (`labels[k]` is position `k`'s block; non-decreasing, or empty for one block). On return `index` is in sorted
+    /// order — block-stable, stable within a block — and `labels` is the dense refined partition
+    /// in that order. Returns the permutation applied, `new_index[k] == old_index[perm[k]]`, so
+    /// a parallel array can be moved the same way, and with `emit` the sorted rows as a column.
+    /// The subset never has to be gathered out first: this is the form a caller with a subset in
+    /// hand wants.
+    pub fn sort_indexed(v: &Value, labels: &mut Vec<u64>, index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
+        let mut scratch = crate::ops::cmp::sort::SortScratch::default();
+        let emit = if emit { crate::ops::cmp::sort::Emit::Both } else { crate::ops::cmp::sort::Emit::Groups };
+        crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch)
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
@@ -462,6 +481,23 @@ pub mod arrange {
             check_survey(&mk(1, 500, 300), &mk(2, 500, 300)); // dense overlap, many Both + dups
             check_survey(&mk(3, 800, 5000), &mk(4, 200, 5000)); // sparse, lopsided sizes
             check_survey(&mk(5, 1, 10), &mk(6, 1000, 10)); // single-element vs large
+        }
+
+        /// `sort_indexed` on a subset: the index comes back sorted, the labels refined, the
+        /// permutation moves a parallel array into the same order, and the column is the rows.
+        #[test]
+        fn sort_indexed_moves_a_parallel_array() {
+            let v = Value::Prod(vec![Value::u64(vec![9, 3, 3, 7, 1, 3]), Value::u64(vec![0, 2, 1, 0, 0, 0])]);
+            let mut index = vec![5, 1, 4, 2]; // rows (3,0) (3,2) (1,0) (3,1)
+            let mut labels = vec![0, 0, 0, 0];
+            let mut payload = vec!["e", "b", "d", "c"];
+            let (perm, out) = super::sort_indexed(&v, &mut labels, &mut index, true);
+            assert_eq!(index, vec![4, 5, 2, 1]); // (1,0) (3,0) (3,1) (3,2)
+            assert_eq!(labels, vec![0, 1, 2, 3]);
+            let moved: Vec<&str> = perm.iter().map(|&p| payload[p]).collect();
+            payload = moved;
+            assert_eq!(payload, vec!["d", "e", "c", "b"]);
+            assert_eq!(out.unwrap(), gather(&v, &index));
         }
 
         #[test]
