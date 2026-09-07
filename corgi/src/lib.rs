@@ -192,7 +192,7 @@ pub mod arrange {
         crate::ops::cmp::order::run_layout(labels)
     }
 
-    pub use crate::ops::cmp::order::Run;
+    pub use crate::ops::cmp::survey::{GroupRun, Run};
 
     /// Survey the mutual interleaving of two structurally-sorted columns `a` and `b` as a sequence
     /// of [`Run`]s — maximal ranges exclusive to one side, single matched pairs common to both — in
@@ -202,7 +202,15 @@ pub mod arrange {
     /// once per *range*, not once per *row*, and corgi owns no times — the caller drives the lattice
     /// consolidation off the returned runs. See [`Run`] for the coverage/sortedness guarantees.
     pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
-        crate::ops::cmp::order::survey(a, b)
+        crate::ops::cmp::survey::survey(a, b)
+    }
+
+    /// [`survey`] at class granularity, rank at a time: a match is the maximal equal class on
+    /// BOTH sides ([`GroupRun::Both`]), so a caller carrying per-row payloads (times, diffs)
+    /// consolidates the whole class in one place; the leading leaf decides the interleaving with
+    /// one gallop and every level below refines all the classes it left equal at once.
+    pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
+        crate::ops::cmp::survey::survey_groups(a, b)
     }
 
     /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`:
