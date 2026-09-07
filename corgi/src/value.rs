@@ -519,6 +519,18 @@ macro_rules! prim {
                 self.like_from(keys.iter().copied())
             }
 
+            /// `keys[q] = (keys[q] << width) | self[index[q]]`: this leaf's rows packed below the
+            /// keys already there, at the leaf's declared width.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn pack_u64(&self, index: &[usize], keys: &mut [u64]) {
+                match self {
+                    $( Prim::$V(v) => {
+                        let bits = (std::mem::size_of::<$t>() * 8) as u32;
+                        for (k, &i) in keys.iter_mut().zip(index) { *k = (*k << bits) | v[i] as u64; }
+                    } )+
+                }
+            }
+
             /// a leaf of this width holding the keys `it` yields, narrowed.
             #[allow(clippy::unnecessary_cast)]
             pub(crate) fn like_from(&self, it: impl Iterator<Item = u64>) -> Prim {

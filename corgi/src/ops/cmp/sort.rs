@@ -22,7 +22,6 @@ pub(crate) struct SortScratch {
     counts: Vec<u32>,    // digit counters
     rows: Vec<usize>,    // a sub-call's rows, while its permutation is applied
     old: Vec<usize>,     // and the positions they came from
-    pull: Vec<u64>,      // a field's keys before they are packed into the segment's
 }
 
 // ---- entry points ---------------------------------------------------------------------------
@@ -113,7 +112,7 @@ fn sort_leaf(
 }
 
 /// A product: its fields in turn, at the same positions, under the labels the fields before
-/// refined. Consecutive leaf fields whose significant bits fit one `u64` sort as one packed key
+/// refined. Consecutive leaf fields whose declared widths fit one `u64` sort as one packed key
 /// ([`sort_packed`]). A field's output is final when emitted, since later fields permute only
 /// within its classes, on which it is constant; once nothing is tied the remaining fields are
 /// read out by the index.
@@ -162,11 +161,10 @@ fn sort_prod(
     (perm.expect("at least one field"), emit.then_some(Value::Prod(outs)))
 }
 
-/// The leaf fields of `cols` from `f` on, as many as pack into one `u64` by their significant
-/// bits, sorted as one key: one set of passes and one refinement for the run, and a field every
-/// row agrees on costs no bits at all. Returns the permutation, one column per field with
-/// `emit`, and the index of the first field not taken. A field declared wider than the room
-/// left is pulled to learn its width, and pulled again by the next segment if it did not fit.
+/// The leaf fields of `cols` from `f` on, as many as fit one `u64` by their declared widths,
+/// sorted as one key, most significant field first: one set of passes and one refinement for
+/// the run. Returns the permutation, one column per field with `emit`, and the index of the
+/// first field not taken.
 fn sort_packed(
     cols: &[Value],
     f: usize,
@@ -175,48 +173,38 @@ fn sort_packed(
     emit: bool,
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Vec<Value>, usize) {
-    let m = index.len();
     let leaf = |c: &Value| match c {
         Value::Prim(p) => p.clone(),
         _ => unreachable!("sort_packed: a leaf field"),
     };
-    let mut keys = std::mem::take(&mut scratch.keys);
-    let mut pull = std::mem::take(&mut scratch.pull);
-    let mut widths: Vec<u32> = Vec::new();
-    let mut used = 0u32;
     let mut g = f;
-    while g < cols.len() && used < 64 {
+    let mut used = 0u32;
+    while g < cols.len() {
         let Value::Prim(p) = &cols[g] else { break };
-        pull.clear();
-        p.pull_u64(index, &mut pull);
-        let sig = 64 - pull.iter().copied().max().unwrap_or(0).leading_zeros();
-        if used + sig > 64 {
+        if used + p.bits() > 64 {
             break;
         }
-        if used == 0 {
-            std::mem::swap(&mut keys, &mut pull);
-        } else if sig > 0 {
-            for (k, &x) in keys.iter_mut().zip(&pull) {
-                *k = (*k << sig) | x;
-            }
-        }
-        widths.push(sig);
-        used += sig;
+        used += p.bits();
         g += 1;
+    }
+    let mut keys = std::mem::take(&mut scratch.keys);
+    keys.clear();
+    leaf(&cols[f]).pull_u64(index, &mut keys);
+    for c in &cols[f + 1..g] {
+        leaf(c).pack_u64(index, &mut keys);
     }
     let perm = sort_keys(&mut keys, labels, index, scratch);
     let mut outs = Vec::new();
     if emit {
         let mut shift = used;
-        for (x, &sig) in widths.iter().enumerate() {
-            shift -= sig;
-            let mask = if sig == 64 { u64::MAX } else { (1u64 << sig) - 1 };
-            outs.push(Value::Prim(leaf(&cols[f + x]).like_from(keys.iter().map(|&k| (k >> shift) & mask))));
+        for c in &cols[f..g] {
+            let p = leaf(c);
+            shift -= p.bits();
+            let mask = if p.bits() == 64 { u64::MAX } else { (1u64 << p.bits()) - 1 };
+            outs.push(Value::Prim(p.like_from(keys.iter().map(|&k| (k >> shift) & mask))));
         }
     }
-    debug_assert_eq!(m, keys.len());
     scratch.keys = keys;
-    scratch.pull = pull;
     (perm, outs, g)
 }
 
@@ -384,7 +372,8 @@ fn sort_keys(keys: &mut [u64], labels: &mut [u64], index: &mut [usize], scratch:
 
 /// Stable sort of one block by `keys`, `perm` moving with them. Blocks of 32 or fewer take an
 /// insertion sort; the rest an LSD radix with every pass sequential, a digit widening with the
-/// block ([`digit_width`]) and high all-zero digits skipped.
+/// block ([`digit_width`]). One sweep counts every digit at once; a digit on which every key
+/// agrees is skipped, as are the leading all-zero digits.
 fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     let n = keys.len();
     if n <= 32 {
@@ -415,21 +404,26 @@ fn sort_block(keys: &mut [u64], perm: &mut [usize], scratch: &mut SortScratch) {
     let d = digit_width(n);
     let buckets = 1usize << d;
     let mask = (buckets - 1) as u64;
-    let passes = sig.div_ceil(d);
+    let passes = sig.div_ceil(d) as usize;
     let SortScratch { keys_alt, perm_alt, counts, .. } = scratch;
     keys_alt.resize(keys_alt.len().max(n), 0);
     perm_alt.resize(perm_alt.len().max(n), 0);
-    counts.resize(counts.len().max(buckets), 0);
-    let counts = &mut counts[..buckets];
+    counts.resize(counts.len().max(passes * buckets), 0);
+    let counts = &mut counts[..passes * buckets];
+    counts.iter_mut().for_each(|c| *c = 0);
+    for &k in keys.iter() {
+        for p in 0..passes {
+            counts[p * buckets + ((k >> (p as u32 * d)) & mask) as usize] += 1;
+        }
+    }
     let (keys_alt, perm_alt) = (&mut keys_alt[..n], &mut perm_alt[..n]);
     let mut primary = true;
     for p in 0..passes {
-        let shift = p * d;
-        counts.iter_mut().for_each(|c| *c = 0);
-        let src: &[u64] = if primary { keys } else { keys_alt };
-        for &k in src {
-            counts[((k >> shift) & mask) as usize] += 1;
+        let counts = &mut counts[p * buckets..(p + 1) * buckets];
+        if counts.iter().any(|&c| c as usize == n) {
+            continue; // every key agrees on this digit
         }
+        let shift = p as u32 * d;
         let mut start = 0u32;
         for c in counts.iter_mut() {
             let cnt = *c;

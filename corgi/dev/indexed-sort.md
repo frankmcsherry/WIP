@@ -41,16 +41,23 @@ row at output position `k`); `sort_values(labels, v)` adds the sorted column. `a
 - **List.** The length as a virtual leaf, then one refining pass per element position over the
   rows still tied and still that long, then one gather of the elements in final order, the only
   gather in the file. Byte records up to 8 wide pack into one `u64` key.
-- **Packed leaf runs.** Consecutive leaf fields of a `Prod` whose significant bits fit one
-  `u64` sort as one key (`sort_packed`): one set of passes and one refinement for the run, and a
-  field every row agrees on costs no bits. A field is pulled to learn its width; one declared
-  wide that does not fit is pulled again by the next segment. Two forms measured and rejected:
-  multiword keys as separate words lose whenever a wide field joins the run (four unique `u64`
-  fields, 21 → 114 ns per row), because the run forgoes the early-out after a field that
-  separates everything and moves wider rows through every pass; and sorting only the tied
-  positions field by field, as the `Sum` and `List` arms do, loses 15–40% on every product
-  shape, because the leaf already skips a singleton block in O(1) and the subset bookkeeping
-  costs more than the sequential passes it saves.
+- **Packed leaf runs.** Consecutive leaf fields of a `Prod` whose declared widths fit one `u64`
+  sort as one key (`sort_packed`), most significant field first: one set of passes and one
+  refinement for the run, and the digit skip below drops the zero digits a narrow value leaves.
+  The rule is a function of the shape alone. An adaptive form that pulled each field to learn
+  its significant bits and packed by those was measured at 1.7x better on `u64` columns holding
+  small values (four fields under 64: 28 → 16 ns per row) and set aside as past the complexity
+  budget; narrowing such columns to their width gets the same result under the simple rule.
+  Multiword keys, the fields as separate words, lose whenever a wide field joins the run (four
+  unique `u64` fields, 21 → 114): an LSD radix sorts by the last word first, so every pass over
+  the later fields is spent before the first field, which alone decides the order, is reached,
+  where field by field the sort stops after that first field. Sorting only the tied positions
+  field by field, as the `Sum` and `List` arms do, loses 15–40% on every product shape: the leaf
+  already passes a singleton block in O(1), and the subset bookkeeping costs more than the
+  sequential passes it saves.
+- **Digits.** One sweep counts every digit of a block at once, and a digit on which every key
+  agrees is skipped, as are the leading all-zero ones (datatoad's `lsb_range`). Neutral on the
+  leaf rows, and what makes a packed `(u32, u32)` cost two passes rather than three.
 - **Subsets.** The `Sum` and `List` arms sort only tied positions; a row drops out as soon as its
   block has split down to itself. While subsets refine, a label is the position its run starts
   at, unique per class over the whole problem, so a class one sub-call splits cannot collide
@@ -76,19 +83,16 @@ value a `Sum` of four `u64` lanes, a ragged `List<u64>`, or `List<Sum<Prod<u64,u
 | 10% in pairs | 66.7 / 80.4 / 101.0 | 25.7 / 29.6 / 31.3 |
 | all in pairs | 75.5 / 97.4 / 165.9 | 30.9 / 33.3 / 37.2 |
 
-Products of leaves at 1M rows, `sort_perm` / `sort_values`, master → packed:
+Products of leaves at 1M rows, `sort_perm` / `sort_values`, master → packed by declared width:
 
-| fields | master | packed |
+| fields | master | here |
 |---|---|---|
-| (u64 unique, u64 unique) | 17.0 / 18.5 | 16.4 / 18.7 |
-| (u64 % 1000, u64 % 1000) | 15.5 / 20.6 | 13.9 / 14.4 |
-| (u64 % 64) × 4 | 28.3 / 34.2 | 16.4 / 16.2 |
-| (u32 % 65536, u32 % 65536) | 18.4 / 23.0 | 11.7 / 12.4 |
-| (u64 unique, u64 % 1000, u64 % 1000) | 20.2 / 21.2 | 20.6 / 21.3 |
-| (u8 % 4) × 3, u64 unique | 33.8 / 32.2 | 29.2 / 28.8 |
-| (u64 % 1000) × 4 | 27.5 / 34.1 | 16.4 / 19.2 |
-| (u64 unique) × 4 | 20.6 / 23.6 | 17.6 / 23.6 |
-| (u64 % 1000, u64 unique) | 19.4 / 23.3 | 23.7 / 20.3 |
+| (u32 % 65536, u32 % 65536) | 18.4 / 23.0 | 13.0 / 16.5 |
+| (u8 % 4) × 3, u64 unique | 33.8 / 32.2 | 24.2 / 25.3 |
+| (u64 unique, u64 unique) | 17.0 / 18.5 | 17.6 / 19.1 |
+| (u64 % 1000, u64 % 1000) | 15.5 / 20.6 | 17.7 / 21.2 |
+| (u64 % 64) × 4 | 28.3 / 34.2 | 28.9 / 35.7 |
+| (u64 unique) × 4 | 20.6 / 23.6 | 17.3 / 26.7 |
 
 Also: dedup over 1M lists with 50 distinct 40.5 → 40.7, over all-distinct lists 58.8 → 44.0; a
 deep nested sort of 200k rows 129.7 → 86.5; a 64-row `Sum` sorted twenty thousand times 32.1 →
