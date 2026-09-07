@@ -76,8 +76,8 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 | **C4 scan_prefix** (general) | aggregation | **1150×** | **252×** | **205×** | lockstep foldscan on ONE long row: #rounds = row length, body re-evaluated per round | monoid body → C4k; general → single-row interpreter |
 | C4k scan_add (kernel) | aggregation | 1.4× | 0.98× | 1.09× | the monoid prefix kernel — one in-place pass | **DONE** |
 | **C5 fold_sum_count** | aggregation | **6394×** | **4716×** | **2949×** | same lockstep degeneration, product-of-monoids accumulator | monoid kernel, or the interpreter |
-| D1 sort_u64 | order | 1.4× | 2.4× | 4.5× | radix-permute + gather; the gather scatter is DRAM-bound at scale | no — sort kernel |
-| D2 dedup | order | 1.7× | 2.6× | 4.5× | sort + adjacent unique | no — sort kernel |
+| D1 sort_u64 | order | 1.3× | 1.2× | 2.6× | the indexed sort: keys pulled once, radixed with the permutation alongside, emitted as the column; the carried permutation is the residue | values-only leaf mode |
+| D2 dedup | order | 1.7× | 1.5× | 2.8× | the same sort, run starts read off the sorted column | values-only leaf mode |
 | **E1 join_find_slices** | relational | — | 5.3× | 6.3× | `find` searches per probe instead of merging two sorted runs | merge-join path |
 | E2 gather | relational | — | **0.71×** | 1.03× | corgi at or below the Rust ceiling | — |
 | E3 gather_chain | relational | — | 1.00× | 1.25× | two gathers, each resolve+gather | index-composition rewrite |
@@ -87,7 +87,11 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 | G2 csv_sum | text | — | 1.9× | 1.9× | total `parse_u64` (Sum) + reduce vs hand atoi | — near ceiling |
 | H gather (safe) | safety | 0.33 vs 0.67 | 1.04 vs 0.89 | 0.57 vs 1.40 ns/row | corgi's TOTAL (bounds-checked) sequential gather vs Rust `unsafe` | — **no safety tax** |
 | I pointer-chase | latency | — | 0.64 vs 5.40 | 0.78 vs 9.58 ns/step | lockstep gather extracts MLP a serial chase cannot | — **8–15× FASTER** |
-| R1 arrange_sort_perm | arrangement | — | 1.01× | 1.37× | stable radix argsort vs Rust stable sort with cached keys | — |
+| R1 arrange_sort_perm | arrangement | — | **0.50×** | **0.83×** | the indexed sort's permutation vs Rust stable sort with cached keys | — |
+| R7 arrange_sort_sum | arrangement | — | 0.74× | 0.68× | a Sum of four u64 lanes, one block, vs a stable cached-key Rust sort on (tag, payload) | — |
+| R8 arrange_sort_list | arrangement | — | 0.48× | 0.27× | a List of u64 of lengths 0..4, one block, vs a stable Rust sort on (len, elements) | — |
+| R9 arrange_sort_sum_seg | arrangement | — | 5.1× | 5.5× | the Sum under a block per four rows, vs a stable Rust sort per row (was 15×) | per-call fixed cost |
+| R10 arrange_sort_list_seg | arrangement | — | 3.5× | 3.3× | the List under a block per four rows, vs a stable Rust sort per row (was 18×) | per-call fixed cost |
 | R2 arrange_compare | arrangement | — | 3.3× | 2.6× | batched adjacent compare vs a direct leaf compare | — |
 | R3 arrange_find | arrangement | — | 0.98× | 1.01× | the u64 fast path, at the Rust partition-point ceiling | — |
 | R4 arrange_survey | arrangement | — | **0.25×** | **0.78×** | galloping runs beat a two-pointer survey | — |

@@ -24,7 +24,7 @@ fn weave_unweaves_round_trip() {
     assert_eq!(eval_graph(&g, x.clone()), x);
 }
 
-/// The stride fast path in `sort_list_blocks` must produce the SAME sort as the general structural
+/// The stride fast path in the indexed sort's `List` arm must produce the SAME sort as the general structural
 /// path. Build `n` equal-width byte records two ways — the inner list as a `Stride` (which diverts to
 /// the packed-u64 leaf radix) vs the equivalent `Offsets` (the position-by-position structural sort) —
 /// sort each, and require identical results. A silent wrong-order regression fails here.

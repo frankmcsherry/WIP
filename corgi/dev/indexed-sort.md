@@ -1,11 +1,11 @@
-# The indexed sort: what `sort_blocks` is today, and what replaces it
+# The indexed sort: what `sort_blocks` was, what replaced it, and why
 
 Branch `corgi-indexed-sort`, off `master` 8b7d878. Line 2 of the corgi work: a discrimination
 sort that takes `(labels, index)` and returns sorted data, in the shape of datatoad's
-`FactColumn::sort(lists, groups, indexs, last)`. This file is the map of the ground it starts
-from, written because the module's own documentation does not state its contract.
+`FactColumn::sort(lists, groups, indexs, last)`. Sections 1–4 are the map of the ground it started from (master 8b7d878), written because the
+module's own documentation did not state its contract; 5–7 are what the branch built and measured.
 
-## 1. The entry point, and what the other `pub fn`s are
+## 1. Before: the entry point, and what the other `pub fn`s were
 
 `corgi/src/ops/cmp/order.rs`, `mod discriminate` (`:355-623`). The ONE entry point is
 
@@ -29,7 +29,7 @@ Callers of `sort_blocks`: `cmp.rs:89` (SortList), `:96` (DedupList), `:109` (Gro
 `lib.rs:125` (`arrange::sort_perm`) and `:157` (`arrange::sort_blocks`, used by DDIR's reduce at
 `interactive/src/corgi/reduce.rs:498` and `:534`); and the recursion at `order.rs:516, :528, :550, :586, :610`.
 
-## 2. The contract `sort_blocks` actually has
+## 2. Before: the contract `sort_blocks` actually had
 
 Inputs: a column `v` of any shape, and `labels`, one `u64` per row of `v` **in `v`'s stored order**.
 There is no index argument; the rows in play are always all of `v`, in the order `v` stores them.
@@ -65,7 +65,7 @@ Structural order: leaf by stored unsigned bytes; `Prod` lexicographic by field; 
 payload; `List` length-first, then element by element; `Unit` all equal. `compare_at`
 (`order.rs:15`) is the scalar oracle the tests check against.
 
-## 3. Where the copies are
+## 3. Before: where the copies were
 
 Per call of `sort_blocks` on `n` rows, master allocates and moves:
 
@@ -209,3 +209,19 @@ Gap rows after this: R9 12.6, R10 13.4 (master 37.0, 72.0), R7/R8 unchanged, R1 
 The one number not better is the 64-row `Sum` at 34.2 against 32.1, the fixed cost of a call
 (the per-lane position lists, the run-start and dense passes) on a column too small to amortize
 it; worth a look if tiny sums are ever hot, not a regression the workloads see.
+
+## 8. Scope of the PR
+
+The block-wise arms (`sort_leaf_blocks`, `sort_prod_blocks`, `sort_sum_blocks`, `sort_list_blocks`,
+`find_blocks`, `Prim::sort_block_scratch`) are deleted, not deprecated: `sort_blocks(labels, v)`
+keeps its name and contract as the labels-form entry, implemented as `sort_indexed` at the
+identity index, and every caller runs through it or through `sort_values`. DDIR built against
+this branch passes its test suite, and its medium-scale workloads all move a little the right
+way (one worker, initial epoch: list_val 84.7 → 74.5 ms, sum_key 103.1 → 97.0, sum_val 71.0 → 67.2,
+unnest 254.8 → 238.4, scc 1.71 → 1.69 s, adt 42.2 → 41.3; churn epochs unchanged), without
+changing a line on its side. Left for later, in order: a values-only leaf mode (`sort` and
+`dedup` on a bare leaf carry a permutation they do not use; the value radix on
+`corgi-opportunities` is 2.5x faster there), range copies for the `List` arm's final gather
+(corgi's `extend_from_self`), dedup-as-you-go for `dedup` (one position per class per level),
+a caller-held scratch for tiny calls, and DDIR taking `sort_values` in `from_columns` and
+`sort_indexed` for the reduce's candidate subset.
