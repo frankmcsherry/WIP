@@ -75,7 +75,12 @@ churn unchanged; its test suite passes against this crate unchanged.
 ## Follow-ups
 
 1. A values-only leaf mode: `sort` and `dedup` on a bare leaf carry a permutation they never
-   use; the value radix on `corgi-opportunities` is 2.5x faster there (4.9 ns at 1M).
+   use; the value radix on `corgi-opportunities` is 2.5x faster there (4.9 ns at 1M, 8.6 at 8M
+   against this leaf's 28). The digit width is not the cause: capping it at 11 or 8 bits costs
+   more passes and measures worse at both 1M and 8M (D1 at 8M: 28.7 / 33.0 / 36.2 for 16 / 11 /
+   8 bits). What the 8M row pays for is the permutation carried through every pass and the
+   full-column passes around the radix — the labels copy, the identity index, the refine, the
+   permute of the index, the narrowing copy — none of which a values-only sort needs.
 2. Range copies for the `List` arm's final gather, corgi's `extend_from_self`; `gather` on a
    `List` is element-wise today (`engine.rs:119-130`).
 3. Dedup as you go: one position per class per level, expanding from the runs at the end.

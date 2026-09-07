@@ -165,12 +165,14 @@ pub mod arrange {
 
     /// The indexed sort: order the rows `index[..]` of `v` within the blocks of `labels`
     /// (`labels[k]` is position `k`'s block; non-decreasing). On return `index` is in sorted
-    /// order — block-stable, stable within a block — and `labels` is the refined partition in
-    /// that order; with `emit` the sorted rows come back as a column. The subset never has to be
-    /// gathered out first: this is the form a caller with a subset in hand wants.
-    pub fn sort_indexed(v: &Value, labels: &mut [u64], index: &mut [usize], emit: bool) -> Option<Value> {
+    /// order — block-stable, stable within a block — and `labels` is the dense refined partition
+    /// in that order. Returns the permutation applied, `new_index[k] == old_index[perm[k]]`, so
+    /// a parallel array can be moved the same way, and with `emit` the sorted rows as a column.
+    /// The subset never has to be gathered out first: this is the form a caller with a subset in
+    /// hand wants.
+    pub fn sort_indexed(v: &Value, labels: &mut [u64], index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
         let mut scratch = crate::ops::cmp::sort::SortScratch::default();
-        crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch).1
+        crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch)
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
@@ -478,6 +480,23 @@ pub mod arrange {
             check_survey(&mk(1, 500, 300), &mk(2, 500, 300)); // dense overlap, many Both + dups
             check_survey(&mk(3, 800, 5000), &mk(4, 200, 5000)); // sparse, lopsided sizes
             check_survey(&mk(5, 1, 10), &mk(6, 1000, 10)); // single-element vs large
+        }
+
+        /// `sort_indexed` on a subset: the index comes back sorted, the labels refined, the
+        /// permutation moves a parallel array into the same order, and the column is the rows.
+        #[test]
+        fn sort_indexed_moves_a_parallel_array() {
+            let v = Value::Prod(vec![Value::u64(vec![9, 3, 3, 7, 1, 3]), Value::u64(vec![0, 2, 1, 0, 0, 0])]);
+            let mut index = vec![5, 1, 4, 2]; // rows (3,0) (3,2) (1,0) (3,1)
+            let mut labels = vec![0, 0, 0, 0];
+            let mut payload = vec!["e", "b", "d", "c"];
+            let (perm, out) = super::sort_indexed(&v, &mut labels, &mut index, true);
+            assert_eq!(index, vec![4, 5, 2, 1]); // (1,0) (3,0) (3,1) (3,2)
+            assert_eq!(labels, vec![0, 1, 2, 3]);
+            let moved: Vec<&str> = perm.iter().map(|&p| payload[p]).collect();
+            payload = moved;
+            assert_eq!(payload, vec!["d", "e", "c", "b"]);
+            assert_eq!(out.unwrap(), gather(&v, &index));
         }
 
         #[test]

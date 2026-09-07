@@ -123,11 +123,11 @@ fn sort_prod(
     scratch: &mut SortScratch,
 ) -> (Vec<usize>, Option<Value>) {
     let m = index.len();
-    let mut perm: Vec<usize> = (0..m).collect();
     if cols.is_empty() {
         refine(labels, |_| false);
-        return (perm, emit.then_some(Value::Prod(Vec::new())));
+        return ((0..m).collect(), emit.then_some(Value::Prod(Vec::new())));
     }
+    let mut perm: Option<Vec<usize>> = None; // the first field's step is the running permutation
     let mut outs = Vec::with_capacity(cols.len());
     let mut settled = false;
     for c in cols {
@@ -138,11 +138,17 @@ fn sort_prod(
             continue;
         }
         let (step, out) = sort_indexed(c, labels, index, emit, scratch);
-        permute(&mut perm, &step, &mut scratch.index_alt);
+        perm = Some(match perm {
+            None => step,
+            Some(mut running) => {
+                permute(&mut running, &step, &mut scratch.index_alt);
+                running
+            }
+        });
         outs.extend(out);
         settled = fully_discriminated(labels);
     }
-    (perm, emit.then_some(Value::Prod(outs)))
+    (perm.expect("at least one field"), emit.then_some(Value::Prod(outs)))
 }
 
 /// A sum: the tag as a virtual leaf, then each lane at the positions that carry its tag and are
