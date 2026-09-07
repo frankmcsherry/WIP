@@ -188,7 +188,7 @@ fn signed_rem_is_total_at_a_zero_divisor() {
     assert_eq!(dec_col(eval_graph(&g, input)), vec![-17, 9]);
 }
 
-/// The judge rejects a float `Rem` (integer-only), the mirror of its integer-`Div` rejection.
+/// Remainder remains integer-only; division supports both integer and float columns.
 #[test]
 fn float_rem_is_rejected() {
     let mut b = Builder::<NumOp>::default();
@@ -200,4 +200,38 @@ fn float_rem_is_rejected() {
     let g = b.finish(out);
     let shape = Shape::Prod(vec![Shape::Prim(64), Shape::Prim(64)]);
     assert!(shape_of(&g, &shape).is_err(), "float Rem must not type");
+}
+
+/// Division fills the signed/unsigned grid, including the encoded zero divisor
+/// and signed overflow. The same contract applies at every integer width.
+#[test]
+fn integer_division_grid() {
+    macro_rules! check {
+        ($col:ident, $u:ty, $i:ty, $w:expr) => {{
+            let m: $u = 1 << ($w - 1);
+            let signed = |xs: &[$i]| Value::$col(xs.iter().map(|&x| (x as $u) ^ m).collect());
+            assert_eq!(
+                bin(BinOp::Div, Kind::I, $w,
+                    signed(&[-17, 17, -17, <$i>::MIN, 9, -9, 0, <$i>::MIN]),
+                    signed(&[5, -5, -5, -1, 0, 0, 0, <$i>::MIN])),
+                signed(&[-3, -3, 3, <$i>::MIN, 0, 0, 0, 1]),
+            );
+            assert_eq!(
+                bin(BinOp::Div, Kind::U, $w,
+                    Value::$col(vec![17, 9, 0, <$u>::MAX]),
+                    Value::$col(vec![5, 0, 0, 1])),
+                Value::$col(vec![3, 0, 0, <$u>::MAX]),
+            );
+        }};
+    }
+    check!(u8, u8, i8, 8);
+    check!(u16, u16, i16, 16);
+    check!(u32, u32, i32, 32);
+    check!(u64, u64, i64, 64);
+
+    // The existing surface spelling now reaches the integer kernel too.
+    let g = parse_ml("input div_i64").unwrap();
+    let input = Value::Prod(vec![i64col(&[-17]), i64col(&[5])]);
+    assert_eq!(shape_of(&g, &shape_of_value(&input)).unwrap(), Shape::Prim(64));
+    assert_eq!(dec_col(eval_graph(&g, input)), vec![-3]);
 }

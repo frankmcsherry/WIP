@@ -58,7 +58,7 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
-    Div, // FLOAT-ONLY (integer div deferred: no NEON op, div-by-zero would panic). x/0 -> ±inf, 0/0 -> NaN.
+    Div, // Integer: truncating, x/0 = 0, signed MIN/-1 wraps. Float: IEEE division.
     Rem, // INTEGER-ONLY (the float remainder has no caller). `x % 0 = x`: a total definition, so the
          // lane body needs no branch out and callers that guard the divisor pay nothing. It is the
          // "no reduction" reading of a zero modulus, which is what DDIR's `hash(0, ..)` means.
@@ -169,10 +169,11 @@ macro_rules! grid {
                         let m = !(<$u>::MAX >> 1);
                         if (y ^ m) as $i == 0 { x } else { swiz!($u, $i, x, y, wrapping_rem) }
                     }),
-                    // integer division is deferred; `eval` rejects it up front, so this is never reached.
-                    (Kind::U, BinOp::Div) | (Kind::I, BinOp::Div) => {
-                        unreachable!("integer Div is rejected before dispatch")
-                    }
+                    (Kind::U, BinOp::Div) => bin_into(av, bv, |x: $u, y: $u| if y == 0 { 0 } else { x / y }),
+                    (Kind::I, BinOp::Div) => bin_into(av, bv, |x: $u, y: $u| {
+                        let m = !(<$u>::MAX >> 1);
+                        if (y ^ m) as $i == 0 { m } else { swiz!($u, $i, x, y, wrapping_div) }
+                    }),
                     // float is dispatched by `bin_eval` before reaching here.
                     (Kind::F, _) => unreachable!("int_bin: float dispatched by bin_eval"),
                 }), )+
@@ -197,7 +198,7 @@ macro_rules! grid {
 grid! { U8 => u8:i8, U16 => u16:i16, U32 => u32:i32, U64 => u64:i64 }
 
 /// the binary leaf op, dispatching `Kind::F` to the float path (32/64 only) and `U`/`I` to the macro
-/// grid. `eval` has already rejected float at widths 8/16 and integer `Div`, so the fallthroughs panic.
+/// grid. `eval` has already rejected float at widths 8/16, so the fallthroughs panic.
 fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
     match kind {
         Kind::F => float_bin(op, a, b),
@@ -239,9 +240,6 @@ impl ArithOp {
             ArithOp::Bin(op, kind, w) => {
                 if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
                     return Err(format!("float arith only at width 32/64, got {w}"));
-                }
-                if matches!(op, BinOp::Div) && !matches!(kind, Kind::F) {
-                    return Err("integer div is deferred — div is float-only (use div_f32/div_f64)".into());
                 }
                 if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
                     return Err("rem is integer-only".into());
