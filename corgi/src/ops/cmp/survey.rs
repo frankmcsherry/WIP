@@ -6,9 +6,10 @@
 //! is refined by the next level at once — a product's next field, a sum's lane at the carried
 //! offsets, a list's next element position — never one pair at a time. A level reads its keys
 //! through index lists into the two columns; the reports form a tree, an equal class holding its
-//! refinement as children, flattened once at the end, so a level's work is proportional to the
-//! classes it refines and not to the reports already made. Nothing is gathered, and the shape is
-//! walked once per level rather than once per comparison. [`survey`] is the older pairwise
+//! refinement as children, flattened once at the end. A level's work is proportional to the rows
+//! of the classes it refines — a full pass over both inputs while a leading field leaves most
+//! rows tied, and nothing once it does not — and never to the reports already made. Nothing is
+//! gathered, and the shape is walked once per level rather than once per comparison. [`survey`] is the older pairwise
 //! report: a leaf pair is walked directly, anything else is derived from the groups. Layout, top
 //! down: the reports, the entry points, the level walk, the leaf merges, the report tree.
 
@@ -43,7 +44,7 @@ pub enum Run {
 /// a `Both` class on either side is structurally equal to every other, and the class is maximal;
 /// adjacent reports never share a side.
 pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
-    let mut tree = Tree { nodes: vec![Node::Class { alo: 0, ahi: a.len(), blo: 0, bhi: b.len(), la: 0, lb: 0, kids: (0, 0) }] };
+    let mut tree = Tree { nodes: vec![Node::Class { alo: 0, ahi: a.len(), blo: 0, bhi: b.len(), la: 0, lb: 0, kids: None }] };
     level(a, b, Identity, Identity, &[0], &mut tree);
     tree.flatten()
 }
@@ -206,6 +207,30 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
                 for &c in &cur {
                     let (cl, _, _) = tree.class(c);
                     let (na, nb) = (cl.ahi - cl.alo, cl.bhi - cl.blo);
+                    // one row a side over leaf elements: the rest of the two spans decide at
+                    // once, rather than a level per remaining position.
+                    if na == 1 && nb == 1 {
+                        if let Some(ord) = cmp_spans(va, vb, ba.span(ra[oa]), bb.span(rb[ob]), pos) {
+                            let first = tree.nodes.len();
+                            match ord {
+                                std::cmp::Ordering::Less => {
+                                    tree.push(Node::A(cl.alo, cl.ahi));
+                                    tree.push(Node::B(cl.blo, cl.bhi));
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    tree.push(Node::B(cl.blo, cl.bhi));
+                                    tree.push(Node::A(cl.alo, cl.ahi));
+                                }
+                                std::cmp::Ordering::Equal => {}
+                            }
+                            if ord != std::cmp::Ordering::Equal {
+                                tree.set_kids(c, first, tree.nodes.len());
+                            }
+                            oa += na;
+                            ob += nb;
+                            continue;
+                        }
+                    }
                     if len(ba, ra[oa]) > pos {
                         live.push(c);
                         tree.set_offsets(c, la.len(), lb.len());
@@ -238,6 +263,21 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
         ($($V:ident),*) => {
             match (pa, pb) {
                 $( (Prim::$V(va), Prim::$V(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree), )*
+                _ => panic!("survey: leaf width mismatch"),
+            }
+        };
+    }
+    go!(U8, U16, U32, U64)
+}
+
+/// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
+/// are leaves: one slice comparison. `None` for any other element shape.
+fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize, usize), from: usize) -> Option<std::cmp::Ordering> {
+    let (Value::Prim(pa), Value::Prim(pb)) = (va, vb) else { return None };
+    macro_rules! go {
+        ($($V:ident),*) => {
+            match (pa, pb) {
+                $( (Prim::$V(x), Prim::$V(y)) => Some(x[sa + from..ea].cmp(&y[sb + from..eb])), )*
                 _ => panic!("survey: leaf width mismatch"),
             }
         };
@@ -342,7 +382,7 @@ fn merge<T: Ord + Copy>(ka: impl Fn(usize) -> T, kb: impl Fn(usize) -> T, open: 
                     gallop(&mut i, ea, |k| ka(k) == key);
                     j += 1;
                     gallop(&mut j, eb, |k| kb(k) == key);
-                    tree.push(Node::Class { alo: top_a(si), ahi: top_a(i), blo: top_b(sj), bhi: top_b(j), la: si, lb: sj, kids: (0, 0) });
+                    tree.push(Node::Class { alo: top_a(si), ahi: top_a(i), blo: top_b(sj), bhi: top_b(j), la: si, lb: sj, kids: None });
                 }
             }
         }
@@ -422,12 +462,14 @@ struct Class {
 }
 
 /// The reports as a tree: an exclusive run, or an equal class with its refinement as children,
-/// a contiguous range of nodes, an empty range meaning equal throughout. `la`/`lb` are the
-/// class's offsets in the index lists of the level that made it.
+/// a contiguous range of nodes. `kids` is `None` until a level has refined the class, which is
+/// what makes it equal throughout when the tree is read; a refined class may have no children
+/// at all (two empty inputs), which is not the same thing. `la`/`lb` are the class's offsets in
+/// the index lists of the level that made it.
 enum Node {
     A(usize, usize),
     B(usize, usize),
-    Class { alo: usize, ahi: usize, blo: usize, bhi: usize, la: usize, lb: usize, kids: (usize, usize) },
+    Class { alo: usize, ahi: usize, blo: usize, bhi: usize, la: usize, lb: usize, kids: Option<(usize, usize)> },
 }
 
 struct Tree {
@@ -440,7 +482,7 @@ impl Tree {
     }
     fn set_kids(&mut self, c: usize, first: usize, end: usize) {
         match &mut self.nodes[c] {
-            Node::Class { kids, .. } => *kids = (first, end),
+            Node::Class { kids, .. } => *kids = Some((first, end)),
             _ => unreachable!("only a class is refined"),
         }
     }
@@ -473,7 +515,9 @@ impl Tree {
             stack.push(p);
             while let Some(n) = stack.pop() {
                 if let Node::Class { alo, ahi, blo, bhi, kids, .. } = &self.nodes[n] {
-                    if kids.0 == kids.1 {
+                    if let Some((s, e)) = *kids {
+                        stack.extend((s..e).rev());
+                    } else {
                         let (oa, ob) = (la + alo - top.alo, lb + blo - top.blo);
                         let (na, nb) = (ahi - alo, bhi - blo);
                         cur.push(n);
@@ -481,8 +525,6 @@ impl Tree {
                         sa.extend((oa..oa + na).map(|j| ia.row(j)));
                         sb.extend((ob..ob + nb).map(|j| ib.row(j)));
                         self.set_offsets(n, at.0, at.1);
-                    } else {
-                        stack.extend((kids.0..kids.1).rev());
                     }
                 }
             }
@@ -503,15 +545,10 @@ impl Tree {
                     Some(GroupRun::B(_, end)) if *end == *lo => *end = *hi,
                     _ => out.push(GroupRun::B(*lo, *hi)),
                 },
-                Node::Class { alo, ahi, blo, bhi, kids, .. } => {
-                    if kids.0 == kids.1 {
-                        if *alo < *ahi || *blo < *bhi {
-                            out.push(GroupRun::Both(*alo, *ahi, *blo, *bhi));
-                        }
-                    } else {
-                        stack.extend((kids.0..kids.1).rev());
-                    }
-                }
+                Node::Class { alo, ahi, blo, bhi, kids, .. } => match *kids {
+                    Some((s, e)) => stack.extend((s..e).rev()),
+                    None => out.push(GroupRun::Both(*alo, *ahi, *blo, *bhi)),
+                },
             }
         }
         out
@@ -660,6 +697,64 @@ mod tests {
             }
         }
         assert_eq!((ca, cb), (a.len(), b.len()));
+    }
+
+    /// the pairwise oracle: the old two-pointer walk with `compare_at`.
+    fn naive_pairs(a: &Value, b: &Value) -> Vec<Run> {
+        let (na, nb) = (a.len(), b.len());
+        let (mut i, mut j) = (0, 0);
+        let mut out = Vec::new();
+        while i < na && j < nb {
+            match compare_at(a, i, b, j) {
+                Ordering::Less => {
+                    let s = i;
+                    while i < na && compare_at(a, i, b, j) == Ordering::Less {
+                        i += 1;
+                    }
+                    out.push(Run::A(s, i));
+                }
+                Ordering::Equal => {
+                    out.push(Run::Both(i, j));
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    let s = j;
+                    while j < nb && compare_at(b, j, a, i) == Ordering::Less {
+                        j += 1;
+                    }
+                    out.push(Run::B(s, j));
+                }
+            }
+        }
+        if i < na {
+            out.push(Run::A(i, na));
+        }
+        if j < nb {
+            out.push(Run::B(j, nb));
+        }
+        out
+    }
+
+    #[test]
+    fn pairs_agree_with_the_scalar_walk_on_random_shapes() {
+        for seed in 1..120u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+            let (na, nb) = (rng.below(30), rng.below(30));
+            let (a, b) = two_sorted(&mut rng, na, nb, 3);
+            assert_eq!(survey(&a, &b), naive_pairs(&a, &b), "\n{}\n{}", crate::value::show(&a), crate::value::show(&b));
+        }
+    }
+
+    /// two rows of long lists decide on their spans at once, not a level per element.
+    #[test]
+    fn long_lists_one_row_a_side() {
+        let n = 200_000usize;
+        let mk = |last: u64| Value::List(Bounds::offsets(vec![n]), Box::new(Value::u64((0..n as u64).map(|i| if i + 1 == n as u64 { last } else { 7 }).collect())));
+        let (a, b) = (mk(1), mk(2));
+        assert_eq!(survey_groups(&a, &b), vec![GroupRun::A(0, 1), GroupRun::B(0, 1)]);
+        assert_eq!(survey_groups(&b, &a), vec![GroupRun::B(0, 1), GroupRun::A(0, 1)]);
+        assert_eq!(survey_groups(&a, &a), vec![GroupRun::Both(0, 1, 0, 1)]);
     }
 
     #[test]

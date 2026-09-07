@@ -34,10 +34,17 @@ and the excess joins the run that follows, which is what a two-pointer walk repo
   leaf, then each lane merges its classes at the carried within-lane offsets. A list merges on
   the length, then element by element over the classes still that long, each position as one
   level over index lists into the elements; a class at its length is equal throughout.
-- **Reports are a tree.** An equal class holds its refinement as children; an empty refinement
-  means equal throughout. A level's work is proportional to the classes it refines and the
-  reports it makes, not to the reports already there, and the tree is flattened once at the end
-  with adjacent runs of one side joined. A class keeps its offsets in the index lists of the
+- **Reports are a tree.** An equal class holds its refinement as children, `None` until a level
+  has refined it, which is what marks it equal throughout. A level's work is proportional to the
+  rows of the classes it refines, since each level copies the row lists of every class still
+  open: a leading field that leaves most rows tied costs a full pass over both inputs per level,
+  and one that separates them costs nothing after. It is never proportional to the reports
+  already made; the tree is flattened once at the end with adjacent runs of one side joined.
+- **Long lists.** Each element position is a level, so a column of a few rows holding long
+  lists would pay a level's fixed cost, five vectors and a walk, per element. A class down to
+  one row a side over leaf elements compares the rest of its two spans as slices at once
+  instead, which covers the two-rows-of-a-million case; a class of several rows sharing a long
+  prefix still pays per position, linear in the elements but with that constant. A class keeps its offsets in the index lists of the
   level that made it, and a level that descends rewrites them to the lists it builds, so a
   sub-class's rows are always a sub-range of an ancestor's segment.
 
