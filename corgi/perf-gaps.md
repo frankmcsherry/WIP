@@ -73,7 +73,7 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 | C1 fold_add | aggregation | 1.2× | **1.00×** | **1.00×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | **C3 group_by_sum** | aggregation | 22× | **49–63×** | **79–82×** | sort-based group where a 256-bucket accumulate is one O(n) pass | no — **missing narrow-key op** |
-| **C4 scan_prefix** (general) | aggregation | **1150×** | **252×** | **205×** | lockstep foldscan on ONE long row: #rounds = row length, body re-evaluated per round | monoid body → C4k; general → single-row interpreter |
+| **C4 scan_prefix** (general) | aggregation | **771×** | **326×** | **164×** | lockstep foldscan on ONE long row: #rounds = row length; the body is prepared once, the output scattered into one column, and what remains is one body evaluation per element (2026-09-10, same machine) | monoid body → C4k; general → single-row interpreter |
 | C4k scan_add (kernel) | aggregation | 1.4× | 0.98× | 1.09× | the monoid prefix kernel — one in-place pass | **DONE** |
 | **C5 fold_sum_count** | aggregation | **6394×** | **4716×** | **2949×** | same lockstep degeneration, product-of-monoids accumulator | monoid kernel, or the interpreter |
 | D1 sort_u64 | order | 1.3× | 1.2× | 2.6× | the indexed sort: keys pulled once, radixed with the permutation alongside, emitted as the column; the carried permutation is the residue | values-only leaf mode |
