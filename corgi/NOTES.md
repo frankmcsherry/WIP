@@ -184,6 +184,13 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
   the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
+- **A `Fold` whose body is a product of monoids does not run the loop.** Each accumulator field
+  updated by an associative op from a contribution that never reads the accumulator is
+  `seed_i ⊕ reduce_i(list)`, one reduction per field. Recognized at eval time in the numeric layer
+  (`ops::numeric::monoid_fold`), not the core, because whether an op is a monoid is a numeric
+  question; a physical choice like `strided`, not an optimizer rewrite. Conservative: only
+  `Add`/`Mul` at `Kind::U` width 64 and `Min`/`Max`, and only `U64` seeds and contributions;
+  anything else declines and the lockstep fold, which is the definition, runs.
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Remaining
   constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
