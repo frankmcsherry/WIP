@@ -19,6 +19,8 @@ src/
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
+               `Prepared` is a graph with its consumer counts and buffers computed once, for a caller
+               that runs the same graph many times (Fold/FoldScan run their body once per round).
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
@@ -27,7 +29,8 @@ src/
                downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`; `is_total`
                is the syntactic query. No second evaluator: the lowered graph is pure vocabulary.
   ops/
-    core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
+    core.rs    Op<L>: structure only, organized as the KERNEL MATRIX. `mod lockstep` holds what
+               Fold/FoldScan need to run a body across rows (scatter / OutputSink / init_active).
                           intro          elim     map       capture
                    PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
