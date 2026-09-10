@@ -10,11 +10,11 @@ pub(crate) mod sort;
 pub(crate) mod survey;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
+use order::{compare_adjacent, compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Prim, Value};
-use survey::find_sorted;
+use survey::{find_groups, find_sorted};
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -126,51 +126,19 @@ impl CmpOp {
                 let (hb, hvals) = haystack.into_list("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
-                // A leaf needle that is itself in order is MERGED into the haystack, one forward
-                // walk with galloping, instead of searched per probe: the shape a join has, both
-                // sides sorted, and the difference between `|needle| * log|haystack|` comparisons
-                // and `|needle| + |haystack|`. Asking costs one pass over the needle, which exits
-                // at the first inversion.
-                if let Value::Prim(p) = &nvals {
-                    if rows_sorted(&nb, p) {
-                        if let Some((lo_c, hi_c)) = find_sorted(&nb, &nvals, &hb, &hvals) {
-                            return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)]))));
-                        }
+                // A needle that is itself in order is MERGED into the haystack instead of
+                // searched per probe: the shape a join has, both sides sorted, and the difference
+                // between `|needle| * log|haystack|` comparisons and `|needle| + |haystack|`. A
+                // leaf pair takes the direct walk; any other shape the level walk of the survey.
+                // Asking costs one pass over the needle, which exits at the first inversion.
+                let (lo_c, hi_c) = if rows_sorted(&nb, &nvals) {
+                    match find_sorted(&nb, &nvals, &hb, &hvals) {
+                        Some(walk) => walk,
+                        None => find_groups(&nb, &nvals, &hb, &hvals),
                     }
-                }
-                let n = nvals.len();
-                // each needle element's haystack-row window [lo,hi). The window's start is also the
-                // row base the answer is relative to; the search moves `lo`, so the base is rewalked
-                // off the bounds at the end rather than kept as a third copy of the same column.
-                let (mut lo, mut hi) = (vec![0usize; n], vec![0usize; n]);
-                let (mut ns, mut hs) = (0, 0);
-                for r in 0..nb.len() {
-                    let (ne, he) = (nb.end(r), hb.end(r));
-                    for k in ns..ne {
-                        lo[k] = hs;
-                        hi[k] = he;
-                    }
-                    ns = ne;
-                    hs = he;
-                }
-                // lower = first haystack pos NOT less than the needle; upper = first GREATER. Same
-                // batched search, different tie rule on `haystack[mid] vs needle`.
-                let mut lower = (lo.clone(), hi.clone());
-                let mut upper = (lo, hi);
-                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
-                batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
-                // row-relative: subtract each element's haystack row start, rewalked here.
-                let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                let (mut ns, mut hs) = (0, 0);
-                for r in 0..nb.len() {
-                    let (ne, he) = (nb.end(r), hb.end(r));
-                    for k in ns..ne {
-                        lo_c.push((lower.0[k] - hs) as u64);
-                        hi_c.push((upper.0[k] - hs) as u64);
-                    }
-                    ns = ne;
-                    hs = he;
-                }
+                } else {
+                    find_search(&nb, &nvals, &hb, &hvals)
+                };
                 Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
             }
         })
@@ -178,9 +146,10 @@ impl CmpOp {
 
 }
 
-/// Is every row of `bounds` non-decreasing in `p`? One pass, exiting at the first inversion, so an
-/// unordered column costs a few loads for the question.
-fn rows_sorted(bounds: &Bounds, p: &Prim) -> bool {
+/// Is every row of `bounds` non-decreasing in structural order? A leaf is scanned directly,
+/// exiting at the first inversion, so an unordered leaf costs a few loads for the question; any
+/// other shape takes one adjacent structural compare, a pass over the column.
+fn rows_sorted(bounds: &Bounds, vals: &Value) -> bool {
     fn scan<T: Ord>(bounds: &Bounds, v: &[T]) -> bool {
         let mut start = 0;
         for end in bounds.ends() {
@@ -191,12 +160,64 @@ fn rows_sorted(bounds: &Bounds, p: &Prim) -> bool {
         }
         true
     }
-    match p {
-        Prim::U8(v) => scan(bounds, v),
-        Prim::U16(v) => scan(bounds, v),
-        Prim::U32(v) => scan(bounds, v),
-        Prim::U64(v) => scan(bounds, v),
+    match vals {
+        Value::Prim(Prim::U8(v)) => scan(bounds, v),
+        Value::Prim(Prim::U16(v)) => scan(bounds, v),
+        Value::Prim(Prim::U32(v)) => scan(bounds, v),
+        Value::Prim(Prim::U64(v)) => scan(bounds, v),
+        _ => {
+            // `signs[k]` orders element `k` against `k + 1`; a row boundary is not a comparison.
+            let signs = compare_adjacent(vals);
+            let mut start = 0;
+            for end in bounds.ends() {
+                if end > start && signs[start..end - 1].iter().any(|&o| o > 0) {
+                    return false;
+                }
+                start = end;
+            }
+            true
+        }
     }
+}
+
+/// Every needle element's `[lo, hi)` in its haystack row by the batched binary search: each
+/// element's window `[lo, hi)` halves per round until it collapses, one `compare_idx` per round
+/// (see [`batched_bound`]). The form for a needle in no particular order.
+fn find_search(nb: &Bounds, nvals: &Value, hb: &Bounds, hvals: &Value) -> (Vec<u64>, Vec<u64>) {
+    let n = nvals.len();
+    // each needle element's haystack-row window [lo,hi). The window's start is also the
+    // row base the answer is relative to; the search moves `lo`, so the base is rewalked
+    // off the bounds at the end rather than kept as a third copy of the same column.
+    let (mut lo, mut hi) = (vec![0usize; n], vec![0usize; n]);
+    let (mut ns, mut hs) = (0, 0);
+    for r in 0..nb.len() {
+        let (ne, he) = (nb.end(r), hb.end(r));
+        for k in ns..ne {
+            lo[k] = hs;
+            hi[k] = he;
+        }
+        ns = ne;
+        hs = he;
+    }
+    // lower = first haystack pos NOT less than the needle; upper = first GREATER. Same
+    // batched search, different tie rule on `haystack[mid] vs needle`.
+    let mut lower = (lo.clone(), hi.clone());
+    let mut upper = (lo, hi);
+    batched_bound(hvals, nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+    batched_bound(hvals, nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
+    // row-relative: subtract each element's haystack row start, rewalked here.
+    let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut ns, mut hs) = (0, 0);
+    for r in 0..nb.len() {
+        let (ne, he) = (nb.end(r), hb.end(r));
+        for k in ns..ne {
+            lo_c.push((lower.0[k] - hs) as u64);
+            hi_c.push((upper.0[k] - hs) as u64);
+        }
+        ns = ne;
+        hs = he;
+    }
+    (lo_c, hi_c)
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
@@ -328,5 +349,86 @@ mod merged_find {
             merged(vec![needles.len()], &needles, vec![hay.len()], &hay),
             reference(vec![needles.len()], &needles, vec![hay.len()], &hay),
         );
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// a random column of `rows` rows over a small value space, so that the two sides share rows,
+    /// nesting up to `depth` levels below the top.
+    fn random_value(rng: &mut Rng, rows: usize, depth: usize) -> Value {
+        if depth == 0 {
+            return Value::u64((0..rows).map(|_| rng.below(4) as u64).collect());
+        }
+        match rng.below(6) {
+            0 => Value::u8((0..rows).map(|_| rng.below(3) as u8).collect()),
+            1 => Value::Prod((0..1 + rng.below(3)).map(|_| random_value(rng, rows, depth - 1)).collect()),
+            2 => {
+                let arity = 1 + rng.below(3);
+                let tags: Vec<usize> = (0..rows).map(|_| rng.below(arity)).collect();
+                let lanes = (0..arity)
+                    .map(|t| random_value(rng, tags.iter().filter(|&&x| x == t).count(), depth - 1))
+                    .collect();
+                Value::sum(tags, lanes)
+            }
+            3 => {
+                let mut ends = Vec::with_capacity(rows);
+                let mut total = 0;
+                for _ in 0..rows {
+                    total += rng.below(3);
+                    ends.push(total);
+                }
+                Value::List(ends.into(), Box::new(random_value(rng, total, depth - 1)))
+            }
+            4 => Value::List(crate::value::Bounds::Stride(2, rows), Box::new(random_value(rng, rows * 2, depth - 1))),
+            _ => Value::Unit(rows),
+        }
+    }
+
+    /// ragged row ends over `total` elements.
+    fn row_ends(rng: &mut Rng, rows: usize, total: usize) -> Vec<usize> {
+        let mut cuts: Vec<usize> = (0..rows.saturating_sub(1)).map(|_| rng.below(total + 1)).collect();
+        cuts.sort_unstable();
+        cuts.push(total);
+        cuts
+    }
+
+    /// The level walk answers exactly what the batched search answers, on random shapes at every
+    /// nesting, with ragged and empty rows on both sides, needles present and absent.
+    #[test]
+    fn structured_find_matches_the_search_on_random_shapes() {
+        use super::super::cmp::sort::sort_values;
+        use super::super::cmp::order::segment_labels;
+        use super::{find_groups, find_search};
+        for seed in 1..200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let rows = 1 + rng.below(4);
+            let (nn, nh) = (rng.below(12), rng.below(24));
+            // one draw for both sides, so that they share rows, then each side sorted per row.
+            let both = random_value(&mut rng, nn + nh, 3);
+            let needles = crate::engine::gather(&both, &(0..nn).collect::<Vec<_>>());
+            let hay = crate::engine::gather(&both, &(nn..nn + nh).collect::<Vec<_>>());
+            let nb: crate::value::Bounds = row_ends(&mut rng, rows, nn).into();
+            let hb: crate::value::Bounds = row_ends(&mut rng, rows, nh).into();
+            let (_, _, needles) = sort_values(&segment_labels(&nb), &needles);
+            let (_, _, hay) = sort_values(&segment_labels(&hb), &hay);
+            let want = find_search(&nb, &needles, &hb, &hay);
+            assert_eq!(find_groups(&nb, &needles, &hb, &hay), want, "seed {seed}:\n{}\n{}", crate::value::show(&needles), crate::value::show(&hay));
+            // and the op itself takes the merge for these, since the needle rows are in order.
+            let out = CmpOp::Find.eval(Value::Prod(vec![Value::List(nb.clone(), Box::new(needles)), Value::List(hb, Box::new(hay))])).unwrap();
+            let (_, pair) = out.into_list("find").unwrap();
+            let (lo, hi) = pair.into_pair("find").unwrap();
+            assert_eq!((lo.into_u64("lo").unwrap(), hi.into_u64("hi").unwrap()), want, "seed {seed}");
+        }
     }
 }

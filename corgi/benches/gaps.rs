@@ -570,6 +570,110 @@ fn family_e(n: usize, reps: u32) {
         "find (merged walk when the needle is sorted) + slices vs two-pointer merge",
     );
 
+    // E1p / E1m / E1l the STRUCTURED finds: the same join over a pair key, a sum key and a ragged
+    // list key, the shapes a per-probe search served worst. Every 64 consecutive rows share a
+    // group id `g`, and the key is built from `g`, so the haystack has 64 equal rows per key and
+    // the needle, its distinct rows, is n/64 long. The haystack is corgi-sorted outside the timer;
+    // the Rust ceiling is the two-pointer walk over the typed rows in the same structural order.
+    fn two_pointer<T: Ord>(probes: &[T], keys: &[T]) -> (Vec<u64>, Vec<u64>) {
+        let (mut lo, mut hi) = (Vec::with_capacity(probes.len()), Vec::with_capacity(probes.len()));
+        let mut j = 0usize;
+        for p in probes {
+            while j < keys.len() && keys[j] < *p {
+                j += 1;
+            }
+            let start = j;
+            while j < keys.len() && keys[j] == *p {
+                j += 1;
+            }
+            lo.push(start as u64);
+            hi.push(j as u64);
+        }
+        (lo, hi)
+    }
+    // a one-row list of `rows`, sorted by corgi, and its distinct rows: (haystack, needle).
+    let prepared = |rows: Value| -> (Value, Value) {
+        let list = Value::List(vec![rows.len()].into(), Box::new(rows));
+        let sorted = eval_graph(&compile("input sort"), list);
+        let distinct = eval_graph(&compile("input dedup"), sorted.clone());
+        (sorted, distinct)
+    };
+    let find_t = |hay: &Value, needle: &Value| -> Duration {
+        corgi_t(&compile("(input.0, input.1) find"), &Value::Prod(vec![needle.clone(), hay.clone()]), reps)
+    };
+    let g_of = |i: u64| i >> 6;
+    fn inner_of(v: &Value) -> &Value {
+        let Value::List(_, inner) = v else { panic!("a one-row list") };
+        inner
+    }
+    fn pairs_of(v: &Value) -> Vec<(u64, u64)> {
+        let Value::Prod(fs) = inner_of(v) else { panic!("pairs") };
+        let (a, b) = (fs[0].as_u64("a").unwrap(), fs[1].as_u64("b").unwrap());
+        a.iter().zip(b).map(|(&x, &y)| (x, y)).collect()
+    }
+    fn sums_of(v: &Value) -> Vec<(u8, u64)> {
+        let Value::Sum(tags, lanes) = inner_of(v) else { panic!("sums") };
+        (0..tags.len())
+            .map(|i| {
+                let t = tags.tag_at(i);
+                (t as u8, lanes[t].as_u64("lane").unwrap()[tags.offset_at(i)])
+            })
+            .collect()
+    }
+    fn lists_of(v: &Value) -> Vec<(u8, [u64; 4])> {
+        let Value::List(b, elems) = inner_of(v) else { panic!("lists") };
+        let e = elems.as_u64("elements").unwrap();
+        let ends = b.to_vec();
+        let mut out = Vec::with_capacity(ends.len());
+        let mut start = 0;
+        for end in ends {
+            let mut a = [0u64; 4];
+            for (k, x) in e[start..end].iter().enumerate() {
+                a[k] = *x;
+            }
+            out.push(((end - start) as u8, a));
+            start = end;
+        }
+        out
+    }
+
+    let (hay, needle) = prepared(Value::Prod(vec![
+        Value::u64((0..n as u64).map(|i| g_of(i) >> 4).collect()),
+        Value::u64((0..n as u64).map(|i| g_of(i) & 15).collect()),
+    ]));
+    let (hk, pk) = (pairs_of(&hay), pairs_of(&needle));
+    let c = find_t(&hay, &needle);
+    let r = rust_t(reps, || {
+        black_box(two_pointer(black_box(&pk), black_box(&hk)));
+    });
+    row("E1p find_pairs", n, c, r, "find over (u64, u64) keys, needle sorted, vs a typed two-pointer walk");
+
+    let tags: Vec<usize> = (0..n as u64).map(|i| (g_of(i) & 1) as usize).collect();
+    let lane = |t: u64| Value::u64((0..n as u64).filter(|&i| g_of(i) & 1 == t).map(|i| g_of(i) >> 1).collect());
+    let (hay, needle) = prepared(Value::sum(tags, vec![lane(0), lane(1)]));
+    let (hk, pk) = (sums_of(&hay), sums_of(&needle));
+    let c = find_t(&hay, &needle);
+    let r = rust_t(reps, || {
+        black_box(two_pointer(black_box(&pk), black_box(&hk)));
+    });
+    row("E1m find_sums", n, c, r, "find over Sum{u64 | u64} keys, needle sorted, vs a typed two-pointer walk");
+
+    let (mut ends, mut elems) = (Vec::with_capacity(n), Vec::new());
+    for i in 0..n as u64 {
+        let g = g_of(i);
+        for k in 0..(g & 3) {
+            elems.push((g >> 2) + k);
+        }
+        ends.push(elems.len());
+    }
+    let (hay, needle) = prepared(Value::List(ends.into(), Box::new(Value::u64(elems))));
+    let (hk, pk) = (lists_of(&hay), lists_of(&needle));
+    let c = find_t(&hay, &needle);
+    let r = rust_t(reps, || {
+        black_box(two_pointer(black_box(&pk), black_box(&hk)));
+    });
+    row("E1l find_lists", n, c, r, "find over List<u64> keys of length 0..=3, needle sorted, vs a typed two-pointer walk");
+
     // E2 gather — random permutation. corgi: `resolve_indices` (scalar, +bounds assert) then `Prim::gather`.
     let g = compile(&format!(
         "let h = input in (h map (e -> e and {mask}), h) gather"

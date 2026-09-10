@@ -157,13 +157,17 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
                 }
                 if first {
                     if g > f { lanes_level(&lanes, ia, ib, &cur, tree) } else { level(&ca[f], &cb[f], ia, ib, &cur, tree) }
-                    (cur, sa, sb) = tree.refined(&cur, ia, ib);
-                    first = false;
                 } else {
                     if g > f { lanes_level(&lanes, &sa[..], &sb[..], &cur, tree) } else { level(&ca[f], &cb[f], &sa[..], &sb[..], &cur, tree) }
-                    (cur, sa, sb) = tree.refined(&cur, &sa[..], &sb[..]);
                 }
                 f = next;
+                // the classes this field left equal, and their rows, for the next field; after
+                // the last field nothing reads them, and collecting them would be a pass over
+                // every row still in an equal class.
+                if f < ca.len() {
+                    (cur, sa, sb) = if first { tree.refined(&cur, ia, ib) } else { tree.refined(&cur, &sa[..], &sb[..]) };
+                }
+                first = false;
             }
         }
         (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
@@ -475,6 +479,61 @@ pub(crate) fn find_sorted(nb: &Bounds, needles: &Value, hb: &Bounds, hay: &Value
     }
 }
 
+/// `Find` for needle rows in order, at any shape: every needle row is merged into its haystack
+/// row by the level walk of [`survey_groups`], one class per row and all rows at once, and the
+/// reports are read one-sidedly. An exclusive needle run is absent, an empty range at the
+/// haystack cursor; an equal class is every needle in it at the class's haystack range; an
+/// exclusive haystack run only moves the cursor. The cost is the survey's: one gallop per row
+/// at the leading level, then a pass per level over the classes still tied, and never a round
+/// per search step. Requires every row of both sides sorted. Returns each needle element's
+/// `[lo, hi)` relative to its haystack row.
+pub(crate) fn find_groups(nb: &Bounds, needles: &Value, hb: &Bounds, hay: &Value) -> (Vec<u64>, Vec<u64>) {
+    let rows = nb.len();
+    let mut tree = Tree { nodes: Vec::with_capacity(rows) };
+    let roots: Vec<usize> = (0..rows).collect();
+    for r in 0..rows {
+        let (ns, ne) = nb.span(r);
+        let (hs, he) = hb.span(r);
+        tree.push(Node::Class { alo: ns, ahi: ne, blo: hs, bhi: he, la: ns, lb: hs, kids: None });
+    }
+    level(needles, hay, Identity, Identity, &roots, &mut tree);
+    let n = needles.len();
+    let (mut lo, mut hi) = (vec![0u64; n], vec![0u64; n]);
+    // The reports come in row order and, within a row, in merged order. The cursor is where
+    // an absent needle would sit in the haystack; rows are contiguous in the flat columns, so at
+    // every row's start it equals that row's haystack start, and it carries across rows.
+    let mut cursor = 0usize;
+    for g in tree.flatten_roots(&roots) {
+        match g {
+            GroupRun::A(alo, ahi) => {
+                for k in alo..ahi {
+                    lo[k] = cursor as u64;
+                    hi[k] = cursor as u64;
+                }
+            }
+            GroupRun::B(_, bhi) => cursor = bhi,
+            GroupRun::Both(alo, ahi, blo, bhi) => {
+                for k in alo..ahi {
+                    lo[k] = blo as u64;
+                    hi[k] = bhi as u64;
+                }
+                cursor = bhi;
+            }
+        }
+    }
+    let (mut ns, mut hs) = (0usize, 0usize);
+    for r in 0..rows {
+        let (ne, he) = (nb.end(r), hb.end(r));
+        for k in ns..ne {
+            lo[k] -= hs as u64;
+            hi[k] -= hs as u64;
+        }
+        ns = ne;
+        hs = he;
+    }
+    (lo, hi)
+}
+
 /// Advance `idx` while `pred` holds, by doubling steps then bisection: `O(log gap)` probes.
 fn gallop(idx: &mut usize, hi: usize, pred: impl Fn(usize) -> bool) {
     if *idx < hi && pred(*idx) {
@@ -577,8 +636,12 @@ impl Tree {
     }
     /// the reports in merged order, adjacent runs of one side joined.
     fn flatten(&self) -> Vec<GroupRun> {
+        self.flatten_roots(&[0])
+    }
+    /// [`flatten`](Self::flatten) from several top-level classes, in their order.
+    fn flatten_roots(&self, roots: &[usize]) -> Vec<GroupRun> {
         let mut out: Vec<GroupRun> = Vec::new();
-        let mut stack = vec![0usize];
+        let mut stack: Vec<usize> = roots.iter().rev().copied().collect();
         while let Some(n) = stack.pop() {
             match &self.nodes[n] {
                 Node::A(lo, hi) => match out.last_mut() {
