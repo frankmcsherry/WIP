@@ -13,7 +13,8 @@ use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Prim, Value};
+use survey::find_sorted;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -125,6 +126,18 @@ impl CmpOp {
                 let (hb, hvals) = haystack.into_list("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
+                // A leaf needle that is itself in order is MERGED into the haystack, one forward
+                // walk with galloping, instead of searched per probe: the shape a join has, both
+                // sides sorted, and the difference between `|needle| * log|haystack|` comparisons
+                // and `|needle| + |haystack|`. Asking costs one pass over the needle, which exits
+                // at the first inversion.
+                if let Value::Prim(p) = &nvals {
+                    if rows_sorted(&nb, p) {
+                        if let Some((lo_c, hi_c)) = find_sorted(&nb, &nvals, &hb, &hvals) {
+                            return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)]))));
+                        }
+                    }
+                }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
                 // row base the answer is relative to; the search moves `lo`, so the base is rewalked
@@ -163,6 +176,27 @@ impl CmpOp {
         })
     }
 
+}
+
+/// Is every row of `bounds` non-decreasing in `p`? One pass, exiting at the first inversion, so an
+/// unordered column costs a few loads for the question.
+fn rows_sorted(bounds: &Bounds, p: &Prim) -> bool {
+    fn scan<T: Ord>(bounds: &Bounds, v: &[T]) -> bool {
+        let mut start = 0;
+        for end in bounds.ends() {
+            if v[start..end].windows(2).any(|w| w[0] > w[1]) {
+                return false;
+            }
+            start = end;
+        }
+        true
+    }
+    match p {
+        Prim::U8(v) => scan(bounds, v),
+        Prim::U16(v) => scan(bounds, v),
+        Prim::U32(v) => scan(bounds, v),
+        Prim::U64(v) => scan(bounds, v),
+    }
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
@@ -227,5 +261,72 @@ fn batched_bound(
             }
         }
         active.truncate(w);
+    }
+}
+
+#[cfg(test)]
+mod merged_find {
+    use super::CmpOp;
+    use crate::value::Value;
+
+    fn u(xs: &[u64]) -> Value {
+        Value::u64(xs.to_vec())
+    }
+    fn list(ends: Vec<usize>, vals: Value) -> Value {
+        Value::List(ends.into(), Box::new(vals))
+    }
+
+    /// The merged `find` (a sorted needle walked into the haystack) must answer exactly what the
+    /// per-probe search answers, including absent needles, duplicate runs on either side, empty
+    /// rows, needles outside the haystack's range on both ends, and needles at every leaf width.
+    #[test]
+    fn merged_find_matches_the_per_probe_search() {
+        /// the batched-search path: a two-field product orders exactly as its first field but is
+        /// not a leaf, so it never takes the merge.
+        fn reference(nb: Vec<usize>, needles: &[u64], hb: Vec<usize>, hay: &[u64]) -> Value {
+            let pad = |xs: &[u64]| Value::Prod(vec![u(xs), Value::u64(vec![0; xs.len()])]);
+            CmpOp::Find.eval(Value::Prod(vec![list(nb, pad(needles)), list(hb, pad(hay))])).unwrap()
+        }
+        fn merged(nb: Vec<usize>, needles: &[u64], hb: Vec<usize>, hay: &[u64]) -> Value {
+            CmpOp::Find.eval(Value::Prod(vec![list(nb, u(needles)), list(hb, u(hay))])).unwrap()
+        }
+        fn merged_u16(nb: Vec<usize>, needles: &[u64], hb: Vec<usize>, hay: &[u64]) -> Value {
+            let narrow = |xs: &[u64]| Value::u16(xs.iter().map(|&x| x as u16).collect());
+            CmpOp::Find.eval(Value::Prod(vec![list(nb, narrow(needles)), list(hb, narrow(hay))])).unwrap()
+        }
+        /// (needle row ends, needle values, haystack row ends, haystack values)
+        type Case = (Vec<usize>, Vec<u64>, Vec<usize>, Vec<u64>);
+        let cases: Vec<Case> = vec![
+            // dense hits, misses at both ends, duplicate runs on both sides
+            (vec![6], vec![0, 1, 1, 3, 7, 9], vec![8], vec![1, 1, 2, 3, 3, 3, 5, 8]),
+            // needle entirely below / above the haystack
+            (vec![2], vec![0, 0], vec![3], vec![5, 6, 7]),
+            (vec![2], vec![9, 9], vec![3], vec![5, 6, 7]),
+            // several rows, each with its own range; the needle is sorted within each row only
+            (vec![2, 4], vec![1, 5, 2, 2], vec![3, 7], vec![1, 5, 5, 0, 2, 2, 9]),
+            // empty needle row, empty haystack row
+            (vec![0, 2], vec![3, 4], vec![2, 2], vec![3, 4]),
+            (vec![2, 2], vec![3, 4], vec![0, 2], vec![3, 4]),
+            // everything empty
+            (vec![0], vec![], vec![0], vec![]),
+            // every needle equal, every haystack element equal
+            (vec![3], vec![4, 4, 4], vec![4], vec![4, 4, 4, 4]),
+            // an UNSORTED needle row: the search, not the merge, and the same answer
+            (vec![4], vec![9, 1, 5, 1], vec![4], vec![1, 1, 5, 8]),
+        ];
+        for (nb, needles, hb, hay) in cases {
+            let want = reference(nb.clone(), &needles, hb.clone(), &hay);
+            assert_eq!(merged(nb.clone(), &needles, hb.clone(), &hay), want, "needles={needles:?} hay={hay:?}");
+            assert_eq!(merged_u16(nb, &needles, hb, &hay), want, "u16 needles={needles:?} hay={hay:?}");
+        }
+        // at scale: a sorted needle over an overlapping key space, against the same reference.
+        let mut hay: Vec<u64> = (0..2000u64).map(|i| (i * 7) % 900).collect();
+        hay.sort_unstable();
+        let mut needles: Vec<u64> = (0..500u64).map(|i| (i * 13) % 1000).collect();
+        needles.sort_unstable();
+        assert_eq!(
+            merged(vec![needles.len()], &needles, vec![hay.len()], &hay),
+            reference(vec![needles.len()], &needles, vec![hay.len()], &hay),
+        );
     }
 }

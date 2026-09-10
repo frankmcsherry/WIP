@@ -431,6 +431,59 @@ fn merge_pairs<T: Ord + Copy>(ka: impl Fn(usize) -> T, kb: impl Fn(usize) -> T, 
     out
 }
 
+/// Equal-range of every element of a SORTED needle in its haystack row: one forward walk with
+/// galloping, instead of an independent search per probe. The one-sided form of the merge above,
+/// for the shape a join has, both sides in key order and the question being where each needle
+/// sits. A per-probe search costs `|needle| * log|haystack|` comparisons and cannot use the fact
+/// that the probes are ordered; the walk costs `|needle| + |haystack|` at worst and less when the
+/// needles are dense, because the cursor never goes backwards.
+///
+/// Requires every row of `needles` non-decreasing and every row of `hay` sorted. Leaves only,
+/// `None` otherwise: the structured comparator allocates per call, which a per-element gallop
+/// cannot afford, and the shape this exists for is the scalar or hashed key. Returns each
+/// element's `[lo, hi)` relative to its haystack row, aligned with the needle's elements.
+pub(crate) fn find_sorted(nb: &Bounds, needles: &Value, hb: &Bounds, hay: &Value) -> Option<(Vec<u64>, Vec<u64>)> {
+    fn walk<T: Ord + Copy>(nb: &Bounds, hb: &Bounds, needles: &[T], hay: &[T]) -> (Vec<u64>, Vec<u64>) {
+        let n = needles.len();
+        let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let (mut ns, mut hs) = (0usize, 0usize);
+        for r in 0..nb.len() {
+            let (ne, he) = (nb.end(r), hb.end(r));
+            walk_ranges(&needles[ns..ne], &hay[hs..he], |lo, hi| {
+                lo_c.push(lo as u64);
+                hi_c.push(hi as u64);
+            });
+            ns = ne;
+            hs = he;
+        }
+        (lo_c, hi_c)
+    }
+    match (needles, hay) {
+        (Value::Prim(Prim::U8(nv)), Value::Prim(Prim::U8(hv))) => Some(walk(nb, hb, nv, hv)),
+        (Value::Prim(Prim::U16(nv)), Value::Prim(Prim::U16(hv))) => Some(walk(nb, hb, nv, hv)),
+        (Value::Prim(Prim::U32(nv)), Value::Prim(Prim::U32(hv))) => Some(walk(nb, hb, nv, hv)),
+        (Value::Prim(Prim::U64(nv)), Value::Prim(Prim::U64(hv))) => Some(walk(nb, hb, nv, hv)),
+        _ => None,
+    }
+}
+
+/// The walk itself, over one sorted `needles` slice into one sorted `hay` slice: `report(lo, hi)`
+/// is called once per needle, in order, with its equal range in `hay`. Each needle gallops from
+/// the previous needle's `lo`, so the cursor never goes backwards and a repeated needle costs one
+/// probe; a needle far from the last costs `O(log gap)`, where a search from scratch costs
+/// `O(log |hay|)` whatever the gap.
+pub(crate) fn walk_ranges<T: Ord + Copy>(needles: &[T], hay: &[T], mut report: impl FnMut(usize, usize)) {
+    let mut cursor = 0usize;
+    for &want in needles {
+        let mut lo = cursor;
+        gallop(&mut lo, hay.len(), |j| hay[j] < want);
+        let mut hi = lo;
+        gallop(&mut hi, hay.len(), |j| hay[j] <= want);
+        report(lo, hi);
+        cursor = lo;
+    }
+}
+
 /// Advance `idx` while `pred` holds, by doubling steps then bisection: `O(log gap)` probes.
 fn gallop(idx: &mut usize, hi: usize, pred: impl Fn(usize) -> bool) {
     if *idx < hi && pred(*idx) {
