@@ -449,18 +449,10 @@ pub(crate) fn find_sorted(nb: &Bounds, needles: &Value, hb: &Bounds, hay: &Value
         let (mut ns, mut hs) = (0usize, 0usize);
         for r in 0..nb.len() {
             let (ne, he) = (nb.end(r), hb.end(r));
-            let mut cursor = hs; // monotone within the row, since the needles are ordered
-            for &want in &needles[ns..ne] {
-                let mut lo = cursor;
-                gallop(&mut lo, he, |j| hay[j] < want);
-                let mut hi = lo;
-                gallop(&mut hi, he, |j| hay[j] <= want);
-                lo_c.push((lo - hs) as u64);
-                hi_c.push((hi - hs) as u64);
-                // resume from `lo`, not `hi`: a repeated needle finds the same range, and the
-                // gallop from `lo` then costs one probe.
-                cursor = lo;
-            }
+            walk_ranges(&needles[ns..ne], &hay[hs..he], |lo, hi| {
+                lo_c.push(lo as u64);
+                hi_c.push(hi as u64);
+            });
             ns = ne;
             hs = he;
         }
@@ -472,6 +464,23 @@ pub(crate) fn find_sorted(nb: &Bounds, needles: &Value, hb: &Bounds, hay: &Value
         (Value::Prim(Prim::U32(nv)), Value::Prim(Prim::U32(hv))) => Some(walk(nb, hb, nv, hv)),
         (Value::Prim(Prim::U64(nv)), Value::Prim(Prim::U64(hv))) => Some(walk(nb, hb, nv, hv)),
         _ => None,
+    }
+}
+
+/// The walk itself, over one sorted `needles` slice into one sorted `hay` slice: `report(lo, hi)`
+/// is called once per needle, in order, with its equal range in `hay`. Each needle gallops from
+/// the previous needle's `lo`, so the cursor never goes backwards and a repeated needle costs one
+/// probe; a needle far from the last costs `O(log gap)`, where a search from scratch costs
+/// `O(log |hay|)` whatever the gap.
+pub(crate) fn walk_ranges<T: Ord + Copy>(needles: &[T], hay: &[T], mut report: impl FnMut(usize, usize)) {
+    let mut cursor = 0usize;
+    for &want in needles {
+        let mut lo = cursor;
+        gallop(&mut lo, hay.len(), |j| hay[j] < want);
+        let mut hi = lo;
+        gallop(&mut hi, hay.len(), |j| hay[j] <= want);
+        report(lo, hi);
+        cursor = lo;
     }
 }
 
