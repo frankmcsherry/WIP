@@ -503,6 +503,35 @@ fn family_d(n: usize, reps: u32) {
         black_box(v);
     });
     row("D2 dedup", n, c, r, "sort+unique vs sort+dedup");
+
+    // D4/D5 the ALREADY-SORTED input: a leaf column sorted upstream and sorted or deduped again,
+    // which used to cost a full sort. The check declines on list and sum elements, so G1's
+    // `sort` then `dedup` over strings does not take this path. The ceilings are what the answer
+    // actually is: confirm the order, and for dedup one pass keeping the first of each run.
+    let mut asc = src.clone();
+    asc.sort_unstable();
+    let sorted = Value::List(vec![n].into(), Box::new(Value::u64(asc.clone())));
+
+    let g = compile("input sort");
+    let c = corgi_t(&g, &sorted, reps);
+    let r = rust_t(reps, || {
+        black_box(black_box(&asc).windows(2).all(|w| w[0] <= w[1]));
+    });
+    row("D4 sort_sorted", n, c, r, "detect the order and return vs confirm it");
+
+    let g = compile("input dedup");
+    let c = corgi_t(&g, &sorted, reps);
+    let r = rust_t(reps, || {
+        let s = black_box(&asc);
+        let mut out: Vec<u64> = Vec::with_capacity(s.len());
+        for (k, &x) in s.iter().enumerate() {
+            if k == 0 || x != s[k - 1] {
+                out.push(x);
+            }
+        }
+        black_box(out);
+    });
+    row("D5 dedup_sorted", n, c, r, "run boundaries from the order check vs one unique pass");
 }
 
 /// E — relational / index generators. `gather` is fresh-allocating by necessity; the open question is

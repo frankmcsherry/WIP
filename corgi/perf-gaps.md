@@ -78,6 +78,8 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 | **C5 fold_sum_count** | aggregation | **6394×** | **4716×** | **2949×** | same lockstep degeneration, product-of-monoids accumulator | monoid kernel, or the interpreter |
 | D1 sort_u64 | order | 1.3× | 1.2× | 2.6× | the indexed sort: keys pulled once, radixed with the permutation alongside, emitted as the column; the carried permutation is the residue | values-only leaf mode |
 | D2 dedup | order | 1.7× | 1.5× | 2.8× | the same sort, run starts read off the sorted column | values-only leaf mode |
+| D4 sort_sorted | order | 1.16× | 1.10× | 1.12× | a leaf already in order: one pass confirms it and the column returns as it is. The check declines on list and sum elements, so G1's sort-then-dedup over strings is unchanged (2026-09-10, same machine) | — at ceiling |
+| D5 dedup_sorted | order | 5.7× | 4.0× | 3.3× | already in order: run boundaries from the order check, then a gather of the firsts (2026-09-10, same machine) | a writer (as B1) |
 | **E1 join_find_slices** | relational | — | 5.3× | 6.3× | `find` searches per probe instead of merging two sorted runs | merge-join path |
 | E2 gather | relational | — | **0.71×** | 1.03× | corgi at or below the Rust ceiling | — |
 | E3 gather_chain | relational | — | 1.00× | 1.25× | two gathers, each resolve+gather | index-composition rewrite |

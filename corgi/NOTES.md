@@ -46,6 +46,9 @@ src/
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
+               The order ops ASK whether the column is already in order before they sort
+               (`sortedness.rs`: known_sorted / sorted_signs); a leaf or product of leaves is
+               settled cheaply, a list or sum element with ties declines and sorts as before.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
