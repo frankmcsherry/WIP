@@ -78,7 +78,8 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 | **C5 fold_sum_count** | aggregation | **6394×** | **4716×** | **2949×** | same lockstep degeneration, product-of-monoids accumulator | monoid kernel, or the interpreter |
 | D1 sort_u64 | order | 1.3× | 1.2× | 2.6× | the indexed sort: keys pulled once, radixed with the permutation alongside, emitted as the column; the carried permutation is the residue | values-only leaf mode |
 | D2 dedup | order | 1.7× | 1.5× | 2.8× | the same sort, run starts read off the sorted column | values-only leaf mode |
-| **E1 join_find_slices** | relational | — | 5.3× | 6.3× | `find` searches per probe instead of merging two sorted runs | merge-join path |
+| E1f join_find | relational | — | **0.27–0.37×** | **0.38×** | a sorted needle is merged into the haystack with galloping, which skips the duplicate runs a two-pointer walks (2026-09-10, same machine) | — |
+| E1 join_find_slices | relational | — | 1.3–3.5× | 1.3× | the merged find, then `slices` materializes; the row is the output copy. The harness now builds both sides outside the timer (it used to run a `dedup`, a full sort, inside it) (2026-09-10, same machine) | a writer (as B1) |
 | E2 gather | relational | — | **0.71×** | 1.03× | corgi at or below the Rust ceiling | — |
 | E3 gather_chain | relational | — | 1.00× | 1.25× | two gathers, each resolve+gather | index-composition rewrite |
 | **F1 branch_match** | sum-type | — | **16×** | **15×** | columnar partition + recombine where the scalar form vectorizes to a blend | use `select`; `match` pays off on heterogeneous lanes |
@@ -128,7 +129,7 @@ Those rows are why navigating by the old map was unsafe: it was directionally wr
 **Three gaps stand, unchanged in character:**
 
 1. **group-by on a low-cardinality key, 49–82×.** corgi has only the general structural `group`, which sorts; a 256-bucket sum is one O(n) accumulate pass. The missing piece is a narrow-key fast path, the same lever collie added to its `group`.
-2. **the single-key join, 5.3–6.3×.** With both sides sorted the Rust ceiling is a two-pointer merge; corgi's `find` does an independent search per probe and then `slices` materializes. A relational-op gap, not fusion. (`arrange::survey` already *is* the merge kernel — it is the surface `join` that does not reach it.)
+2. ~~**the single-key join, 5.3–6.3×.**~~ The find half is done: a sorted needle is merged into the haystack (`survey::find_sorted`), 0.3–0.4× of a two-pointer walk. What remains of E1 is `slices` materializing the output.
 3. **`mul`/`sub` by a constant cost a full extra column.** The `pair_imm` desugaring makes `Lit` broadcast an n-element constant and build a product, where `AddU64`/`Shr`/`And`/`Gt` have immediate kernels that touch neither. Cheap and local; A3's tax is 1.6–2.8× and this is most of it.
 
 **The aggregation controls were 8–12× off the ceiling they are named for, and the mechanism was a copy.**

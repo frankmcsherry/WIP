@@ -155,14 +155,6 @@ fn one_list(n: usize) -> Value {
     Value::List(vec![n].into(), Box::new(Value::u64(scrambled(n))))
 }
 
-/// a SORTED big `List<U64>` (one `n`-wide row of `0..n`) — the equi-join feeds find/slices a haystack
-/// already in key order, so the measurement isolates the join primitives from a sort cost.
-fn sorted_list(n: usize) -> Value {
-    Value::List(
-        vec![n].into(),
-        Box::new(Value::u64((0..n as u64).collect())),
-    )
-}
 
 fn compile(src: &str) -> Graph<NumOp> {
     // the lowered graph is what a `Program` runs: fallible stages' downstream ops on the Ok lane.
@@ -511,25 +503,56 @@ fn family_e(n: usize, reps: u32) {
     let mask = n as u64 - 1; // n is a power of two, so `& mask` is an in-bounds row-relative index
     let src = scrambled(n);
 
-    // E1 single-key equi-join (find + slices) over a SORTED haystack — the join primitives, no sort cost.
-    let g = compile(
-        "let bn = input in let build = bn map (x -> (x shr 8, x)) in \
-         let probes = bn map (x -> x shr 8) dedup in let t = build transpose in \
-         let r = (probes, t.0) find in (r, t.1) slices",
-    );
-    let sl = sorted_list(n);
-    let c = corgi_t(&g, &sl, reps);
+    // E1 single-key equi-join (find + slices) over a SORTED haystack — the join PRIMITIVES only.
+    // Both sides are built OUTSIDE the timer. The probe side used to be computed by a `dedup`
+    // inside the timed program, which is a full sort: the row then measured a sort plus a join and
+    // moved with every sort change, which is not what a join row is for.
+    let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
+    let vals: Vec<u64> = (0..n as u64).collect();
+    let probes = {
+        let mut p = keys.clone();
+        p.dedup();
+        p
+    };
+    let np = probes.len();
+    let arg = Value::Prod(vec![
+        Value::List(vec![np].into(), Box::new(Value::u64(probes.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(keys.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::u64(vals.clone()))),
+    ]);
+    // E1f the `find` alone: each probe's `[lo, hi)` in the keys, no materialization. The Rust
+    // ceiling is the two-pointer walk that produces the same two vectors.
+    let g = compile("(input.0, input.1) find");
+    let c = corgi_t(&g, &arg, reps);
     let r = rust_t(reps, || {
-        let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
-        let vals: Vec<u64> = (0..n as u64).collect();
-        let mut probes = keys.clone();
-        probes.dedup();
+        let (keys, probes) = (black_box(&keys), black_box(&probes));
+        let (mut lo, mut hi) = (Vec::with_capacity(probes.len()), Vec::with_capacity(probes.len()));
+        let mut j = 0usize;
+        for &p in probes {
+            while j < keys.len() && keys[j] < p {
+                j += 1;
+            }
+            let start = j;
+            while j < keys.len() && keys[j] == p {
+                j += 1;
+            }
+            lo.push(start as u64);
+            hi.push(j as u64);
+        }
+        black_box((lo, hi));
+    });
+    row("E1f join_find", n, c, r, "find alone (merged walk when the needle is sorted) vs a two-pointer walk");
+
+    let g = compile("let r = (input.0, input.1) find in (r, input.2) slices");
+    let c = corgi_t(&g, &arg, reps);
+    let r = rust_t(reps, || {
+        let (keys, vals, probes) = (black_box(&keys), black_box(&vals), black_box(&probes));
         // materialize the matched value ranges into a flat (values, bounds) list — corgi's `slices`
         // produces exactly this, so the ceiling must pay the same output copy, not reference ranges.
         let mut flat: Vec<u64> = Vec::with_capacity(n);
         let mut bounds: Vec<usize> = Vec::with_capacity(probes.len());
         let mut j = 0usize;
-        for &p in &probes {
+        for &p in probes {
             let start = j;
             while j < keys.len() && keys[j] == p {
                 j += 1;
@@ -544,7 +567,7 @@ fn family_e(n: usize, reps: u32) {
         n,
         c,
         r,
-        "find (per-probe search)+slices vs two-pointer merge, both materializing",
+        "find (merged walk when the needle is sorted) + slices vs two-pointer merge",
     );
 
     // E2 gather — random permutation. corgi: `resolve_indices` (scalar, +bounds assert) then `Prim::gather`.
