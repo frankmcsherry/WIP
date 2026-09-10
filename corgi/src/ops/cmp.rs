@@ -1,11 +1,13 @@
 //! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `Gt` (a column
 //! vs a constant, the immediate-form sugar) — plus the list ops `SortList`/`DedupList`/`GroupKey`
-//! (discrimination via `sort_blocks`/`run_starts`) and `Find` (batched binary search via `compare_idx`). All are
+//! (discrimination via `sort_blocks`/`run_starts`) and `Find` (a search per needle on leaves, `search`;
+//! a batched binary search via `compare_idx` otherwise). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
 //! The structural-order engine these ops reduce to is the private [`order`] submodule.
 
 pub(crate) mod order;
+pub(crate) mod search;
 pub(crate) mod sort;
 pub(crate) mod survey;
 
@@ -13,8 +15,8 @@ use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_starts, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
-use crate::value::{Bounds, Prim, Value};
-use survey::find_sorted;
+use crate::value::{Bounds, Value};
+use search::find_leaf;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -133,8 +135,9 @@ impl CmpOp {
                 Value::List(no.into(), Box::new(Value::Prod(vec![keys, inner])))
             }
 
-            // for each needle element, equal_range it in the matching haystack row (batched binary
-            // search, see `batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
+            // for each needle element, equal_range it in the matching haystack row: leaves by a
+            // search per needle (`search`), anything else by the batched binary search
+            // (`batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find")?;
                 let (nb, nvals) = needle.into_list("Find needle")?;
@@ -143,17 +146,10 @@ impl CmpOp {
                 let (hb, hvals) = haystack.rows_of("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
-                // A leaf needle that is itself in order is MERGED into the haystack, one forward
-                // walk with galloping, instead of searched per probe: the shape a join has, both
-                // sides sorted, and the difference between `|needle| * log|haystack|` comparisons
-                // and `|needle| + |haystack|`. Asking costs one pass over the needle, which exits
-                // at the first inversion.
-                if let Value::Prim(p) = &nvals {
-                    if rows_sorted(&nb, p) {
-                        if let Some((lo_c, hi_c)) = find_sorted(&nb, &nvals, hb, hvals) {
-                            return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)]))));
-                        }
-                    }
+                // Leaves: a search per needle (a walk for a dense row of needles in order; a
+                // branch-free binary search, sixteen needles at a time, otherwise). See `search`.
+                if let Some((lo_c, hi_c)) = find_leaf(&nb, &nvals, hb, hvals) {
+                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)]))));
                 }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
@@ -189,27 +185,6 @@ impl CmpOp {
         })
     }
 
-}
-
-/// Is every row of `bounds` non-decreasing in `p`? One pass, exiting at the first inversion, so an
-/// unordered column costs a few loads for the question.
-fn rows_sorted(bounds: &Bounds, p: &Prim) -> bool {
-    fn scan<T: Ord>(bounds: &Bounds, v: &[T]) -> bool {
-        let mut start = 0;
-        for end in bounds.ends() {
-            if v[start..end].windows(2).any(|w| w[0] > w[1]) {
-                return false;
-            }
-            start = end;
-        }
-        true
-    }
-    match p {
-        Prim::U8(v) => scan(bounds, v),
-        Prim::U16(v) => scan(bounds, v),
-        Prim::U32(v) => scan(bounds, v),
-        Prim::U64(v) => scan(bounds, v),
-    }
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.

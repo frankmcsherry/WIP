@@ -105,8 +105,9 @@ src/
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
-               `find` merges a leaf needle that is itself in order into the haystack (one walk with
-               galloping, `survey::find_sorted`) and searches per probe otherwise.
+               `find` on leaves (`cmp/search.rs`): a dense row of needles in order is walked into
+               its haystack row (galloping, `survey::walk_ranges`); every other needle gets a
+               branch-free binary search, sixteen in lockstep. Structured values: `batched_bound`.
     cmp/       the order machinery the cmp ops reduce to. order.rs: compare_idx (bulk structural
                order over index pairs; compare_cols is the diagonal case), block labels, group_bounds.
                sort.rs: the indexed discrimination sort (dev/indexed-sort.md). survey.rs: the merge
