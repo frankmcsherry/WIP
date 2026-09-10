@@ -755,6 +755,15 @@ impl Value {
         }
     }
 
+    /// borrow the leaf: for an op that reads a MASK or a TAG column, whose width is the
+    /// producer's choice rather than a fixed u64.
+    pub fn as_prim(&self, who: &str) -> Result<&Prim, String> {
+        match self {
+            Value::Prim(p) => Ok(p),
+            other => Err(format!("{who}: expected a leaf, got {}", shape_of_value(other))),
+        }
+    }
+
     pub fn into_prim(self, who: &str) -> Result<Prim, String> {
         match self {
             Value::Prim(p) => Ok(p),

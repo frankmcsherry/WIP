@@ -364,8 +364,8 @@ impl<L: OpLike> Op<L> {
                 let (bounds, vals) = data.into_list("Filter data")?;
                 let (mb, mv) = mask.into_list("Filter mask")?;
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
-                let m = mv.as_u64("Filter mask")?;
-                let (idx, nb) = filter_mask(&bounds, m);
+                // any nonzero-is-true leaf reads as a mask; `filter_mask` dispatches the width.
+                let (idx, nb) = filter_mask(&bounds, mv.as_prim("Filter mask")?);
                 Value::List(nb.into(), Box::new(gather(&vals, &idx)))
             }
 

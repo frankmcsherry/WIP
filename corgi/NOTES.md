@@ -48,6 +48,9 @@ src/
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+               A NARROWER unsigned operand widens to a cell's declared width (the declared width is
+               the result's). Reduce/Scan take any leaf width and accumulate at u64; min/max come out
+               at the element's width. A mask reads at any width (`Filter`, `arrange::mask_positions`).
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
                per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each

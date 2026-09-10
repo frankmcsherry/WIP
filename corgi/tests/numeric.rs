@@ -201,3 +201,83 @@ fn float_rem_is_rejected() {
     let shape = Shape::Prod(vec![Shape::Prim(64), Shape::Prim(64)]);
     assert!(shape_of(&g, &shape).is_err(), "float Rem must not type");
 }
+
+
+/// run a graph of one op on one input.
+fn one(op: impl Into<NumOp>, input: Value) -> Result<Value, String> {
+    let mut b = Builder::<NumOp>::default();
+    let inp = b.input();
+    let out = b.add(op, vec![inp]);
+    let g = b.finish(out);
+    shape_of(&g, &shape_of_value(&input))?;
+    Ok(eval_graph(&g, input))
+}
+
+fn list(ends: Vec<usize>, vals: Value) -> Value {
+    Value::List(ends.into(), Box::new(vals))
+}
+
+/// The reductions take any leaf width. The accumulating ones (`add`, `mul`, `all`, `any`) come
+/// out at u64, since a sum of bytes is not a byte; the order ones (`min`, `max`) come out at the
+/// element's width, since the answer is an element.
+#[test]
+fn reductions_take_any_width_and_accumulate_at_u64() {
+    use corgi::Red;
+    let bytes = list(vec![3, 3, 5], Value::u8(vec![200, 100, 7, 9, 3]));
+    assert_eq!(one(ArithOp::Reduce(Red::Add), bytes.clone()).unwrap(), u64(&[307, 0, 12]));
+    assert_eq!(one(ArithOp::Reduce(Red::Mul), bytes.clone()).unwrap(), u64(&[140000, 1, 27]));
+    assert_eq!(one(ArithOp::Reduce(Red::Min), bytes.clone()).unwrap(), Value::u8(vec![7, 255, 3]));
+    assert_eq!(one(ArithOp::Reduce(Red::Max), bytes.clone()).unwrap(), Value::u8(vec![200, 0, 9]));
+    assert_eq!(one(ArithOp::Reduce(Red::All), bytes.clone()).unwrap(), u64(&[1, 1, 1]));
+    // the scans follow the same split: a running sum widens, a running minimum stays a byte.
+    assert_eq!(
+        one(ArithOp::Scan(Red::Add), bytes.clone()).unwrap(),
+        list(vec![3, 3, 5], u64(&[200, 300, 307, 9, 12]))
+    );
+    assert_eq!(
+        one(ArithOp::Scan(Red::Min), bytes).unwrap(),
+        list(vec![3, 3, 5], Value::u8(vec![200, 100, 7, 9, 3]))
+    );
+    // u64 in, u64 out, unchanged.
+    let wide = list(vec![2], u64(&[u64::MAX, 2]));
+    assert_eq!(one(ArithOp::Reduce(Red::Add), wide.clone()).unwrap(), u64(&[1]));
+    assert_eq!(one(ArithOp::Reduce(Red::Max), wide).unwrap(), u64(&[u64::MAX]));
+}
+
+/// A NARROWER unsigned operand widens to a cell's declared width: the declared width is the
+/// result's. A wider operand does not fit, and a signed or float kind, whose encoding is
+/// width-dependent, must already match.
+#[test]
+fn a_narrower_unsigned_operand_widens_to_the_cell() {
+    let pair = |a, b| Value::Prod(vec![a, b]);
+    assert_eq!(
+        one(ArithOp::Bin(BinOp::Mul, Kind::U, 64), pair(u64(&[7, 9]), Value::u8(vec![1, 0]))).unwrap(),
+        u64(&[7, 0])
+    );
+    assert_eq!(
+        one(ArithOp::Bin(BinOp::Add, Kind::U, 32), pair(Value::u8(vec![200]), Value::u16(vec![1000]))).unwrap(),
+        Value::u32(vec![1200])
+    );
+    let err = one(ArithOp::Bin(BinOp::Add, Kind::U, 8), pair(Value::u8(vec![1]), u64(&[1]))).unwrap_err();
+    assert!(err.contains("does not fit"), "{err}");
+    let err = one(ArithOp::Bin(BinOp::Add, Kind::I, 64), pair(Value::u8(vec![1]), u64(&[1]))).unwrap_err();
+    assert!(err.contains("cannot widen"), "{err}");
+}
+
+/// A filter mask reads at any leaf width, and `arrange::mask_positions` is the same index list.
+#[test]
+fn a_mask_reads_at_any_width() {
+    let data = list(vec![3, 5], u64(&[10, 20, 30, 40, 50]));
+    for mask in [
+        list(vec![3, 5], Value::u8(vec![1, 0, 1, 0, 1])),
+        list(vec![3, 5], Value::u16(vec![7, 0, 7, 0, 7])),
+        list(vec![3, 5], u64(&[1, 0, 1, 0, 1])),
+    ] {
+        assert_eq!(
+            one(Op::Filter, Value::Prod(vec![data.clone(), mask])).unwrap(),
+            list(vec![2, 3], u64(&[10, 30, 50]))
+        );
+    }
+    assert_eq!(corgi::arrange::mask_positions(&Value::u8(vec![0, 3, 0, 1])), Some(vec![1, 3]));
+    assert_eq!(corgi::arrange::mask_positions(&Value::Unit(2)), None);
+}
