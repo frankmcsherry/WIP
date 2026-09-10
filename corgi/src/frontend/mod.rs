@@ -22,7 +22,10 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "chunk")
+    matches!(
+        name,
+        "field" | "gt" | "lit" | "add_u64" | "cast" | "chunk"
+    )
         || name.starts_with("lit_") // typed literals `lit_<k><w> N`
 }
 
@@ -66,17 +69,57 @@ fn typed_arith(name: &str, arg: Option<u64>) -> Option<NumOp> {
         "mul" => bin(BinOp::Mul),
         "div" => bin(BinOp::Div),
         "rem" => bin(BinOp::Rem),
+        // the bitwise cells reach every width by suffix, as the arithmetic ones do. `eval` rejects
+        // a non-unsigned kind, so `xor_i32` is a shape error rather than a silent bit twiddle on a
+        // swizzled encoding.
+        "shl" => bin(BinOp::Shl),
+        "shr" => bin(BinOp::Shr),
+        "and" => bin(BinOp::And),
+        "or" => bin(BinOp::Or),
+        "xor" => bin(BinOp::Xor),
         "neg" => Some(ArithOp::Neg(k, w).into()),
         // min/max take no kind/width suffix — they're kind-blind and width-inferred (`min`/`max`).
         _ => None,
     }
 }
 
-/// which op idents are pair-eating binaries that accept an optional immediate: `x sub 1` is sugar
-/// for `(x, x lit 1) sub`. (`and`/`shr`/`gt`/`add_u64` above are the core's immediate KERNELS and
-/// always take their number; these desugar at the surface and the core sees the lit-pair graph.)
+/// which op idents are pair-eating binaries that accept an immediate: `x sub 1`. Most of them have
+/// an immediate CELL in the grid and lower straight to it ([`resolve_imm`]); the rest fall back to
+/// the pair form `(x, x lit 1) sub`.
 pub(crate) fn pair_imm(name: &str) -> bool {
-    matches!(name, "add" | "sub" | "mul" | "min" | "max" | "eq" | "ne" | "lt" | "le")
+    matches!(
+        name,
+        "add" | "sub" | "mul" | "rem" | "min" | "max" | "eq" | "ne" | "lt" | "le" | "shl" | "shr"
+            | "and" | "or" | "xor"
+    )
+}
+
+/// the immediate kernel for a pair-eating binary, at the unsigned-64 row the kind-blind surface
+/// reaches. `None` means the grid has no immediate cell for that name and the caller should build
+/// the `(x, x lit c)` pair — which is where `min`/`max` land, since they are kind-blind ORDER ops
+/// in `cmp` rather than cells of the arithmetic grid.
+///
+/// This is the whole of the immediate axis at the surface: before it, `x mul 3` broadcast a
+/// million-element constant column and built a product to multiply by three.
+pub(crate) fn resolve_imm(name: &str, c: u64) -> Option<NumOp> {
+    let bin = |op| Some(ArithOp::BinImm(op, Kind::U, 64, c).into());
+    let rel = |p| Some(CmpOp::RelImm(p, c).into());
+    match name {
+        "add" => bin(BinOp::Add),
+        "sub" => bin(BinOp::Sub),
+        "mul" => bin(BinOp::Mul),
+        "rem" => bin(BinOp::Rem),
+        "shl" => bin(BinOp::Shl),
+        "shr" => bin(BinOp::Shr),
+        "and" => bin(BinOp::And),
+        "or" => bin(BinOp::Or),
+        "xor" => bin(BinOp::Xor),
+        "eq" => rel(Pred::Eq),
+        "ne" => rel(Pred::Ne),
+        "lt" => rel(Pred::Lt),
+        "le" => rel(Pred::Le),
+        _ => None,
+    }
 }
 
 /// the op-name -> `NumOp` table the front-end lowers through. `map` / `map_variant` are NOT here:
@@ -85,7 +128,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     let n = || arg.ok_or_else(|| format!("op '{name}' needs a numeric argument"));
     Ok(match name {
         "field" => Op::Field(n()? as usize).into(),
-        "gt" => CmpOp::Gt(n()?).into(), // column vs immediate (the threshold-filter sugar)
+        "gt" => CmpOp::RelImm(Pred::Gt, n()?).into(), // column vs immediate (the threshold-filter sugar)
         "cast" => Op::Cast(n()? as u32).into(),
         "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
@@ -148,9 +191,17 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "to_f64" => ArithOp::ToFloat(64).into(),
         // branchless blend: (mask, then, else) -> picked column (the SIMD bitselect, see Op::Select)
         "select" => Op::Select.into(),
-        "add_u64" => ArithOp::AddU64(n()?).into(),
-        "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
-        "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
+        // `add_u64 N` names an immediate cell directly; it predates the immediate axis and is kept
+        // because programs and hosts spell it. Every other immediate is written as a binary with a
+        // trailing number (`x shr 1`) and reaches the same cell through `resolve_imm`.
+        "add_u64" => ArithOp::BinImm(BinOp::Add, Kind::U, 64, n()?).into(),
+        // the bitwise family, as PAIR-eating binaries like `add`/`sub`/`mul` — unsigned-only, since
+        // they read stored bytes. `x shr 1` is the immediate cell of the same op.
+        "shl" => ArithOp::Bin(BinOp::Shl, Kind::U, 64).into(),
+        "shr" => ArithOp::Bin(BinOp::Shr, Kind::U, 64).into(), // x >> k  (divide by 2^k)
+        "and" => ArithOp::Bin(BinOp::And, Kind::U, 64).into(), // x & m   (mod 2^k via m = 2^k-1)
+        "or" => ArithOp::Bin(BinOp::Or, Kind::U, 64).into(),
+        "xor" => ArithOp::Bin(BinOp::Xor, Kind::U, 64).into(),
         // named monoid reductions, each `fold_<binop>` (fold_add = sum, fold_mul = product):
         "fold_add" => ArithOp::Reduce(Red::Add).into(),
         "fold_mul" => ArithOp::Reduce(Red::Mul).into(),

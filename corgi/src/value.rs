@@ -577,13 +577,42 @@ macro_rules! prim {
 
             /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
             /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
-            /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
+            /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`) and pick ONE concrete lane function
+            /// above the loop, so the lane body is one comparison, branchless.
             pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
                 match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
-                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u64)
-                        .collect(), )+
+                    $( (Prim::$V(a), Prim::$V(b)) => match (lt, eq, gt) {
+                        (true, false, false) => mask_zip(a, b, |x: $t, y| x < y),
+                        (false, true, false) => mask_zip(a, b, |x: $t, y| x == y),
+                        (false, false, true) => mask_zip(a, b, |x: $t, y| x > y),
+                        (true, true, false) => mask_zip(a, b, |x: $t, y| x <= y),
+                        (false, true, true) => mask_zip(a, b, |x: $t, y| x >= y),
+                        (true, false, true) => mask_zip(a, b, |x: $t, y| x != y),
+                        // no predicate is all-false or all-true, but the grid is total.
+                        (false, false, false) => vec![0u64; a.len()],
+                        (true, true, true) => vec![1u64; a.len()],
+                    }, )+
                     _ => panic!("rel: prim width mismatch"),
+                }
+            }
+
+            /// lane-wise relational compare against a CONSTANT → a 0/1 mask, at this width. The
+            /// immediate sibling of [`Prim::rel`]: the same kind-blindness (it reads stored bytes,
+            /// so it is correct for the swizzled signed and float encodings too) and the same one
+            /// lane function per predicate, but no second column to read, where the pair form has
+            /// to broadcast the constant into one first.
+            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+                match self {
+                    $( Prim::$V(v) => { let y = c as $t; match (lt, eq, gt) {
+                        (true, false, false) => mask_imm(v, y, |x: $t, y| x < y),
+                        (false, true, false) => mask_imm(v, y, |x: $t, y| x == y),
+                        (false, false, true) => mask_imm(v, y, |x: $t, y| x > y),
+                        (true, true, false) => mask_imm(v, y, |x: $t, y| x <= y),
+                        (false, true, true) => mask_imm(v, y, |x: $t, y| x >= y),
+                        (true, false, true) => mask_imm(v, y, |x: $t, y| x != y),
+                        (false, false, false) => vec![0u64; v.len()],
+                        (true, true, true) => vec![1u64; v.len()],
+                    } } )+
                 }
             }
 
@@ -617,6 +646,21 @@ prim! {
     U16 => u16,
     U32 => u32,
     U64 => u64,
+}
+
+/// One 0/1 mask per lane from a concrete comparison: the lane body of [`Prim::rel`] and
+/// [`Prim::rel_imm`], monomorphized per predicate. Resolving a predicate to its three order
+/// flags keeps the body branchless, but evaluating all three comparisons and OR-ing them was
+/// three times the work of the one asked for; the callers pick a single `f` above the loop.
+#[inline]
+fn mask_zip<T: Copy>(a: &[T], b: &[T], f: impl Fn(T, T) -> bool) -> Vec<u64> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y) as u64).collect()
+}
+
+/// [`mask_zip`] against a constant right operand.
+#[inline]
+fn mask_imm<T: Copy>(a: &[T], y: T, f: impl Fn(T, T) -> bool) -> Vec<u64> {
+    a.iter().map(|&x| f(x, y) as u64).collect()
 }
 
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in
@@ -720,7 +764,7 @@ impl Value {
     /// `into_u64` forces ownership, and ownership is a full column COPY whenever anyone else still
     /// holds the buffer: a graph node with fan-out 2, or a caller that keeps its input. Measured on
     /// a one-pass `fold_add` at 1M rows, that copy was 7.9x the whole operation. Reading needs none
-    /// of it; only an op that rewrites its operand in place (`AddU64`, `Shr`, `And`, `Scan`) has to
+    /// of it; only an op that rewrites its operand in place (`BinImm`, `Scan`) has to
     /// consume it.
     pub fn as_u64(&self, who: &str) -> Result<&[u64], String> {
         match self {

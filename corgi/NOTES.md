@@ -45,9 +45,13 @@ src/
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
-    cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
+    cmp.rs     CmpOp: Rel(Pred) + RelImm(Pred, c) + Min/Max + SortList/DedupList/GroupKey/Find. Kind-blind
+               comparisons; `Gt(c)` is the older spelling of `RelImm(Gt, c)`.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
-               (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+               (op × kind × width) grid in two forms, `Bin` (eats a pair) and `BinImm` (eats one column and
+               a constant), driven from one table of lane bodies; BinOp covers arithmetic plus the
+               unsigned-only bitwise family Shl/Shr/And/Or/Xor. `AddU64`/`Shr`/`And` are the older
+               spellings of `BinImm` cells. Reduce/Scan over List<U64>. enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
                per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
@@ -159,10 +163,10 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
   *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
-  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
+  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`BinImm` does).
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
-  *Reuse policy:* an op that is elementwise AND same-width (`AddU64`/`Shr`/`And`, `bin_into`, `neg_into`,
+  *Reuse policy:* an op that is elementwise AND same-width (`Bin`/`BinImm`, `bin_into`, `neg_into`,
   `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
   fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, `cast` = re-width, `rel`/`cmp_idx`/
@@ -306,7 +310,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
   naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
-  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1` ≡ `(x, x lit 1) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are untouched).
+  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1`), which lowers to the grid's immediate cell where one exists (`BinImm`/`RelImm`) and to `(x, x lit 1) sub` otherwise (`min`/`max`).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).

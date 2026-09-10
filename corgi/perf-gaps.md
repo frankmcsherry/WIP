@@ -66,10 +66,10 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 |---|---|---|---|---|---|---|
 | A1 add_const | pointwise | 1.8× | 0.92× | 1.09× | single pass at the bandwidth ceiling (upper bound — in-place op, shared input) | — at ceiling |
 | A2 add_chain8 | pointwise | tax 1.06 / prize 6.65 | tax 0.93 / prize 2.11 | tax 1.26 / prize 3.69 | per-pass at the Rust ceiling; the gap is un-fused passes | **fusion** |
-| A3 mixed_chain | pointwise | tax 2.76 | tax 2.79 | tax 1.61 | `mul`/`sub` by a constant lack immediate kernels, so `Lit` broadcasts a column and builds a `Prod` | immediate kernels, then fusion |
+| A3 mixed_chain | pointwise | tax 1.13 | tax 0.71 | tax 0.99 | every constant right operand is an immediate cell of the grid; the gap is un-fused passes (2026-09-10, same machine) | fusion |
 | A4 map_reduce | pointwise | tax 2.54 / prize 2.18 | tax 1.10 / prize 14.4 | tax 1.25 / prize 9.30 | intermediate map column, then a fold over it | **fusion — the biggest prize on the board** |
 | B1 filter_values | selection | 3.3× | 2.7× | 3.9× | mask column + scalar `filter_mask` + gather vs one predicated push | partly fusion; SIMD compaction |
-| B2 cmp_select | selection | 4.5× | 3.3× | 3.7× | 4 passes vs 1 fused | fusion |
+| B2 cmp_select | selection | 2.6× | 2.5× | 2.8× | 4 passes vs 1 fused; `rel` runs one comparison per lane (2026-09-10, same machine) | fusion |
 | C1 fold_add | aggregation | 1.2× | **1.00×** | **1.00×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | C2 fold_max | aggregation | 1.05× | **1.00×** | **1.01×** | one SIMD pass, at the Rust ceiling | — at ceiling |
 | **C3 group_by_sum** | aggregation | 22× | **49–63×** | **79–82×** | sort-based group where a 256-bucket accumulate is one O(n) pass | no — **missing narrow-key op** |
@@ -129,7 +129,7 @@ Those rows are why navigating by the old map was unsafe: it was directionally wr
 
 1. **group-by on a low-cardinality key, 49–82×.** corgi has only the general structural `group`, which sorts; a 256-bucket sum is one O(n) accumulate pass. The missing piece is a narrow-key fast path, the same lever collie added to its `group`.
 2. **the single-key join, 5.3–6.3×.** With both sides sorted the Rust ceiling is a two-pointer merge; corgi's `find` does an independent search per probe and then `slices` materializes. A relational-op gap, not fusion. (`arrange::survey` already *is* the merge kernel — it is the surface `join` that does not reach it.)
-3. **`mul`/`sub` by a constant cost a full extra column.** The `pair_imm` desugaring makes `Lit` broadcast an n-element constant and build a product, where `AddU64`/`Shr`/`And`/`Gt` have immediate kernels that touch neither. Cheap and local; A3's tax is 1.6–2.8× and this is most of it.
+3. ~~**`mul`/`sub` by a constant cost a full extra column.**~~ Done: every constant right operand lowers to an immediate cell of the grid (`BinImm`/`RelImm`), and A3's tax is 0.7–1.1×.
 
 **The aggregation controls were 8–12× off the ceiling they are named for, and the mechanism was a copy.**
 `C1 fold_add` and `C2 fold_max` measured 12.1× and 8.0× at 1 M under a harness that shares the input

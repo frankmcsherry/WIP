@@ -1,5 +1,5 @@
-//! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `Gt` (a column
-//! vs a constant, the immediate-form sugar) — plus the list ops `SortList`/`DedupList`/`GroupKey`
+//! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `RelImm` (a
+//! column vs a constant, the immediate form) — plus the list ops `SortList`/`DedupList`/`GroupKey`
 //! (discrimination via `sort_blocks`/`run_layout`) and `Find` (batched binary search via `compare_idx`). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
@@ -43,7 +43,12 @@ impl Pred {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
-    Gt(u64),   // X -> U64 mask    (x > c) as 0/1   — the column-vs-immediate sugar form
+    RelImm(Pred, u64), // X -> U64 mask   the IMMEDIATE form of `Rel`: compare a leaf column against
+               // a constant, given in the leaf's stored form. Kind-blind and reads ANY width, where
+               // the pair form `(x, x lit c) <pred>` has to broadcast an n-element constant column
+               // and build a product to say the same thing.
+    Gt(u64),   // X -> U64 mask   (x > c) as 0/1: the spelling of `RelImm(Gt, c)` that predates it,
+               // kept so a host that builds it keeps compiling; it evaluates through `RelImm`.
     Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
     Max,       // (X, X) -> X   lane-wise maximum
     SortList,  // List<X> -> List<X>   structural order
@@ -60,8 +65,9 @@ impl CmpOp {
                 same(&shape_of_value(&a), &shape_of_value(&b)).map_err(|e| format!("Rel: {e}"))?;
                 assert_eq!(a.len(), b.len(), "Rel: operands at different strata");
                 let mask = match (&a, &b) {
-                    // leaf pair: the vectorized lane compare. Resolve the predicate to its three
-                    // order-flags ONCE here (sign `-1`/`0`/`+1`), so `rel`'s lane loop is branchless.
+                    // leaf pair: the vectorized lane compare. Resolve the predicate to a single
+                    // concrete lane function ONCE here (from its three order-flags, sign
+                    // `-1`/`0`/`+1`), so `rel`'s loop is one comparison per element.
                     (Value::Prim(pa), Value::Prim(pb)) =>
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
@@ -82,10 +88,8 @@ impl CmpOp {
                 Value::Prim(pa.lane_pick(pb, take_max))
             }
 
-            CmpOp::Gt(c) => {
-                let xs = input.as_u64("Gt")?;
-                Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
-            }
+            CmpOp::RelImm(pred, c) => Value::u64(rel_imm(input.into_prim("relational immediate")?, *pred, *c)?),
+            CmpOp::Gt(c) => Value::u64(rel_imm(input.into_prim("Gt")?, Pred::Gt, *c)?),
 
             // the sort produces the sorted column itself; nothing is gathered afterwards.
             CmpOp::SortList => {
@@ -163,6 +167,16 @@ impl CmpOp {
         })
     }
 
+}
+
+/// `pred` of every row of `p` against the constant `c`, as a 0/1 mask. The constant is the leaf's
+/// STORED form, so it has to fit the leaf's width: truncating it silently would compare against a
+/// different value than the one written.
+fn rel_imm(p: crate::value::Prim, pred: Pred, c: u64) -> Result<Vec<u64>, String> {
+    if p.bits() < 64 && c >= (1u64 << p.bits()) {
+        return Err(format!("{pred:?} {c}: constant does not fit a U{} leaf", p.bits()));
+    }
+    Ok(p.rel_imm(c, pred.test(-1), pred.test(0), pred.test(1)))
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
