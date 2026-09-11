@@ -563,9 +563,12 @@ mod tests {
 
     #[test]
     fn labels_mark_runs() {
-        // sorted [1,1,3,4,5] → run labels [0,0,1,2,3]
+        // sorted [1,1,3,4,5] → each position labelled by its run's start, [0,0,2,3,4]; densely
+        // numbered, [0,0,1,2,3].
         let seed = vec![0u64; 5];
-        let (_perm, labels) = sort_blocks(&seed, &u(&[3, 1, 4, 1, 5]));
+        let (_perm, mut labels) = sort_blocks(&seed, &u(&[3, 1, 4, 1, 5]));
+        assert_eq!(labels, vec![0, 0, 2, 3, 4]);
+        crate::ops::cmp::sort::dense(&mut labels);
         assert_eq!(labels, vec![0, 0, 1, 2, 3]);
     }
 

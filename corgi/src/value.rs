@@ -514,11 +514,6 @@ macro_rules! prim {
                 match self { $( Prim::$V(v) => out.extend(index.iter().map(|&i| v[i] as u64)), )+ }
             }
 
-            /// a leaf of this width holding `keys`, narrowed: the sorted keys are the sorted column.
-            pub(crate) fn like(&self, keys: &[u64]) -> Prim {
-                self.like_from(keys.iter().copied())
-            }
-
             /// `keys[q] = (keys[q] << width) | self[index[q]]`: this leaf's rows packed below the
             /// keys already there, at the leaf's declared width.
             #[allow(clippy::unnecessary_cast)]

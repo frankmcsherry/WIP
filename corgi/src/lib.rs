@@ -154,13 +154,17 @@ pub mod arrange {
     /// so argmin/argmax/first-per-segment and per-segment sorted order fall out while keeping the row
     /// positions the caller indexed by.
     pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-        crate::ops::cmp::sort::sort_blocks(labels, v)
+        let (perm, mut labels) = crate::ops::cmp::sort::sort_blocks(labels, v);
+        crate::ops::cmp::sort::dense(&mut labels);
+        (perm, labels)
     }
 
     /// [`sort_blocks`], and the sorted rows as a column: `(perm, refined labels, sorted)`, with
     /// `sorted == gather(v, &perm)` — produced by the sort itself, not by a gather after it.
     pub fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, Value) {
-        crate::ops::cmp::sort::sort_values(labels, v)
+        let (perm, mut labels, sorted) = crate::ops::cmp::sort::sort_values(labels, v);
+        crate::ops::cmp::sort::dense(&mut labels);
+        (perm, labels, sorted)
     }
 
     /// The indexed sort: order the rows `index[..]` of `v` within the blocks of `labels`
@@ -173,7 +177,9 @@ pub mod arrange {
     pub fn sort_indexed(v: &Value, labels: &mut Vec<u64>, index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
         let mut scratch = crate::ops::cmp::sort::SortScratch::default();
         let emit = if emit { crate::ops::cmp::sort::Emit::Both } else { crate::ops::cmp::sort::Emit::Groups };
-        crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch)
+        let out = crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch);
+        crate::ops::cmp::sort::dense(labels);
+        out
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
