@@ -1061,6 +1061,94 @@ fn family_arrange(n: usize, reps: u32) {
         r,
         "two-source column gather vs direct two-slice gather",
     );
+
+    // R13/R14 the hash-led arrangement sort: a string key (List<u8>, 8..16 bytes) stored under its
+    // hash lane, `Prod([hash, key])`, with ~2 rows per key, as DDIR stores a structured key; and
+    // the same with a List<u64> value under its own lane. The radix on the lanes does the sorting;
+    // the List arm only confirms that the rows one hash left tied are one value. The Rust ceiling
+    // sorts by (hash, bytes) with the key cached.
+    {
+        let ids: Vec<u64> = src.iter().map(|&x| x % (n as u64 / 2).max(1)).collect();
+        let mut bytes = Vec::with_capacity(n * 12);
+        let mut ends = Vec::with_capacity(n);
+        for &i in &ids {
+            let len = 8 + (i % 9) as usize;
+            let mut x = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for _ in 0..len {
+                bytes.push(b'a' + (x % 26) as u8);
+                x = (x >> 5) ^ x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            }
+            ends.push(bytes.len());
+        }
+        let key = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u8(bytes.clone())));
+        let hashes = corgi::hash(&key);
+        let col = Value::Prod(vec![Value::u64(hashes.clone()), key.clone()]);
+        let c = rust_t(reps, || {
+            black_box(arrange::sort_perm(black_box(&col)));
+        });
+        let r = rust_t(reps, || {
+            let (hashes, ends, bytes) = (black_box(&hashes), black_box(&ends), black_box(&bytes));
+            let span = |i: usize| -> &[u8] { let s = if i == 0 { 0 } else { ends[i - 1] }; &bytes[s..ends[i]] };
+            let mut perm: Vec<usize> = (0..ends.len()).collect();
+            perm.sort_by_cached_key(|&i| (hashes[i], span(i).to_vec()));
+            black_box(perm);
+        });
+        row("R13 arrange_sort_hashed_str", n, c, r, "(hash, List<u8> key) sort, ~2 rows a key, vs a stable cached-key Rust sort on (hash, bytes)");
+
+        let vals: Vec<u64> = scrambled(n).into_iter().map(|x| x % 1000).collect();
+        let vlist = Value::List(Bounds::Stride(3, n), Box::new(Value::u64(vals.iter().flat_map(|&v| [v, v + 1, v * 2]).collect())));
+        let vh = corgi::hash(&vlist);
+        let kv = Value::Prod(vec![col.clone(), Value::Prod(vec![Value::u64(vh.clone()), vlist])]);
+        let c = rust_t(reps, || {
+            black_box(arrange::sort_perm(black_box(&kv)));
+        });
+        let r = rust_t(reps, || {
+            let (hashes, ends, bytes, vh, vals) = (black_box(&hashes), black_box(&ends), black_box(&bytes), black_box(&vh), black_box(&vals));
+            let span = |i: usize| -> &[u8] { let s = if i == 0 { 0 } else { ends[i - 1] }; &bytes[s..ends[i]] };
+            let mut perm: Vec<usize> = (0..ends.len()).collect();
+            perm.sort_by_cached_key(|&i| (hashes[i], span(i).to_vec(), vh[i], [vals[i], vals[i] + 1, vals[i] * 2]));
+            black_box(perm);
+        });
+        row("R14 arrange_sort_hashed_kv", n, c, r, "((hash, List<u8> key), (hash, List<u64> val)) sort vs a stable cached-key Rust sort on the same tuple");
+    }
+
+    // R15 the run boundaries of a sorted list column (`group_bounds`): one equality pass over
+    // adjacent rows, a list row confirmed as a span, vs a Rust `windows(2)` over the spans.
+    {
+        let (perm, _, sorted) = arrange::sort_values(&[], &col_list_for_bounds(&src, n));
+        black_box(perm);
+        let (ends, elems) = match &sorted {
+            Value::List(b, v) => (b.to_vec(), v.as_u64("R15").unwrap().to_vec()),
+            _ => unreachable!(),
+        };
+        let c = rust_t(reps, || {
+            black_box(arrange::group_bounds(black_box(&sorted)));
+        });
+        let r = rust_t(reps, || {
+            let (ends, elems) = (black_box(&ends), black_box(&elems));
+            let span = |i: usize| -> &[u64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
+            let mut out = Vec::new();
+            for i in 1..ends.len() {
+                if span(i - 1) != span(i) {
+                    out.push(i);
+                }
+            }
+            out.push(ends.len());
+            black_box(out);
+        });
+        row("R15 arrange_group_bounds_list", n, c, r, "run ends of a sorted List<u64> column (span equality) vs a Rust windows(2) over spans");
+    }
+}
+
+/// A List<u64> column of lengths 0..=4 over a small alphabet, so that a sorted copy has runs of
+/// equal rows: the R8 shape, for R15.
+fn col_list_for_bounds(src: &[u64], n: usize) -> Value {
+    let lens: Vec<usize> = src.iter().map(|&x| ((x >> 8) % 5) as usize).collect();
+    let mut ends = Vec::with_capacity(n);
+    let mut total = 0;
+    for &l in &lens { total += l; ends.push(total); }
+    let elems: Vec<u64> = scrambled(total).into_iter().map(|x| x % 8).collect();
+    Value::List(Bounds::offsets(ends), Box::new(Value::u64(elems)))
 }
 
 // ----- driver ------------------------------------------------------------

@@ -5,10 +5,13 @@
 //! `Sum` by tag then payload, `List` length first and then element by element, `Unit` all equal.
 //! Nothing is gathered before a level sorts. A leaf pulls its keys through the index once and
 //! radixes them with the positions alongside, every pass sequential, and the sorted keys are the
-//! output column. Layout, top down: the entry points, the four arms, the leaf kernel, the label
-//! and position helpers.
+//! output column. A structured column under labels first asks whether each tied block is uniform
+//! — one equality pass — and descends only into the blocks that are not, since the blocks a hash
+//! lane leaves tied are almost always one value. Layout, top down: the entry points, the uniform
+//! check, the four arms, the leaf kernel, the label and position helpers.
 
 use crate::engine::gather;
+use crate::ops::cmp::order::equal_idx;
 use crate::value::{Bounds, Prim, Tags, Value};
 
 /// Buffers reused across every block and level of one call, so that a refinement pass producing
@@ -82,6 +85,24 @@ pub(crate) fn sort_indexed(
         refine(labels, |_| false);
         return ((0..m).collect(), emit.values().then(|| gather(v, index)));
     }
+    // a sum or list under labels: the blocks that are one value are done, and only the rest
+    // need the arm. Blocks handed down by a hash lane are one value up to a collision; a
+    // product asks this of each structured field in turn, after its leaves have refined.
+    if !labels.is_empty() && matches!(v, Value::Sum(..) | Value::List(..)) {
+        return sort_uniform(v, labels, index, emit, scratch);
+    }
+    sort_arms(v, labels, index, emit, scratch)
+}
+
+/// [`sort_indexed`] by the arms, past the uniform check.
+fn sort_arms(
+    v: &Value,
+    labels: &mut Vec<u64>,
+    index: &mut [usize],
+    emit: Emit,
+    scratch: &mut SortScratch,
+) -> (Vec<usize>, Option<Value>) {
+    let m = index.len();
     match v {
         Value::Prim(p) => sort_leaf(p, labels, index, emit, scratch),
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
@@ -125,6 +146,90 @@ pub(crate) fn sort_values_only(labels: &[u64], v: &Value) -> (Vec<u64>, Value) {
     let (_, out) = sort_indexed(v, &mut labels, &mut index, Emit::Values, &mut scratch);
     (labels, out.expect("emit was requested"))
 }
+
+// ---- the uniform check ----------------------------------------------------------------------
+
+/// Sort a structured column under labels by first confirming which blocks are uniform: every
+/// tied position is compared for equality with its block's first row in one pass, and only the
+/// positions of the blocks where some row differs are sorted by the arms, the rest being in
+/// order already. A sample of the tied positions goes first, and when most of those differ the
+/// column is handed to the arms whole — the labels were not a hash of these rows, and the
+/// check would be a pass for nothing. Same contract as [`sort_indexed`].
+fn sort_uniform(
+    v: &Value,
+    labels: &mut Vec<u64>,
+    index: &mut [usize],
+    emit: Emit,
+    scratch: &mut SortScratch,
+) -> (Vec<usize>, Option<Value>) {
+    let m = index.len();
+    // the tied positions, each against its block's first row: a sample first, and the rest
+    // only once the sample has said the blocks are mostly uniform.
+    let (mut firsts, mut tied) = (Vec::new(), Vec::new());
+    let mut first = 0usize;
+    let mut q = 1;
+    while q < m && tied.len() < SAMPLE {
+        if labels[q] != labels[q - 1] {
+            first = q;
+        } else {
+            firsts.push(index[first]);
+            tied.push(index[q]);
+        }
+        q += 1;
+    }
+    let mut eq = equal_idx(v, v, &firsts, &tied);
+    if eq.iter().filter(|&&e| e).count() * 2 < tied.len() {
+        return sort_arms(v, labels, index, emit, scratch);
+    }
+    let sampled = tied.len();
+    while q < m {
+        if labels[q] != labels[q - 1] {
+            first = q;
+        } else {
+            firsts.push(index[first]);
+            tied.push(index[q]);
+        }
+        q += 1;
+    }
+    eq.extend(equal_idx(v, v, &firsts[sampled..], &tied[sampled..]));
+    // the positions of every block with an unequal row, in order.
+    let mut at: Vec<usize> = Vec::new();
+    let (mut q, mut k) = (0usize, 0usize);
+    while q < m {
+        let mut end = q + 1;
+        while end < m && labels[end] == labels[q] {
+            end += 1;
+        }
+        let mut uniform = true;
+        for _ in q + 1..end {
+            uniform &= eq[k];
+            k += 1;
+        }
+        if !uniform {
+            at.extend(q..end);
+        }
+        q = end;
+    }
+    if at.len() * 2 > m {
+        return sort_arms(v, labels, index, emit, scratch);
+    }
+    let mut perm: Vec<usize> = (0..m).collect();
+    if at.is_empty() {
+        refine(labels, |_| false);
+    } else {
+        let mut index_t: Vec<usize> = at.iter().map(|&q| index[q]).collect();
+        let mut labels_t: Vec<u64> = at.iter().map(|&q| labels[q]).collect();
+        let (step, _) = sort_arms(v, &mut labels_t, &mut index_t, Emit::Groups, scratch);
+        apply(index, &mut perm, &at, &step, scratch);
+        run_starts(labels);
+        write_starts(labels, &at, &labels_t);
+        refine(labels, |_| false);
+    }
+    (perm, emit.values().then(|| gather(v, index)))
+}
+
+/// How many tied positions the uniform check samples before committing to the whole column.
+const SAMPLE: usize = 256;
 
 // ---- the arms -------------------------------------------------------------------------------
 
@@ -856,6 +961,27 @@ mod tests {
         }
         let elems: Vec<u64> = (0..total).map(|_| rng.below(4) as u64).collect();
         check(&Value::List(ends.into(), Box::new(Value::u64(elems))), &zeros, &index);
+    }
+
+    /// The uniform check: labels that are a hash of the rows leave blocks of one value, which
+    /// must come back untouched and densely labelled; a forced collision — two values under one
+    /// label — must still sort by the arms and split the label. Checked against the reference
+    /// on every emit mode, including a collision block of three distinct values.
+    #[test]
+    fn hash_led_blocks_confirm_and_collide() {
+        for seed in 1..60u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let rows = 2 + rng.below(60);
+            let v = random_value(&mut rng, rows, 3);
+            // labels from a hash of the rows, sorted: equal rows share a block. Folding the
+            // hash to a few bits makes distinct rows share blocks too — the collisions.
+            let shift = 40 + rng.below(21) as u32;
+            let folded: Vec<u64> = crate::hash::hash(&v).iter().map(|&h| h >> shift).collect();
+            let mut index: Vec<usize> = (0..rows).collect();
+            index.sort_by_key(|&r| folded[r]);
+            let labels: Vec<u64> = index.iter().map(|&r| folded[r]).collect();
+            check(&v, &labels, &index);
+        }
     }
 
     #[test]

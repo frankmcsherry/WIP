@@ -135,9 +135,24 @@ pub mod arrange {
 
     /// Adjacent structural compare: `out[k]` = sign of row `k` of `v` vs row `k+1` (`v.len() - 1`
     /// results). The run-boundary scan over a sorted column — `out[k] != 0` marks a boundary after
-    /// `k`, which is what [`group_bounds`] turns into segment ends.
+    /// `k`, which is what [`group_bounds`] turns into segment ends. Where no sign is needed,
+    /// [`equal_adjacent`] is the cheaper read.
     pub fn compare_adjacent(v: &Value) -> Vec<i8> {
         crate::ops::cmp::order::compare_adjacent(v)
+    }
+
+    /// Batched structural equality: `out[k]` iff row `ia[k]` of `a` equals row `ib[k]` of `b`.
+    /// The sign-free reading of [`compare_idx`], and cheaper for it: a list row is confirmed
+    /// equal by one span comparison rather than an element position at a time. The check that
+    /// rows sharing an identifier — a hash lane's tie — hold one value.
+    pub fn equal_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<bool> {
+        crate::ops::cmp::order::equal_idx(a, b, ia, ib)
+    }
+
+    /// Adjacent structural equality: `out[k]` iff row `k` of `v` equals row `k+1` (`v.len() - 1`
+    /// results); the run boundaries of a sorted column, as [`group_bounds`] reads them.
+    pub fn equal_adjacent(v: &Value) -> Vec<bool> {
+        crate::ops::cmp::order::equal_adjacent(v)
     }
 
     /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given
