@@ -575,6 +575,33 @@ macro_rules! prim {
                 }
             }
 
+            /// structural equality of paired records: `out[k]` iff `self[ia[k]] == other[ib[k]]`. The
+            /// equality-only reading of [`Prim::cmp_idx`], for callers that need no sign.
+            pub(crate) fn eq_idx(&self, ia: &[usize], ib: &[usize], other: &Prim) -> Vec<bool> {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => ia.iter().zip(ib).map(|(&i, &j)| a[i] == b[j]).collect(), )+
+                    _ => panic!("eq_idx: prim width mismatch"),
+                }
+            }
+
+            /// structural equality of DENSE pairs: `out[k]` iff `self[k] == other[k + skew]`, for `n`
+            /// pairs; the equality-only reading of [`Prim::cmp_dense`].
+            pub(crate) fn eq_dense(&self, other: &Prim, n: usize, skew: usize) -> Vec<bool> {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => (0..n).map(|k| a[k] == b[k + skew]).collect(), )+
+                    _ => panic!("eq_dense: prim width mismatch"),
+                }
+            }
+
+            /// equality of two element spans, `self[sa..ea]` against `other[sb..eb]`: one slice
+            /// comparison, which is how a list row is confirmed equal to another at once.
+            pub(crate) fn eq_spans(&self, (sa, ea): (usize, usize), other: &Prim, (sb, eb): (usize, usize)) -> bool {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => a[sa..ea] == b[sb..eb], )+
+                    _ => panic!("eq_spans: prim width mismatch"),
+                }
+            }
+
             /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
             /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
             /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.

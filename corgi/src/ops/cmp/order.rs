@@ -1,13 +1,16 @@
 //! Structural comparison — the order machinery `sort`/`dedup`/`group`/`find` reduce to, minus the sort
 //! itself, which is `super::sort`. Here: `mod compare` (the bulk structural comparator `compare_idx`,
-//! which `Rel` and `find` reduce to), `mod labels` (the block-label vocabulary the sort speaks and
-//! `dedup`/`group` read), and `group_bounds`; the merge kernel is `super::survey`.
+//! which `Rel` and `find` reduce to), `mod equal` (the bulk structural equality `equal_idx`, the
+//! sign-free reading the sort's uniform-class check and `group_bounds` want), `mod labels` (the
+//! block-label vocabulary the sort speaks and `dedup`/`group` read), and `group_bounds`; the merge
+//! kernel is `super::survey`.
 
 use crate::engine::row_span;
 use crate::value::{Bounds, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
+pub(crate) use equal::*;
 pub(crate) use labels::*;
 
 /// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
@@ -23,19 +26,20 @@ pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
 
 /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
 /// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
-/// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
+/// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-equality pass — the
 /// single-column analogue of the equal-key boundaries a survey reveals across two runs, and the
 /// `Value`-column counterpart of [`run_layout`]'s `ends` (which reads a precomputed labels vector).
+/// A boundary needs no sign, so this is the equality kernel, which compares a list row as a span.
 pub fn group_bounds(keys: &Value) -> Vec<usize> {
     let n = keys.len();
     if n == 0 {
         return Vec::new();
     }
-    // signs[k] = order of keys[k] vs keys[k+1]; a nonzero sign is a group boundary after k.
-    let signs = compare_adjacent(keys);
+    // eq[k] iff keys[k] == keys[k+1]; an inequality is a group boundary after k.
+    let eq = equal_adjacent(keys);
     let mut ends = Vec::new();
-    for (k, &s) in signs.iter().enumerate() {
-        if s != 0 {
+    for (k, &e) in eq.iter().enumerate() {
+        if !e {
             ends.push(k + 1);
         }
     }
@@ -91,14 +95,14 @@ mod compare {
             }
         }
         #[inline]
-        fn left(&self, k: usize) -> usize {
+        pub(super) fn left(&self, k: usize) -> usize {
             match self {
                 Pairs::Explicit(ia, _) => ia[k],
                 Pairs::Diagonal(_) | Pairs::Adjacent(_) => k,
             }
         }
         #[inline]
-        fn right(&self, k: usize) -> usize {
+        pub(super) fn right(&self, k: usize) -> usize {
             match self {
                 Pairs::Explicit(_, ib) => ib[k],
                 Pairs::Diagonal(_) => k,
@@ -241,6 +245,148 @@ mod compare {
     /// of a sorted column ([`super::group_bounds`]), and the shape a `windows(2)` scan has.
     pub fn compare_adjacent(v: &Value) -> Vec<i8> {
         compare_pairs(v, v, Pairs::Adjacent(v.len().saturating_sub(1)))
+    }
+}
+
+mod equal {
+    //! The bulk structural equality: the sign-free reading of [`compare::compare_pairs`], for the
+    //! two places that ask only whether rows are equal — the sort's check that a tied class is
+    //! uniform, and the run boundaries of a sorted column. Same descent, cheaper levels: a leaf is
+    //! one lane compare, a product narrows to the pairs still equal, a sum matches tags then lanes
+    //! at the carried offsets, and a list of leaf elements is decided by ONE span comparison per
+    //! pair rather than an element position at a time, so equal long strings cost their bytes and
+    //! unequal ones their common prefix.
+
+    use super::*;
+
+    /// Bulk structural equality over index pairs: `out[k]` iff row `ia[k]` of `a` equals row
+    /// `ib[k]` of `b`, one descent per type level.
+    pub fn equal_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<bool> {
+        debug_assert_eq!(ia.len(), ib.len());
+        equal_pairs(a, b, Pairs::Explicit(ia, ib))
+    }
+
+    /// The adjacent case: `out[k]` iff row `k` of `v` equals row `k+1` — the run structure of a
+    /// sorted column, as [`super::group_bounds`] reads it.
+    pub fn equal_adjacent(v: &Value) -> Vec<bool> {
+        equal_pairs(v, v, Pairs::Adjacent(v.len().saturating_sub(1)))
+    }
+
+    /// [`equal_idx`] over any [`Pairs`] — the kernel proper.
+    pub(crate) fn equal_pairs(a: &Value, b: &Value, pairs: Pairs) -> Vec<bool> {
+        let m = pairs.len();
+        match (a, b) {
+            (Value::Prim(pa), Value::Prim(pb)) => match pairs {
+                Pairs::Explicit(ia, ib) => pa.eq_idx(ia, ib, pb),
+                Pairs::Diagonal(n) => pa.eq_dense(pb, n, 0),
+                Pairs::Adjacent(n) => pa.eq_dense(pb, n, 1),
+            },
+
+            // product: field 0 over all pairs, each later field over the pairs still equal.
+            (Value::Prod(ca), Value::Prod(cb)) => {
+                assert_eq!(ca.len(), cb.len(), "equal_idx: product arity");
+                if ca.is_empty() {
+                    return vec![true; m];
+                }
+                let mut eq = equal_pairs(&ca[0], &cb[0], pairs);
+                if ca.len() > 1 {
+                    let mut live: Vec<usize> = (0..m).filter(|&k| eq[k]).collect();
+                    let mut lia: Vec<usize> = live.iter().map(|&k| pairs.left(k)).collect();
+                    let mut lib: Vec<usize> = live.iter().map(|&k| pairs.right(k)).collect();
+                    for (x, y) in ca[1..].iter().zip(&cb[1..]) {
+                        if live.is_empty() {
+                            break;
+                        }
+                        let sub = equal_pairs(x, y, Pairs::Explicit(&lia, &lib));
+                        let mut w = 0usize;
+                        for t in 0..live.len() {
+                            if sub[t] {
+                                live[w] = live[t];
+                                lia[w] = lia[t];
+                                lib[w] = lib[t];
+                                w += 1;
+                            } else {
+                                eq[live[t]] = false;
+                            }
+                        }
+                        live.truncate(w);
+                        lia.truncate(w);
+                        lib.truncate(w);
+                    }
+                }
+                eq
+            }
+
+            // sum: equal tags, then the lane at the carried within-variant offsets.
+            (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
+                assert_eq!(va.len(), vb.len(), "equal_idx: sum arity");
+                if let (Some(t), Some(u)) = (ta.const_tag(), tb.const_tag()) {
+                    return if t == u { equal_pairs(&va[t], &vb[t], pairs) } else { vec![false; m] };
+                }
+                let mut eq = vec![false; m];
+                let mut by_tag: Vec<Vec<usize>> = vec![Vec::new(); va.len()];
+                for k in 0..m {
+                    let t = ta.tag_at(pairs.left(k));
+                    if t == tb.tag_at(pairs.right(k)) {
+                        by_tag[t].push(k);
+                    }
+                }
+                for (t, ks) in by_tag.iter().enumerate() {
+                    if ks.is_empty() {
+                        continue;
+                    }
+                    let sia: Vec<usize> = ks.iter().map(|&k| ta.offset_at(pairs.left(k))).collect();
+                    let sib: Vec<usize> = ks.iter().map(|&k| tb.offset_at(pairs.right(k))).collect();
+                    let sub = equal_pairs(&va[t], &vb[t], Pairs::Explicit(&sia, &sib));
+                    for (&k, e) in ks.iter().zip(sub) {
+                        eq[k] = e;
+                    }
+                }
+                eq
+            }
+
+            // list: equal lengths, then the elements — leaf elements as one span comparison per
+            // pair, anything else as element pairs recursed once and folded per row.
+            (Value::List(ba, va), Value::List(bb, vb)) => {
+                let mut eq = vec![false; m];
+                let leaves = match (&**va, &**vb) {
+                    (Value::Prim(pa), Value::Prim(pb)) => Some((pa, pb)),
+                    _ => None,
+                };
+                let (mut sia, mut sib) = (Vec::new(), Vec::new());
+                let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)
+                for (k, e) in eq.iter_mut().enumerate() {
+                    let (i, j) = (pairs.left(k), pairs.right(k));
+                    let ((s_a, e_a), (s_b, e_b)) = (row_span(ba, i), row_span(bb, j));
+                    let len = e_a - s_a;
+                    if len != e_b - s_b {
+                        continue;
+                    }
+                    if len == 0 {
+                        *e = true;
+                    } else if let Some((pa, pb)) = leaves {
+                        *e = pa.eq_spans((s_a, e_a), pb, (s_b, e_b));
+                    } else {
+                        seg.push((k, sia.len(), len));
+                        for p in 0..len {
+                            sia.push(s_a + p);
+                            sib.push(s_b + p);
+                        }
+                    }
+                }
+                if !seg.is_empty() {
+                    let sub = equal_pairs(va, vb, Pairs::Explicit(&sia, &sib));
+                    for (k, start, len) in seg {
+                        eq[k] = sub[start..start + len].iter().all(|&x| x);
+                    }
+                }
+                eq
+            }
+
+            (Value::Unit(_), Value::Unit(_)) => vec![true; m],
+
+            _ => panic!("equal_idx: shape mismatch"),
+        }
     }
 }
 
@@ -401,6 +547,62 @@ mod tests {
         // an empty column has no pairs either way (the adjacent count must not underflow).
         assert!(compare_adjacent(&u(&[])).is_empty());
         assert!(compare_adjacent(&u(&[7])).is_empty());
+    }
+
+    /// Equality is the sign-free reading of the comparison: agree with `compare_idx == 0` on every
+    /// pair form and every constructor, including the span path of a leaf-element list and the
+    /// element path of a structured-element list.
+    #[test]
+    fn equality_is_the_zero_of_compare() {
+        let shapes = [
+            u(&[5, 3, 3, 8, 1, 3]),
+            Value::Prod(vec![u(&[1, 1, 1, 2, 2, 1]), u(&[7, 7, 9, 0, 0, 7])]),
+            Value::sum(vec![0, 0, 1, 1, 0, 1], vec![u(&[4, 4, 6]), u(&[2, 2, 2])]),
+            Value::List(vec![1, 3, 3, 6, 6, 8].into(), Box::new(u(&[9, 1, 1, 5, 5, 5, 1, 1]))),
+            Value::List(vec![2, 4, 4, 6].into(), Box::new(Value::sum(vec![0, 1, 0, 1, 0, 1], vec![u(&[5, 5, 5]), u(&[2, 2, 2])]))),
+            Value::List(Bounds::Stride(2, 5), Box::new(Value::u8(vec![1, 2, 1, 2, 3, 4, 1, 2, 3, 3]))),
+            Value::Unit(5),
+        ];
+        for v in shapes {
+            let n = v.len();
+            let id: Vec<usize> = (0..n).collect();
+            let all: Vec<bool> = compare_cols(&v, &v).iter().map(|&o| o == 0).collect();
+            assert_eq!(equal_pairs(&v, &v, Pairs::Diagonal(n)), all, "diagonal");
+            if n > 0 {
+                let adj: Vec<bool> = compare_adjacent(&v).iter().map(|&o| o == 0).collect();
+                assert_eq!(equal_adjacent(&v), adj, "adjacent");
+                // every ordered pair, both ways round.
+                let (mut ia, mut ib) = (Vec::new(), Vec::new());
+                for i in 0..n {
+                    for j in 0..n {
+                        ia.push(i);
+                        ib.push(j);
+                    }
+                }
+                let want: Vec<bool> = compare_idx(&v, &v, &ia, &ib).iter().map(|&o| o == 0).collect();
+                assert_eq!(equal_idx(&v, &v, &ia, &ib), want, "all pairs\n{}", crate::value::show(&v));
+                let _ = &id;
+            }
+        }
+        assert!(equal_adjacent(&u(&[])).is_empty());
+        // two columns with different tag assignments and a constant-tag side.
+        let a = Value::sum(vec![0, 1, 0, 1], vec![u(&[5, 5]), u(&[2, 9])]);
+        let b = Value::sum(vec![0, 0, 1, 1], vec![u(&[5, 7]), u(&[2, 9])]);
+        let c = Value::sum(vec![0, 0, 0, 0], vec![u(&[5, 7, 5, 5]), u(&[])]);
+        for (x, y) in [(&a, &b), (&a, &c), (&c, &a), (&c, &c)] {
+            let want: Vec<bool> = compare_cols(x, y).iter().map(|&o| o == 0).collect();
+            assert_eq!(equal_pairs(x, y, Pairs::Diagonal(4)), want);
+        }
+    }
+
+    #[test]
+    fn group_bounds_reads_lists_by_span() {
+        // sorted list rows with equal neighbours of every length, ragged and strided:
+        // [], [], [7], [7], [9], [1,2], [1,2], [1,3].
+        let v = Value::List(vec![0, 0, 1, 2, 3, 5, 7, 9].into(), Box::new(u(&[7, 7, 9, 1, 2, 1, 2, 1, 3])));
+        assert_eq!(group_bounds(&v), vec![2, 4, 5, 7, 8]);
+        let s = Value::List(Bounds::Stride(3, 4), Box::new(Value::u8(vec![1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 2])));
+        assert_eq!(group_bounds(&s), vec![2, 4]);
     }
 
     #[test]
