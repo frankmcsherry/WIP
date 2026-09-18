@@ -221,6 +221,7 @@ pub mod arrange {
     /// (not of position or batch), so ids computed here coincide across the output->input
     /// boundary of a dataflow operator. Returns a Vec<u64> aligned with `v`'s rows.
     pub fn hash_rows(v: &Value) -> Vec<u64> {
+        use crate::value::Refs;
         match v {
             // Leaf: mix the width tag into the seed (so different widths of the same numeric
             // value need not collide), then avalanche each row's bytes read straight from the Vec.
@@ -263,6 +264,24 @@ pub mod arrange {
             }
             // Unit: every row is identical content, so a single constant.
             Value::Unit(n) => vec![splitmix64(SEED_UNIT); *n],
+            // Box: the referenced rows' hashes.
+            Value::Box(arena, Refs::Rows(rows)) => {
+                let ah = hash_rows(arena);
+                rows.iter().map(|&r| ah[r]).collect()
+            }
+            Value::Box(payload, Refs::Spans(spans)) => {
+                let elem = hash_rows(payload);
+                spans
+                    .iter()
+                    .map(|&(s, e)| {
+                        let mut h = mix(SEED_LIST, (e - s) as u64);
+                        for k in s..e {
+                            h = mix(h, elem[k]);
+                        }
+                        h
+                    })
+                    .collect()
+            }
         }
     }
 

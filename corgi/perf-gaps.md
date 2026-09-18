@@ -130,12 +130,24 @@ Peak memory tracks the same product: at L=2048 the capture materializes 128 M wo
 **Mechanism.** Two things compound: (1) capture is spelled as a copy of the context per element rather than a reference to it, and (2) capture of a Prod is eager on every field, so an unread list field costs as much as a read one.
 Neither is a kernel gap; `gather` itself runs at ~1× Rust (E2). This is a value-model gap.
 
-**Fix (design settled in discussion, not yet built).**
-1. A `Bounds::Spans(Vec<(lo, hi)>)` variant so a List row can be any span of a shared payload — overlapping, repeated, out of order. `cap_list` on a List-shaped context then records one span per element (or a virtual owner index) and copies nothing; `Find`/`Get`/`Gather`/`Fold` already read rows through `span(r)`. K1 → the control line.
-2. A deferred-gather reference (`Ref(arena, idx)`, resolved in the `into_pair`/`into_list`/`into_u64` accessors: free through Prod, Spans at List, a real gather at Prim) so a captured tuple pays one index per element and materializes only the fields the body reaches. K2 → the control line. The same constructor is the μ-type recursion knot later.
-3. Field pushdown through `cap_list`/`cap_sum` in the optimizer, which gets K2's win statically when the pass runs, and which becomes load-bearing once the mechanical closure-capture pass makes every map body capture its whole environment implicitly.
+**Fix — two spikes, same machine, same suite.**
 
-Order: 1, then 2, then the closure pass — without 1 and 2 the closure pass would turn every implicit list capture into this table.
+*Spike A, branch `corgi-spans`:* a `Bounds::Spans` form so a List row can be a reference, produced implicitly by the capture family (`gather_shared`) and read through a second accessor (`into_list_shared`), with `into_list` compacting for everyone else. It closes the gap (K1 2088× → 3.6×, K2 8196× → 7.5×) but it folds the reference-or-copy decision into which gather a producer calls, which accessor a reader calls, and a bounds variant nobody can see in the program or the shape. Rejected for that reason.
+
+*Spike B, branch `corgi-box` (this branch):* **the reference is a shape.** `Box<T>` is a column of references; `box` takes them (O(rows), nothing copied), `unbox` copies the rows out and is the ONLY place referenced data is copied. The representation is fixed by the boxed shape — a boxed list row is a `(lo, hi)` span of the list's payload (`&[T]`), any other boxed row is a row index into the arena (`&T`) — so there is no runtime choice. `gather` has one meaning everywhere (by value) plus one arm: on a Box it moves refs and never touches the arena, which makes `cap_list`/`cap_sum`/`lit` free on a boxed context with no code of their own. `Field` projects through a boxed product by reference. The readers `get`/`gather`/`find`/`slices`/`len` accept a boxed list haystack (`into_rows`: rows via `span(i)` over one payload); every other op given a Box is the shape error "expected a list, got Box<..>" — nothing is silently materialized. `slices` on a boxed haystack returns `List<Box<List<T>>>`, references, O(ranges); on a list it copies as before. `Bounds` is untouched and always a partition.
+
+| task | L=16 | L=256 | L=2048 | n=1, L=2048 | ns/element at L=2048 |
+|---|---|---|---|---|---|
+| K1 `(ctx box, ys) cap_list … get` | 7.1× | 3.1× | **7.3×** | **3.7×** | 4.1 ns |
+| K1x the same without `box` (copies) | 38× | 259× | 5025× | 2212× | 2843 ns |
+| K2 `(ctx box, ys) cap_list … (c.0 unbox, y) add` | 3.7× | 3.7× | **4.0×** | **0.9×** | 1.3 ns |
+| K2x the same without `box` (copies) | 54× | 1261× | 8381× | 2032× | 2707 ns |
+
+Both boxed spellings are flat in L. K2 lands better than spike A's 7.5× because a boxed tuple is one index per element and only the scalar is ever copied (at the `unbox`), where spike A still built one span per element for the unread list field. The by-value spellings stay in the suite on purpose: the copy is now a visible choice in the program, and its cost is the row above it.
+
+What the spike did NOT need: a second gather, a second list accessor, compaction-on-read, content-based `Value` equality, or a new bounds form on the wire. What it did need: a `Value`/`Shape` constructor (nine exhaustive matches: hash, codec, sort, `fixed_width`, `gather_lanes`, …), two ops, the `Rows` view for the five readers. Known copies left in: `gather_lanes`/`Unwrap` over boxes and sorting a Box column unbox first (documented at the site); the wire sends a Box as the rows it names.
+
+Next: Field pushdown through `cap_list`/`cap_sum` in the optimizer and the mechanical closure-capture pass, which now has an explicit target — insert `box` around a captured list or tuple, `unbox` at the leaves the body reaches. The same `Box` is the μ-type recursion knot.
 
 ## Recommended order (preliminary)
 

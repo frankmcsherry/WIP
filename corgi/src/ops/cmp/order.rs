@@ -346,6 +346,9 @@ mod discriminate {
             Value::List(bounds, vals) => sort_list_blocks(labels, bounds, vals),
             // unit rows are all equal: stable identity perm, no label refinement.
             Value::Unit(n) => ((0..*n).collect(), labels.to_vec()),
+            // a reference sorts as what it names: copy the referenced rows out and sort those. (A
+            // refs-aware sort would read through the arena; not needed yet.)
+            Value::Box(..) => sort_blocks(labels, &crate::engine::unbox(v.clone())),
         }
     }
 

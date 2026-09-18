@@ -610,10 +610,13 @@ fn family_k(owners: usize, per_owner: usize, ctx_len: usize, reps: u32) {
     let scalars = scrambled(owners);
     let label = format!("n={owners} k={per_owner} L={ctx_len}");
 
-    // K1 capture a long list, look one element up per element. Today: m × L words copied.
-    let g = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (y, c) get)");
+    // K1 capture a long list, look one element up per element. `ctx box` captures by reference
+    // (one span per element); the `K1x` spelling without the box copies L words per element.
+    let g = compile("let (ctx, ys) = input in (ctx box, ys) cap_list map ((c, y) -> (y, c) get)");
     let arg = Value::Prod(vec![ctx.clone(), ys.clone()]);
     let c = corgi_t(&g, &arg, reps);
+    let gx = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (y, c) get)");
+    let cx = corgi_t(&gx, &arg, reps);
     // control: the same lookups with no capture — row-relative `gather` reads the owner's context in
     // place. This is what a by-reference capture (or the capture→gather rewrite) would produce.
     let g2 = compile("let (ctx, ys) = input in (ys, ctx) gather");
@@ -629,15 +632,18 @@ fn family_k(owners: usize, per_owner: usize, ctx_len: usize, reps: u32) {
         }
         black_box(out);
     });
-    row(&format!("K1 cap_list_get {label}"), m, c, r, "cap_list copies L words per element, then get");
+    row(&format!("K1 cap_box_get {label}"), m, c, r, "cap_list of a BOXED list: one ref per element, get through it");
+    row(&format!("K1x cap_copy_get {label}"), m, cx, r, "the by-value spelling: cap_list copies L words per element");
     row(&format!("K1c gather_ctrl {label}"), m, c2, r, "control: same lookups via row-relative gather (no capture)");
 
     // K2 capture a tuple (scalar, long list); the body reads only the scalar. Today the unused list
     // field is copied per element regardless. Control: capture the projected scalar only (what Field
     // pushdown through cap_list, or a lazy reference resolved per field, would do).
-    let g = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (c.0, y) add)");
+    let g = compile("let (ctx, ys) = input in (ctx box, ys) cap_list map ((c, y) -> (c.0 unbox, y) add)");
     let arg = Value::Prod(vec![Value::Prod(vec![Value::u64(scalars.clone()), ctx.clone()]), ys.clone()]);
     let c = corgi_t(&g, &arg, reps);
+    let gx = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (c.0, y) add)");
+    let cx = corgi_t(&gx, &arg, reps);
     let g2 = compile("let (ctx, ys) = input in (ctx.0, ys) cap_list map ((c, y) -> (c, y) add)");
     let c2 = corgi_t(&g2, &arg, reps);
     let r = rust_t(reps, || {
@@ -651,7 +657,8 @@ fn family_k(owners: usize, per_owner: usize, ctx_len: usize, reps: u32) {
         }
         black_box(out);
     });
-    row(&format!("K2 cap_tuple_add {label}"), m, c, r, "cap_list copies the UNUSED list field per element");
+    row(&format!("K2 cap_box_tuple {label}"), m, c, r, "boxed tuple: one ref per element; Field through the box, unbox the scalar");
+    row(&format!("K2x cap_copy_tuple {label}"), m, cx, r, "the by-value spelling: copies the UNUSED list field per element");
     row(&format!("K2c proj_ctrl {label}"), m, c2, r, "control: capture only the scalar field (pushdown)");
 }
 

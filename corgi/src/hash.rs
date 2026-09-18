@@ -33,7 +33,7 @@
 //! unreferenced (empty) lane's shape hash equal — every row's OBSERVABLE value is identical, so sharing an
 //! id is correct (and more stable than derived `PartialEq`, which would call them distinct).
 
-use crate::value::Value;
+use crate::value::{Refs, Value};
 
 /// splitmix64 finalizer — a full-avalanche 64-bit mix. The one bit-mixing primitive; both the leaf
 /// hashing ([`Prim::hashes`]) and the structural [`combine`] build on it.
@@ -107,6 +107,25 @@ pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
 
         // unit = no payload; every row hashes to the same constant.
         Value::Unit(n) => vec![UNIT; *n],
+
+        // box = the referenced rows' hashes (a reference has the identity of what it names).
+        Value::Box(arena, Refs::Rows(rows)) => {
+            let ah = hash_cols(arena);
+            rows.iter().map(|&r| ah[r]).collect()
+        }
+        Value::Box(payload, Refs::Spans(spans)) => {
+            let ch = hash_cols(payload);
+            spans
+                .iter()
+                .map(|&(s, e)| {
+                    let mut a = combine(LIST, (e - s) as u64);
+                    for &x in &ch[s..e] {
+                        a = combine(a, x);
+                    }
+                    a
+                })
+                .collect()
+        }
     }
 }
 

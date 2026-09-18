@@ -3,7 +3,8 @@
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Refs, Rows, Value};
+use std::sync::Arc;
 
 pub(crate) use generators::*;
 
@@ -13,9 +14,36 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 
 /// lift a single-row constant to a column of length `n` (its stratum): `n` copies of `row`'s row 0. Total
 /// over every shape — it is `gather` at the all-zero index, so `Op::Lit` (which accepts any value's
-/// shape) and `eval` agree.
+/// shape) and `eval` agree. (A boxed constant is `n` references, since `gather` on a Box moves refs.)
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
     gather(row, &vec![0usize; n])
+}
+
+/// TAKE REFERENCES: `Box` = box every row of `v`. A list's rows become spans of its payload (the
+/// payload is the arena); any other column becomes its own arena with the identity refs. O(rows),
+/// nothing copied — the by-reference half of the pair.
+pub(crate) fn boxed(v: Value) -> Value {
+    match v {
+        Value::List(bounds, payload) => {
+            let spans = (0..bounds.len()).map(|i| bounds.span(i)).collect();
+            Value::Box(Arc::new(*payload), Refs::Spans(spans))
+        }
+        other => {
+            let n = other.len();
+            Value::Box(Arc::new(other), Refs::Rows((0..n).collect()))
+        }
+    }
+}
+
+/// COPY OUT: `Unbox` = the referenced rows as a fresh by-value column (the ONE place referenced data
+/// is copied). Rows refs are a `gather` of the arena; span refs rebuild a partition over the
+/// referenced elements. A non-Box comes back as it is.
+pub(crate) fn unbox(v: Value) -> Value {
+    match v {
+        Value::Box(arena, Refs::Rows(rows)) => gather(&arena, &rows),
+        Value::Box(payload, Refs::Spans(spans)) => materialize_spans(&spans, &payload),
+        other => other,
+    }
 }
 
 mod generators {
@@ -59,43 +87,51 @@ mod generators {
 
     /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
     /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
-    /// of `expand_ranges` below. An index outside its row's span is a (data-dependent) panic.
-    pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: &Bounds) -> Vec<usize> {
+    /// of `range_spans` below. An index outside its row's span is a (data-dependent) panic. `hay` may
+    /// be a list or a boxed list (`Rows`): rows are read through `span`.
+    pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: &Rows) -> Vec<usize> {
         let mut abs = Vec::with_capacity(idx.len());
-        let (mut os, mut hs) = (0, 0);
         for r in 0..outer.len() {
-            let (oe, he) = (outer.end(r), hay.end(r));
+            let (os, oe) = outer.span(r);
+            let (hs, he) = hay.span(r);
             for &x in &idx[os..oe] {
                 let p = hs + x as usize;
                 assert!(p < he, "Gather: index {x} out of row {r}'s bounds");
                 abs.push(p);
             }
-            os = oe;
-            hs = he;
         }
         abs
     }
 
     /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row
-    /// (rows spanned by `hay`). Emits the absolute haystack positions each pair names and the per-pair inner
-    /// bounds. Pairs with `gather` to realise `Slices` — the materialising inverse of `Flatten`.
-    pub(crate) fn expand_ranges(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Bounds) -> (Vec<usize>, Vec<usize>) {
-        let mut idx = Vec::new();
-        let mut inner = Vec::new();
-        let mut acc = 0;
-        let (mut os, mut hs) = (0, 0);
+    /// (rows spanned by `hay`). Emits each pair as an ABSOLUTE span of the haystack payload. `Slices` on
+    /// a list copies those spans out into a partition (the materialising inverse of `Flatten`); on a
+    /// BOXED list it hands them back as references. A range outside its row is a (data-dependent)
+    /// panic; `TrySlices` is the total form.
+    pub(crate) fn range_spans(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Rows) -> Vec<(usize, usize)> {
+        let mut spans = Vec::with_capacity(lo.len());
         for r in 0..outer.len() {
-            let (oe, he) = (outer.end(r), hay.end(r));
+            let (os, oe) = outer.span(r);
+            let (hs, he) = hay.span(r);
             for k in os..oe {
-                let (a, b) = (hs + lo[k] as usize, hs + hi[k] as usize);
-                idx.extend(a..b);
-                acc += b - a;
-                inner.push(acc);
+                let (a, b) = (lo[k] as usize, hi[k] as usize);
+                assert!(a <= b && b <= he - hs, "Slices: range ({a}, {b}) outside row {r} of {} elements", he - hs);
+                spans.push((hs + a, hs + b));
             }
-            os = oe;
-            hs = he;
         }
-        (idx, inner)
+        spans
+    }
+
+    /// spans over a payload as a by-value list: the partition of their lengths over a gather of
+    /// exactly the spanned elements. What `Slices` on a list (and `unbox` of span refs) builds.
+    pub(crate) fn materialize_spans(spans: &[(usize, usize)], payload: &Value) -> Value {
+        let mut elem = Vec::with_capacity(spans.iter().map(|(s, e)| e - s).sum());
+        let mut nb = Vec::with_capacity(spans.len());
+        for &(s, e) in spans {
+            elem.extend(s..e);
+            nb.push(elem.len());
+        }
+        Value::List(nb.into(), Box::new(gather(payload, &elem)))
     }
 
 }
@@ -130,6 +166,9 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             Value::sum_from_prim(new_tags, nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
+        // a reference column: move the refs, never the arena. This one arm is the entire cost model
+        // of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Box they are free.
+        Value::Box(arena, refs) => Value::Box(arena.clone(), refs.gather(idx)),
     }
 }
 
@@ -228,6 +267,13 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             Value::sum_from_prim(out_tags, out_vars)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
+        // sources may reference different arenas, so their refs cannot be merged: copy out, pick,
+        // re-box. (A merge of same-arena boxes would be refs-only; not needed yet.)
+        Value::Box(..) => {
+            let owned: Vec<Value> = filled.iter().map(|v| unbox(v.clone())).collect();
+            let refs: Vec<Option<&Value>> = owned.iter().map(Some).collect();
+            boxed(gather_lanes(&refs, tags, off))
+        }
     }
 }
 
@@ -295,6 +341,10 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             Value::sum_from_prim(Prim::concat(&tag_parts), lanes)
         }
         Value::Unit(_) => Value::Unit(parts.iter().map(Value::len).sum()),
+        Value::Box(..) => {
+            let owned: Vec<Value> = parts.iter().map(|v| unbox(v.clone())).collect();
+            boxed(concat(&owned))
+        }
     }
 }
 
@@ -347,6 +397,31 @@ mod tests {
         }
         let flipped = gather_lanes(&[Some(&b), Some(&a)], &tags, &off);
         assert_eq!(flipped.len(), 4);
+    }
+
+    /// `boxed`/`unbox` round-trip by content; `gather` on a Box moves refs only (the arena `Arc`
+    /// is the same allocation); `fill` of a boxed row is `n` references.
+    #[test]
+    fn box_gather_moves_refs_not_the_arena() {
+        let list = Value::List(vec![2, 3, 6].into(), Box::new(u(&[1, 2, 3, 4, 5, 6])));
+        let b = boxed(list.clone());
+        assert_eq!(unbox(b.clone()), list);
+        let Value::Box(arena, Refs::Spans(s)) = &b else { panic!("a boxed list holds spans") };
+        assert_eq!(*s, vec![(0, 2), (2, 3), (3, 6)]);
+        let g = gather(&b, &[2, 0, 2, 2, 1]);
+        let Value::Box(arena2, Refs::Spans(s2)) = &g else { panic!() };
+        assert!(Arc::ptr_eq(arena, arena2), "gather on a Box must not touch the arena");
+        assert_eq!(*s2, vec![(3, 6), (0, 2), (3, 6), (3, 6), (2, 3)]);
+        assert_eq!(unbox(g), gather(&list, &[2, 0, 2, 2, 1]));
+        // non-list rows: row refs into the arena
+        let prod = Value::Prod(vec![u(&[10, 20]), list]);
+        let bp = boxed(prod.clone());
+        assert!(matches!(&bp, Value::Box(_, Refs::Rows(r)) if *r == vec![0, 1]));
+        assert_eq!(unbox(gather(&bp, &[1, 1, 0])), gather(&prod, &[1, 1, 0]));
+        // the broadcast
+        let row = boxed(Value::List(vec![3].into(), Box::new(u(&[4, 5, 6]))));
+        let f = fill(&row, 4);
+        assert!(matches!(&f, Value::Box(_, Refs::Spans(s)) if *s == vec![(0, 3); 4]));
     }
 
     #[test]

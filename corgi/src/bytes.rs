@@ -51,6 +51,8 @@ pub fn length_in_bytes(v: &Value) -> usize {
         }
         Value::List(bounds, values) => 8 + bounds_len(bounds) + length_in_bytes(values),
         Value::Unit(_) => 16,
+        // the wire carries values: a reference column is sent as the rows it names.
+        Value::Box(..) => length_in_bytes(&crate::engine::unbox(v.clone())),
     }
 }
 
@@ -85,6 +87,7 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
             word(writer, 4)?;
             word(writer, *n as u64)
         }
+        Value::Box(..) => write_to(&crate::engine::unbox(v.clone()), writer),
     }
 }
 
@@ -178,6 +181,7 @@ pub fn declared_rows(v: &Value) -> u64 {
             .max(bounds_total(bounds))
             .max(declared_rows(values)),
         Value::Unit(n) => *n as u64,
+        Value::Box(_, refs) => refs.len() as u64,
     }
 }
 

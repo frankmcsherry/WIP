@@ -17,10 +17,10 @@
 //! program written against pure values runs on the Ok lane of whatever fails upstream. The layout is
 //! what `try` reveals — `try` is the identity on values and a marker to the totality query.
 
-use crate::engine::gather;
+use crate::engine::{gather, materialize_spans};
 use crate::graph::OpLike;
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Refs, Rows, Value};
 use std::sync::Arc;
 
 // --- the representation --------------------------------------------------------------------------
@@ -173,20 +173,19 @@ pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Result<Value, Strin
 pub(crate) fn try_get(input: Value) -> Result<Value, String> {
     let (idx, haystack) = input.into_pair("TryGet")?;
     let idxs = idx.into_u64("TryGet index")?;
-    let (hb, hvals) = haystack.into_list("TryGet haystack")?;
+    let (hb, hvals) = haystack.into_rows("TryGet haystack")?;
     assert_eq!(idxs.len(), hb.len(), "TryGet: index/haystack row count");
     let mut err = Vec::with_capacity(idxs.len());
     let mut abs = Vec::new();
-    let mut hs = 0;
-    for (r, he) in hb.ends().enumerate() {
-        let x = idxs[r] as usize;
+    for (r, &x) in idxs.iter().enumerate() {
+        let (hs, he) = hb.span(r);
+        let x = x as usize;
         if x < he - hs {
             err.push(false);
             abs.push(hs + x);
         } else {
             err.push(true);
         }
-        hs = he;
     }
     Ok(fail(&err, gather(&hvals, &abs)))
 }
@@ -195,10 +194,12 @@ pub(crate) fn try_get(input: Value) -> Result<Value, String> {
 pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
     let (idx, haystack) = input.into_pair("TryGather")?;
     let (ib, ivals) = idx.into_list("TryGather indices")?;
-    let (hb, hvals) = haystack.into_list("TryGather haystack")?;
+    let (hb, hvals) = haystack.into_rows("TryGather haystack")?;
     assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
     let idxs = ivals.into_u64("TryGather indices")?;
-    if ib.len() == 1 && hb.len() == 1 {
+    // the one-row leaf fast path indexes the payload directly, so row 0 must BE the payload (a
+    // partition); a boxed haystack takes the row-relative path below.
+    if let (1, 1, Some(part)) = (ib.len(), hb.len(), hb.as_partition()) {
         if let Value::Prim(p) = &hvals {
             // One row over a leaf: validate and gather in the index buffer itself (an identity
             // gather reuses the haystack leaf), and recover the uniform `Stride` form of the bounds
@@ -207,7 +208,7 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
                 Bounds::Offsets(ends) => ends.into(),
                 bounds => bounds,
             };
-            return Ok(match p.gather_u64_checked_owned(idxs, hb.end(0)) {
+            return Ok(match p.gather_u64_checked_owned(idxs, part.end(0)) {
                 Some(g) => fail(&[false], Value::List(ib, Box::new(Value::Prim(g)))),
                 None => fail(&[true], Value::List(Bounds::Offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
             });
@@ -216,9 +217,9 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
     let mut err = Vec::with_capacity(ib.len());
     let mut abs = Vec::new();
     let mut bounds = Vec::new();
-    let (mut is, mut hs) = (0usize, 0usize);
     for r in 0..ib.len() {
-        let (ie, he) = (ib.end(r), hb.end(r));
+        let (is, ie) = ib.span(r);
+        let (hs, he) = hb.span(r);
         let rowlen = he - hs;
         if idxs[is..ie].iter().all(|&x| (x as usize) < rowlen) {
             err.push(false);
@@ -227,28 +228,26 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
         } else {
             err.push(true);
         }
-        is = ie;
-        hs = he;
     }
     Ok(fail(&err, Value::List(bounds.into(), Box::new(gather(&hvals, &abs)))))
 }
 
 /// `(ranges:List<(lo,hi)>, haystack:List<T>) -> Fail<List<List<T>>>`: per row, every range must
-/// satisfy `lo <= hi <= rowlen`.
+/// satisfy `lo <= hi <= rowlen`. Like `Slices`, a BOXED haystack yields the ranges as references
+/// (`Fail<List<Box<List<T>>>>`) rather than copies.
 pub(crate) fn try_slices(input: Value) -> Result<Value, String> {
     let (lohi, haystack) = input.into_pair("TrySlices")?;
     let (lb, lvals) = lohi.into_list("TrySlices ranges")?;
-    let (hb, hvals) = haystack.into_list("TrySlices haystack")?;
+    let (hb, hvals) = haystack.into_rows("TrySlices haystack")?;
     assert_eq!(lb.len(), hb.len(), "TrySlices: row count");
     let (lo, hi) = lvals.into_pair("TrySlices lo_hi")?;
     let (lo_c, hi_c) = (lo.into_u64("TrySlices lo")?, hi.into_u64("TrySlices hi")?);
     let mut err = Vec::with_capacity(lb.len());
-    let mut abs = Vec::new();
-    let mut inner = Vec::new();
+    let mut spans = Vec::new();
     let mut outer = Vec::new();
-    let (mut ls, mut hs) = (0usize, 0usize);
     for r in 0..lb.len() {
-        let (le, he) = (lb.end(r), hb.end(r));
+        let (ls, le) = lb.span(r);
+        let (hs, he) = hb.span(r);
         let rowlen = he - hs;
         let row_ok = (ls..le).all(|k| {
             let (l, h) = (lo_c[k] as usize, hi_c[k] as usize);
@@ -257,17 +256,17 @@ pub(crate) fn try_slices(input: Value) -> Result<Value, String> {
         if row_ok {
             err.push(false);
             for k in ls..le {
-                abs.extend((lo_c[k] as usize..hi_c[k] as usize).map(|p| hs + p));
-                inner.push(abs.len());
+                spans.push((hs + lo_c[k] as usize, hs + hi_c[k] as usize));
             }
-            outer.push(inner.len());
+            outer.push(spans.len());
         } else {
             err.push(true);
         }
-        ls = le;
-        hs = he;
     }
-    let mats = Value::List(inner.into(), Box::new(gather(&hvals, &abs)));
+    let mats = match hb {
+        Rows::Part(_) => materialize_spans(&spans, &hvals),
+        Rows::Spans(_) => Value::Box(Arc::new(hvals), Refs::Spans(spans)),
+    };
     Ok(fail(&err, Value::List(outer.into(), Box::new(mats))))
 }
 

@@ -1,0 +1,138 @@
+//! `Box<T>`: a column of references. `box` takes them (nothing copied), `unbox` copies the rows
+//! out, `gather` (hence the capture family and `lit`) moves only refs, `Field` projects through a
+//! boxed product, and the readers `get`/`gather`/`find`/`slices`/`len` accept a boxed list. These
+//! tests pin that a boxed haystack answers exactly as the list it references, and that the two
+//! spellings of a capture — by value and by reference — agree.
+
+use corgi::{eval_graph, lower_effects, parse_ml, show, Value};
+
+fn run(src: &str, input: Value) -> Value {
+    let g = lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("parse {src:?}: {e}")));
+    eval_graph(&g, input)
+}
+
+fn seed(n: u64) -> Value {
+    Value::u64(vec![n])
+}
+
+/// a 3-row list over a 6-element payload
+fn haystack() -> Value {
+    Value::List(vec![2, 5, 6].into(), Box::new(Value::u64(vec![10, 11, 20, 21, 22, 30])))
+}
+
+#[test]
+fn box_unbox_round_trips_and_shows_as_the_rows() {
+    let h = haystack();
+    let boxed = run("input box", h.clone());
+    assert_eq!(show(&boxed), format!("Box <{}>", show(&h)));
+    assert_eq!(run("input box unbox", h.clone()), h);
+    // a boxed non-list is row refs into an arena; still round-trips
+    let p = Value::Prod(vec![Value::u64(vec![1, 2, 3]), h.clone()]);
+    assert_eq!(run("input box unbox", p.clone()), p);
+}
+
+/// every reader gives the same answer on `h box` as on `h`.
+#[test]
+fn readers_agree_through_a_box() {
+    let h = haystack();
+    let idx = Value::u64(vec![1, 2, 0]);
+    let lists = Value::List(vec![1, 3, 4].into(), Box::new(Value::u64(vec![1, 2, 0, 0])));
+    let needles = Value::List(vec![1, 2, 3].into(), Box::new(Value::u64(vec![11, 21, 22, 5])));
+    let ranges = Value::List(
+        vec![1, 3, 4].into(),
+        Box::new(Value::Prod(vec![Value::u64(vec![0, 0, 2, 0]), Value::u64(vec![2, 1, 3, 1])])),
+    );
+    for (name, lhs, by_value, by_ref) in [
+        ("get", Some(idx), "let (i, h) = input in (i, h) get", "let (i, h) = input in (i, h box) get"),
+        ("gather", Some(lists), "let (i, h) = input in (i, h) gather", "let (i, h) = input in (i, h box) gather"),
+        ("find", Some(needles), "let (n, h) = input in (n, h) find", "let (n, h) = input in (n, h box) find"),
+        ("slices", Some(ranges), "let (r, h) = input in (r, h) slices", "let (r, h) = input in (r, h box) slices"),
+        ("len", None, "input len", "input box len"),
+    ] {
+        let arg = match lhs {
+            Some(l) => Value::Prod(vec![l, h.clone()]),
+            None => h.clone(),
+        };
+        let a = run(by_value, arg.clone());
+        let b = run(by_ref, arg);
+        // `slices` on a box returns references (its own test below); the rest are by value.
+        if name == "slices" {
+            assert_eq!(show(&a), show(&b).replace("Box <", "").replacen(">>>", ">>", 1), "{name}");
+        } else {
+            assert_eq!(a, b, "{name}: boxed haystack disagrees with the list");
+        }
+    }
+}
+
+/// `slices` on a boxed haystack hands out references; on a list it copies. Same rows either way.
+#[test]
+fn slices_on_a_box_is_by_reference() {
+    let h = haystack();
+    let ranges = Value::List(
+        vec![2, 2, 3].into(),
+        Box::new(Value::Prod(vec![Value::u64(vec![0, 1, 0]), Value::u64(vec![2, 2, 1])])),
+    );
+    let copied = run("let (r, h) = input in (r, h) slices", Value::Prod(vec![ranges.clone(), h.clone()]));
+    let referenced = run("let (r, h) = input in (r, h box) slices", Value::Prod(vec![ranges, h]));
+    let expect = "Sum tags=[0, 0, 0] [List ends=[2, 2, 3] <List ends=[2, 3, 4] <[10, 11, 11, 30]>>, ()x0]";
+    assert_eq!(show(&copied), expect);
+    assert_eq!(show(&referenced), expect.replace("<List ends=[2, 3, 4]", "<Box <List ends=[2, 3, 4]").replace(">>, ()x0]", ">>>, ()x0]"));
+    let Value::Sum(_, _, lanes) = &referenced else { panic!() };
+    let Value::List(_, inner) = &lanes[0] else { panic!() };
+    assert!(matches!(&**inner, Value::Box(..)), "the inner rows are references");
+}
+
+/// the capture: a boxed list context is one reference per element and the body's `get` reads
+/// through it — the same answer as the by-value capture and as the capture-free `gather`.
+#[test]
+fn cap_list_of_a_boxed_list_agrees_with_the_copy() {
+    let by_ref = run(
+        "let xs = input iota in let ys = xs map (y -> y shr 1) in \
+         (xs box, ys) cap_list map ((c, y) -> (y, c) get)",
+        seed(6),
+    );
+    let by_value = run(
+        "let xs = input iota in let ys = xs map (y -> y shr 1) in \
+         (xs, ys) cap_list map ((c, y) -> (y, c) get)",
+        seed(6),
+    );
+    let via_gather = run(
+        "let xs = input iota in let ys = xs map (y -> y shr 1) in (ys, xs) gather",
+        seed(6),
+    );
+    assert_eq!(by_ref, by_value);
+    assert_eq!(show(&by_ref), show(&via_gather));
+    assert_eq!(show(&by_ref), "Sum tags=[0] [List ends=[6] <[0, 0, 1, 1, 2, 2]>, ()x0]");
+}
+
+/// `Field` through a boxed product projects by reference; `unbox` then copies just that field.
+#[test]
+fn field_projects_through_a_boxed_product() {
+    let out = run(
+        "let xs = input iota in let p = (xs, xs map (y -> y shr 1)) in let b = p box in (b.1 unbox, b.0 unbox)",
+        seed(6),
+    );
+    let expect = run("let xs = input iota in (xs map (y -> y shr 1), xs)", seed(6));
+    assert_eq!(out, expect);
+    // and a list field of a boxed product comes back as a boxed LIST (spans), readable by `gather`
+    let by_ref = run(
+        "let xs = input iota in let ys = xs map (y -> y shr 1) in let b = (xs, xs) box in (ys, b.1) gather",
+        seed(6),
+    );
+    let by_value = run(
+        "let xs = input iota in let ys = xs map (y -> y shr 1) in (ys, xs) gather",
+        seed(6),
+    );
+    assert_eq!(by_ref, by_value);
+    assert_eq!(show(&by_ref), "Sum tags=[0] [List ends=[6] <[0, 0, 1, 1, 2, 2]>, ()x0]");
+}
+
+/// a Box where a list is required is the shape error "unbox first", not a silent copy.
+#[test]
+fn a_box_is_not_silently_materialized() {
+    let g = parse_ml("input box map (x -> x)").unwrap();
+    let err = corgi::shape_of(&g, &corgi::Shape::List(Box::new(corgi::Shape::Prim(64))));
+    assert!(err.is_err(), "map over a Box must be a shape error");
+    let msg = err.unwrap_err();
+    assert!(msg.contains("expected a list") && msg.contains("Box<"), "{msg}");
+}

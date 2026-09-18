@@ -1,0 +1,11 @@
+# capture of a LIST-shaped context BY REFERENCE: `box` turns each row of `xs` into a reference (one span
+# of the one shared payload), so `cap_list` pairs every element with a reference to its owner's list and
+# copies nothing; the body's `get` reads through the reference. Without the `box`, `cap_list` copies the
+# list into every element (same answer, `elements x length` cost) — the choice is in the program.
+# n = 6
+# = Sum tags=[0] [(List ends=[6] <[0, 0, 1, 1, 2, 2]>, List ends=[6] <[0, 0, 1, 1, 2, 2]>), ()x0]
+let xs = input iota in
+let ys = xs map (y -> y shr 1) in
+let by_ref = (xs box, ys) cap_list map ((c, y) -> (y, c) get) in
+let by_val = (xs, ys) cap_list map ((c, y) -> (y, c) get) in
+(by_ref, by_val)

@@ -3,11 +3,11 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
+    boxed, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans, resolve_indices, unbox,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Refs, Rows, Value};
 use std::sync::Arc;
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
@@ -41,7 +41,7 @@ fn fixed_width(v: &Value) -> bool {
     match v {
         Value::Prim(_) | Value::Unit(_) => true, // a unit row is a (zero-byte) constant slot
         Value::Prod(cs) => cs.iter().all(fixed_width),
-        Value::List(..) | Value::Sum(..) => false,
+        Value::List(..) | Value::Sum(..) | Value::Box(..) => false,
     }
 }
 
@@ -124,7 +124,15 @@ pub enum Op<L> {
                     // plain scan can't (running deltas, indexing, RLE). `Fold` is kept separate — the
                     // R=Unit specialization, ~3x cheaper than FoldScan (no output pair, no recording).
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
-                    // (né Broadcast); the list-side closure capture.
+                    // (né Broadcast); the list-side closure capture. Copies X per element unless X
+                    // is boxed — then it is one reference per element (a closure's `&ctx`).
+    // BOX — a column of references. The explicit by-reference/by-value pair: everything that moves
+    // rows (`gather`, hence the capture family and `Lit`) moves only refs on a Box, and nothing
+    // copies referenced data except `Unbox`. `Field` projects through a boxed product; the readers
+    // `Get`/`Gather`/`Find`/`Slices`/`Len` accept a boxed list haystack; every other op on a Box is
+    // the shape error "unbox first".
+    Boxed,          // T -> Box<T>       take references (O(rows), nothing copied)
+    Unbox,          // Box<T> -> T       copy the referenced rows out
 
     // ---- structural isos: de-/re-structure between nestings the layout already stores; linear
     // bounds work at most, no per-element compute. Three pairs: List⊗Prod (Transpose/Zip),
@@ -215,12 +223,34 @@ impl<L: OpLike> Op<L> {
             Op::Lit(v) => fill(v, input.len()),
 
             Op::Field(i) => {
+                // through a boxed product: the field, still by reference (same rows; a list field's
+                // rows become spans of that field's payload). Nothing is copied.
+                if let Value::Box(arena, Refs::Rows(rows)) = &input {
+                    let Value::Prod(cols) = &**arena else {
+                        return Err(format!("Field({i}) expects a product, got {}", shape_of_value(&input)));
+                    };
+                    if *i >= cols.len() {
+                        return Err(format!("Field({i}) expects a product with > {i} fields, got {}", shape_of_value(&input)));
+                    }
+                    return Ok(match &cols[*i] {
+                        Value::List(b, payload) => {
+                            Value::Box(Arc::new((**payload).clone()), Refs::Spans(rows.iter().map(|&r| b.span(r)).collect()))
+                        }
+                        field => Value::Box(Arc::new(field.clone()), Refs::Rows(rows.clone())),
+                    });
+                }
                 let mut cols = input.into_prod("Field")?;
                 if *i >= cols.len() {
                     return Err(format!("Field({i}) expects a product with > {i} fields, got {}", Shape::Prod(cols.iter().map(shape_of_value).collect())));
                 }
                 cols.swap_remove(*i)
             }
+
+            Op::Boxed => boxed(input),
+            Op::Unbox => match input {
+                b @ Value::Box(..) => unbox(b),
+                other => return Err(format!("Unbox expects a Box, got {}", shape_of_value(&other))),
+            },
 
             Op::Transpose => {
                 let (bounds, vals) = input.into_list("Transpose")?;
@@ -390,9 +420,8 @@ impl<L: OpLike> Op<L> {
 
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
-                let (bounds, _vals) = input.into_list("Len")?;
-                let mut prev = 0;
-                let lens = bounds.ends().map(|e| { let l = (e - prev) as u64; prev = e; l }).collect();
+                let (rows, _vals) = input.into_rows("Len")?;
+                let lens = (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as u64 }).collect();
                 Value::u64(lens)
             }
 
@@ -649,15 +678,21 @@ impl<L: OpLike> Op<L> {
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it
             // names. List<(lo,hi)> -> List<List<T>>; reuses `gather`. A list-introducer.
+            // on a list haystack the ranges are copied out (List<List<T>>); on a BOXED haystack they
+            // are handed back as references (List<Box<List<T>>>), O(ranges) — the per-anchor sub-list
+            // of a join/WCO plan without materializing it.
             Op::Slices => {
                 let (lohi, haystack) = input.into_pair("Slices")?;
                 let (lb, lvals) = lohi.into_list("Slices ranges")?;
-                let (hb, hvals) = haystack.into_list("Slices haystack")?;
+                let (hrows, hvals) = haystack.into_rows("Slices haystack")?;
                 let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
                 let (lo_c, hi_c) = (lo.into_u64("Slices lo")?, hi.into_u64("Slices hi")?);
-                assert_eq!(lb.len(), hb.len(), "Slices: row count");
-                let (idx, inner_bounds) = expand_ranges(&lb, &lo_c, &hi_c, &hb);
-                let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
+                assert_eq!(lb.len(), hrows.len(), "Slices: row count");
+                let spans = range_spans(&lb, &lo_c, &hi_c, &hrows);
+                let inner = match hrows {
+                    Rows::Part(_) => materialize_spans(&spans, &hvals),
+                    Rows::Spans(_) => Value::Box(Arc::new(hvals), Refs::Spans(spans)),
+                };
                 Value::List(lb, Box::new(inner))
             }
 
@@ -666,15 +701,14 @@ impl<L: OpLike> Op<L> {
             Op::Get => {
                 let (idx, haystack) = input.into_pair("Get")?;
                 let idxs = idx.into_u64("Get index")?;
-                let (hb, hvals) = haystack.into_list("Get haystack")?;
+                let (hb, hvals) = haystack.into_rows("Get haystack")?;
                 assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
                 let mut abs = Vec::with_capacity(idxs.len());
-                let mut hs = 0;
-                for (r, he) in hb.ends().enumerate() {
-                    let x = idxs[r] as usize;
+                for (r, &x) in idxs.iter().enumerate() {
+                    let (hs, he) = hb.span(r);
+                    let x = x as usize;
                     assert!(x < he - hs, "Get: index {x} out of range for a row of {} elements", he - hs);
                     abs.push(hs + x);
-                    hs = he;
                 }
                 gather(&hvals, &abs)
             }
@@ -682,10 +716,12 @@ impl<L: OpLike> Op<L> {
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather")?;
                 let (ib, ivals) = idx.into_list("Gather indices")?;
-                let (hb, hvals) = haystack.into_list("Gather haystack")?;
+                let (hb, hvals) = haystack.into_rows("Gather haystack")?;
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
                 let idxs = ivals.into_u64("Gather indices")?;
-                if ib.len() == 1 && hb.len() == 1 {
+                // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
+                // payload (a partition); a boxed haystack takes the row-relative path below.
+                if ib.len() == 1 && hb.len() == 1 && hb.as_partition().is_some() {
                     if let Value::Prim(p) = &hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
                         // indexing in the gather supplies that check without a separate scan.
@@ -703,15 +739,15 @@ impl<L: OpLike> Op<L> {
             Op::GatherTry => {
                 let (idx, haystack) = input.into_pair("GatherTry")?;
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
-                let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
+                let (hb, hvals) = haystack.into_rows("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
                 let idxs = ivals.into_u64("GatherTry indices")?;
                 let mut tags = Vec::with_capacity(idxs.len());
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
-                let (mut is, mut hs) = (0, 0);
                 for r in 0..ib.len() {
-                    let (ie, he) = (ib.end(r), hb.end(r));
+                    let (is, ie) = ib.span(r);
+                    let (hs, he) = hb.span(r);
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
@@ -722,8 +758,6 @@ impl<L: OpLike> Op<L> {
                             oob.push(x);
                         }
                     }
-                    is = ie;
-                    hs = he;
                 }
                 let sum = Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)]);
                 Value::List(ib, Box::new(sum))
