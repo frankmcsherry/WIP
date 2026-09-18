@@ -109,11 +109,11 @@ pub(crate) fn hash_cols(v: &Value) -> Vec<u64> {
         Value::Unit(n) => vec![UNIT; *n],
 
         // box = the referenced rows' hashes (a reference has the identity of what it names).
-        Value::Box(arena, Refs::Rows(rows)) => {
+        Value::Ref(arena, Refs::Thin(rows)) => {
             let ah = hash_cols(arena);
             rows.iter().map(|&r| ah[r]).collect()
         }
-        Value::Box(payload, Refs::Spans(spans)) => {
+        Value::Ref(payload, Refs::Fat(spans)) => {
             let ch = hash_cols(payload);
             spans
                 .iter()

@@ -103,8 +103,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // a KERNEL op (the optimizer's `Weave(Unweave x)=x` round-trip; tested at Builder level), never
         // a verb. (A `try_weave` would only carry an unactionable "inconsistent columns" error.)
         "cap_list" => Op::CapList.into(), // capture: pair a context with every list element
-        "box" => Op::Boxed.into(),          // T -> Box<T>: take references (a capture then costs one ref per element)
-        "unbox" => Op::Unbox.into(),      // Box<T> -> T: copy the referenced rows out
+        "ref" => Op::Ref.into(),          // T -> Ref<T>: take references (a capture then costs one ref per element)
+        "clone" => Op::Clone.into(),      // Ref<T> -> T: clone the referenced rows out
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
         "branch" => Op::TryBranch(n()? as usize).into(), // the demux; a tag >= n errs its row
         "filter" => Op::TryFilter.into(), // per row: data/mask lengths agree, else Err

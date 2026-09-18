@@ -264,12 +264,12 @@ pub mod arrange {
             }
             // Unit: every row is identical content, so a single constant.
             Value::Unit(n) => vec![splitmix64(SEED_UNIT); *n],
-            // Box: the referenced rows' hashes.
-            Value::Box(arena, Refs::Rows(rows)) => {
+            // Ref: the referenced rows' hashes.
+            Value::Ref(arena, Refs::Thin(rows)) => {
                 let ah = hash_rows(arena);
                 rows.iter().map(|&r| ah[r]).collect()
             }
-            Value::Box(payload, Refs::Spans(spans)) => {
+            Value::Ref(payload, Refs::Fat(spans)) => {
                 let elem = hash_rows(payload);
                 spans
                     .iter()

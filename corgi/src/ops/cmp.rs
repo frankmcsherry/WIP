@@ -122,7 +122,7 @@ impl CmpOp {
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find")?;
                 let (nb, nvals) = needle.into_list("Find needle")?;
-                // the haystack may be a boxed list (captured or sliced by reference): rows are read
+                // the haystack may be a referenced list (captured or sliced by reference): rows are read
                 // through `span`, and the search indexes the payload absolutely, so no copy.
                 let (hb, hvals) = haystack.into_rows("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;

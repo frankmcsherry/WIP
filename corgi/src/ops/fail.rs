@@ -198,7 +198,7 @@ pub(crate) fn try_gather(input: Value) -> Result<Value, String> {
     assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
     let idxs = ivals.into_u64("TryGather indices")?;
     // the one-row leaf fast path indexes the payload directly, so row 0 must BE the payload (a
-    // partition); a boxed haystack takes the row-relative path below.
+    // partition); a referenced haystack takes the row-relative path below.
     if let (1, 1, Some(part)) = (ib.len(), hb.len(), hb.as_partition()) {
         if let Value::Prim(p) = &hvals {
             // One row over a leaf: validate and gather in the index buffer itself (an identity
@@ -265,7 +265,7 @@ pub(crate) fn try_slices(input: Value) -> Result<Value, String> {
     }
     let mats = match hb {
         Rows::Part(_) => materialize_spans(&spans, &hvals),
-        Rows::Spans(_) => Value::Box(Arc::new(hvals), Refs::Spans(spans)),
+        Rows::Spans(_) => Value::Ref(Arc::new(hvals), Refs::Fat(spans)),
     };
     Ok(fail(&err, Value::List(outer.into(), Box::new(mats))))
 }

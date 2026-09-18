@@ -19,12 +19,12 @@ src/
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
-               Value::Box(Arc<arena>, Refs) = a column of REFERENCES (shape Box<T>): `box` takes them,
-               `unbox` copies out (the only copy of referenced data), `gather` moves refs only. Refs form is
-               fixed by the boxed shape: a boxed List row is a (lo,hi) span of its payload (&[T]), else a row
-               index (&T). `Rows` = the reader's view (List or Box<List>) via `into_rows`; `into_list` takes
-               only a List, so a Box elsewhere is the shape error "unbox first".
-  shape.rs     Shape (Prim(width) | Prod | Sum | List | Box) + shape_of_value + Display.
+               Value::Ref(Arc<arena>, Refs) = a column of REFERENCES (shape Ref<T>): `ref` takes them,
+               `clone` copies out (the only copy of referenced data), `gather` moves refs only. Refs form is
+               fixed by the referenced shape: a referenced List row is a (lo,hi) span of its payload (&[T]), else a row
+               index (&T) — thin vs fat pointers (`Refs::Thin`/`Refs::Fat`); fat refs are what `slices` hands out by reference. `Rows` = the reader's view (List or Ref<List>) via `into_rows`; `into_list` takes
+               only a List, so a Ref elsewhere is the shape error "clone first".
+  shape.rs     Shape (Prim(width) | Prod | Sum | List | Ref) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
                passes are latent, not dead.
@@ -266,14 +266,14 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   that law, so gather chains become index math + one final gather. The lazy form (multiplicity View:
   0 = filter, ≥1 = repeat, range = slice) stays OUT of `List` — collie's `Selector` (4 variants × a
   composition matrix × per-op awareness) is the cautionary tale. What IS in the representation is
-  the REFERENCE, as its own shape: `Box<T>` (`box`/`unbox`), because a List row is the only
+  the REFERENCE, as its own shape: `Ref<T>` (`ref`/`clone`), because a List row is the only
   unbounded-size row and capturing it by copy is `elements × length` where a closure pays `elements`
-  (perf-gaps.md family K: 2088× → 3.7×). The choice is explicit in the program — `(ctx box, ys)
+  (perf-gaps.md family K: 2088× → 3.7×). The choice is explicit in the program — `(ctx ref, ys)
   cap_list` is one reference per element, `(ctx, ys) cap_list` copies — and the only copy of
-  referenced data is `unbox`. A first spike put the same spans inside `Bounds` with a second gather
+  referenced data is `clone`. A first spike put the same spans inside `Bounds` with a second gather
   and a second accessor deciding reference-vs-copy implicitly (branch `corgi-spans`); rejected as
   sneaky. Next: Field pushdown through `cap_list`/`cap_sum`, then the mechanical closure-capture
-  pass (which inserts the `box`/`unbox`); `Box` is also the μ-type recursion knot.
+  pass (which inserts the `ref`/`clone`); `Ref` is also the μ-type recursion knot.
 - **Vectorized abstract machine — the CPS connection (to discuss).** The term graph with let-sharing
   is already ANF (the "essence of CPS", Flanagan et al.), so CPS's bookkeeping benefits — named
   intermediates, explicit order, local rewrites — are built in. The deeper half, control flow

@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    boxed, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans, resolve_indices, unbox,
+    clone_ref, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans, resolve_indices, take_ref,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
@@ -41,7 +41,7 @@ fn fixed_width(v: &Value) -> bool {
     match v {
         Value::Prim(_) | Value::Unit(_) => true, // a unit row is a (zero-byte) constant slot
         Value::Prod(cs) => cs.iter().all(fixed_width),
-        Value::List(..) | Value::Sum(..) | Value::Box(..) => false,
+        Value::List(..) | Value::Sum(..) | Value::Ref(..) => false,
     }
 }
 
@@ -125,14 +125,14 @@ pub enum Op<L> {
                     // R=Unit specialization, ~3x cheaper than FoldScan (no output pair, no recording).
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
                     // (né Broadcast); the list-side closure capture. Copies X per element unless X
-                    // is boxed — then it is one reference per element (a closure's `&ctx`).
+                    // is referenced — then it is one reference per element (a closure's `&ctx`).
     // BOX — a column of references. The explicit by-reference/by-value pair: everything that moves
-    // rows (`gather`, hence the capture family and `Lit`) moves only refs on a Box, and nothing
-    // copies referenced data except `Unbox`. `Field` projects through a boxed product; the readers
-    // `Get`/`Gather`/`Find`/`Slices`/`Len` accept a boxed list haystack; every other op on a Box is
-    // the shape error "unbox first".
-    Boxed,          // T -> Box<T>       take references (O(rows), nothing copied)
-    Unbox,          // Box<T> -> T       copy the referenced rows out
+    // rows (`gather`, hence the capture family and `Lit`) moves only refs on a Ref, and nothing
+    // copies referenced data except `Unbox`. `Field` projects through a referenced product; the readers
+    // `Get`/`Gather`/`Find`/`Slices`/`Len` accept a referenced list haystack; every other op on a Ref is
+    // the shape error "clone first".
+    Ref,            // T -> Ref<T>       take references (O(rows), nothing copied)
+    Clone,          // Ref<T> -> T       clone the referenced rows out (the ONLY copy of referenced data)
 
     // ---- structural isos: de-/re-structure between nestings the layout already stores; linear
     // bounds work at most, no per-element compute. Three pairs: List⊗Prod (Transpose/Zip),
@@ -223,9 +223,9 @@ impl<L: OpLike> Op<L> {
             Op::Lit(v) => fill(v, input.len()),
 
             Op::Field(i) => {
-                // through a boxed product: the field, still by reference (same rows; a list field's
+                // through a referenced product: the field, still by reference (same rows; a list field's
                 // rows become spans of that field's payload). Nothing is copied.
-                if let Value::Box(arena, Refs::Rows(rows)) = &input {
+                if let Value::Ref(arena, Refs::Thin(rows)) = &input {
                     let Value::Prod(cols) = &**arena else {
                         return Err(format!("Field({i}) expects a product, got {}", shape_of_value(&input)));
                     };
@@ -234,9 +234,9 @@ impl<L: OpLike> Op<L> {
                     }
                     return Ok(match &cols[*i] {
                         Value::List(b, payload) => {
-                            Value::Box(Arc::new((**payload).clone()), Refs::Spans(rows.iter().map(|&r| b.span(r)).collect()))
+                            Value::Ref(Arc::new((**payload).clone()), Refs::Fat(rows.iter().map(|&r| b.span(r)).collect()))
                         }
-                        field => Value::Box(Arc::new(field.clone()), Refs::Rows(rows.clone())),
+                        field => Value::Ref(Arc::new(field.clone()), Refs::Thin(rows.clone())),
                     });
                 }
                 let mut cols = input.into_prod("Field")?;
@@ -246,10 +246,10 @@ impl<L: OpLike> Op<L> {
                 cols.swap_remove(*i)
             }
 
-            Op::Boxed => boxed(input),
-            Op::Unbox => match input {
-                b @ Value::Box(..) => unbox(b),
-                other => return Err(format!("Unbox expects a Box, got {}", shape_of_value(&other))),
+            Op::Ref => take_ref(input),
+            Op::Clone => match input {
+                b @ Value::Ref(..) => clone_ref(b),
+                other => return Err(format!("Clone expects a Ref, got {}", shape_of_value(&other))),
             },
 
             Op::Transpose => {
@@ -691,7 +691,7 @@ impl<L: OpLike> Op<L> {
                 let spans = range_spans(&lb, &lo_c, &hi_c, &hrows);
                 let inner = match hrows {
                     Rows::Part(_) => materialize_spans(&spans, &hvals),
-                    Rows::Spans(_) => Value::Box(Arc::new(hvals), Refs::Spans(spans)),
+                    Rows::Spans(_) => Value::Ref(Arc::new(hvals), Refs::Fat(spans)),
                 };
                 Value::List(lb, Box::new(inner))
             }
@@ -720,7 +720,7 @@ impl<L: OpLike> Op<L> {
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
                 let idxs = ivals.into_u64("Gather indices")?;
                 // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
-                // payload (a partition); a boxed haystack takes the row-relative path below.
+                // payload (a partition); a referenced haystack takes the row-relative path below.
                 if ib.len() == 1 && hb.len() == 1 && hb.as_partition().is_some() {
                     if let Value::Prim(p) = &hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary

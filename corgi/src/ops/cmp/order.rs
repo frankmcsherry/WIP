@@ -348,7 +348,7 @@ mod discriminate {
             Value::Unit(n) => ((0..*n).collect(), labels.to_vec()),
             // a reference sorts as what it names: copy the referenced rows out and sort those. (A
             // refs-aware sort would read through the arena; not needed yet.)
-            Value::Box(..) => sort_blocks(labels, &crate::engine::unbox(v.clone())),
+            Value::Ref(..) => sort_blocks(labels, &crate::engine::clone_ref(v.clone())),
         }
     }
 
