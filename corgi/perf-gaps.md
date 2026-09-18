@@ -160,7 +160,7 @@ The suite fixes the element count at 64 K and sweeps the row length k, so a flat
 |---|---|---|---|---|---|
 | **L1 fold_collect** — `(acc, x) -> (acc, x enlist) append` | 3.5× | 187× | **5927×** | 15 → 217 → 3327 | `v.push(x)` |
 | L1s foldscan control — fixed state, element streamed to the output | 0.8× | 5.4× | 34× | 3.2 → 6.3 → 19 | the same, written as mapAccumL |
-| **L2 fold_selfref** — `(acc, x) -> (acc, (x, acc) get_uns enlist) append` | 2.8× | 166× | **4567×** | 19 → 225 → 3397 | `v.push(v[x])` |
+| **L2 fold_selfref** — `(acc, x) -> (acc, [acc[x]]) append` | 2.8× | 166× | **4567×** | 19 → 225 → 3397 | `v.push(v[x])` |
 
 Reading the sweep: L1 and L2 cost ≈ 0.8 ns × k per element — one copy of the accumulator per step, quadratic per row exactly as predicted. (The Rust L1 ceiling *falls* with k, 4.2 → 0.56 ns, because a per-row `Vec` allocation is amortized over more pushes.)
 
@@ -169,7 +169,7 @@ Two different gaps hide in the two rows:
 - **L1 is a usage finding, like F1.** The unconditional collect has a linear corgi spelling — `foldscan` with a fixed (here unit) state and the element pushed to the output — and it should be written that way. What L1s then shows is source 2 of the K/L analysis, the **rounds term**: `foldscan` runs one round per element of the longest row, and at k=4096 with only 16 rows the per-round dispatch is amortized over 16 elements, so the streamed form drifts from 0.8× to 34×. That is the C4/C5 single-row degeneration, not the quadratic.
 - **L2 is the real gap.** A step that must *read back* the growing accumulator has no non-quadratic spelling today: the state has to be the whole list because the body needs random access into it, and the state is rebuilt per round. Rust's `Vec` is both the state and the output. The fix `Ref` makes possible: a `FoldScan` whose fixed-size state may hold a **fat ref into the output emitted so far** — the emitted stream is append-only and immutable, so the reference is stable, `get` through it is O(1), and the accumulator stops being carried as a value. That is a stack machine / parser / self-referential recurrence at O(k) per row. Not built; the design item is recorded in NOTES.md.
 
-`get_uns` (the partial-tier `Get`, panics out of range) is exposed at the surface for this family, because a fold body's state cannot carry a `Fail`.
+L2's body is built with the `Builder` rather than the surface: it needs the partial-tier `Get` (a fold state cannot carry a `Fail`), and that tier is deliberately not a surface word.
 
 ## Recommended order (preliminary)
 

@@ -117,7 +117,6 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // each element's miss as data — kept as its own verb. `head` is sugar for `get 0` (see ml.rs).
         "slices" => Op::TrySlices.into(),     // per row: every range in bounds, else Err
         "get" => Op::TryGet.into(),           // (idx, haystack) -> the element, or Err out of range
-        "get_uns" => Op::Get.into(),          // the PARTIAL tier (panics out of range) — for bodies whose state cannot carry a Fail
         "gather" => Op::TryGather.into(),     // per row all-or-nothing over its indices
         "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Oob | Found}>
         "try" => Op::Try.into(), // handle a fallible stage here: its Fail<T> = Sum{T | Unit} is now data to match

@@ -710,7 +710,24 @@ fn family_l(rows: usize, k: usize, reps: u32) {
     // it is pushing onto; corgi has to carry the whole list as state.
     let idx_vals: Vec<u64> = xs_vals.iter().enumerate().map(|(j, &e)| e % ((j % k) as u64 + 1)).collect();
     let idx = Value::List(bounds.into(), Box::new(Value::u64(idx_vals.clone())));
-    let g = compile("let (seed, xs) = input in (seed, xs) fold ((acc, x) -> (acc, (x, acc) get_uns enlist) append)");
+    // Built with the Builder rather than the surface: the body needs the partial-tier `Get` (its
+    // state cannot carry a `Fail`), and that tier is deliberately not a surface word.
+    let g = {
+        let mut body = Builder::default();
+        let p = body.input();
+        let acc = body.add(Op::Field(0), vec![p]);
+        let x = body.add(Op::Field(1), vec![p]);
+        let xi = body.tuple(vec![x, acc]);
+        let got = body.add(Op::Get, vec![xi]);
+        let one = body.add(Op::Enlist, vec![got]);
+        let both = body.tuple(vec![acc, one]);
+        let out = body.add(Op::Append, vec![both]);
+        let body = body.finish(out);
+        let mut b = Builder::default();
+        let inp = b.input();
+        let out = b.add(Op::Fold(Box::new(body)), vec![inp]);
+        b.finish(out)
+    };
     let arg = Value::Prod(vec![zero.clone(), idx.clone()]);
     let c = corgi_t(&g, &arg, reps);
     let r = rust_t(reps, || {
