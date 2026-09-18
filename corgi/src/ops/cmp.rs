@@ -144,6 +144,13 @@ impl CmpOp {
                 let mut lower = (lo.clone(), hi.clone());
                 let mut upper = (lo, hi);
                 batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                // the upper bound is the end of the needle's run of equals starting at its lower
+                // bound. Runs are short in the common case (distinct keys: 0 or 1), so on leaf
+                // columns scan a few positions forward and only send the needles whose run is
+                // longer into the batched search, from where the scan left off.
+                if let (Value::Prim(hp), Value::Prim(np)) = (&hvals, &nvals) {
+                    hp.run_ends(np, &lower.0, &mut upper.0, &mut upper.1);
+                }
                 batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
                 let lo_c: Vec<u64> = lower.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
                 let hi_c: Vec<u64> = upper.0.iter().zip(&base).map(|(&p, &b)| (p - b) as u64).collect();
@@ -170,6 +177,15 @@ fn batched_bound(
     // round's work tracks the ACTIVE needles, not all of them (the full rescan per round was
     // ~8% of a join-heavy profile). `active` doubles as the needle indices into `nvals`.
     let mut active: Vec<usize> = (0..lo.len()).filter(|&k| lo[k] < hi[k]).collect();
+    if active.is_empty() {
+        return;
+    }
+    // leaf columns: compare and update in one loop, no per-round comparison vector (that vector
+    // was a third of a join-heavy profile: one allocation and fill per round, forty rounds deep).
+    if let (Value::Prim(hp), Value::Prim(np)) = (hvals, nvals) {
+        hp.batched_bound(np, lo, hi, &mut active, &go_right);
+        return;
+    }
     let mut mids: Vec<usize> = Vec::with_capacity(active.len());
     while !active.is_empty() {
         mids.clear();
