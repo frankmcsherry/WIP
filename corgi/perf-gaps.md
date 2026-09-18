@@ -171,6 +171,27 @@ Two different gaps hide in the two rows:
 
 L2's body is built with the `Builder` rather than the surface: it needs the partial-tier `Get` (a fold state cannot carry a `Fail`), and that tier is deliberately not a surface word.
 
+## W — the WCO join step is reachable with Ref (measured 2026-09-17, branch `corgi-ref`)
+
+> `cargo bench --bench gaps -- --family W`. 1024 anchors × 16 searches fixed; the large side D swept 16 → 16384.
+
+The worst-case-optimal step: per anchor, a SMALL list and a range of a shared sorted adjacency (the LARGE side); every element of the small side binary-searches its anchor's large side, for Σ |small| · log |large|. corgi's `find` already pairs needle row i with haystack row i and searches per element, so the whole question is how the per-anchor haystack rows are produced. Before Ref, `slices` copied each anchor's range out — Σ |large|, the cost WCO exists to avoid — and the capture of the adjacency into every anchor copied the adjacency itself. Now each anchor holds a fat ref to the adjacency, `slices` on it hands out one fat ref per anchor's range, `get 0` unnests, and `find` searches through the refs:
+
+```
+let (small, ranges, adj) = input in
+let hay = (ranges len sub 1, (ranges, adj) slices) get in
+(small, hay) find
+```
+
+| spelling | D=16 | D=256 | D=4096 | D=16384 | ns/search | shape in D |
+|---|---|---|---|---|---|---|
+| **W1** `adj` a per-anchor ref, slices a fat ref, find through it | 8.7× | 8.1× | 6.7× | **5.4×** | 23 → 43 → 64 → 84 | log D — WCO cost |
+| W1x `adj clone` per anchor, slices copies the range | 29× | 42× | 237× | **531×** | 76 → 224 → 2237 → 8289 | linear in D — the copy |
+
+Rust's ceiling is 2.7 → 15.6 ns per search (log D plus cache); W1 tracks it with a ~5–9× constant (slices + get + find each a pass, and the `Fail` lanes of `get`/`slices` threaded through), W1x tracks D. Both spellings are checked equal once per run.
+
+Two notes. The per-anchor ref to the adjacency is built by the host — the surface has no value broadcast (`lit` lifts u64 constants only), so "the same adjacency for every anchor" cannot yet be written in a program; mechanical capture (below) is what would supply it. And the choose-the-smaller-side-per-anchor half of WCO is a `branch` on `len lt` into two lanes with the roles swapped, then `weave`; it is orthogonal to the reference question and not measured here.
+
 ## Recommended order (preliminary)
 
 1. **fold/scan single-row fast path** — by far the largest gap (~1000–7000×), a common workload (prefix-sum / running aggregate of a column), self-contained.

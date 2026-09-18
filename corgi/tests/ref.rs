@@ -136,3 +136,34 @@ fn a_box_is_not_silently_materialized() {
     let msg = err.unwrap_err();
     assert!(msg.contains("expected a list") && msg.contains("Ref<"), "{msg}");
 }
+
+/// the WCO step: per anchor, every element of the small side searches its anchor's range of a
+/// shared adjacency held by reference. The ref spelling agrees with the copying one.
+#[test]
+fn wco_step_searches_through_references() {
+    use corgi::Refs;
+    use std::sync::Arc;
+    let anchors = 4;
+    let adj_vals: Vec<u64> = (0..40).collect();
+    let by_ref = Value::Ref(Arc::new(Value::u64(adj_vals)), Refs::Fat(vec![(0, 40); anchors]));
+    let ranges = Value::List(
+        vec![1, 2, 3, 4].into(),
+        Box::new(Value::Prod(vec![Value::u64(vec![0, 10, 20, 30]), Value::u64(vec![10, 20, 30, 40])])),
+    );
+    let small = Value::List(vec![2, 4, 6, 8].into(), Box::new(Value::u64(vec![3, 9, 10, 15, 25, 29, 30, 99])));
+    let prog = |adj: &str| {
+        format!(
+            "let (small, ranges, adj) = input in let hay = (ranges len sub 1, (ranges, {adj}) slices) get in (small, hay) find"
+        )
+    };
+    let arg = Value::Prod(vec![small, ranges, by_ref]);
+    let a = run(&prog("adj"), arg.clone());
+    let b = run(&prog("adj clone"), arg);
+    assert_eq!(a, b);
+    // row-relative (lo, hi) per needle: 3 -> (3,4), 9 -> (9,10) in [0,10); 10 -> (0,1), 15 -> (5,6) in
+    // [10,20); 25 -> (5,6), 29 -> (9,10); 30 -> (0,1), 99 -> (10,10) (absent) in [30,40)
+    assert_eq!(
+        show(&a),
+        "Sum tags=[0, 0, 0, 0] [List ends=[2, 4, 6, 8] <([3, 9, 0, 5, 5, 9, 0, 10], [4, 10, 1, 6, 6, 10, 1, 10])>, ()x0]"
+    );
+}

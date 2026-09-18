@@ -20,8 +20,9 @@
 
 use corgi::{
     arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
-    Op, Value,
+    Op, Refs, Value,
 };
+use std::sync::Arc;
 use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -748,6 +749,69 @@ fn family_l(rows: usize, k: usize, reps: u32) {
     row(&format!("L2 fold_selfref {label}"), m, c, r, "fold reading its own growing accumulator: O(k^2)/row, no streamed spelling");
 }
 
+/// W — the worst-case-optimal join step. Per anchor, a SMALL list and a range of a shared sorted
+/// adjacency (the LARGE side); every element of the small side binary-searches its anchor's large
+/// side. Rust pays Σ |small| · log |large|. corgi's `find` already pairs needle row i with haystack
+/// row i and searches per element — the question is how the per-anchor haystack rows are produced:
+/// `(ranges, adj) slices` COPIES each anchor's range out (Σ |large|, the cost WCO exists to avoid);
+/// `(ranges, adj ref) slices` hands out one fat ref per anchor and `find` reads through it. The
+/// sweep fixes the anchors and searches and grows the large side D, so a flat line is WCO cost.
+fn family_w(anchors: usize, s: usize, d: usize, reps: u32) {
+    let searches = anchors * s;
+    // one shared sorted adjacency payload: 0..n, each anchor's range a D-wide window into it.
+    let n = 4 * d + anchors;
+    let adj_vals: Vec<u64> = (0..n as u64).collect();
+    // every anchor holds a REFERENCE to the one adjacency (a fat ref to the whole payload): the
+    // surface has no value broadcast (`lit` lifts u64 constants only), so the input carries it.
+    let adj = Value::Ref(Arc::new(Value::u64(adj_vals.clone())), Refs::Fat(vec![(0, n); anchors]));
+    let mask = (anchors - 1) as u64;
+    let los: Vec<u64> = scrambled(anchors).iter().map(|&e| e & mask).collect();
+    let his: Vec<u64> = los.iter().map(|&lo| lo + d as u64).collect();
+    let ranges = Value::List(
+        vec![1usize; anchors].iter().scan(0, |acc, &x| { *acc += x; Some(*acc) }).collect::<Vec<usize>>().into(),
+        Box::new(Value::Prod(vec![Value::u64(los.clone()), Value::u64(his.clone())])),
+    );
+    // per anchor, s needles: values inside the window (so every search hits) — sorted by construction.
+    let needle_vals: Vec<u64> = (0..anchors)
+        .flat_map(|a| { let lo = los[a]; (0..s).map(move |j| lo + ((j * d) / s) as u64) })
+        .collect();
+    let small = Value::List((1..=anchors).map(|r| r * s).collect::<Vec<usize>>().into(), Box::new(Value::u64(needle_vals.clone())));
+    let label = format!("anchors={anchors} s={s} D={d}");
+    let arg = Value::Prod(vec![small, ranges, adj]);
+
+    // W1 by reference: slice each anchor's range out of its referenced adjacency as a fat ref,
+    // unnest with `get 0`, and let find search through it. Nothing of the adjacency is copied.
+    let g = compile(
+        "let (small, ranges, adj) = input in \
+         let hay = (ranges len sub 1, (ranges, adj) slices) get in (small, hay) find",
+    );
+    let c = corgi_t(&g, &arg, reps);
+    // W1x by value: `adj clone` copies the adjacency into every anchor first, then slices copies
+    // each range out of that.
+    let gx = compile(
+        "let (small, ranges, adj) = input in \
+         let hay = (ranges len sub 1, (ranges, adj clone) slices) get in (small, hay) find",
+    );
+    let cx = corgi_t(&gx, &arg, reps);
+    // the two spellings must agree (checked once, outside the timer).
+    assert_eq!(eval_graph(&g, arg.clone()), eval_graph(&gx, arg.clone()), "W1: ref and copy spellings disagree");
+    let r = rust_t(reps, || {
+        let (av, nv) = (black_box(&adj_vals), black_box(&needle_vals));
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(searches);
+        for a in 0..anchors {
+            let hay = &av[los[a] as usize..his[a] as usize];
+            for &x in &nv[a * s..(a + 1) * s] {
+                let lo = hay.partition_point(|&h| h < x);
+                let hi = hay.partition_point(|&h| h <= x);
+                out.push((lo as u64, hi as u64));
+            }
+        }
+        black_box(out);
+    });
+    row(&format!("W1 wco_find_ref {label}"), searches, c, r, "per-anchor ref to adj; slices a fat ref; find through it");
+    row(&format!("W1x wco_find_copy {label}"), searches, cx, r, "`adj clone` per anchor (copies it), then slices copies the range");
+}
+
 /// F — sum-type / variant. The differentiator: data-parallel `branch`/`match` keep each lane dense
 /// (SIMD per-lane) where a scalar loop branches per element; on an unpredictable tag that is the trade.
 fn family_f(n: usize, reps: u32) {
@@ -1219,7 +1283,7 @@ impl Config {
                 "--family" | "--families" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| format!("{arg} requires A-I, K, L or R"))?;
+                        .ok_or_else(|| format!("{arg} requires A-I, K, L, R or W"))?;
                     if value == "--bench" {
                         return Err(format!("{arg} requires A-I, K or R"));
                     }
@@ -1227,9 +1291,9 @@ impl Config {
                         let family = family.trim().to_ascii_uppercase();
                         if !matches!(
                             family.as_str(),
-                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "K" | "L" | "R"
+                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "K" | "L" | "R" | "W"
                         ) {
-                            return Err(format!("unknown family {family:?}; expected A-I, K, L or R"));
+                            return Err(format!("unknown family {family:?}; expected A-I, K, L, R or W"));
                         }
                         if !families.contains(&family) {
                             families.push(family);
@@ -1238,9 +1302,9 @@ impl Config {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "gaps [--smoke] [--family A-I,K,L,R] \
+                        "gaps [--smoke] [--family A-I,K,L,R,W] \
                          (repeatable; comma-separated values accepted)\n\
-                         H=safety, I=pointer-chase, K=capture, L=growing state, R=arrangement"
+                         H=safety, I=pointer-chase, K=capture, L=growing state, R=arrangement, W=WCO step"
                     );
                     std::process::exit(0);
                 }
@@ -1400,6 +1464,19 @@ fn main() {
         } else {
             for (k, reps) in [(16usize, 100u32), (256, 20), (4096, 3)] {
                 family_l(65536 / k, k, reps);
+            }
+        }
+    }
+
+    // W the WCO step: 1024 anchors × 16 searches fixed, the large side D swept 16 → 16384; the
+    // by-value spelling copies the whole adjacency (4D + anchors words) into every anchor.
+    if cfg.runs("W") {
+        println!("\n==== W WCO step: per-anchor search in the large side, cost vs its size ======");
+        if cfg.smoke {
+            family_w(8, 2, 16, 1);
+        } else {
+            for (d, reps) in [(16usize, 50u32), (256, 20), (4096, 5), (16384, 2)] {
+                family_w(1024, 16, d, reps);
             }
         }
     }
