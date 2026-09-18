@@ -588,6 +588,73 @@ fn family_e(n: usize, reps: u32) {
     );
 }
 
+/// K — closure capture. `cap_list` pairs a context with every element of a list by GATHERING the
+/// context at each element's owner row (`core.rs` CapList = `gather(x, owner_ids(bounds))`). For a
+/// scalar context that is the SIMD operand you want; for a List-shaped context it copies the whole
+/// list once per element, so the cost is (elements × context length) where a Rust closure holds a
+/// reference and pays (elements). The tasks fix the element count and sweep the context length, so a
+/// flat line is "reference semantics" and a line rising with L is the copy. Each task has a corgi
+/// CONTROL spelling that reaches the same result without the capture (the form a lazy reference or a
+/// projection-pushdown rewrite would recover), so the gap is split into capture-copy vs engine.
+fn family_k(owners: usize, per_owner: usize, ctx_len: usize, reps: u32) {
+    let m = owners * per_owner; // elements: the work a reference-capturing loop does
+    let ctx_total = owners * ctx_len;
+    // per-owner context lists (scrambled values) and per-owner element lists (indices into the
+    // owner's context, so a body can `get` into the captured list).
+    let ctx_vals = scrambled(ctx_total);
+    let ctx_bounds: Vec<usize> = (1..=owners).map(|r| r * ctx_len).collect();
+    let ctx = Value::List(ctx_bounds.into(), Box::new(Value::u64(ctx_vals.clone())));
+    let ys_vals: Vec<u64> = scrambled(m).iter().map(|&e| e % ctx_len as u64).collect();
+    let ys_bounds: Vec<usize> = (1..=owners).map(|r| r * per_owner).collect();
+    let ys = Value::List(ys_bounds.into(), Box::new(Value::u64(ys_vals.clone())));
+    let scalars = scrambled(owners);
+    let label = format!("n={owners} k={per_owner} L={ctx_len}");
+
+    // K1 capture a long list, look one element up per element. Today: m × L words copied.
+    let g = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (y, c) get)");
+    let arg = Value::Prod(vec![ctx.clone(), ys.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    // control: the same lookups with no capture — row-relative `gather` reads the owner's context in
+    // place. This is what a by-reference capture (or the capture→gather rewrite) would produce.
+    let g2 = compile("let (ctx, ys) = input in (ys, ctx) gather");
+    let c2 = corgi_t(&g2, &arg, reps);
+    let r = rust_t(reps, || {
+        let (cv, yv) = (black_box(&ctx_vals), black_box(&ys_vals));
+        let mut out = Vec::with_capacity(m);
+        for i in 0..owners {
+            let base = i * ctx_len;
+            for &y in &yv[i * per_owner..(i + 1) * per_owner] {
+                out.push(cv[base + y as usize]);
+            }
+        }
+        black_box(out);
+    });
+    row(&format!("K1 cap_list_get {label}"), m, c, r, "cap_list copies L words per element, then get");
+    row(&format!("K1c gather_ctrl {label}"), m, c2, r, "control: same lookups via row-relative gather (no capture)");
+
+    // K2 capture a tuple (scalar, long list); the body reads only the scalar. Today the unused list
+    // field is copied per element regardless. Control: capture the projected scalar only (what Field
+    // pushdown through cap_list, or a lazy reference resolved per field, would do).
+    let g = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (c.0, y) add)");
+    let arg = Value::Prod(vec![Value::Prod(vec![Value::u64(scalars.clone()), ctx.clone()]), ys.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    let g2 = compile("let (ctx, ys) = input in (ctx.0, ys) cap_list map ((c, y) -> (c, y) add)");
+    let c2 = corgi_t(&g2, &arg, reps);
+    let r = rust_t(reps, || {
+        let (sv, yv) = (black_box(&scalars), black_box(&ys_vals));
+        let mut out = Vec::with_capacity(m);
+        for i in 0..owners {
+            let s = sv[i];
+            for &y in &yv[i * per_owner..(i + 1) * per_owner] {
+                out.push(s.wrapping_add(y));
+            }
+        }
+        black_box(out);
+    });
+    row(&format!("K2 cap_tuple_add {label}"), m, c, r, "cap_list copies the UNUSED list field per element");
+    row(&format!("K2c proj_ctrl {label}"), m, c2, r, "control: capture only the scalar field (pushdown)");
+}
+
 /// F — sum-type / variant. The differentiator: data-parallel `branch`/`match` keep each lane dense
 /// (SIMD per-lane) where a scalar loop branches per element; on an unpredictable tag that is the trade.
 fn family_f(n: usize, reps: u32) {
@@ -1059,17 +1126,17 @@ impl Config {
                 "--family" | "--families" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| format!("{arg} requires A-I or R"))?;
+                        .ok_or_else(|| format!("{arg} requires A-I, K or R"))?;
                     if value == "--bench" {
-                        return Err(format!("{arg} requires A-I or R"));
+                        return Err(format!("{arg} requires A-I, K or R"));
                     }
                     for family in value.split(',') {
                         let family = family.trim().to_ascii_uppercase();
                         if !matches!(
                             family.as_str(),
-                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "R"
+                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "K" | "R"
                         ) {
-                            return Err(format!("unknown family {family:?}; expected A-I or R"));
+                            return Err(format!("unknown family {family:?}; expected A-I, K or R"));
                         }
                         if !families.contains(&family) {
                             families.push(family);
@@ -1078,9 +1145,9 @@ impl Config {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "gaps [--smoke] [--family A-I,R] \
+                        "gaps [--smoke] [--family A-I,K,R] \
                          (repeatable; comma-separated values accepted)\n\
-                         H=safety, I=pointer-chase, R=arrangement"
+                         H=safety, I=pointer-chase, K=capture, R=arrangement"
                     );
                     std::process::exit(0);
                 }
@@ -1213,6 +1280,21 @@ fn main() {
             for (r, reps) in [(1024usize, 200u32), (1 << 14, 40), (1 << 18, 12)] {
                 family_chase(r, 256, 1 << 22, reps);
             }
+        }
+    }
+
+    // K capture: fixed element count (64 owners × 1 K elements = 64 K lookups), context length swept
+    // 16 → 2048 so the copy grows from 8 MB to 1 GB while the reference-semantics work stays 64 K.
+    // The n=1 case is the "one dictionary, broadcast to every key" shape.
+    if cfg.runs("K") {
+        println!("\n==== K capture: list-shaped context, cost vs context length ==============");
+        if cfg.smoke {
+            family_k(4, 8, 16, 1);
+        } else {
+            for (l, reps) in [(16usize, 200u32), (256, 30), (2048, 4)] {
+                family_k(64, 1024, l, reps);
+            }
+            family_k(1, 65536, 2048, 4);
         }
     }
 

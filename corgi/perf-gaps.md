@@ -105,6 +105,38 @@ The relational and sum-type families resolved two stated unknowns:
 
 Text came out competitive once the ceiling was honest: `csv_sum` at 2.2× (the total `parse_u64` Sum path is close to hand atoi), `word_count` at 3.5× (corgi's structural ragged-string sort vs a fixed slice sort).
 
+## K — closure capture copies the context (measured 2026-09-17, current master)
+
+> Added after the pre-DPS baseline above; measured on the same M4 mini with `cargo bench --bench gaps -- --family K`.
+
+The worst case in the engine today is not a slow kernel but a **representation choice**: `cap_list` (the List strength, `(X, List<Y>) -> List<(X,Y)>`) is implemented as `gather(x, owner_ids(bounds))`, and `gather` recurses through every shape.
+For a scalar context that is the SIMD operand you want.
+For a **List-shaped context** it copies the whole list once per element, so capture costs `elements × context length` where a Rust closure holds a reference and pays `elements`.
+A tuple context is no better: every field is gathered, including the ones the body never reads.
+
+The suite fixes the element count at 64 K (64 owners × 1 K elements; the `n=1` row is one dictionary broadcast to every key) and sweeps the captured list's length `L`.
+Each task has a corgi **control** that reaches the same result without the capture — the spelling a by-reference capture (or the capture→gather / Field-pushdown rewrite) would recover — so the gap splits into capture-copy vs engine.
+
+| task | L=16 | L=256 | L=2048 | n=1, L=2048 | ns/element at L=2048 | control (no capture) |
+|---|---|---|---|---|---|---|
+| **K1 cap_list_get** — capture a list, `get` one element per element | 41× | 746× | **2088×** | **2226×** | 2829 ns (corgi) vs 1.36 (Rust) | `(ys, ctx) gather`: 0.9 ns, **0.7–1.6×** Rust |
+| **K2 cap_tuple_add** — capture `(scalar, list)`, body reads only the scalar | 54× | 345× | **8196×** | **8396×** | 2704 ns (corgi) vs 0.33 (Rust) | capture `ctx.0` only: 0.65 ns, **2.0×** Rust |
+
+Reading the sweep: corgi's cost per element is ≈ 1.4 ns × L (21 → 396 → 2829 ns as L goes 16 → 256 → 2048) — a memcpy of the context per element, exactly linear in what should be a free reference.
+The controls are flat in L at 0.5–0.9 ns/element, at or under the Rust ceiling.
+(The Rust K1 ceiling rises 0.5 → 1.4 ns with L because the random `get` into a 1 MB context misses L1; the 1.3 ns Rust K2 reading at L=256 is timer noise at 30 reps.)
+Peak memory tracks the same product: at L=2048 the capture materializes 128 M words (1 GB) plus a 1 GB index vector to produce 64 K lookups.
+
+**Mechanism.** Two things compound: (1) capture is spelled as a copy of the context per element rather than a reference to it, and (2) capture of a Prod is eager on every field, so an unread list field costs as much as a read one.
+Neither is a kernel gap; `gather` itself runs at ~1× Rust (E2). This is a value-model gap.
+
+**Fix (design settled in discussion, not yet built).**
+1. A `Bounds::Spans(Vec<(lo, hi)>)` variant so a List row can be any span of a shared payload — overlapping, repeated, out of order. `cap_list` on a List-shaped context then records one span per element (or a virtual owner index) and copies nothing; `Find`/`Get`/`Gather`/`Fold` already read rows through `span(r)`. K1 → the control line.
+2. A deferred-gather reference (`Ref(arena, idx)`, resolved in the `into_pair`/`into_list`/`into_u64` accessors: free through Prod, Spans at List, a real gather at Prim) so a captured tuple pays one index per element and materializes only the fields the body reaches. K2 → the control line. The same constructor is the μ-type recursion knot later.
+3. Field pushdown through `cap_list`/`cap_sum` in the optimizer, which gets K2's win statically when the pass runs, and which becomes load-bearing once the mechanical closure-capture pass makes every map body capture its whole environment implicitly.
+
+Order: 1, then 2, then the closure pass — without 1 and 2 the closure pass would turn every implicit list capture into this table.
+
 ## Recommended order (preliminary)
 
 1. **fold/scan single-row fast path** — by far the largest gap (~1000–7000×), a common workload (prefix-sum / running aggregate of a column), self-contained.
