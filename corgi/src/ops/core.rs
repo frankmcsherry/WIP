@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
+    fill, filter_mask, gather, gather_lanes, gather_shared, owner_ids, range_spans, resolve_indices,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
@@ -312,11 +312,14 @@ impl<L: OpLike> Op<L> {
                 Value::List(tb, Box::new(sum))
             }
 
+            // the context is gathered BY REFERENCE (`gather_shared`): a scalar context is replicated
+            // per element (the SIMD operand), a List-shaped context becomes one span per element over
+            // its one shared payload — a closure capturing by reference, not by copy.
             Op::CapList => {
                 let (x, list) = input.into_pair("CapList")?;
                 let (bounds, y) = list.into_list("CapList list")?;
                 let idx = owner_ids(&bounds);
-                Value::List(bounds, Box::new(Value::Prod(vec![gather(&x, &idx), y])))
+                Value::List(bounds, Box::new(Value::Prod(vec![gather_shared(x, &idx), y])))
             }
 
             // capture into a sum: row i's context pairs with its payload inside variant tags[i].
@@ -336,7 +339,7 @@ impl<L: OpLike> Op<L> {
                 let new = lanes
                     .into_iter()
                     .zip(&per)
-                    .map(|(lane, rows)| Value::Prod(vec![gather(&x, rows), lane]))
+                    .map(|(lane, rows)| Value::Prod(vec![gather_shared(x.clone(), rows), lane]))
                     .collect();
                 // the tag and offset columns are unchanged: each lane keeps its rows, now paired.
                 Value::Sum(tags, offset, new)
@@ -390,9 +393,8 @@ impl<L: OpLike> Op<L> {
 
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
-                let (bounds, _vals) = input.into_list("Len")?;
-                let mut prev = 0;
-                let lens = bounds.ends().map(|e| { let l = (e - prev) as u64; prev = e; l }).collect();
+                let (bounds, _vals) = input.into_list_shared("Len")?;
+                let lens = (0..bounds.len()).map(|r| { let (s, e) = bounds.span(r); (e - s) as u64 }).collect();
                 Value::u64(lens)
             }
 
@@ -649,15 +651,18 @@ impl<L: OpLike> Op<L> {
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it
             // names. List<(lo,hi)> -> List<List<T>>; reuses `gather`. A list-introducer.
+            // BY REFERENCE: each range becomes a span of the haystack payload, which the inner list
+            // shares (`Bounds::Spans`) — O(ranges), no copy of the ranged elements. The per-anchor
+            // sub-list of a join/WCO plan is exactly this.
             Op::Slices => {
                 let (lohi, haystack) = input.into_pair("Slices")?;
                 let (lb, lvals) = lohi.into_list("Slices ranges")?;
-                let (hb, hvals) = haystack.into_list("Slices haystack")?;
+                let (hb, hvals) = haystack.into_list_shared("Slices haystack")?;
                 let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
                 let (lo_c, hi_c) = (lo.into_u64("Slices lo")?, hi.into_u64("Slices hi")?);
                 assert_eq!(lb.len(), hb.len(), "Slices: row count");
-                let (idx, inner_bounds) = expand_ranges(&lb, &lo_c, &hi_c, &hb);
-                let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
+                let spans = range_spans(&lb, &lo_c, &hi_c, &hb);
+                let inner = Value::List(Bounds::Spans(spans), Box::new(hvals));
                 Value::List(lb, Box::new(inner))
             }
 
@@ -666,15 +671,14 @@ impl<L: OpLike> Op<L> {
             Op::Get => {
                 let (idx, haystack) = input.into_pair("Get")?;
                 let idxs = idx.into_u64("Get index")?;
-                let (hb, hvals) = haystack.into_list("Get haystack")?;
+                let (hb, hvals) = haystack.into_list_shared("Get haystack")?;
                 assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
                 let mut abs = Vec::with_capacity(idxs.len());
-                let mut hs = 0;
-                for (r, he) in hb.ends().enumerate() {
-                    let x = idxs[r] as usize;
+                for (r, &x) in idxs.iter().enumerate() {
+                    let (hs, he) = hb.span(r);
+                    let x = x as usize;
                     assert!(x < he - hs, "Get: index {x} out of range for a row of {} elements", he - hs);
                     abs.push(hs + x);
-                    hs = he;
                 }
                 gather(&hvals, &abs)
             }
@@ -682,10 +686,12 @@ impl<L: OpLike> Op<L> {
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather")?;
                 let (ib, ivals) = idx.into_list("Gather indices")?;
-                let (hb, hvals) = haystack.into_list("Gather haystack")?;
+                let (hb, hvals) = haystack.into_list_shared("Gather haystack")?;
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
                 let idxs = ivals.into_u64("Gather indices")?;
-                if ib.len() == 1 && hb.len() == 1 {
+                // the one-row leaf fast path indexes the payload directly, so it needs row 0 to BE the
+                // payload (a partition); a shared haystack takes the row-relative path below.
+                if ib.len() == 1 && hb.len() == 1 && hb.is_partition() {
                     if let Value::Prim(p) = &hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
                         // indexing in the gather supplies that check without a separate scan.
@@ -703,15 +709,15 @@ impl<L: OpLike> Op<L> {
             Op::GatherTry => {
                 let (idx, haystack) = input.into_pair("GatherTry")?;
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
-                let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
+                let (hb, hvals) = haystack.into_list_shared("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
                 let idxs = ivals.into_u64("GatherTry indices")?;
                 let mut tags = Vec::with_capacity(idxs.len());
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
-                let (mut is, mut hs) = (0, 0);
                 for r in 0..ib.len() {
-                    let (ie, he) = (ib.end(r), hb.end(r));
+                    let (is, ie) = ib.span(r);
+                    let (hs, he) = hb.span(r);
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
@@ -722,8 +728,6 @@ impl<L: OpLike> Op<L> {
                             oob.push(x);
                         }
                     }
-                    is = ie;
-                    hs = he;
                 }
                 let sum = Value::sum(tags, vec![Value::u64(oob), gather(&hvals, &abs)]);
                 Value::List(ib, Box::new(sum))

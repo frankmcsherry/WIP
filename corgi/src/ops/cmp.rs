@@ -122,22 +122,22 @@ impl CmpOp {
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find")?;
                 let (nb, nvals) = needle.into_list("Find needle")?;
-                let (hb, hvals) = haystack.into_list("Find haystack")?;
+                // the haystack may be shared (a captured or sliced list): rows are read through `span`,
+                // and the search indexes the payload absolutely, so no copy is needed.
+                let (hb, hvals) = haystack.into_list_shared("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi) and its row start (row-relative answer).
                 let (mut lo, mut hi, mut base) = (vec![0usize; n], vec![0usize; n], vec![0usize; n]);
-                let (mut ns, mut hs) = (0, 0);
                 for r in 0..nb.len() {
-                    let (ne, he) = (nb.end(r), hb.end(r));
+                    let (ns, ne) = nb.span(r);
+                    let (hs, he) = hb.span(r);
                     for k in ns..ne {
                         lo[k] = hs;
                         hi[k] = he;
                         base[k] = hs;
                     }
-                    ns = ne;
-                    hs = he;
                 }
                 // lower = first haystack pos NOT less than the needle; upper = first GREATER. Same
                 // batched search, different tie rule on `haystack[mid] vs needle`.

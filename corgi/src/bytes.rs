@@ -186,6 +186,7 @@ fn bounds_rows(bounds: &Bounds) -> usize {
     match bounds {
         Bounds::Offsets(v) => v.len(),
         Bounds::Stride(_, rows) => *rows,
+        Bounds::Spans(v) => v.len(),
     }
 }
 
@@ -195,6 +196,7 @@ fn bounds_total(bounds: &Bounds) -> u64 {
     match bounds {
         Bounds::Offsets(v) => v.last().copied().unwrap_or(0) as u64,
         Bounds::Stride(k, rows) => (*k as u64).saturating_mul(*rows as u64),
+        Bounds::Spans(v) => v.iter().fold(0u64, |acc, (lo, hi)| acc.saturating_add(hi.saturating_sub(*lo) as u64)),
     }
 }
 
@@ -272,6 +274,7 @@ fn bounds_len(bounds: &Bounds) -> usize {
     match bounds {
         Bounds::Offsets(v) => 16 + 8 * v.len(),
         Bounds::Stride(..) => 24,
+        Bounds::Spans(v) => 16 + 16 * v.len(),
     }
 }
 
@@ -290,6 +293,17 @@ fn write_bounds<W: std::io::Write>(bounds: &Bounds, writer: &mut W) -> std::io::
             word(writer, 1)?;
             word(writer, *k as u64)?;
             word(writer, *rows as u64)
+        }
+        // form 2: the row spans as they stand — a shared list stays shared across the wire (one
+        // payload, `(lo, hi)` per row), rather than being copied out into a partition.
+        Bounds::Spans(v) => {
+            word(writer, 2)?;
+            word(writer, v.len() as u64)?;
+            for &(lo, hi) in v {
+                word(writer, lo as u64)?;
+                word(writer, hi as u64)?;
+            }
+            Ok(())
         }
     }
 }
@@ -476,6 +490,16 @@ fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
                 return Err(format!("corgi::bytes: list stride {k} x {n} rows reaches {total} over {rows} values"));
             }
         }
+        Bounds::Spans(spans) => {
+            for (i, &(lo, hi)) in spans.iter().enumerate() {
+                if lo > hi {
+                    return Err(format!("corgi::bytes: list span {i} = ({lo}, {hi}) is reversed"));
+                }
+                if hi > rows {
+                    return Err(format!("corgi::bytes: list span {i} reaches {hi} over {rows} values"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -521,6 +545,11 @@ fn read_bounds(r: &mut Reader) -> Result<Bounds, String> {
             let stride = r.word()? as usize;
             let rows = r.word()? as usize;
             Ok(Bounds::Stride(stride, rows))
+        }
+        2 => {
+            let n = r.count(16, "list spans")?;
+            let words = r.words(2 * n)?;
+            Ok(Bounds::Spans(words.chunks_exact(2).map(|c| (c[0], c[1])).collect()))
         }
         other => Err(format!("corgi::bytes: bad bounds form {other}")),
     }
@@ -656,10 +685,22 @@ mod test {
                 Value::Prod((0..fields).map(|_| random_value(rng, rows, depth - 1)).collect())
             }
             3 => {
-                // Lists: sometimes uniform (so `Stride` is exercised), sometimes ragged.
-                let (bounds, total) = if rng.below(2) == 0 {
+                // Lists: sometimes uniform (so `Stride` is exercised), sometimes ragged, sometimes
+                // shared rows (`Spans`: overlapping / repeated / unordered over a payload they need
+                // not cover).
+                let (bounds, total) = if rng.below(3) == 0 {
                     let stride = rng.below(3);
                     (Bounds::Stride(stride, rows), stride * rows)
+                } else if rng.below(2) == 0 {
+                    let payload = rng.below(5);
+                    let spans = (0..rows)
+                        .map(|_| {
+                            let lo = rng.below(payload + 1);
+                            let hi = lo + rng.below(payload + 1 - lo);
+                            (lo, hi)
+                        })
+                        .collect();
+                    (Bounds::Spans(spans), payload)
                 } else {
                     let mut ends = Vec::with_capacity(rows);
                     let mut acc = 0;

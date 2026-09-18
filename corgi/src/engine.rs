@@ -12,10 +12,11 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 }
 
 /// lift a single-row constant to a column of length `n` (its stratum): `n` copies of `row`'s row 0. Total
-/// over every shape — it is `gather` at the all-zero index, so `Op::Lit` (which accepts any value's
-/// shape) and `eval` agree.
+/// over every shape — it is `gather_shared` at the all-zero index, so `Op::Lit` (which accepts any
+/// value's shape) and `eval` agree; a List-shaped constant is `n` references to one payload, not
+/// `n` copies (the broadcast-dictionary case).
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
-    gather(row, &vec![0usize; n])
+    gather_shared(row.clone(), &vec![0usize; n])
 }
 
 mod generators {
@@ -59,48 +60,73 @@ mod generators {
 
     /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
     /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
-    /// of `expand_ranges` below. An index outside its row's span is a (data-dependent) panic.
+    /// of `range_spans` below. An index outside its row's span is a (data-dependent) panic. `outer` is
+    /// a partition (the index list's own bounds); `hay` may be shared — rows are read through `span`.
     pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: &Bounds) -> Vec<usize> {
         let mut abs = Vec::with_capacity(idx.len());
-        let (mut os, mut hs) = (0, 0);
         for r in 0..outer.len() {
-            let (oe, he) = (outer.end(r), hay.end(r));
+            let (os, oe) = outer.span(r);
+            let (hs, he) = hay.span(r);
             for &x in &idx[os..oe] {
                 let p = hs + x as usize;
                 assert!(p < he, "Gather: index {x} out of row {r}'s bounds");
                 abs.push(p);
             }
-            os = oe;
-            hs = he;
         }
         abs
     }
 
     /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row
-    /// (rows spanned by `hay`). Emits the absolute haystack positions each pair names and the per-pair inner
-    /// bounds. Pairs with `gather` to realise `Slices` — the materialising inverse of `Flatten`.
-    pub(crate) fn expand_ranges(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Bounds) -> (Vec<usize>, Vec<usize>) {
-        let mut idx = Vec::new();
-        let mut inner = Vec::new();
-        let mut acc = 0;
-        let (mut os, mut hs) = (0, 0);
+    /// (rows spanned by `hay`). Emits each pair as an ABSOLUTE span of the haystack payload — the
+    /// `Bounds::Spans` of `Slices`' inner list, which then shares the haystack instead of copying the
+    /// ranges out (the by-reference inverse of `Flatten`). A range outside its row is a
+    /// (data-dependent) panic; `TrySlices` is the total form.
+    pub(crate) fn range_spans(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Bounds) -> Vec<(usize, usize)> {
+        let mut spans = Vec::with_capacity(lo.len());
         for r in 0..outer.len() {
-            let (oe, he) = (outer.end(r), hay.end(r));
+            let (os, oe) = outer.span(r);
+            let (hs, he) = hay.span(r);
             for k in os..oe {
-                let (a, b) = (hs + lo[k] as usize, hs + hi[k] as usize);
-                idx.extend(a..b);
-                acc += b - a;
-                inner.push(acc);
+                let (a, b) = (lo[k] as usize, hi[k] as usize);
+                assert!(a <= b && b <= he - hs, "Slices: range ({a}, {b}) outside row {r} of {} elements", he - hs);
+                spans.push((hs + a, hs + b));
             }
-            os = oe;
-            hs = he;
         }
-        (idx, inner)
+        spans
     }
 
 }
 
-/// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape.
+/// build a column whose row j is `v`'s row `idx[j]` BY REFERENCE where a reference is cheaper than a
+/// copy: a leaf is gathered (a copy of fixed width per row — the SIMD operand a kernel wants), a
+/// product per field, a sum per lane, and a LIST becomes one span per row over its payload, shared
+/// (`Bounds::Spans`; the leaves are `Arc`s, so nothing of unbounded size moves). The capture family's
+/// gather: `CapList`, `Lit`, and `CapSum` route through it so a captured list costs one span per
+/// element, not one copy. CONSUMES `v` so the shared payload is moved, not cloned. `gather` (below)
+/// is the by-value form — same rows, fresh partition — for the row movers (filter, sort, permute)
+/// that must not keep a source payload alive.
+pub(crate) fn gather_shared(v: Value, idx: &[usize]) -> Value {
+    match v {
+        Value::Prim(p) => Value::Prim(p.gather(idx)),
+        Value::Prod(cols) => Value::Prod(cols.into_iter().map(|c| gather_shared(c, idx)).collect()),
+        Value::List(bounds, vals) => Value::List(bounds.spans_of(idx), vals),
+        Value::Sum(tags, within, variants) => {
+            let Prim::U8(tag_vec) = &tags else { unreachable!("gather_shared: sum discriminants are u8 columns") };
+            let new_tags = tags.gather(idx);
+            let mut per = vec![Vec::new(); variants.len()];
+            for &i in idx {
+                per[tag_vec[i] as usize].push(within[i]);
+            }
+            let nv = variants.into_iter().zip(&per).map(|(v, s)| gather_shared(v, s)).collect();
+            Value::sum_from_prim(new_tags, nv)
+        }
+        Value::Unit(_) => Value::Unit(idx.len()),
+    }
+}
+
+/// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape. BY VALUE: a list
+/// row is copied into a fresh partition (so a shared source is compacted, and rows referenced through
+/// `Spans` are read via `span`).
 pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     match v {
         Value::Prim(p) => Value::Prim(p.gather(idx)),
@@ -347,6 +373,56 @@ mod tests {
         }
         let flipped = gather_lanes(&[Some(&b), Some(&a)], &tags, &off);
         assert_eq!(flipped.len(), 4);
+    }
+
+    /// `gather_shared` of a List-shaped value is one span per picked row over the SAME payload (the
+    /// leaf `Arc` is the source's), and equals the by-value `gather` as a value.
+    #[test]
+    fn gather_shared_lists_share_the_payload() {
+        let leaf = u(&[1, 2, 3, 4, 5, 6]);
+        let src = Value::List(vec![2, 3, 6].into(), Box::new(leaf.clone()));
+        let idx = [2usize, 0, 2, 2, 1];
+        let shared = gather_shared(src.clone(), &idx);
+        let copied = gather(&src, &idx);
+        assert_eq!(shared, copied); // by content
+        let Value::List(b, vals) = &shared else { panic!("expected a List") };
+        assert_eq!(*b, Bounds::Spans(vec![(3, 6), (0, 2), (3, 6), (3, 6), (2, 3)]));
+        assert!(!b.is_partition());
+        let (Value::Prim(Prim::U64(a)), Value::Prim(Prim::U64(s))) = (&**vals, &leaf) else { panic!() };
+        assert!(std::sync::Arc::ptr_eq(a, s), "the payload must be shared, not copied");
+        // compaction copies exactly the referenced rows into a fresh partition.
+        let compact = shared.clone().compact();
+        let Value::List(cb, cv) = &compact else { panic!() };
+        assert!(cb.is_partition());
+        assert_eq!(cv.len(), 3 + 2 + 3 + 3 + 1);
+        assert_eq!(compact, copied);
+    }
+
+    /// through a product and a sum: leaves are gathered (copied), lists inside become spans.
+    #[test]
+    fn gather_shared_recurses_and_shares_nested_lists() {
+        let list = Value::List(vec![1, 3].into(), Box::new(u(&[7, 8, 9])));
+        let prod = Value::Prod(vec![u(&[10, 20]), list.clone()]);
+        let out = gather_shared(prod.clone(), &[1, 1, 0]);
+        assert_eq!(out, gather(&prod, &[1, 1, 0]));
+        let Value::Prod(cols) = &out else { panic!() };
+        assert_eq!(cols[0], u(&[20, 20, 10]));
+        assert!(matches!(&cols[1], Value::List(b, _) if !b.is_partition()));
+        let sum = Value::sum(vec![0, 1, 0], vec![u(&[1, 2]), list]);
+        let out = gather_shared(sum.clone(), &[2, 1, 1, 0]);
+        assert_eq!(out, gather(&sum, &[2, 1, 1, 0]));
+        let Value::Sum(_, _, lanes) = &out else { panic!() };
+        assert!(matches!(&lanes[1], Value::List(b, _) if !b.is_partition()));
+    }
+
+    /// `fill` (the `Lit` broadcast) of a list row is `n` references to one payload.
+    #[test]
+    fn fill_broadcasts_a_list_by_reference() {
+        let row = Value::List(vec![3].into(), Box::new(u(&[4, 5, 6])));
+        let out = fill(&row, 4);
+        assert_eq!(out, gather(&row, &[0, 0, 0, 0]));
+        let Value::List(b, _) = &out else { panic!() };
+        assert_eq!(*b, Bounds::Spans(vec![(0, 3); 4]));
     }
 
     #[test]

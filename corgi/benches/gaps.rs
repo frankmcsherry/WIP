@@ -524,8 +524,10 @@ fn family_e(n: usize, reps: u32) {
         let vals: Vec<u64> = (0..n as u64).collect();
         let mut probes = keys.clone();
         probes.dedup();
-        // materialize the matched value ranges into a flat (values, bounds) list — corgi's `slices`
-        // produces exactly this, so the ceiling must pay the same output copy, not reference ranges.
+        // materialize the matched value ranges into a flat (values, bounds) list. corgi's `slices`
+        // used to produce exactly this; since `Bounds::Spans` it produces spans over the shared
+        // haystack (no copy), so the ceiling now pays an output copy corgi does not — a reference-
+        // returning Rust ceiling would be ~the two-pointer scan alone.
         let mut flat: Vec<u64> = Vec::with_capacity(n);
         let mut bounds: Vec<usize> = Vec::with_capacity(probes.len());
         let mut j = 0usize;
@@ -544,7 +546,7 @@ fn family_e(n: usize, reps: u32) {
         n,
         c,
         r,
-        "find (per-probe search)+slices vs two-pointer merge, both materializing",
+        "find (per-probe search)+slices(by reference) vs two-pointer merge that materializes",
     );
 
     // E2 gather — random permutation. corgi: `resolve_indices` (scalar, +bounds assert) then `Prim::gather`.

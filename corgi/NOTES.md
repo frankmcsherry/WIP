@@ -19,6 +19,11 @@ src/
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
+               Bounds = Offsets | Stride | Spans: a List row is a span of the payload; Offsets/Stride are the
+               PARTITION encodings (rows tile the payload), Spans the general one (rows overlap/repeat/reorder
+               over a shared payload — a row as a REFERENCE). Value eq/hash/show are by row contents, so the
+               forms are one value. `into_list` hands ops a partition (compacting Spans); the span-aware
+               readers take `into_list_shared` and go through `span(i)`.
   shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
@@ -258,10 +263,18 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying
-  that law, so gather chains become index math + one final gather. The lazy form (multiplicity View:
-  0 = filter, ≥1 = repeat, range = slice) stays OUT of the representation — collie's `Selector`
-  (4 variants × a composition matrix × per-op awareness) is the cautionary tale; laziness lives in
-  the pass, where corgi can see the whole chain.
+  that law, so gather chains become index math + one final gather. Of the lazy forms (multiplicity
+  View: 0 = filter, ≥1 = repeat, range = slice) exactly ONE is in the representation: `Bounds::Spans`,
+  the row-as-reference form, because it is the only one with an asymptotic customer — a List row is
+  the only unbounded-size row, so capturing it by copy is `elements × length` where a closure pays
+  `elements` (perf-gaps.md family K: 2088× → 3.6×). It lives inside `Bounds`, where `Stride` already
+  set the precedent for a representation-invisible encoding, not as a collie-style `View` outside the
+  shape: consumers read rows through `span(i)` either way, and `into_list` compacts for the ones that
+  need a partition, so there is no per-op awareness beyond the readers that opt in. Filter/subset/
+  permute laziness (a constant factor on leaves) stays in the pass, and `gather` proper stays by-value
+  so a filter never keeps its source payload alive. Next: the deferred-gather `Ref` for captured
+  tuples (one index per element, fields materialized on reach — also the μ-type knot) and Field
+  pushdown through `cap_list`/`cap_sum` ahead of the mechanical closure-capture pass.
 - **Vectorized abstract machine — the CPS connection (to discuss).** The term graph with let-sharing
   is already ANF (the "essence of CPS", Flanagan et al.), so CPS's bookkeeping benefits — named
   intermediates, explicit order, local rewrites — are built in. The deeper half, control flow

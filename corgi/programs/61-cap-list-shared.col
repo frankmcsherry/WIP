@@ -1,0 +1,12 @@
+# capture of a LIST-shaped context: `cap_list` pairs every element with a REFERENCE to its owner's list
+# (one `Bounds::Spans` row per element over the one shared payload), not a copy of it, and the body's
+# `get` reads through the reference. Each row of `xs` (a list) is captured into each of its own elements,
+# and every element looks up its half-value in the captured list — the same answer the capture-free
+# `(ys, xs) gather` spelling gives, at the same cost.
+# n = 6
+# = Sum tags=[0] [(List ends=[6] <[0, 0, 1, 1, 2, 2]>, List ends=[6] <[0, 0, 1, 1, 2, 2]>), ()x0]
+let xs = input iota in
+let ys = xs map (y -> y shr 1) in
+let via_capture = (xs, ys) cap_list map ((c, y) -> (y, c) get) in
+let via_gather = (ys, xs) gather in
+(via_capture, via_gather)

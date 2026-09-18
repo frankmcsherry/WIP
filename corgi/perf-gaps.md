@@ -130,12 +130,19 @@ Peak memory tracks the same product: at L=2048 the capture materializes 128 M wo
 **Mechanism.** Two things compound: (1) capture is spelled as a copy of the context per element rather than a reference to it, and (2) capture of a Prod is eager on every field, so an unread list field costs as much as a read one.
 Neither is a kernel gap; `gather` itself runs at ~1× Rust (E2). This is a value-model gap.
 
-**Fix (design settled in discussion, not yet built).**
-1. A `Bounds::Spans(Vec<(lo, hi)>)` variant so a List row can be any span of a shared payload — overlapping, repeated, out of order. `cap_list` on a List-shaped context then records one span per element (or a virtual owner index) and copies nothing; `Find`/`Get`/`Gather`/`Fold` already read rows through `span(r)`. K1 → the control line.
-2. A deferred-gather reference (`Ref(arena, idx)`, resolved in the `into_pair`/`into_list`/`into_u64` accessors: free through Prod, Spans at List, a real gather at Prim) so a captured tuple pays one index per element and materializes only the fields the body reaches. K2 → the control line. The same constructor is the μ-type recursion knot later.
+**Fix.**
+1. **DONE — `Bounds::Spans`.** A third bounds form: one `(lo, hi)` per row, rows free to overlap, repeat, and reorder over a payload they need not cover, so a List row can be a REFERENCE. The capture family gathers by reference (`engine::gather_shared`: leaves copied, lists become spans over the shared payload, recursing through Prod/Sum): `cap_list`, `cap_sum`, `lit` (the broadcast), and `slices`/`try_slices` (each range a span of the haystack). The span-aware readers (`get`/`try_get`, `gather`/`try_gather`/`gather_try`, `find`, `len`) take `into_list_shared` and address rows through `span(r)`; every other op gets a partition from `into_list`, which compacts a spans list (a copy of the referenced rows) so it stays correct by default. Equality, hash, and `show` are by row contents, so the forms are one value. Re-measured (same machine, same suite):
+
+   | task | L=16 | L=256 | L=2048 | n=1, L=2048 | ns/element at L=2048 |
+   |---|---|---|---|---|---|
+   | K1 cap_list_get | 8.8× | 3.9× | **3.6×** | **4.0×** | 4.8 ns (was 2829) |
+   | K2 cap_tuple_add | 9.3× | 2.0× | **7.5×** | **8.3×** | 2.7 ns (was 2704) |
+
+   Flat in L, as a reference should be. A side effect: E1 `join_find_slices` moves 13× → 6× at both sizes, because `slices` no longer copies the matched ranges out of the haystack (its Rust ceiling still materializes them, so that ratio is now generous to corgi; the per-probe `find` search is the rest). What remains is a constant: the span column (16 bytes per element where an owner index would be 0–8), the `Prod` the capture builds, and the body's own passes — the K2 residual is exactly `cap_list` + `map` machinery over a scalar, since the unread list field now costs one span per element and nothing else.
+2. A deferred-gather reference (`Ref(arena, idx)`, resolved in the `into_pair`/`into_list`/`into_u64` accessors: free through Prod, Spans at List, a real gather at Prim) so a captured tuple pays one index per element and materializes only the fields the body reaches. The same constructor is the μ-type recursion knot later.
 3. Field pushdown through `cap_list`/`cap_sum` in the optimizer, which gets K2's win statically when the pass runs, and which becomes load-bearing once the mechanical closure-capture pass makes every map body capture its whole environment implicitly.
 
-Order: 1, then 2, then the closure pass — without 1 and 2 the closure pass would turn every implicit list capture into this table.
+Order: 1 (done), then 2, then the closure pass — without 1 and 2 the closure pass would turn every implicit list capture into the first table.
 
 ## Recommended order (preliminary)
 

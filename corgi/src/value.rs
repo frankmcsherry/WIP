@@ -5,7 +5,7 @@
 use crate::shape::{shape_of_value, Shape};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Prim(Prim),                   // a leaf column at one byte width
     Prod(Vec<Value>),             // parallel columns, equal length
@@ -18,17 +18,26 @@ pub enum Value {
                                   // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
 }
 
-/// how a `List`'s flattened `values` partition into rows. `Offsets` is the general end-offset-per-row
-/// form (row `i` is `[ends[i-1]..ends[i])`, `ends[-1] = 0`). `Stride` is the UNIFORM case — `rows` rows
-/// each exactly `stride` wide — a list carries it when its rows happen to be equal width. This is the
-/// dynamic mirror of `columnar`'s `Strides`: detecting uniformity is O(1) (`strided`), so uniform data
-/// recovers dense / array-language kernels for free, and the property PROPAGATES through a pipeline
-/// instead of being re-derived per op. Equality/hash are by the partition, so a `Stride` and the
-/// equivalent `Offsets` are interchangeable.
+/// how a `List`'s rows map onto its flattened `values`. A row is a span `[lo, hi)` of the payload; the
+/// three forms are encodings of that column of spans. `Offsets` is the PARTITION form (row `i` is
+/// `[ends[i-1]..ends[i])`, `ends[-1] = 0`): rows tile the payload, disjoint and in order — what every
+/// row-producing op builds. `Stride` is the UNIFORM partition — `rows` rows each exactly `stride`
+/// wide — the dynamic mirror of `columnar`'s `Strides`: detecting uniformity is O(1) (`strided`), so
+/// uniform data recovers dense / array-language kernels for free, and the property PROPAGATES through
+/// a pipeline instead of being re-derived per op. `Spans` is the GENERAL form: one `(lo, hi)` per row,
+/// rows free to overlap, repeat, and appear in any order over a payload that may hold more than they
+/// reference. It is how a row can be a REFERENCE — the capture family (`CapList`, `Lit`, `Slices`)
+/// makes a captured list one span per element instead of one copy per element, and the payload is
+/// shared (its leaves are `Arc`s). Equality/hash are by the spans (and `Value` equality by the row
+/// contents), so the forms are interchangeable; only their cost differs. Ops that need a partition
+/// (contiguous rows == the whole payload) get one from `into_list`, which compacts a `Spans` list;
+/// the span-aware readers (`Get`/`Gather`/`Find`/`Slices`/`Len`) take `into_list_shared` and read
+/// through `span` without copying.
 #[derive(Clone, Debug)]
 pub enum Bounds {
     Offsets(Vec<usize>),  // end offset of each row
     Stride(usize, usize), // (stride, rows): row i spans [i*stride .. (i+1)*stride), total = stride*rows
+    Spans(Vec<(usize, usize)>), // (lo, hi) per row, unconstrained: overlapping / repeated / unordered
 }
 
 impl Bounds {
@@ -37,7 +46,18 @@ impl Bounds {
         match self {
             Bounds::Offsets(v) => v.len(),
             Bounds::Stride(_, rows) => *rows,
+            Bounds::Spans(v) => v.len(),
         }
+    }
+    /// is this a partition (rows tile the payload, disjoint and in order)? The `Offsets`/`Stride`
+    /// invariant every running-cursor loop over `ends()` relies on; `Spans` rows are references.
+    pub fn is_partition(&self) -> bool {
+        !matches!(self, Bounds::Spans(_))
+    }
+    /// the spans of rows `idx` of `self`, as a `Spans` bounds: row `j` of the result is row `idx[j]`
+    /// of `self`, by reference. The bounds half of a by-reference gather (`engine::gather_shared`).
+    pub(crate) fn spans_of(&self, idx: &[usize]) -> Bounds {
+        Bounds::Spans(idx.iter().map(|&i| self.span(i)).collect())
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -47,38 +67,46 @@ impl Bounds {
         match self {
             Bounds::Offsets(v) => v[i],
             Bounds::Stride(k, _) => (i + 1) * k,
+            Bounds::Spans(v) => v[i].1,
         }
     }
-    /// total flattened element count.
+    /// total element count over the rows (for a partition, the payload length; for `Spans`, the sum
+    /// of the row lengths — the payload may be larger or smaller).
     pub(crate) fn total(&self) -> usize {
         match self {
             Bounds::Offsets(v) => v.last().copied().unwrap_or(0),
             Bounds::Stride(k, rows) => k * rows,
+            Bounds::Spans(v) => v.iter().map(|(lo, hi)| hi - lo).sum(),
         }
     }
-    /// row `i`'s `[start, end)` span.
+    /// row `i`'s `[start, end)` span. The one accessor every form serves in O(1); a reader that goes
+    /// through it is span-aware for free.
     pub(crate) fn span(&self, i: usize) -> (usize, usize) {
         match self {
             Bounds::Offsets(v) => (if i == 0 { 0 } else { v[i - 1] }, v[i]),
             Bounds::Stride(k, _) => (i * k, (i + 1) * k),
+            Bounds::Spans(v) => v[i],
         }
     }
     /// the uniform stride, if this partition is uniform — the O(1) detection that recovers array kernels.
     pub fn strided(&self) -> Option<usize> {
         match self {
             Bounds::Stride(k, _) => Some(*k),
-            Bounds::Offsets(_) => None,
+            Bounds::Offsets(_) | Bounds::Spans(_) => None,
         }
     }
-    /// iterate the per-row end offsets (materialized for `Stride`).
+    /// iterate the per-row end offsets (materialized for `Stride`). PARTITION readers only: a
+    /// running-cursor loop (`start = previous end`) is wrong on `Spans`, so callers hold a bounds
+    /// from `into_list`, never `into_list_shared`.
     pub(crate) fn ends(&self) -> impl Iterator<Item = usize> + '_ {
+        debug_assert!(self.is_partition(), "Bounds::ends on Spans: use span(i)");
         (0..self.len()).map(move |i| self.end(i))
     }
-    /// materialize the general end-offset form — for ops not yet stride-aware, and for eq/show.
+    /// materialize the general end-offset form — for partition ops not yet stride-aware.
     pub(crate) fn to_vec(&self) -> Vec<usize> {
         match self {
             Bounds::Offsets(v) => v.clone(),
-            Bounds::Stride(..) => self.ends().collect(),
+            Bounds::Stride(..) | Bounds::Spans(_) => self.ends().collect(),
         }
     }
 }
@@ -101,21 +129,24 @@ impl From<Vec<usize>> for Bounds {
     }
 }
 
-// equality/hash are by the PARTITION, so a `Stride` and the equivalent `Offsets` compare and hash equal.
+// equality/hash are by the row SPANS, so a `Stride`, the equivalent `Offsets`, and the equivalent
+// `Spans` compare and hash equal. (Two lists with equal contents but different spans are equal as
+// `Value`s, not as `Bounds` — see `PartialEq for Value`.)
 impl PartialEq for Bounds {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Bounds::Offsets(a), Bounds::Offsets(b)) => a == b,
             (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => k0 == k1 && n0 == n1,
-            _ => self.len() == other.len() && self.ends().eq(other.ends()),
+            (Bounds::Spans(a), Bounds::Spans(b)) => a == b,
+            _ => self.len() == other.len() && (0..self.len()).all(|i| self.span(i) == other.span(i)),
         }
     }
 }
 impl Eq for Bounds {}
 impl std::hash::Hash for Bounds {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for e in self.ends() {
-            e.hash(state);
+        for i in 0..self.len() {
+            self.span(i).hash(state);
         }
     }
 }
@@ -500,6 +531,79 @@ impl Value {
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
+impl Value {
+    /// this column with every row of a `Spans` list at its own level copied into a fresh partition
+    /// (`Offsets`/`Stride`) over exactly the rows' elements — a by-value copy of what the spans
+    /// referenced, O(referenced), the payload no longer shared. Partition lists (and every other
+    /// shape) come back as they are; nested shared lists inside the payload are left shared.
+    pub fn compact(self) -> Value {
+        match self {
+            Value::List(b, vals) if !b.is_partition() => {
+                let idx: Vec<usize> = (0..b.len()).collect();
+                crate::engine::gather(&Value::List(b, vals), &idx)
+            }
+            other => other,
+        }
+    }
+    fn is_shared_list(&self) -> bool {
+        matches!(self, Value::List(b, _) if !b.is_partition())
+    }
+}
+
+// equality/hash are by CONTENT: a list whose rows are references compares (and hashes) as the rows
+// it references, so `Spans`, `Offsets` and `Stride` lists with the same rows are one value. The
+// partition case stays structural (bounds then payload), so the common path allocates nothing.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Prim(a), Value::Prim(b)) => a == b,
+            (Value::Prod(a), Value::Prod(b)) => a == b,
+            (Value::Sum(t0, o0, l0), Value::Sum(t1, o1, l1)) => t0 == t1 && o0 == o1 && l0 == l1,
+            (Value::Unit(a), Value::Unit(b)) => a == b,
+            (Value::List(b0, v0), Value::List(b1, v1)) => {
+                if self.is_shared_list() || other.is_shared_list() {
+                    self.clone().compact() == other.clone().compact()
+                } else {
+                    b0 == b1 && v0 == v1
+                }
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for Value {}
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Prim(p) => p.hash(state),
+            Value::Prod(c) => c.hash(state),
+            Value::Sum(t, o, l) => {
+                t.hash(state);
+                o.hash(state);
+                l.hash(state);
+            }
+            Value::Unit(n) => n.hash(state),
+            Value::List(b, v) => {
+                // a shared list hashes as its compacted form's parts (bounds, then payload), so it
+                // agrees with the partition it equals.
+                let compact;
+                let (b, v): (&Bounds, &Value) = if self.is_shared_list() {
+                    compact = self.clone().compact();
+                    match &compact {
+                        Value::List(cb, cv) => (cb, cv),
+                        _ => unreachable!("compact keeps the List"),
+                    }
+                } else {
+                    (b, v)
+                };
+                b.hash(state);
+                v.hash(state);
+            }
+        }
+    }
+}
+
 /// a `Sum` taken apart: (tags as usize, within-variant offsets, lanes).
 pub type SumParts = (Vec<usize>, Vec<usize>, Vec<Value>);
 
@@ -525,7 +629,21 @@ impl Value {
         }
     }
 
+    /// a list as a PARTITION: rows tile the payload, disjoint and in order, so `ends()` and the
+    /// running-cursor loops are valid. A list whose rows are references (`Spans`) is compacted
+    /// first — a copy of the referenced rows — which keeps every reader correct by default; the
+    /// readers that can work through references take `into_list_shared` instead.
     pub fn into_list(self, who: &str) -> Result<(Bounds, Value), String> {
+        match self.compact() {
+            Value::List(bounds, vals) => Ok((bounds, *vals)),
+            other => Err(format!("{who}: expected a list, got {}", shape_of_value(&other))),
+        }
+    }
+
+    /// a list as it is stored, rows possibly REFERENCES into a shared payload (`Bounds::Spans`).
+    /// The reader must address rows through `span(i)` only — never `ends()` with a running start,
+    /// never `total()` as the payload length.
+    pub fn into_list_shared(self, who: &str) -> Result<(Bounds, Value), String> {
         match self {
             Value::List(bounds, vals) => Ok((bounds, *vals)),
             other => Err(format!("{who}: expected a list, got {}", shape_of_value(&other))),
@@ -571,6 +689,7 @@ pub fn show(v: &Value) -> String {
             let lanes: Vec<String> = vs.iter().map(show).collect();
             format!("Sum tags={:?} [{}]", t.usize_vec(), lanes.join(", "))
         }
+        Value::List(b, _) if !b.is_partition() => show(&v.clone().compact()),
         Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
     }
