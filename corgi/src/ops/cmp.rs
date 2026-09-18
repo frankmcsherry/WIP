@@ -143,7 +143,17 @@ impl CmpOp {
                 // batched search, different tie rule on `haystack[mid] vs needle`.
                 let mut lower = (lo.clone(), hi.clone());
                 let mut upper = (lo, hi);
-                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                // SORTED needles (leaf columns): a galloping merge instead of independent searches —
+                // each needle's lower bound is found by exponential+binary search from the previous
+                // needle's, O(n·log(m/n)) per row and a streaming access pattern, where independent
+                // searches are O(n·log m) random probes. Sortedness is one pass over the needles.
+                let merged = match (&hvals, &nvals) {
+                    (Value::Prim(hp), Value::Prim(np)) => hp.merge_lower(np, &nb, &mut lower.0, &mut lower.1),
+                    _ => false,
+                };
+                if !merged {
+                    batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                }
                 // the upper bound is the end of the needle's run of equals starting at its lower
                 // bound. Runs are short in the common case (distinct keys: 0 or 1), so on leaf
                 // columns scan a few positions forward and only send the needles whose run is

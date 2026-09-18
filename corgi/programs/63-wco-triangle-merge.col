@@ -1,0 +1,35 @@
+# The WCO triangle again (see 62), restructured so that every search is a MERGE: anchors are visited
+# in index order (the a-groups of the forward index), so the positions of a in the backward keys are
+# one sorted `find` over the G group keys, and the positions of each group's b's in the forward keys
+# are a per-group `find` whose needles (the group's b list) are sorted — `find` gallops through the
+# broadcast key list (`fwd.0 ref` captured into every group) instead of binary-searching 3N probes at
+# random. The proposer list N-(a) is fetched once per group, not once per anchor. Count = 3(N-1).
+# n = 8
+# = Sum tags=[0] [[21], ()x0]
+enum Pick = TgtSmall | PropSmall in
+let ks = input iota map (k -> k add_u64 1) in
+let arcs = ((ks map (k -> (k lit 0, k)), ks map (k -> (k, k lit 0))) append, ks map (k -> (k, k add_u64 1))) append in
+let fwd = arcs sort group transpose in
+let bwd = arcs map (p -> (p.1, p.0)) sort group transpose in
+let fadj = fwd.1 map (l -> l ref) in
+let badj = bwd.1 map (l -> l ref) in
+let pa = (fwd.0, bwd.0) find in
+let pbs = ((fwd.0 ref, fwd.1) cap_list) map (e -> (e.1, e.0) find) in
+let grp0 = ((fwd.0, pa) zip, (fwd.1, pbs) zip) zip in
+let grp = (grp0, grp0 map (g -> let apa = g.0 in let pa = apa.1 in (pa.0, pa.1) lt)) filter in
+let ctx = (fadj, badj) ref in
+let cs = (ctx, grp) cap_list map (e ->
+  let c = e.0 in let g = e.1 in let apa = g.0 in let bpb = g.1 in let pa = apa.1 in
+  let prop = (pa.0, c.1) get in
+  let bp0 = (bpb.0, bpb.1) zip in
+  let bp = (bp0, bpb.1 map (q -> (q.0, q.1) lt)) filter in
+  ((prop, c.0), bp) cap_list map (f ->
+    let c2 = f.0 in let x = f.1 in let pb = x.1 in
+    let tgt = (pb.0, c2.1) get in
+    let p = c2.0 in
+    ((p, tgt), (p len, tgt len) le) branch Pick match (
+      TgtSmall (pt -> let n = pt.1 clone in let r = (n, pt.0) find in (n, r map (y -> (y.0, y.1) lt)) filter),
+      PropSmall (pt -> let n = pt.0 clone in let r = (n, pt.1) find in (n, r map (y -> (y.0, y.1) lt)) filter)))) in
+let inner = (cs flatten).1 in
+let flat = (inner flatten).1 in
+flat len

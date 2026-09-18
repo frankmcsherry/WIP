@@ -16,13 +16,23 @@ WCO budget), and binary-search each of its elements in the larger side through t
 | collie `17` (view + row intersect) | 0.25 s | 0.11 s build + 0.14 s join |
 | collie `18` (LFTJ lanes, `def`) | 0.39 s | |
 | datatoad (`.time` around the `tri` rule) | 0.94 s | includes the `Permute-1-0` index copy and the LSM dedup |
-| **corgi `62`** | **1.7 s** | 570 ns per arc; same asymptotics, see below |
+| **corgi `62`** (per-anchor searches) | 1.7 s → **0.96 s** | 570 → 320 ns per arc |
+| **corgi `63`** (every search a merge) | **0.80 s** | 265 ns per arc |
 
-corgi is 4–7× collie and 1.8× datatoad here. The gap is constant-factor, not asymptotic: every
-fallible stage (`get`, `zip`, `filter`, `branch`) threads a `Fail` sum through the rest of the body;
-the per-anchor `Prod`/`Sum` values are materialized and re-gathered at each op; and `group` pays a
-radix discrimination plus two gathers where collie's `group` is one pass. None of these is the
-WCO term, which family W shows tracks log D. (Profile before believing any one of them.)
+The first number was 4–7× collie and 1.8× datatoad. Profiling (`examples/wco_stages`, samply →
+pollard) put 1.1 of the 1.7 s in `find`: the lockstep binary search collected a comparison vector
+per round (a third of all samples) and ran lower and upper bound as separate forty-round passes,
+and the program probed 3N random positions of the key list twice. Two engine fixes (compare and
+update in one loop over the live needles; resolve the upper bound by scanning the equal run past
+the lower bound) took 62 to 0.96 s. A program restructuring (63) then made every search a merge —
+anchors visited in a-group order, so the a-positions are one sorted `find` over the group keys and
+each group's b-positions are a `find` whose needles are the group's sorted b list against the
+broadcast key list (`fwd.0 ref` captured into every group) — which the new galloping-merge path in
+`find` (sorted needles: exponential + binary search from the previous bound, datatoad's `gallop`)
+runs in streaming order: 0.80 s, under datatoad. What remains is the two `group`s (0.25 s, radix
+discrimination + gathers; collie builds both indexes in 0.11 s), the per-anchor `Fail` plumbing of
+`get`/`filter`/`branch` and the `Prod`/`Sum` re-gathers, and `find` itself at ~2× a Rust
+`partition_point` loop (family W).
 
 Two surface gaps showed up writing it, both already on the list: no value broadcast (the per-anchor
 adjacency refs had to be built by capture rather than `lit`), and no nested tuple patterns (`let

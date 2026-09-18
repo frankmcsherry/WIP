@@ -52,7 +52,7 @@ Ratios are corgi/Rust slowdown (higher = corgi slower) at the L2/SLC design cent
 | **C5 fold** | aggregation | **~6900×** | **~5000×** | same lockstep degeneration; here a product-of-monoids `(sum,count)` accumulator | monoid → kernel; else interpreter |
 | D1 sort_u64 | order | 2.6× | 4.7× | radix-permute + gather; the gather scatter is DRAM-bound at scale | no — sort kernel |
 | D2 dedup | order | 2.9× | 4.8× | sort + adjacent unique | no — sort kernel |
-| **E1 join_find_slices** | relational | **13×** | **13×** | `find` is a per-probe search, not a merge over sorted probes; + `slices` gather | no — wants a merge-join path |
+| **E1 join_find_slices** | relational | **13×** | **13×** | `find` is a per-probe search, not a merge over sorted probes; + `slices` gather | no — wants a merge-join path. **2026-09-18:** `find` now merges (gallops) when the needle rows are sorted, compares in place, and resolves the upper bound by run scan; E1 is 6.4× (its rest is the `slices` copy). Family W: 23 → 6 ns/search at D=16, 84 → 34 at D=16384. |
 | E2 gather | relational | 1.8× | 1.3× | `resolve_indices` scalar pass above the gather; latency-bound at DRAM | minor |
 | E3 gather_chain | relational | 1.9× | 1.4× | two gathers, each resolve+gather | index-composition rewrite |
 | **F1 branch_match** | sum-type | **45×** | **45×** | partition+recombine where the scalar form vectorizes to a blend | no — use `select`; `match` pays off only on heterogeneous lanes |

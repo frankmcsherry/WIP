@@ -494,6 +494,51 @@ macro_rules! prim {
                 }
             }
 
+            /// `Find`'s lower bound as a galloping merge, when every needle row is sorted: needles
+            /// are visited in order and each one's bound is found from the previous bound by
+            /// exponential then binary search (datatoad's `gallop`). Writes `lo[k] = hi[k] = bound`
+            /// for every needle (so a batched search afterwards has nothing left to do) and returns
+            /// `true`; returns `false` without touching anything if some needle row is not sorted.
+            /// `lo[k]`/`hi[k]` arrive as the needle's haystack-row window `[start, end)`.
+            pub(crate) fn merge_lower(&self, needles: &Prim, rows: &Bounds, lo: &mut [usize], hi: &mut [usize]) -> bool {
+                match (self, needles) {
+                    $( (Prim::$V(h), Prim::$V(n)) => {
+                        for r in 0..rows.len() {
+                            let (s, e) = rows.span(r);
+                            if n[s..e].windows(2).any(|w| w[0] > w[1]) {
+                                return false;
+                            }
+                        }
+                        for r in 0..rows.len() {
+                            let (s, e) = rows.span(r);
+                            if s == e {
+                                continue;
+                            }
+                            let (mut cur, end) = (lo[s], hi[s]);
+                            for k in s..e {
+                                let y = n[k];
+                                // gallop: widen a step until h[cur+step] >= y (or the row ends) …
+                                let mut step = 1;
+                                while cur + step < end && h[cur + step] < y {
+                                    cur += step;
+                                    step <<= 1;
+                                }
+                                // … then binary-search the last step for the first h >= y.
+                                let mut top = (cur + step).min(end);
+                                while cur < top {
+                                    let mid = (cur + top) / 2;
+                                    if h[mid] < y { cur = mid + 1; } else { top = mid; }
+                                }
+                                lo[k] = cur;
+                                hi[k] = cur;
+                            }
+                        }
+                        true
+                    } )+
+                    _ => panic!("merge_lower: prim width mismatch"),
+                }
+            }
+
             /// the equal-run shortcut of `Find`'s upper bound: needle `k`'s lower bound is
             /// `lower[k]`; scan forward over `self` while equal, at most a few steps. A run that
             /// ends within the scan resolves the upper bound outright (`up_lo[k] = up_hi[k] = end`,
