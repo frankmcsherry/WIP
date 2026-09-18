@@ -273,7 +273,11 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   referenced data is `clone`. A first spike put the same spans inside `Bounds` with a second gather
   and a second accessor deciding reference-vs-copy implicitly (branch `corgi-spans`); rejected as
   sneaky. Next: Field pushdown through `cap_list`/`cap_sum`, then the mechanical closure-capture
-  pass (which inserts the `ref`/`clone`); `Ref` is also the μ-type recursion knot.
+  pass (which inserts the `ref`/`clone`); `Ref` is also the μ-type recursion knot. And the GROWING-STATE
+  fold (perf-gaps.md family L: a List accumulator is rebuilt per round, O(k²)/row, 4567× at k=4096): let
+  a `FoldScan` state hold a fat `Ref` into its own emitted-so-far output — append-only and immutable, so
+  the ref is stable and `get` through it is O(1) — which turns a self-referential recurrence / stack
+  machine into O(k) per row. (The unconditional collect already has the linear `foldscan` spelling.)
 - **Vectorized abstract machine — the CPS connection (to discuss).** The term graph with let-sharing
   is already ANF (the "essence of CPS", Flanagan et al.), so CPS's bookkeeping benefits — named
   intermediates, explicit order, local rewrites — are built in. The deeper half, control flow

@@ -662,6 +662,75 @@ fn family_k(owners: usize, per_owner: usize, ctx_len: usize, reps: u32) {
     row(&format!("K2c proj_ctrl {label}"), m, c2, r, "control: capture only the scalar field (pushdown)");
 }
 
+/// L — growing state. A Rust loop that pushes onto a `Vec` (or reads back what it pushed) is
+/// amortized O(1) per step. corgi's `fold` rebuilds a List-shaped accumulator every round, so a
+/// list that grows to k costs O(k^2) per row — the one genuinely QUADRATIC pattern. The tasks fix
+/// the element count and sweep the row length k, so a flat line is amortized push and a line rising
+/// with k is the rebuild. L1 is the unconditional collect, whose honest corgi spelling is the
+/// streamed `foldscan` (fixed state, pushed output; the bulk `map` is an identity the engine
+/// passes through untouched, so it is not a control); L2 reads the accumulator
+/// back each step (a self-referential stream), which has no non-quadratic spelling today — the
+/// case a fixed-size state holding a Ref into the emitted prefix would fix.
+fn family_l(rows: usize, k: usize, reps: u32) {
+    let m = rows * k;
+    let xs_vals = scrambled(m);
+    let bounds: Vec<usize> = (1..=rows).map(|r| r * k).collect();
+    let xs = Value::List(bounds.clone().into(), Box::new(Value::u64(xs_vals.clone())));
+    // an empty list per row (the seed of a collect), and a one-element [0] per row (L2's seed).
+    let empty = Value::List(vec![0usize; rows].into(), Box::new(Value::u64(Vec::new())));
+    let zero = Value::List((1..=rows).collect::<Vec<usize>>().into(), Box::new(Value::u64(vec![0; rows])));
+    let label = format!("rows={rows} k={k}");
+
+    // L1 collect: acc = acc ++ [x]. Quadratic in k.
+    let g = compile("let (seed, xs) = input in (seed, xs) fold ((acc, x) -> (acc, x enlist) append)");
+    let arg = Value::Prod(vec![empty.clone(), xs.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    // streamed spelling: fixed (unit) state, the element pushed to the output — O(k) rounds of O(rows).
+    let g2 = compile("let (seed, xs) = input in ((seed, xs) foldscan ((s, x) -> (s, x))).1");
+    let arg2 = Value::Prod(vec![Value::u64(vec![0; rows]), xs.clone()]);
+    let c2 = corgi_t(&g2, &arg2, reps);
+    let r = rust_t(reps, || {
+        let xv = black_box(&xs_vals);
+        let mut out: Vec<u64> = Vec::with_capacity(m);
+        let mut ends = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let mut v: Vec<u64> = Vec::new();
+            for &x in &xv[i * k..(i + 1) * k] {
+                v.push(x);
+            }
+            out.extend_from_slice(&v);
+            ends.push(out.len());
+        }
+        black_box((out, ends));
+    });
+    row(&format!("L1 fold_collect {label}"), m, c, r, "fold with a List accumulator: rebuilt every round, O(k^2)/row");
+    row(&format!("L1s foldscan_ctrl {label}"), m, c2, r, "control: fixed state, element streamed to the output");
+
+    // L2 self-referential: acc = acc ++ [acc[x]], x < current length. Rust reads back into the Vec
+    // it is pushing onto; corgi has to carry the whole list as state.
+    let idx_vals: Vec<u64> = xs_vals.iter().enumerate().map(|(j, &e)| e % ((j % k) as u64 + 1)).collect();
+    let idx = Value::List(bounds.into(), Box::new(Value::u64(idx_vals.clone())));
+    let g = compile("let (seed, xs) = input in (seed, xs) fold ((acc, x) -> (acc, (x, acc) get_uns enlist) append)");
+    let arg = Value::Prod(vec![zero.clone(), idx.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    let r = rust_t(reps, || {
+        let iv = black_box(&idx_vals);
+        let mut out: Vec<u64> = Vec::with_capacity(m + rows);
+        let mut ends = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let mut v: Vec<u64> = vec![0];
+            for &x in &iv[i * k..(i + 1) * k] {
+                let y = v[x as usize];
+                v.push(y);
+            }
+            out.extend_from_slice(&v);
+            ends.push(out.len());
+        }
+        black_box((out, ends));
+    });
+    row(&format!("L2 fold_selfref {label}"), m, c, r, "fold reading its own growing accumulator: O(k^2)/row, no streamed spelling");
+}
+
 /// F — sum-type / variant. The differentiator: data-parallel `branch`/`match` keep each lane dense
 /// (SIMD per-lane) where a scalar loop branches per element; on an unpredictable tag that is the trade.
 fn family_f(n: usize, reps: u32) {
@@ -1133,7 +1202,7 @@ impl Config {
                 "--family" | "--families" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| format!("{arg} requires A-I, K or R"))?;
+                        .ok_or_else(|| format!("{arg} requires A-I, K, L or R"))?;
                     if value == "--bench" {
                         return Err(format!("{arg} requires A-I, K or R"));
                     }
@@ -1141,9 +1210,9 @@ impl Config {
                         let family = family.trim().to_ascii_uppercase();
                         if !matches!(
                             family.as_str(),
-                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "K" | "R"
+                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "K" | "L" | "R"
                         ) {
-                            return Err(format!("unknown family {family:?}; expected A-I, K or R"));
+                            return Err(format!("unknown family {family:?}; expected A-I, K, L or R"));
                         }
                         if !families.contains(&family) {
                             families.push(family);
@@ -1152,9 +1221,9 @@ impl Config {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "gaps [--smoke] [--family A-I,K,R] \
+                        "gaps [--smoke] [--family A-I,K,L,R] \
                          (repeatable; comma-separated values accepted)\n\
-                         H=safety, I=pointer-chase, K=capture, R=arrangement"
+                         H=safety, I=pointer-chase, K=capture, L=growing state, R=arrangement"
                     );
                     std::process::exit(0);
                 }
@@ -1302,6 +1371,19 @@ fn main() {
                 family_k(64, 1024, l, reps);
             }
             family_k(1, 65536, 2048, 4);
+        }
+    }
+
+    // L growing state: fixed 64 K elements, row length swept 16 → 4096 so a List accumulator's
+    // rebuild grows from 16 to 4096 words per step while the amortized-push work stays 64 K.
+    if cfg.runs("L") {
+        println!("\n==== L growing state: List accumulator in a fold, cost vs row length =====");
+        if cfg.smoke {
+            family_l(4, 8, 1);
+        } else {
+            for (k, reps) in [(16usize, 100u32), (256, 20), (4096, 3)] {
+                family_l(65536 / k, k, reps);
+            }
         }
     }
 
