@@ -20,8 +20,9 @@
 
 use corgi::{Bounds,
     arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
-    Op, Value,
+    Op, Refs, Value,
 };
+use std::sync::Arc;
 use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -586,6 +587,229 @@ fn family_e(n: usize, reps: u32) {
         r,
         "2 gathers vs 2 gathers (index-rewrite headroom on top)",
     );
+}
+
+/// K — closure capture. `cap_list` pairs a context with every element of a list by GATHERING the
+/// context at each element's owner row (`core.rs` CapList = `gather(x, owner_ids(bounds))`). For a
+/// scalar context that is the SIMD operand you want; for a List-shaped context it copies the whole
+/// list once per element, so the cost is (elements × context length) where a Rust closure holds a
+/// reference and pays (elements). The tasks fix the element count and sweep the context length, so a
+/// flat line is "reference semantics" and a line rising with L is the copy. Each task has a corgi
+/// CONTROL spelling that reaches the same result without the capture (the form a lazy reference or a
+/// projection-pushdown rewrite would recover), so the gap is split into capture-copy vs engine.
+fn family_k(owners: usize, per_owner: usize, ctx_len: usize, reps: u32) {
+    let m = owners * per_owner; // elements: the work a reference-capturing loop does
+    let ctx_total = owners * ctx_len;
+    // per-owner context lists (scrambled values) and per-owner element lists (indices into the
+    // owner's context, so a body can `get` into the captured list).
+    let ctx_vals = scrambled(ctx_total);
+    let ctx_bounds: Vec<usize> = (1..=owners).map(|r| r * ctx_len).collect();
+    let ctx = Value::List(ctx_bounds.into(), Box::new(Value::u64(ctx_vals.clone())));
+    let ys_vals: Vec<u64> = scrambled(m).iter().map(|&e| e % ctx_len as u64).collect();
+    let ys_bounds: Vec<usize> = (1..=owners).map(|r| r * per_owner).collect();
+    let ys = Value::List(ys_bounds.into(), Box::new(Value::u64(ys_vals.clone())));
+    let scalars = scrambled(owners);
+    let label = format!("n={owners} k={per_owner} L={ctx_len}");
+
+    // K1 capture a long list, look one element up per element. `ctx ref` captures by reference
+    // (one span per element); the `K1x` spelling without the ref copies L words per element.
+    let g = compile("let (ctx, ys) = input in (ctx ref, ys) cap_list map ((c, y) -> (y, c) get)");
+    let arg = Value::Prod(vec![ctx.clone(), ys.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    let gx = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (y, c) get)");
+    let cx = corgi_t(&gx, &arg, reps);
+    // control: the same lookups with no capture — row-relative `gather` reads the owner's context in
+    // place. This is what a by-reference capture (or the capture→gather rewrite) would produce.
+    let g2 = compile("let (ctx, ys) = input in (ys, ctx) gather");
+    let c2 = corgi_t(&g2, &arg, reps);
+    let r = rust_t(reps, || {
+        let (cv, yv) = (black_box(&ctx_vals), black_box(&ys_vals));
+        let mut out = Vec::with_capacity(m);
+        for i in 0..owners {
+            let base = i * ctx_len;
+            for &y in &yv[i * per_owner..(i + 1) * per_owner] {
+                out.push(cv[base + y as usize]);
+            }
+        }
+        black_box(out);
+    });
+    row(&format!("K1 cap_ref_get {label}"), m, c, r, "cap_list of a REFERENCED list: one ref per element, get through it");
+    row(&format!("K1x cap_copy_get {label}"), m, cx, r, "the by-value spelling: cap_list copies L words per element");
+    row(&format!("K1c gather_ctrl {label}"), m, c2, r, "control: same lookups via row-relative gather (no capture)");
+
+    // K2 capture a tuple (scalar, long list); the body reads only the scalar. Today the unused list
+    // field is copied per element regardless. Control: capture the projected scalar only (what Field
+    // pushdown through cap_list, or a lazy reference resolved per field, would do).
+    let g = compile("let (ctx, ys) = input in (ctx ref, ys) cap_list map ((c, y) -> (c.0 clone, y) add)");
+    let arg = Value::Prod(vec![Value::Prod(vec![Value::u64(scalars.clone()), ctx.clone()]), ys.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    let gx = compile("let (ctx, ys) = input in (ctx, ys) cap_list map ((c, y) -> (c.0, y) add)");
+    let cx = corgi_t(&gx, &arg, reps);
+    let g2 = compile("let (ctx, ys) = input in (ctx.0, ys) cap_list map ((c, y) -> (c, y) add)");
+    let c2 = corgi_t(&g2, &arg, reps);
+    let r = rust_t(reps, || {
+        let (sv, yv) = (black_box(&scalars), black_box(&ys_vals));
+        let mut out = Vec::with_capacity(m);
+        for i in 0..owners {
+            let s = sv[i];
+            for &y in &yv[i * per_owner..(i + 1) * per_owner] {
+                out.push(s.wrapping_add(y));
+            }
+        }
+        black_box(out);
+    });
+    row(&format!("K2 cap_ref_tuple {label}"), m, c, r, "referenced tuple: one ref per element; Field through the ref, clone the scalar");
+    row(&format!("K2x cap_copy_tuple {label}"), m, cx, r, "the by-value spelling: copies the UNUSED list field per element");
+    row(&format!("K2c proj_ctrl {label}"), m, c2, r, "control: capture only the scalar field (pushdown)");
+}
+
+/// L — growing state. A Rust loop that pushes onto a `Vec` (or reads back what it pushed) is
+/// amortized O(1) per step. corgi's `fold` rebuilds a List-shaped accumulator every round, so a
+/// list that grows to k costs O(k^2) per row — the one genuinely QUADRATIC pattern. The tasks fix
+/// the element count and sweep the row length k, so a flat line is amortized push and a line rising
+/// with k is the rebuild. L1 is the unconditional collect, whose honest corgi spelling is the
+/// streamed `foldscan` (fixed state, pushed output; the bulk `map` is an identity the engine
+/// passes through untouched, so it is not a control); L2 reads the accumulator
+/// back each step (a self-referential stream), which has no non-quadratic spelling today — the
+/// case a fixed-size state holding a Ref into the emitted prefix would fix.
+fn family_l(rows: usize, k: usize, reps: u32) {
+    let m = rows * k;
+    let xs_vals = scrambled(m);
+    let bounds: Vec<usize> = (1..=rows).map(|r| r * k).collect();
+    let xs = Value::List(bounds.clone().into(), Box::new(Value::u64(xs_vals.clone())));
+    // an empty list per row (the seed of a collect), and a one-element [0] per row (L2's seed).
+    let empty = Value::List(vec![0usize; rows].into(), Box::new(Value::u64(Vec::new())));
+    let zero = Value::List((1..=rows).collect::<Vec<usize>>().into(), Box::new(Value::u64(vec![0; rows])));
+    let label = format!("rows={rows} k={k}");
+
+    // L1 collect: acc = acc ++ [x]. Quadratic in k.
+    let g = compile("let (seed, xs) = input in (seed, xs) fold ((acc, x) -> (acc, x enlist) append)");
+    let arg = Value::Prod(vec![empty.clone(), xs.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    // streamed spelling: fixed (unit) state, the element pushed to the output — O(k) rounds of O(rows).
+    let g2 = compile("let (seed, xs) = input in ((seed, xs) foldscan ((s, x) -> (s, x))).1");
+    let arg2 = Value::Prod(vec![Value::u64(vec![0; rows]), xs.clone()]);
+    let c2 = corgi_t(&g2, &arg2, reps);
+    let r = rust_t(reps, || {
+        let xv = black_box(&xs_vals);
+        let mut out: Vec<u64> = Vec::with_capacity(m);
+        let mut ends = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let mut v: Vec<u64> = Vec::new();
+            for &x in &xv[i * k..(i + 1) * k] {
+                v.push(x);
+            }
+            out.extend_from_slice(&v);
+            ends.push(out.len());
+        }
+        black_box((out, ends));
+    });
+    row(&format!("L1 fold_collect {label}"), m, c, r, "fold with a List accumulator: rebuilt every round, O(k^2)/row");
+    row(&format!("L1s foldscan_ctrl {label}"), m, c2, r, "control: fixed state, element streamed to the output");
+
+    // L2 self-referential: acc = acc ++ [acc[x]], x < current length. Rust reads back into the Vec
+    // it is pushing onto; corgi has to carry the whole list as state.
+    let idx_vals: Vec<u64> = xs_vals.iter().enumerate().map(|(j, &e)| e % ((j % k) as u64 + 1)).collect();
+    let idx = Value::List(bounds.into(), Box::new(Value::u64(idx_vals.clone())));
+    // Built with the Builder rather than the surface: the body needs the partial-tier `Get` (its
+    // state cannot carry a `Fail`), and that tier is deliberately not a surface word.
+    let g = {
+        let mut body = Builder::default();
+        let p = body.input();
+        let acc = body.add(Op::Field(0), vec![p]);
+        let x = body.add(Op::Field(1), vec![p]);
+        let xi = body.tuple(vec![x, acc]);
+        let got = body.add(Op::Get, vec![xi]);
+        let one = body.add(Op::Enlist, vec![got]);
+        let both = body.tuple(vec![acc, one]);
+        let out = body.add(Op::Append, vec![both]);
+        let body = body.finish(out);
+        let mut b = Builder::default();
+        let inp = b.input();
+        let out = b.add(Op::Fold(Box::new(body)), vec![inp]);
+        b.finish(out)
+    };
+    let arg = Value::Prod(vec![zero.clone(), idx.clone()]);
+    let c = corgi_t(&g, &arg, reps);
+    let r = rust_t(reps, || {
+        let iv = black_box(&idx_vals);
+        let mut out: Vec<u64> = Vec::with_capacity(m + rows);
+        let mut ends = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let mut v: Vec<u64> = vec![0];
+            for &x in &iv[i * k..(i + 1) * k] {
+                let y = v[x as usize];
+                v.push(y);
+            }
+            out.extend_from_slice(&v);
+            ends.push(out.len());
+        }
+        black_box((out, ends));
+    });
+    row(&format!("L2 fold_selfref {label}"), m, c, r, "fold reading its own growing accumulator: O(k^2)/row, no streamed spelling");
+}
+
+/// W — the worst-case-optimal join step. Per anchor, a SMALL list and a range of a shared sorted
+/// adjacency (the LARGE side); every element of the small side binary-searches its anchor's large
+/// side. Rust pays Σ |small| · log |large|. corgi's `find` already pairs needle row i with haystack
+/// row i and searches per element — the question is how the per-anchor haystack rows are produced:
+/// `(ranges, adj) slices` COPIES each anchor's range out (Σ |large|, the cost WCO exists to avoid);
+/// `(ranges, adj ref) slices` hands out one fat ref per anchor and `find` reads through it. The
+/// sweep fixes the anchors and searches and grows the large side D, so a flat line is WCO cost.
+fn family_w(anchors: usize, s: usize, d: usize, reps: u32) {
+    let searches = anchors * s;
+    // one shared sorted adjacency payload: 0..n, each anchor's range a D-wide window into it.
+    let n = 4 * d + anchors;
+    let adj_vals: Vec<u64> = (0..n as u64).collect();
+    // every anchor holds a REFERENCE to the one adjacency (a fat ref to the whole payload): the
+    // surface has no value broadcast (`lit` lifts u64 constants only), so the input carries it.
+    let adj = Value::Ref(Arc::new(Value::u64(adj_vals.clone())), Refs::Fat(Arc::new(vec![(0, n); anchors])));
+    let mask = (anchors - 1) as u64;
+    let los: Vec<u64> = scrambled(anchors).iter().map(|&e| e & mask).collect();
+    let his: Vec<u64> = los.iter().map(|&lo| lo + d as u64).collect();
+    let ranges = Value::List(
+        vec![1usize; anchors].iter().scan(0, |acc, &x| { *acc += x; Some(*acc) }).collect::<Vec<usize>>().into(),
+        Box::new(Value::Prod(vec![Value::u64(los.clone()), Value::u64(his.clone())])),
+    );
+    // per anchor, s needles: values inside the window (so every search hits) — sorted by construction.
+    let needle_vals: Vec<u64> = (0..anchors)
+        .flat_map(|a| { let lo = los[a]; (0..s).map(move |j| lo + ((j * d) / s) as u64) })
+        .collect();
+    let small = Value::List((1..=anchors).map(|r| r * s).collect::<Vec<usize>>().into(), Box::new(Value::u64(needle_vals.clone())));
+    let label = format!("anchors={anchors} s={s} D={d}");
+    let arg = Value::Prod(vec![small, ranges, adj]);
+
+    // W1 by reference: slice each anchor's range out of its referenced adjacency as a fat ref,
+    // unnest with `get 0`, and let find search through it. Nothing of the adjacency is copied.
+    let g = compile(
+        "let (small, ranges, adj) = input in \
+         let hay = (ranges len sub 1, (ranges, adj) slices) get in (small, hay) find",
+    );
+    let c = corgi_t(&g, &arg, reps);
+    // W1x by value: `adj clone` copies the adjacency into every anchor first, then slices copies
+    // each range out of that.
+    let gx = compile(
+        "let (small, ranges, adj) = input in \
+         let hay = (ranges len sub 1, (ranges, adj clone) slices) get in (small, hay) find",
+    );
+    let cx = corgi_t(&gx, &arg, reps);
+    // the two spellings must agree (checked once, outside the timer).
+    assert_eq!(eval_graph(&g, arg.clone()), eval_graph(&gx, arg.clone()), "W1: ref and copy spellings disagree");
+    let r = rust_t(reps, || {
+        let (av, nv) = (black_box(&adj_vals), black_box(&needle_vals));
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(searches);
+        for a in 0..anchors {
+            let hay = &av[los[a] as usize..his[a] as usize];
+            for &x in &nv[a * s..(a + 1) * s] {
+                let lo = hay.partition_point(|&h| h < x);
+                let hi = hay.partition_point(|&h| h <= x);
+                out.push((lo as u64, hi as u64));
+            }
+        }
+        black_box(out);
+    });
+    row(&format!("W1 wco_find_ref {label}"), searches, c, r, "per-anchor ref to adj; slices a fat ref; find through it");
+    row(&format!("W1x wco_find_copy {label}"), searches, cx, r, "`adj clone` per anchor (copies it), then slices copies the range");
 }
 
 /// F — sum-type / variant. The differentiator: data-parallel `branch`/`match` keep each lane dense
@@ -1237,17 +1461,17 @@ impl Config {
                 "--family" | "--families" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| format!("{arg} requires A-I or R"))?;
+                        .ok_or_else(|| format!("{arg} requires A-I, K, L, R or W"))?;
                     if value == "--bench" {
-                        return Err(format!("{arg} requires A-I or R"));
+                        return Err(format!("{arg} requires A-I, K or R"));
                     }
                     for family in value.split(',') {
                         let family = family.trim().to_ascii_uppercase();
                         if !matches!(
                             family.as_str(),
-                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "R"
+                            "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "K" | "L" | "R" | "W"
                         ) {
-                            return Err(format!("unknown family {family:?}; expected A-I or R"));
+                            return Err(format!("unknown family {family:?}; expected A-I, K, L, R or W"));
                         }
                         if !families.contains(&family) {
                             families.push(family);
@@ -1256,9 +1480,9 @@ impl Config {
                 }
                 "-h" | "--help" => {
                     println!(
-                        "gaps [--smoke] [--family A-I,R] \
+                        "gaps [--smoke] [--family A-I,K,L,R,W] \
                          (repeatable; comma-separated values accepted)\n\
-                         H=safety, I=pointer-chase, R=arrangement"
+                         H=safety, I=pointer-chase, K=capture, L=growing state, R=arrangement, W=WCO step"
                     );
                     std::process::exit(0);
                 }
@@ -1390,6 +1614,47 @@ fn main() {
             println!("\n-- I-sweep: fixed d=256 nodes, widening r (work/node) — dispatch amortization --");
             for (r, reps) in [(1024usize, 200u32), (1 << 14, 40), (1 << 18, 12)] {
                 family_chase(r, 256, 1 << 22, reps);
+            }
+        }
+    }
+
+    // K capture: fixed element count (64 owners × 1 K elements = 64 K lookups), context length swept
+    // 16 → 2048 so the copy grows from 8 MB to 1 GB while the reference-semantics work stays 64 K.
+    // The n=1 case is the "one dictionary, broadcast to every key" shape.
+    if cfg.runs("K") {
+        println!("\n==== K capture: list-shaped context, cost vs context length ==============");
+        if cfg.smoke {
+            family_k(4, 8, 16, 1);
+        } else {
+            for (l, reps) in [(16usize, 200u32), (256, 30), (2048, 4)] {
+                family_k(64, 1024, l, reps);
+            }
+            family_k(1, 65536, 2048, 4);
+        }
+    }
+
+    // L growing state: fixed 64 K elements, row length swept 16 → 4096 so a List accumulator's
+    // rebuild grows from 16 to 4096 words per step while the amortized-push work stays 64 K.
+    if cfg.runs("L") {
+        println!("\n==== L growing state: List accumulator in a fold, cost vs row length =====");
+        if cfg.smoke {
+            family_l(4, 8, 1);
+        } else {
+            for (k, reps) in [(16usize, 100u32), (256, 20), (4096, 3)] {
+                family_l(65536 / k, k, reps);
+            }
+        }
+    }
+
+    // W the WCO step: 1024 anchors × 16 searches fixed, the large side D swept 16 → 16384; the
+    // by-value spelling copies the whole adjacency (4D + anchors words) into every anchor.
+    if cfg.runs("W") {
+        println!("\n==== W WCO step: per-anchor search in the large side, cost vs its size ======");
+        if cfg.smoke {
+            family_w(8, 2, 16, 1);
+        } else {
+            for (d, reps) in [(16usize, 50u32), (256, 20), (4096, 5), (16384, 2)] {
+                family_w(1024, 16, d, reps);
             }
         }
     }
