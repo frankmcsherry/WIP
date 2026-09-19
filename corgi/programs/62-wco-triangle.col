@@ -1,0 +1,30 @@
+# WCO triangle enumeration on the collie/datatoad arc set: arc = (0,k) ∪ (k,0) ∪ (k,k+1) for k in 1..N;
+# tri(a,b,c) :- arc(a,b), arc(b,c), arc(c,a). For each anchor arc (a,b) the candidates are
+# c ∈ N+(b) ∩ N-(a). Both adjacency indexes are grouped lists whose inner lists are held BY REFERENCE
+# (`ref`), captured into every anchor at one thin ref per anchor; `get` picks an anchor's two lists as
+# fat refs. Per anchor the SMALLER side is the proposer — cloned, its size is the WCO budget — and each
+# of its elements binary-searches the LARGER side through the reference (`find`), so an anchor costs
+# min·log max rather than max. Output: the triangle count, 3(N-1).
+# n = 8
+# = Sum tags=[0] [[21], ()x0]
+enum Pick = TgtSmall | PropSmall in
+let ks = input iota map (k -> k add_u64 1) in
+let arcs = ((ks map (k -> (k lit 0, k)), ks map (k -> (k, k lit 0))) append, ks map (k -> (k, k add_u64 1))) append in
+let fwd = arcs sort group transpose in
+let bwd = arcs map (p -> (p.1, p.0)) sort group transpose in
+let fadj = fwd.1 map (l -> l ref) in
+let badj = bwd.1 map (l -> l ref) in
+let pb = (arcs map (p -> p.1), fwd.0) find in
+let pa = (arcs map (p -> p.0), bwd.0) find in
+let trip = ((arcs, pb) zip, pa) zip in
+let ok = trip map (t -> let u = t.0 in let b = u.1 in let a = t.1 in ((b.0, b.1) lt, (a.0, a.1) lt) mul) in
+let good = (trip, ok) filter in
+let ctx = (fadj, badj) ref in
+let cs = (ctx, good) cap_list map (e ->
+  let c = e.0 in let t = e.1 in let u = t.0 in let b = u.1 in let a = t.1 in
+  let tgt = (b.0, c.0) get in
+  let prop = (a.0, c.1) get in
+  ((prop, tgt), (prop len, tgt len) le) branch Pick match (
+    TgtSmall (pt -> let n = pt.1 clone in let r = (n, pt.0) find in (n, r map (x -> (x.0, x.1) lt)) filter),
+    PropSmall (pt -> let n = pt.0 clone in let r = (n, pt.1) find in (n, r map (x -> (x.0, x.1) lt)) filter))) in
+let flat = cs flatten in flat.1 len

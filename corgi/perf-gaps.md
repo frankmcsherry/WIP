@@ -143,3 +143,91 @@ and C4k did not move, and that is the tell that the mechanism was the copy and n
 **What is left on the measurement side:** fix `corgi_t` to hand over pre-built owned columns with the
 cache cleared between build and timer, so A1 and C4k stop being upper bounds; and consider reporting
 corgi's absolute ns/row alongside the ratio, since the Rust ceilings move by up to 2× between runs.
+
+## K — closure capture copies the context (measured 2026-09-17, current master)
+
+> Added after the pre-DPS baseline above; measured on the same M4 mini with `cargo bench --bench gaps -- --family K`.
+
+The worst case in the engine today is not a slow kernel but a **representation choice**: `cap_list` (the List strength, `(X, List<Y>) -> List<(X,Y)>`) is implemented as `gather(x, owner_ids(bounds))`, and `gather` recurses through every shape.
+For a scalar context that is the SIMD operand you want.
+For a **List-shaped context** it copies the whole list once per element, so capture costs `elements × context length` where a Rust closure holds a reference and pays `elements`.
+A tuple context is no better: every field is gathered, including the ones the body never reads.
+
+The suite fixes the element count at 64 K (64 owners × 1 K elements; the `n=1` row is one dictionary broadcast to every key) and sweeps the captured list's length `L`.
+Each task has a corgi **control** that reaches the same result without the capture — the spelling a by-reference capture (or the capture→gather / Field-pushdown rewrite) would recover — so the gap splits into capture-copy vs engine.
+
+| task | L=16 | L=256 | L=2048 | n=1, L=2048 | ns/element at L=2048 | control (no capture) |
+|---|---|---|---|---|---|---|
+| **K1 cap_list_get** — capture a list, `get` one element per element | 41× | 746× | **2088×** | **2226×** | 2829 ns (corgi) vs 1.36 (Rust) | `(ys, ctx) gather`: 0.9 ns, **0.7–1.6×** Rust |
+| **K2 cap_tuple_add** — capture `(scalar, list)`, body reads only the scalar | 54× | 345× | **8196×** | **8396×** | 2704 ns (corgi) vs 0.33 (Rust) | capture `ctx.0` only: 0.65 ns, **2.0×** Rust |
+
+Reading the sweep: corgi's cost per element is ≈ 1.4 ns × L (21 → 396 → 2829 ns as L goes 16 → 256 → 2048) — a memcpy of the context per element, exactly linear in what should be a free reference.
+The controls are flat in L at 0.5–0.9 ns/element, at or under the Rust ceiling.
+(The Rust K1 ceiling rises 0.5 → 1.4 ns with L because the random `get` into a 1 MB context misses L1; the 1.3 ns Rust K2 reading at L=256 is timer noise at 30 reps.)
+Peak memory tracks the same product: at L=2048 the capture materializes 128 M words (1 GB) plus a 1 GB index vector to produce 64 K lookups.
+
+**Mechanism.** Two things compound: (1) capture is spelled as a copy of the context per element rather than a reference to it, and (2) capture of a Prod is eager on every field, so an unread list field costs as much as a read one.
+Neither is a kernel gap; `gather` itself runs at ~1× Rust (E2). This is a value-model gap.
+
+**Fix — two spikes, same machine, same suite.**
+
+*Spike A, branch `corgi-spans`:* a `Bounds::Spans` form so a List row can be a reference, produced implicitly by the capture family (`gather_shared`) and read through a second accessor (`into_list_shared`), with `into_list` compacting for everyone else. It closes the gap (K1 2088× → 3.6×, K2 8196× → 7.5×) but it folds the reference-or-copy decision into which gather a producer calls, which accessor a reader calls, and a bounds variant nobody can see in the program or the shape. Rejected for that reason.
+
+*Spike B, branch `corgi-ref` (this branch):* **the reference is a shape.** `Ref<T>` is a column of references; `ref` takes them (O(rows), nothing copied), `clone` copies the rows out and is the ONLY place referenced data is copied. The representation is fixed by the referenced shape — a referenced list row is a `(lo, hi)` span of the list's payload (`&[T]`), any other referenced row is a row index into the arena (`&T`) — so there is no runtime choice. The two forms are Rust's thin and fat pointers (`Refs::Thin` / `Refs::Fat`); the fat one is what lets `slices` hand out sub-range references, which is why the split is kept rather than collapsed to (VALUE, INDEXES). `gather` has one meaning everywhere (by value) plus one arm: on a Ref it moves refs and never touches the arena, which makes `cap_list`/`cap_sum`/`lit` free on a referenced context with no code of their own. `Field` projects through a referenced product by reference. The readers `get`/`gather`/`find`/`slices`/`len` accept a referenced list haystack (`into_rows`: rows via `span(i)` over one payload); every other op given a Ref is the shape error "expected a list, got Ref<..>" — nothing is silently materialized. `slices` on a referenced haystack returns `List<Ref<List<T>>>`, references, O(ranges); on a list it copies as before. `Bounds` is untouched and always a partition.
+
+| task | L=16 | L=256 | L=2048 | n=1, L=2048 | ns/element at L=2048 |
+|---|---|---|---|---|---|
+| K1 `(ctx ref, ys) cap_list … get` | 7.1× | 3.1× | **7.3×** | **3.7×** | 4.1 ns |
+| K1x the same without `ref` (copies) | 38× | 259× | 5025× | 2212× | 2843 ns |
+| K2 `(ctx ref, ys) cap_list … (c.0 clone, y) add` | 3.7× | 3.7× | **4.0×** | **0.9×** | 1.3 ns |
+| K2x the same without `ref` (copies) | 54× | 1261× | 8381× | 2032× | 2707 ns |
+
+Both referenced spellings are flat in L. K2 lands better than spike A's 7.5× because a referenced tuple is one index per element and only the scalar is ever copied (at the `clone`), where spike A still built one span per element for the unread list field. The by-value spellings stay in the suite on purpose: the copy is now a visible choice in the program, and its cost is the row above it.
+
+What the spike did NOT need: a second gather, a second list accessor, compaction-on-read, content-based `Value` equality, or a new bounds form on the wire. What it did need: a `Value`/`Shape` constructor (nine exhaustive matches: hash, codec, sort, `fixed_width`, `gather_lanes`, …), two ops, the `Rows` view for the five readers. Known copies left in: `gather_lanes`/`Unwrap` over refs and sorting a Ref column clone first (documented at the site); the wire sends a Ref as the rows it names.
+
+Next: Field pushdown through `cap_list`/`cap_sum` in the optimizer and the mechanical closure-capture pass, which now has an explicit target — insert `ref` around a captured list or tuple, `clone` at the leaves the body reaches. The same `Ref` is the μ-type recursion knot.
+
+## L — growing state in a fold is quadratic (measured 2026-09-17, branch `corgi-ref`)
+
+> `cargo bench --bench gaps -- --family L`. Same machine and method as K.
+
+The one genuinely **quadratic** pattern. A Rust loop that pushes onto a `Vec` is amortized O(1) per step, and it can read back what it pushed (`v.push(v[x])`) at O(1). corgi's `fold` carries the accumulator as a value and rebuilds a List-shaped one every round (`gather_lanes`-rebuild), so a list that grows to k costs O(k²) per row.
+The suite fixes the element count at 64 K and sweeps the row length k, so a flat line is amortized push and a line rising with k is the rebuild.
+
+| task | k=16 | k=256 | k=4096 | ns/element | Rust pattern |
+|---|---|---|---|---|---|
+| **L1 fold_collect** — `(acc, x) -> (acc, x enlist) append` | 3.5× | 187× | **5927×** | 15 → 217 → 3327 | `v.push(x)` |
+| L1s foldscan control — fixed state, element streamed to the output | 0.8× | 5.4× | 34× | 3.2 → 6.3 → 19 | the same, written as mapAccumL |
+| **L2 fold_selfref** — `(acc, x) -> (acc, [acc[x]]) append` | 2.8× | 166× | **4567×** | 19 → 225 → 3397 | `v.push(v[x])` |
+
+Reading the sweep: L1 and L2 cost ≈ 0.8 ns × k per element — one copy of the accumulator per step, quadratic per row exactly as predicted. (The Rust L1 ceiling *falls* with k, 4.2 → 0.56 ns, because a per-row `Vec` allocation is amortized over more pushes.)
+
+Two different gaps hide in the two rows:
+
+- **L1 is a usage finding, like F1.** The unconditional collect has a linear corgi spelling — `foldscan` with a fixed (here unit) state and the element pushed to the output — and it should be written that way. What L1s then shows is source 2 of the K/L analysis, the **rounds term**: `foldscan` runs one round per element of the longest row, and at k=4096 with only 16 rows the per-round dispatch is amortized over 16 elements, so the streamed form drifts from 0.8× to 34×. That is the C4/C5 single-row degeneration, not the quadratic.
+- **L2 is the real gap.** A step that must *read back* the growing accumulator has no non-quadratic spelling today: the state has to be the whole list because the body needs random access into it, and the state is rebuilt per round. Rust's `Vec` is both the state and the output. The fix `Ref` makes possible: a `FoldScan` whose fixed-size state may hold a **fat ref into the output emitted so far** — the emitted stream is append-only and immutable, so the reference is stable, `get` through it is O(1), and the accumulator stops being carried as a value. That is a stack machine / parser / self-referential recurrence at O(k) per row. Not built; the design item is recorded in NOTES.md.
+
+L2's body is built with the `Builder` rather than the surface: it needs the partial-tier `Get` (a fold state cannot carry a `Fail`), and that tier is deliberately not a surface word.
+
+## W — the WCO join step is reachable with Ref (measured 2026-09-17, branch `corgi-ref`)
+
+> `cargo bench --bench gaps -- --family W`. 1024 anchors × 16 searches fixed; the large side D swept 16 → 16384.
+
+The worst-case-optimal step: per anchor, a SMALL list and a range of a shared sorted adjacency (the LARGE side); every element of the small side binary-searches its anchor's large side, for Σ |small| · log |large|. corgi's `find` already pairs needle row i with haystack row i and searches per element, so the whole question is how the per-anchor haystack rows are produced. Before Ref, `slices` copied each anchor's range out — Σ |large|, the cost WCO exists to avoid — and the capture of the adjacency into every anchor copied the adjacency itself. Now each anchor holds a fat ref to the adjacency, `slices` on it hands out one fat ref per anchor's range, `get 0` unnests, and `find` searches through the refs:
+
+```
+let (small, ranges, adj) = input in
+let hay = (ranges len sub 1, (ranges, adj) slices) get in
+(small, hay) find
+```
+
+| spelling | D=16 | D=256 | D=4096 | D=16384 | ns/search | shape in D |
+|---|---|---|---|---|---|---|
+| **W1** `adj` a per-anchor ref, slices a fat ref, find through it | 8.7× | 8.1× | 6.7× | **5.4×** | 23 → 43 → 64 → 84 | log D — WCO cost |
+| W1x `adj clone` per anchor, slices copies the range | 29× | 42× | 237× | **531×** | 76 → 224 → 2237 → 8289 | linear in D — the copy |
+
+Rust's ceiling is 2.7 → 15.6 ns per search (log D plus cache); W1 tracks it with a ~5–9× constant (slices + get + find each a pass, and the `Fail` lanes of `get`/`slices` threaded through), W1x tracks D. Both spellings are checked equal once per run.
+
+Two notes. The per-anchor ref to the adjacency is built by the host — the surface has no value broadcast (`lit` lifts u64 constants only), so "the same adjacency for every anchor" cannot yet be written in a program; mechanical capture (below) is what would supply it. And the choose-the-smaller-side-per-anchor half of WCO is a `branch` on `len lt` into two lanes with the roles swapped, then `weave`; it is orthogonal to the reference question and not measured here.
+
