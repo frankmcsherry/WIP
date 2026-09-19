@@ -409,12 +409,57 @@ fn sort_list(
 /// Requires `keys`, `labels` and `index` of one length, `labels` non-decreasing. Ensures `keys`
 /// sorted within each run, `labels` the dense run index of the refined partition, `index`
 /// permuted alike; returns the permutation.
+/// Many small blocks: fold the block label into the key's high bits and sort the whole column
+/// once — datatoad's `(group, value)` radix — instead of setting up a radix sort per block.
+/// Applies when the label and the key fit one `u64` together and the average block is short.
+/// Returns the key mask to strip the label with afterwards.
+fn fold_labels(keys: &mut [u64], labels: &[u64]) -> Option<u64> {
+    let m = keys.len();
+    if m == 0 {
+        return None;
+    }
+    let max_key = keys.iter().copied().max().unwrap_or(0);
+    let max_label = *labels.last().unwrap(); // non-decreasing
+    let key_bits = 64 - max_key.leading_zeros();
+    let label_bits = 64 - max_label.leading_zeros();
+    if key_bits + label_bits > 64 || max_label == 0 || m / (max_label as usize + 1) >= 64 {
+        return None;
+    }
+    // the global sort touches every element; worth it only when most elements sit in blocks that
+    // need sorting at all (a column already refined to singletons has nothing to fold)
+    let mut in_blocks = 0usize;
+    let mut lo = 0;
+    while lo < m {
+        let mut hi = lo + 1;
+        while hi < m && labels[hi] == labels[lo] {
+            hi += 1;
+        }
+        if hi - lo > 1 {
+            in_blocks += hi - lo;
+        }
+        lo = hi;
+    }
+    if in_blocks * 2 < m {
+        return None;
+    }
+    for q in 0..m {
+        keys[q] |= labels[q] << key_bits;
+    }
+    Some(if key_bits == 64 { u64::MAX } else { (1u64 << key_bits) - 1 })
+}
+
 fn sort_keys(keys: &mut [u64], labels: &mut Vec<u64>, index: &mut [usize], scratch: &mut SortScratch) -> Vec<usize> {
     let m = keys.len();
     let mut perm: Vec<usize> = (0..m).collect();
     if labels.is_empty() {
         sort_block(keys, &mut perm, scratch);
         label_runs(labels, m, |q| keys[q] != keys[q - 1]);
+    } else if let Some(mask) = fold_labels(keys, labels) {
+        sort_block(keys, &mut perm, scratch);
+        for k in keys.iter_mut() {
+            *k &= mask;
+        }
+        refine(labels, |q| keys[q] != keys[q - 1]);
     } else {
         let mut lo = 0;
         while lo < m {
@@ -440,6 +485,14 @@ fn sort_keys_only(keys: &mut [u64], labels: &mut Vec<u64>, scratch: &mut SortScr
     if labels.is_empty() {
         sort_block_impl::<false>(keys, &mut [], scratch);
         label_runs(labels, m, |q| keys[q] != keys[q - 1]);
+        return;
+    }
+    if let Some(mask) = fold_labels(keys, labels) {
+        sort_block_impl::<false>(keys, &mut [], scratch);
+        for k in keys.iter_mut() {
+            *k &= mask;
+        }
+        refine(labels, |q| keys[q] != keys[q - 1]);
         return;
     }
     let mut lo = 0;
