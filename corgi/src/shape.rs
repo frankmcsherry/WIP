@@ -10,7 +10,7 @@
 //! whole sum it builds and the merge ops (`Unwrap`, `Select`, `Find`'s two lists) simply
 //! require equality. Lengths/strata are a separate pass.
 
-use crate::value::Value;
+use crate::value::{Refs, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -20,6 +20,7 @@ pub enum Shape {
     Sum(Vec<Shape>), // one shape per variant lane (a lane no row carries is an empty column of it)
     List(Box<Shape>),
     Unit, // the length-carrying unit (payload-free); `None` of `Option = Sum{Unit | T}`.
+    Ref(Box<Shape>), // a column of REFERENCES to rows of a shared T column (`ref` / `clone`)
 }
 
 /// the one shape two merging operands must share: their common shape, or the type error.
@@ -35,6 +36,9 @@ pub fn shape_of_value(v: &Value) -> Shape {
         Value::Sum(_, variants) => Shape::Sum(variants.iter().map(shape_of_value).collect()),
         Value::List(_, vals) => Shape::List(Box::new(shape_of_value(vals))),
         Value::Unit(_) => Shape::Unit,
+        // the refs form is fixed by the referenced shape: spans reference a list's payload, rows an arena.
+        Value::Ref(arena, Refs::Fat(_)) => Shape::Ref(Box::new(Shape::List(Box::new(shape_of_value(arena))))),
+        Value::Ref(arena, Refs::Thin(_)) => Shape::Ref(Box::new(shape_of_value(arena))),
     }
 }
 
@@ -52,6 +56,7 @@ impl std::fmt::Display for Shape {
             }
             Shape::List(t) => write!(f, "List<{t}>"),
             Shape::Unit => write!(f, "()"),
+            Shape::Ref(t) => write!(f, "Ref<{t}>"),
         }
     }
 }

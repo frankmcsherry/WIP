@@ -4,7 +4,7 @@
 
 use crate::shape::shape_of_value;
 use std::sync::Arc;
-use crate::value::{Bounds, Prim, Tags, Value};
+use crate::value::{Bounds, Prim, Refs, Rows, Tags, Value};
 
 pub(crate) use generators::*;
 
@@ -24,8 +24,36 @@ pub(crate) fn fill(row: &Value, n: usize) -> Value {
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| fill(c, n)).collect()),
         Value::Unit(_) => Value::Unit(n),
         // a VARIABLE-WIDTH row (a `List` span, a `Sum` lane) is a row move, which is what a
-        // `gather` at the all-zero index already is; there is no cheaper form of it here.
-        Value::List(..) | Value::Sum(..) => gather(row, &vec![0usize; n]),
+        // `gather` at the all-zero index already is; there is no cheaper form of it here. (A Ref
+        // row broadcasts as `n` references, since `gather` on a Ref moves refs.)
+        Value::List(..) | Value::Sum(..) | Value::Ref(..) => gather(row, &vec![0usize; n]),
+    }
+}
+
+/// TAKE REFERENCES: `Ref` = reference every row of `v`. A list's rows become spans of its payload
+/// (the payload is the arena); any other column becomes its own arena with the identity refs.
+/// O(rows), nothing copied — the by-reference half of the pair.
+pub(crate) fn take_ref(v: Value) -> Value {
+    match v {
+        Value::List(bounds, payload) => {
+            let spans = (0..bounds.len()).map(|i| bounds.span(i)).collect();
+            Value::Ref(Arc::new(*payload), Refs::Fat(Arc::new(spans)))
+        }
+        other => {
+            let n = other.len();
+            Value::Ref(Arc::new(other), Refs::Thin(Arc::new((0..n).collect())))
+        }
+    }
+}
+
+/// CLONE OUT: `Clone` = the referenced rows as a fresh by-value column (the ONE place referenced
+/// data is copied). Thin refs are a `gather` of the arena; fat refs rebuild a partition over the
+/// referenced elements. A non-Ref comes back as it is.
+pub(crate) fn clone_ref(v: Value) -> Value {
+    match v {
+        Value::Ref(arena, Refs::Thin(rows)) => gather(&arena, &rows),
+        Value::Ref(payload, Refs::Fat(spans)) => materialize_spans(&spans, &payload),
+        other => other,
     }
 }
 
@@ -70,43 +98,51 @@ mod generators {
 
     /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
     /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
-    /// of `expand_ranges` below. An index outside its row's span is a (data-dependent) panic.
-    pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: &Bounds) -> Vec<usize> {
+    /// of `range_spans` below. An index outside its row's span is a (data-dependent) panic. `hay` may
+    /// be a list or a referenced list (`Rows`): rows are read through `span`.
+    pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: &Rows) -> Vec<usize> {
         let mut abs = Vec::with_capacity(idx.len());
-        let (mut os, mut hs) = (0, 0);
         for r in 0..outer.len() {
-            let (oe, he) = (outer.end(r), hay.end(r));
+            let (os, oe) = outer.span(r);
+            let (hs, he) = hay.span(r);
             for &x in &idx[os..oe] {
                 let p = hs + x as usize;
                 assert!(p < he, "Gather: index {x} out of row {r}'s bounds");
                 abs.push(p);
             }
-            os = oe;
-            hs = he;
         }
         abs
     }
 
     /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row
-    /// (rows spanned by `hay`). Emits the absolute haystack positions each pair names and the per-pair inner
-    /// bounds. Pairs with `gather` to realise `Slices` — the materialising inverse of `Flatten`.
-    pub(crate) fn expand_ranges(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Bounds) -> (Vec<usize>, Vec<usize>) {
-        let mut idx = Vec::new();
-        let mut inner = Vec::new();
-        let mut acc = 0;
-        let (mut os, mut hs) = (0, 0);
+    /// (rows spanned by `hay`). Emits each pair as an ABSOLUTE span of the haystack payload. `Slices` on
+    /// a list copies those spans out into a partition (the materialising inverse of `Flatten`); on a
+    /// REFERENCED list it hands them back as references. A range outside its row is a (data-dependent)
+    /// panic; `TrySlices` is the total form.
+    pub(crate) fn range_spans(outer: &Bounds, lo: &[u64], hi: &[u64], hay: &Rows) -> Vec<(usize, usize)> {
+        let mut spans = Vec::with_capacity(lo.len());
         for r in 0..outer.len() {
-            let (oe, he) = (outer.end(r), hay.end(r));
+            let (os, oe) = outer.span(r);
+            let (hs, he) = hay.span(r);
             for k in os..oe {
-                let (a, b) = (hs + lo[k] as usize, hs + hi[k] as usize);
-                idx.extend(a..b);
-                acc += b - a;
-                inner.push(acc);
+                let (a, b) = (lo[k] as usize, hi[k] as usize);
+                assert!(a <= b && b <= he - hs, "Slices: range ({a}, {b}) outside row {r} of {} elements", he - hs);
+                spans.push((hs + a, hs + b));
             }
-            os = oe;
-            hs = he;
         }
-        (idx, inner)
+        spans
+    }
+
+    /// spans over a payload as a by-value list: the partition of their lengths over a gather of
+    /// exactly the spanned elements. What `Slices` on a list (and `clone` of fat refs) builds.
+    pub(crate) fn materialize_spans(spans: &[(usize, usize)], payload: &Value) -> Value {
+        let mut elem = Vec::with_capacity(spans.iter().map(|(s, e)| e - s).sum());
+        let mut nb = Vec::with_capacity(spans.len());
+        for &(s, e) in spans {
+            elem.extend(s..e);
+            nb.push(elem.len());
+        }
+        Value::List(nb.into(), Box::new(gather(payload, &elem)))
     }
 
 }
@@ -151,6 +187,9 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
+        // a reference column: move the refs, never the arena. This one arm is the entire cost model
+        // of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Ref they are free.
+        Value::Ref(arena, refs) => Value::Ref(arena.clone(), refs.gather(idx)),
     }
 }
 
@@ -249,6 +288,13 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
+        // sources may reference different arenas, so their refs cannot be merged: copy out, pick,
+        // re-reference. (A merge of same-arena refs would be refs-only; not needed yet.)
+        Value::Ref(..) => {
+            let owned: Vec<Value> = filled.iter().map(|v| clone_ref(v.clone())).collect();
+            let refs: Vec<Option<&Value>> = owned.iter().map(Some).collect();
+            take_ref(gather_lanes(&refs, tags, off))
+        }
     }
 }
 
@@ -341,6 +387,10 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
             Value::Sum(Tags::from_tags(all_tags, arity), lanes)
         }
         Value::Unit(_) => Value::Unit(parts.iter().map(Value::len).sum()),
+        Value::Ref(..) => {
+            let owned: Vec<Value> = parts.iter().map(|v| clone_ref(v.clone())).collect();
+            take_ref(concat(&owned))
+        }
     }
 }
 

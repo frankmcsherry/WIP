@@ -16,6 +16,91 @@ pub enum Value {
     Unit(usize),                  // a length-carrying unit column: `n` rows, no payload. The terminal
                                   // object as a COLUMN (a fieldless `Prod` has no length witness); the
                                   // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
+    Ref(Arc<Value>, Refs),        // a column of REFERENCES: row `j` is a row of the shared arena, named
+                                  // by `refs[j]`. `ref` takes references (O(rows), nothing copied),
+                                  // `clone` copies them out; `gather` on a Ref moves only the refs.
+                                  // The explicit "by reference, not by value" — a closure's `&ctx`.
+}
+
+/// how a `Ref`'s rows name rows of its arena. Fixed by the referenced SHAPE, so there is never a
+/// choice at runtime: a referenced `List<T>` row is a span `(lo, hi)` of the list's payload (the
+/// arena is the payload; Rust's `&[T]`, a FAT pointer), and a referenced row of any other shape is
+/// a row index into the arena (`&T`, THIN). Fat refs are what let `slices` hand out sub-ranges of a
+/// shared haystack, and let `get`/`gather`/`find` read a captured list through the reference.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Refs {
+    Thin(Arc<Vec<usize>>),         // `&T`: a row index into the arena
+    Fat(Arc<Vec<(usize, usize)>>), // `&[T]`: a span of a list's payload (the arena is the payload)
+}
+// (behind an `Arc` like a leaf and a tag column: a clone of a reference column is a refcount bump,
+// never a copy of the refs — `eval` clones freely for shared edges.)
+
+impl Refs {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Refs::Thin(r) => r.len(),
+            Refs::Fat(s) => s.len(),
+        }
+    }
+    /// the refs of rows `idx`: a gather that never touches the arena.
+    pub(crate) fn gather(&self, idx: &[usize]) -> Refs {
+        match self {
+            Refs::Thin(r) => Refs::Thin(Arc::new(idx.iter().map(|&i| r[i]).collect())),
+            Refs::Fat(s) => Refs::Fat(Arc::new(idx.iter().map(|&i| s[i]).collect())),
+        }
+    }
+}
+
+/// the rows of a haystack as a reader sees them: `span(i)` over one payload, whether the rows came
+/// as a `List` (a partition of its payload) or as a `Ref<List>` (spans of a shared payload). The
+/// span-aware readers (`Get`/`Gather`/`Find`/`Slices`/`Len`) take this via `into_rows`; every other
+/// op takes `into_list`, which only accepts a `List` — a Ref is the shape error "clone first".
+pub enum Rows {
+    Part(Bounds),
+    Spans(Vec<(usize, usize)>),
+}
+
+impl Rows {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Rows::Part(b) => b.len(),
+            Rows::Spans(s) => s.len(),
+        }
+    }
+    pub(crate) fn span(&self, i: usize) -> (usize, usize) {
+        match self {
+            Rows::Part(b) => b.span(i),
+            Rows::Spans(s) => s[i],
+        }
+    }
+    /// the one-row-is-the-payload guarantee the leaf fast paths need (a partition of one row).
+    pub(crate) fn as_partition(&self) -> Option<&Bounds> {
+        match self {
+            Rows::Part(b) => Some(b),
+            Rows::Spans(_) => None,
+        }
+    }
+}
+
+/// the borrowed form of [`Rows`], for a mask pass that only reads (see `fail::rows_of`).
+pub enum RowsRef<'a> {
+    Part(&'a Bounds),
+    Spans(&'a [(usize, usize)]),
+}
+
+impl RowsRef<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            RowsRef::Part(b) => b.len(),
+            RowsRef::Spans(s) => s.len(),
+        }
+    }
+    pub(crate) fn span(&self, i: usize) -> (usize, usize) {
+        match self {
+            RowsRef::Part(b) => b.span(i),
+            RowsRef::Spans(s) => s[i],
+        }
+    }
 }
 
 /// how a `List`'s flattened `values` partition into rows. `Offsets` is the general end-offset-per-row
@@ -659,6 +744,10 @@ impl Value {
             }
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
+            Shape::Ref(s) => match &**s {
+                Shape::List(inner) => Value::Ref(Arc::new(Value::empty(inner)), Refs::Fat(Arc::new(Vec::new()))),
+                other => Value::Ref(Arc::new(Value::empty(other)), Refs::Thin(Arc::new(Vec::new()))),
+            },
         }
     }
 
@@ -670,6 +759,7 @@ impl Value {
             Value::Sum(t, _) => t.len(),
             Value::List(b, _) => b.len(),
             Value::Unit(n) => *n,
+            Value::Ref(_, refs) => refs.len(),
         }
     }
 
@@ -705,6 +795,29 @@ impl Value {
         match self {
             Value::List(bounds, vals) => Ok((bounds, *vals)),
             other => Err(format!("{who}: expected a list, got {}", shape_of_value(&other))),
+        }
+    }
+
+    /// a haystack's rows over its payload: a `List` (partition) or a `Ref<List>` (spans of the
+    /// shared payload), for the readers that address rows through `span(i)` and never need the
+    /// payload to be exactly the rows.
+    pub fn into_rows(self, who: &str) -> Result<(Rows, Value), String> {
+        match self {
+            Value::List(bounds, vals) => Ok((Rows::Part(bounds), *vals)),
+            Value::Ref(arena, Refs::Fat(spans)) => {
+                let spans = Arc::try_unwrap(spans).unwrap_or_else(|a| (*a).clone());
+                Ok((Rows::Spans(spans), Arc::try_unwrap(arena).unwrap_or_else(|a| (*a).clone())))
+            }
+            other => Err(format!("{who}: expected a list (or a referenced list), got {}", shape_of_value(&other))),
+        }
+    }
+
+    /// the borrowed `into_rows`: a mask pass reads the rows and leaves the value where it is.
+    pub fn rows_of(&self, who: &str) -> Result<(RowsRef<'_>, &Value), String> {
+        match self {
+            Value::List(bounds, vals) => Ok((RowsRef::Part(bounds), vals)),
+            Value::Ref(arena, Refs::Fat(spans)) => Ok((RowsRef::Spans(spans), arena)),
+            other => Err(format!("{who}: expected a list (or a referenced list), got {}", shape_of_value(other))),
         }
     }
 
@@ -774,6 +887,7 @@ pub fn show(v: &Value) -> String {
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
+        Value::Ref(..) => format!("Ref <{}>", show(&crate::engine::clone_ref(v.clone()))),
     }
 }
 
