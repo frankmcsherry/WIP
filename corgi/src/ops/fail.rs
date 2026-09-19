@@ -20,7 +20,7 @@
 use crate::engine::gather;
 use crate::graph::OpLike;
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, Tags, Value};
+use crate::value::{Bounds, Prim, RowsRef, Tags, Value};
 use std::sync::Arc;
 
 // --- the representation --------------------------------------------------------------------------
@@ -286,12 +286,11 @@ pub(crate) fn try_get<L: OpLike>(input: Value) -> Result<Value, String> {
     {
         let (idx, haystack) = pair_of(&input, "TryGet")?;
         let idxs = idx.as_u64("TryGet index")?;
-        let (hb, _) = list_of(haystack, "TryGet haystack")?;
+        let (hb, _) = haystack.rows_of("TryGet haystack")?;
         assert_eq!(idxs.len(), hb.len(), "TryGet: index/haystack row count");
-        let mut hs = 0;
-        for (r, he) in hb.ends().enumerate() {
-            err.push(idxs[r] as usize >= he - hs);
-            hs = he;
+        for (r, &x) in idxs.iter().enumerate() {
+            let (hs, he) = hb.span(r);
+            err.push(x as usize >= he - hs);
         }
     }
     per_row_try(&err, &super::core::Op::<L>::Get, input)
@@ -302,9 +301,11 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
     let one_row_leaf = {
         let (idx, haystack) = pair_of(&input, "TryGather")?;
         let (ib, _) = list_of(idx, "TryGather indices")?;
-        let (hb, hvals) = list_of(haystack, "TryGather haystack")?;
+        let (hb, hvals) = haystack.rows_of("TryGather haystack")?;
         assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
-        ib.len() == 1 && matches!(hvals, Value::Prim(_))
+        // the leaf fast path indexes the payload directly, so row 0 must BE the payload (a
+        // partition); a referenced haystack takes the row-relative path.
+        ib.len() == 1 && matches!(hvals, Value::Prim(_)) && matches!(hb, RowsRef::Part(_))
     };
     if one_row_leaf {
         // One row over a leaf: validate and gather in the index buffer itself (an identity
@@ -325,15 +326,13 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
     {
         let (idx, haystack) = pair_of(&input, "TryGather")?;
         let (ib, ivals) = list_of(idx, "TryGather indices")?;
-        let (hb, _) = list_of(haystack, "TryGather haystack")?;
+        let (hb, _) = haystack.rows_of("TryGather haystack")?;
         let idxs = ivals.as_u64("TryGather indices")?;
-        let (mut is, mut hs) = (0usize, 0usize);
         for r in 0..ib.len() {
-            let (ie, he) = (ib.end(r), hb.end(r));
+            let (is, ie) = ib.span(r);
+            let (hs, he) = hb.span(r);
             let rowlen = (he - hs) as u64;
             err.push(!idxs[is..ie].iter().all(|&x| x < rowlen));
-            is = ie;
-            hs = he;
         }
     }
     per_row_try(&err, &super::core::Op::<L>::Gather, input)
@@ -346,20 +345,18 @@ pub(crate) fn try_slices<L: OpLike>(input: Value) -> Result<Value, String> {
     {
         let (lohi, haystack) = pair_of(&input, "TrySlices")?;
         let (lb, lvals) = list_of(lohi, "TrySlices ranges")?;
-        let (hb, _) = list_of(haystack, "TrySlices haystack")?;
+        let (hb, _) = haystack.rows_of("TrySlices haystack")?;
         assert_eq!(lb.len(), hb.len(), "TrySlices: row count");
         let (lo, hi) = pair_of(lvals, "TrySlices lo_hi")?;
         let (lo_c, hi_c) = (lo.as_u64("TrySlices lo")?, hi.as_u64("TrySlices hi")?);
-        let (mut ls, mut hs) = (0usize, 0usize);
         for r in 0..lb.len() {
-            let (le, he) = (lb.end(r), hb.end(r));
+            let (ls, le) = lb.span(r);
+            let (hs, he) = hb.span(r);
             let rowlen = he - hs;
             err.push(!(ls..le).all(|k| {
                 let (l, h) = (lo_c[k] as usize, hi_c[k] as usize);
                 l <= h && h <= rowlen
             }));
-            ls = le;
-            hs = he;
         }
     }
     per_row_try(&err, &super::core::Op::<L>::Slices, input)

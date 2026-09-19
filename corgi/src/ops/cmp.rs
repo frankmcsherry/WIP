@@ -122,7 +122,9 @@ impl CmpOp {
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find")?;
                 let (nb, nvals) = needle.into_list("Find needle")?;
-                let (hb, hvals) = haystack.into_list("Find haystack")?;
+                // the haystack may be a referenced list (captured or sliced by reference): rows are
+                // read through `span`, and the search indexes the payload absolutely, so no copy.
+                let (hb, hvals) = haystack.into_rows("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
                 let n = nvals.len();
@@ -130,15 +132,13 @@ impl CmpOp {
                 // row base the answer is relative to; the search moves `lo`, so the base is rewalked
                 // off the bounds at the end rather than kept as a third copy of the same column.
                 let (mut lo, mut hi) = (vec![0usize; n], vec![0usize; n]);
-                let (mut ns, mut hs) = (0, 0);
                 for r in 0..nb.len() {
-                    let (ne, he) = (nb.end(r), hb.end(r));
+                    let (ns, ne) = nb.span(r);
+                    let (hs, he) = hb.span(r);
                     for k in ns..ne {
                         lo[k] = hs;
                         hi[k] = he;
                     }
-                    ns = ne;
-                    hs = he;
                 }
                 // lower = first haystack pos NOT less than the needle; upper = first GREATER. Same
                 // batched search, different tie rule on `haystack[mid] vs needle`.
@@ -148,15 +148,13 @@ impl CmpOp {
                 batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
                 // row-relative: subtract each element's haystack row start, rewalked here.
                 let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                let (mut ns, mut hs) = (0, 0);
                 for r in 0..nb.len() {
-                    let (ne, he) = (nb.end(r), hb.end(r));
+                    let (ns, ne) = nb.span(r);
+                    let (hs, _) = hb.span(r);
                     for k in ns..ne {
                         lo_c.push((lower.0[k] - hs) as u64);
                         hi_c.push((upper.0[k] - hs) as u64);
                     }
-                    ns = ne;
-                    hs = he;
                 }
                 Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
             }
