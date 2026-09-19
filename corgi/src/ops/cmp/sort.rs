@@ -88,6 +88,12 @@ pub(crate) fn sort_indexed(
         // a sum's lanes and a list's elements are read through the index after their sorts.
         Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit.keeping_index(), scratch),
         Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit.keeping_index(), scratch),
+        // a reference sorts as what it names: clone the referenced rows out and sort those. (A
+        // refs-aware sort would read through the arena; not needed yet.)
+        Value::Ref(..) => {
+            let owned = crate::engine::clone_ref(v.clone());
+            sort_indexed(&owned, labels, index, emit, scratch)
+        }
         Value::Unit(_) => {
             densify(labels, m);
             ((0..m).collect(), emit.values().then_some(Value::Unit(m)))
@@ -679,6 +685,10 @@ pub(crate) fn contains_list(v: &Value) -> bool {
         Value::Prod(cols) => cols.iter().any(contains_list),
         Value::Sum(_, lanes) => lanes.iter().any(contains_list),
         Value::Prim(_) | Value::Unit(_) => false,
+        // a fat ref IS a list row (its sorted form gathers the spanned elements); a thin one is
+        // whatever it names.
+        Value::Ref(_, crate::value::Refs::Fat(_)) => true,
+        Value::Ref(arena, crate::value::Refs::Thin(_)) => contains_list(arena),
     }
 }
 
