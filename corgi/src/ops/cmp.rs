@@ -13,7 +13,7 @@ use crate::engine::gather;
 use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Prim, Value};
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -109,8 +109,16 @@ impl CmpOp {
                 // permutation; the keys are one representative per run.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
-                let (keys, ends, firsts, perm) = representatives(&row_labels(&bounds), &k_col, true);
-                let v_sorted = gather(&v_col, &perm);
+                // keys already in order within every row (an output emitted in trie order, a
+                // sorted column): the groups are the runs of equal adjacent keys, no sort, and the
+                // payload stays where it is. One structural pass over adjacent pairs decides.
+                let (keys, ends, firsts, v_sorted) = match sorted_runs(&bounds, &k_col) {
+                    Some((firsts, ends)) => (gather(&k_col, &firsts), ends, firsts, v_col),
+                    None => {
+                        let (keys, ends, firsts, perm) = representatives(&row_labels(&bounds), &k_col, true);
+                        (keys, ends, firsts, gather(&v_col, &perm))
+                    }
+                };
                 let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
                 let no = runs_per_row(&bounds, &firsts);
@@ -144,8 +152,30 @@ impl CmpOp {
                 // batched search, different tie rule on `haystack[mid] vs needle`.
                 let mut lower = (lo.clone(), hi.clone());
                 let mut upper = (lo, hi);
-                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
-                batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
+                // Leaf keys: sorted needles merge (gallop) from the previous needle's bound; the
+                // upper bound is resolved by scanning the equal run, the batched search finishing
+                // any long run. Product keys: LAYERED, one field at a time — field 0 narrows every
+                // needle's window to its equal class by the same merge, and each later field
+                // narrows within that class by the batched search (windows are now per needle and
+                // small). Column-independent, width-generic, no tuple is ever compared as a tuple.
+                let leaf_fields = leaf_fields(&hvals, &nvals);
+                match leaf_fields.as_deref() {
+                    Some([(hp, np)]) => {
+                        let merged = hp.merge_lower(np, &nb, &mut lower.0, &mut lower.1);
+                        if !merged {
+                            batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                        }
+                        hp.run_ends(np, &lower.0, &mut upper.0, &mut upper.1);
+                        batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
+                    }
+                    Some(fields) => {
+                        layered_find(fields, &nb, &mut lower, &mut upper);
+                    }
+                    None => {
+                        batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                        batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
+                    }
+                }
                 // row-relative: subtract each element's haystack row start, rewalked here.
                 let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
                 for r in 0..nb.len() {
@@ -164,6 +194,40 @@ impl CmpOp {
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
+/// if `keys` is non-decreasing within every row of `bounds`, its runs of equal keys as
+/// `(run starts, run ends)`; `None` as soon as a descent is found.
+fn sorted_runs(bounds: &Bounds, keys: &Value) -> Option<(Vec<usize>, Vec<usize>)> {
+    let n = keys.len();
+    if n == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
+    // adjacent pairs (k-1, k) for k in 1..n, compared structurally in one pass
+    let ia: Vec<usize> = (1..n).collect();
+    let ib: Vec<usize> = (0..n - 1).collect();
+    let ord = compare_idx(keys, keys, &ia, &ib); // sign of keys[k] vs keys[k-1]
+    let mut firsts = Vec::new();
+    let mut ends = Vec::new();
+    for r in 0..bounds.len() {
+        let (s, e) = bounds.span(r);
+        if s == e {
+            continue;
+        }
+        firsts.push(s);
+        for k in s + 1..e {
+            match ord[k - 1] {
+                o if o < 0 => return None,
+                0 => {}
+                _ => {
+                    ends.push(k);
+                    firsts.push(k);
+                }
+            }
+        }
+        ends.push(e);
+    }
+    Some((firsts, ends))
+}
+
 fn row_labels(bounds: &Bounds) -> Vec<u64> {
     if bounds.len() == 1 { Vec::new() } else { segment_labels(bounds) }
 }
@@ -190,6 +254,97 @@ fn representatives(labels: &[u64], v: &Value, with_perm: bool) -> (Value, Vec<us
     }
 }
 
+/// a leaf key, or a product of leaf keys, as (haystack field, needle field) pairs — the fields a
+/// layered search walks. `None` for any other shape (a nested product, a list, a sum), which takes
+/// the structural comparator.
+fn leaf_fields<'a>(h: &'a Value, n: &'a Value) -> Option<Vec<(&'a Prim, &'a Prim)>> {
+    match (h, n) {
+        (Value::Prim(hp), Value::Prim(np)) => Some(vec![(hp, np)]),
+        (Value::Prod(hc), Value::Prod(nc)) if hc.len() == nc.len() && !hc.is_empty() => hc
+            .iter()
+            .zip(nc)
+            .map(|(a, b)| match (a, b) {
+                (Value::Prim(hp), Value::Prim(np)) => Some((hp, np)),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// equal-range search of product keys, one field at a time — datatoad's layered intersection.
+/// `lower`/`upper` arrive as each needle's haystack-row window and leave as its equal range on the
+/// whole key. Field 0 is a galloping merge over the sorted needle rows; every later field is the
+/// same merge over the CLASSES the previous fields left equal: needles with the same window are a
+/// class, their values on this field are sorted within it (the needles are in structural order), and
+/// the class's window is the haystack range equal on the prefix. Each field is one leaf column
+/// against one leaf column at whatever width it has; nothing compares a tuple. Needle rows that are
+/// not sorted fall back to the per-needle batched search.
+fn layered_find(fields: &[(&Prim, &Prim)], nb: &Bounds, lower: &mut (Vec<usize>, Vec<usize>), upper: &mut (Vec<usize>, Vec<usize>)) {
+    let n = lower.0.len();
+    let mut rows: Bounds = nb.clone();
+    for (f, &(hf, nf)) in fields.iter().enumerate() {
+        if f > 0 {
+            // the classes: maximal runs of needles with the same [lower, upper) window
+            let mut ends = Vec::new();
+            for k in 0..n {
+                if k + 1 == n || lower.0[k + 1] != lower.0[k] || upper.0[k + 1] != upper.0[k] {
+                    ends.push(k + 1);
+                }
+            }
+            rows = Bounds::offsets(ends);
+            // every needle's window is its class's prefix range
+            for k in 0..n {
+                lower.1[k] = upper.0[k];
+                upper.1[k] = upper.0[k];
+                upper.0[k] = lower.0[k];
+            }
+        }
+        if !hf.merge_lower(nf, &rows, &mut lower.0, &mut lower.1) {
+            batched_bound_leaf(hf, nf, &mut lower.0, &mut lower.1, &|o| o < 0);
+        }
+        // the upper bound, once per RUN of equal needles: consecutive needles of one class with the
+        // same lower bound have the same value on this field (both sides are sorted), so the run's
+        // head searches and the rest copy — the prefix sharing of a trie, on the needle side.
+        let mut heads: Vec<usize> = Vec::new();
+        let mut run_of: Vec<usize> = vec![0; n];
+        let eq_prev = nf.eq_prev();
+        let mut row = 0usize; // the class of needle k, walked in order
+        for k in 0..n {
+            while rows.span(row).1 <= k {
+                row += 1;
+            }
+            let same = k > 0 && eq_prev[k] && rows.span(row).0 <= k - 1;
+            if !same {
+                heads.push(k);
+            }
+            run_of[k] = heads.len() - 1;
+        }
+        // upper window per head: [lower bound, class upper); resolve by scanning the equal run,
+        // then the batched search for whatever is left
+        let mut active = heads.clone();
+        for &k in &heads {
+            upper.0[k] = lower.0[k];
+        }
+        hf.run_ends_at(nf, &heads, &mut upper.0, &mut upper.1);
+        active.retain(|&k| upper.0[k] < upper.1[k]);
+        hf.batched_bound(nf, &mut upper.0, &mut upper.1, &mut active, &|o| o <= 0);
+        for k in 0..n {
+            let h = heads[run_of[k]];
+            upper.0[k] = upper.0[h];
+        }
+    }
+}
+
+/// the batched search on one leaf field, every needle keeping its own window
+fn batched_bound_leaf(h: &Prim, n: &Prim, lo: &mut [usize], hi: &mut [usize], go_right: &dyn Fn(i8) -> bool) {
+    let mut active: Vec<usize> = (0..lo.len()).filter(|&k| lo[k] < hi[k]).collect();
+    if active.is_empty() {
+        return;
+    }
+    h.batched_bound(n, lo, hi, &mut active, go_right);
+}
+
 /// one batched lower/upper-bound search: every needle element advances its window `[lo,hi)` in
 /// lockstep until it collapses, one `compare_idx` per round comparing `haystack[mid]` to its needle
 /// element. `go_right(sign)` is the tie rule (`sign` is haystack-vs-needle, `-1`/`0`/`+1`): lower bound
@@ -206,6 +361,15 @@ fn batched_bound(
     // round's work tracks the ACTIVE needles, not all of them (the full rescan per round was
     // ~8% of a join-heavy profile). `active` doubles as the needle indices into `nvals`.
     let mut active: Vec<usize> = (0..lo.len()).filter(|&k| lo[k] < hi[k]).collect();
+    if active.is_empty() {
+        return;
+    }
+    // leaf columns: compare and update in one loop, no per-round comparison vector (that vector
+    // was a third of a join-heavy profile: one allocation and fill per round, forty rounds deep).
+    if let (Value::Prim(hp), Value::Prim(np)) = (hvals, nvals) {
+        hp.batched_bound(np, lo, hi, &mut active, &go_right);
+        return;
+    }
     let mut mids: Vec<usize> = Vec::with_capacity(active.len());
     while !active.is_empty() {
         mids.clear();

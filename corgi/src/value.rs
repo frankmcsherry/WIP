@@ -660,6 +660,142 @@ macro_rules! prim {
                 }
             }
 
+            /// the leaf of `cmp::batched_bound`: every active needle `k` (an index into `self`'s
+            /// partner `needles`) halves its window `[lo[k], hi[k])` over `self` each round, the
+            /// comparison folded into the update — no comparison vector. `go_right(sign)` is the
+            /// tie rule (`sign` = haystack-vs-needle as -1/0/+1). `active` is compacted in place.
+            pub(crate) fn batched_bound(
+                &self,
+                needles: &Prim,
+                lo: &mut [usize],
+                hi: &mut [usize],
+                active: &mut Vec<usize>,
+                go_right: &dyn Fn(i8) -> bool,
+            ) {
+                match (self, needles) {
+                    $( (Prim::$V(h), Prim::$V(n)) => {
+                        while !active.is_empty() {
+                            let mut w = 0usize;
+                            for t in 0..active.len() {
+                                let k = active[t];
+                                let mid = (lo[k] + hi[k]) / 2;
+                                let (x, y) = (h[mid], n[k]);
+                                let sign = (x > y) as i8 - (x < y) as i8;
+                                if go_right(sign) {
+                                    lo[k] = mid + 1;
+                                } else {
+                                    hi[k] = mid;
+                                }
+                                if lo[k] < hi[k] {
+                                    active[w] = k;
+                                    w += 1;
+                                }
+                            }
+                            active.truncate(w);
+                        }
+                    } )+
+                    _ => panic!("batched_bound: prim width mismatch"),
+                }
+            }
+
+            /// `Find`'s lower bound as a galloping merge, when every needle row is sorted: needles
+            /// are visited in order and each one's bound is found from the previous bound by
+            /// exponential then binary search (datatoad's `gallop`). Writes `lo[k] = hi[k] = bound`
+            /// for every needle (so a batched search afterwards has nothing left to do) and returns
+            /// `true`; returns `false` without touching anything if some needle row is not sorted.
+            /// `lo[k]`/`hi[k]` arrive as the needle's haystack-row window `[start, end)`.
+            pub(crate) fn merge_lower(&self, needles: &Prim, rows: &Bounds, lo: &mut [usize], hi: &mut [usize]) -> bool {
+                match (self, needles) {
+                    $( (Prim::$V(h), Prim::$V(n)) => {
+                        for r in 0..rows.len() {
+                            let (s, e) = rows.span(r);
+                            if n[s..e].windows(2).any(|w| w[0] > w[1]) {
+                                return false;
+                            }
+                        }
+                        for r in 0..rows.len() {
+                            let (s, e) = rows.span(r);
+                            if s == e {
+                                continue;
+                            }
+                            let (mut cur, end) = (lo[s], hi[s]);
+                            for k in s..e {
+                                let y = n[k];
+                                // gallop: widen a step until h[cur+step] >= y (or the row ends) …
+                                let mut step = 1;
+                                while cur + step < end && h[cur + step] < y {
+                                    cur += step;
+                                    step <<= 1;
+                                }
+                                // … then binary-search the last step for the first h >= y.
+                                let mut top = (cur + step).min(end);
+                                while cur < top {
+                                    let mid = (cur + top) / 2;
+                                    if h[mid] < y { cur = mid + 1; } else { top = mid; }
+                                }
+                                lo[k] = cur;
+                                hi[k] = cur;
+                            }
+                        }
+                        true
+                    } )+
+                    _ => panic!("merge_lower: prim width mismatch"),
+                }
+            }
+
+            /// the equal-run shortcut of `Find`'s upper bound: needle `k`'s lower bound is
+            /// `lower[k]`; scan forward over `self` while equal, at most a few steps. A run that
+            /// ends within the scan resolves the upper bound outright (`up_lo[k] = up_hi[k] = end`,
+            /// so the batched search skips it); a longer one leaves the window `[scan end, up_hi[k])`
+            /// for the batched search to finish.
+            pub(crate) fn run_ends(&self, needles: &Prim, lower: &[usize], up_lo: &mut [usize], up_hi: &mut [usize]) {
+                const SCAN: usize = 4;
+                match (self, needles) {
+                    $( (Prim::$V(h), Prim::$V(n)) => {
+                        for k in 0..lower.len() {
+                            let (mut q, end, y) = (lower[k], up_hi[k], n[k]);
+                            let stop = end.min(q + SCAN);
+                            while q < stop && h[q] == y {
+                                q += 1;
+                            }
+                            up_lo[k] = q;
+                            if q < stop || q == end {
+                                up_hi[k] = q; // the run ended (or the row did): resolved
+                            }
+                        }
+                    } )+
+                    _ => panic!("run_ends: prim width mismatch"),
+                }
+            }
+
+            /// `out[k]` = element `k` equals element `k-1` (false at 0): the runs of equal values.
+            pub(crate) fn eq_prev(&self) -> Vec<bool> {
+                match self {
+                    $( Prim::$V(v) => (0..v.len()).map(|k| k > 0 && v[k] == v[k - 1]).collect(), )+
+                }
+            }
+
+            /// `run_ends` over a subset of needles (`at`), for the layered search's run heads.
+            pub(crate) fn run_ends_at(&self, needles: &Prim, at: &[usize], up_lo: &mut [usize], up_hi: &mut [usize]) {
+                const SCAN: usize = 4;
+                match (self, needles) {
+                    $( (Prim::$V(h), Prim::$V(n)) => {
+                        for &k in at {
+                            let (mut q, end, y) = (up_lo[k], up_hi[k], n[k]);
+                            let stop = end.min(q + SCAN);
+                            while q < stop && h[q] == y {
+                                q += 1;
+                            }
+                            up_lo[k] = q;
+                            if q < stop || q == end {
+                                up_hi[k] = q;
+                            }
+                        }
+                    } )+
+                    _ => panic!("run_ends_at: prim width mismatch"),
+                }
+            }
+
             /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
             /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
             /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
