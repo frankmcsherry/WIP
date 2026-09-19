@@ -18,3 +18,8 @@ harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see
 [[bench]]
 name = "stride"
 harness = false   # stride-detection spike: ragged vs dense sort of uniform-width keys
+
+[dev-dependencies]
+# the GALEN examples run under mimalloc, as datatoad does: allocator parity for the comparison
+# (the library itself has no dependencies; this reaches only examples, tests and benches).
+mimalloc = "0.1"
