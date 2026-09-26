@@ -72,8 +72,20 @@ pub fn hash(v: &Value) -> Vec<u64> {
         Value::Prod(cols) => {
             let mut acc = vec![PROD; v.len()];
             for c in cols {
-                for (a, x) in acc.iter_mut().zip(hash(c)) {
-                    *a = combine(*a, x);
+                // Leaves can fold directly into the parent. Materializing their hashes
+                // only to consume them here adds a full-width temporary per field.
+                match c {
+                    Value::Prim(p) => p.fold_hashes(&mut acc, combine),
+                    Value::Unit(n) => {
+                        for a in acc.iter_mut().take(*n) {
+                            *a = combine(*a, UNIT);
+                        }
+                    }
+                    _ => {
+                        for (a, x) in acc.iter_mut().zip(hash(c)) {
+                            *a = combine(*a, x);
+                        }
+                    }
                 }
             }
             acc
@@ -262,5 +274,69 @@ mod tests {
             h(&u(&[0, 1, 2])),
             vec![0, 6238072747940578789, 15839785061582574730],
         );
+    }
+
+    #[test]
+    fn fused_product_hashes_match_scalar_rows() {
+        use crate::value::Prim;
+        // Independent row traversal locks the structural fold across every constructor;
+        // unlike the columnar implementation it has no intermediate hash columns.
+        fn row(v: &Value, r: usize) -> u64 {
+            match v {
+                Value::Prim(p) => mix64(match p {
+                    Prim::U8(v) => v[r] as u64,
+                    Prim::U16(v) => v[r] as u64,
+                    Prim::U32(v) => v[r] as u64,
+                    Prim::U64(v) => v[r],
+                }),
+                Value::Prod(cols) => cols.iter().fold(PROD, |a, c| combine(a, row(c, r))),
+                Value::Unit(_) => UNIT,
+                Value::Sum(tags, lanes) => {
+                    let tag = tags.tag_at(r);
+                    combine(
+                        combine(SUM, tag as u64),
+                        row(&lanes[tag], tags.offset_at(r)),
+                    )
+                }
+                Value::List(bounds, vals) => {
+                    let (s, e) = bounds.span(r);
+                    (s..e).fold(combine(LIST, (e - s) as u64), |a, i| {
+                        combine(a, row(vals, i))
+                    })
+                }
+            }
+        }
+        for n in [0, 1, 2, 31, 257] {
+            let mut tags = Vec::new();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let (mut ends, mut vals) = (Vec::new(), Vec::new());
+            for i in 0..n {
+                tags.push(i % 2);
+                if i % 2 == 0 {
+                    a.push(i as u16);
+                } else {
+                    b.push(u64::MAX - i as u64);
+                }
+                vals.extend((0..i % 4).map(|j| (i + j) as u64));
+                ends.push(vals.len());
+            }
+            let nested = Value::Prod(vec![
+                Value::Unit(n),
+                Value::List(
+                    Bounds::offsets(ends),
+                    Box::new(Value::Prod(vec![Value::Unit(vals.len()), u(&vals)])),
+                ),
+                Value::sum(tags, vec![Value::u16(a), u(&b), Value::Unit(0)]),
+            ]);
+            let v = Value::Prod(vec![
+                Value::u8((0..n).map(|i| i as u8).collect()),
+                Value::u16((0..n).map(|i| (i * 257) as u16).collect()),
+                Value::u32((0..n).map(|i| u32::MAX - i as u32).collect()),
+                u(&(0..n).map(|i| u64::MAX - i as u64).collect::<Vec<_>>()),
+                nested,
+            ]);
+            assert_eq!(hash(&v), (0..n).map(|r| row(&v, r)).collect::<Vec<_>>());
+        }
+        assert!(hash(&Value::Prod(vec![])).is_empty());
     }
 }
