@@ -13,6 +13,17 @@ use crate::value::Value;
 
 /// A kernel over columns. `eval` receives a column of shape `input()` with at least one row, and
 /// must return a column of shape `output()` with the same number of rows.
+///
+/// The contract, which corgi relies on but cannot check:
+/// - **Deterministic, no side effects.** The optimizer rewrites host nodes like any other op:
+///   common-subexpression elimination merges calls of one kernel on one input, and dead-code
+///   elimination drops unused calls.
+/// - **Row-local.** Output row `i` depends only on input row `i`. Batches are split and joined
+///   differently with worker count and inside `MapList`, so no row may see another.
+/// - **`Err` is fatal.** It is not an in-language failure: `eval_graph` panics on it, and
+///   `is_total` counts a host call as total. Return `Err` only for a broken contract.
+/// - **No arguments: declare `Unit` input.** A `Prod` of no columns has no rows (`Value::len`
+///   reads its first column), so a kernel over it would never run; `Unit` carries its row count.
 pub trait HostKernel: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn input(&self) -> &Shape;
@@ -108,6 +119,24 @@ mod tests {
         let cols = vals.into_prod("test").unwrap();
         assert_eq!(cols[0].as_u64("t").unwrap(), &[7, 7]);
         assert_eq!(cols[1].as_u64("t").unwrap(), &[0, 1]);
+    }
+
+    /// Two calls of one kernel on one input merge under CSE; calls of two kernels do not.
+    #[test]
+    fn cse_merges_calls_of_one_kernel_only() {
+        let (k, other) = (repeat(), repeat());
+        let mut b = Builder::<NumOp>::default();
+        let x = b.input();
+        let calls = vec![
+            b.add(NumOp::Host(k.clone()), vec![x]),
+            b.add(NumOp::Host(k), vec![x]),
+            b.add(NumOp::Host(other), vec![x]),
+        ];
+        let out = b.tuple(calls);
+        let g = b.finish(out);
+        let hosts = |g: &crate::Graph<NumOp>| g.nodes.iter().filter(|n| matches!(n.kind, crate::graph::NodeKind::Op(NumOp::Host(_)))).count();
+        assert_eq!(hosts(&g), 3);
+        assert_eq!(hosts(&crate::cse(&g)), 2);
     }
 
     #[test]
