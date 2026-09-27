@@ -406,6 +406,9 @@ fn sort_list(
 fn sort_keys(keys: &mut [u64], labels: &mut Vec<u64>, index: &mut [usize], scratch: &mut SortScratch) -> Vec<usize> {
     let m = keys.len();
     let mut perm: Vec<usize> = (0..m).collect();
+    if refine_if_ordered(keys, labels) {
+        return perm;
+    }
     if labels.is_empty() {
         sort_block(keys, &mut perm, scratch);
         label_runs(labels, m, |q| keys[q] != keys[q - 1]);
@@ -431,6 +434,7 @@ fn sort_keys(keys: &mut [u64], labels: &mut Vec<u64>, index: &mut [usize], scrat
 /// caller that will not read the index again.
 fn sort_keys_only(keys: &mut [u64], labels: &mut Vec<u64>, scratch: &mut SortScratch) {
     let m = keys.len();
+    if refine_if_ordered(keys, labels) { return; }
     if labels.is_empty() {
         sort_block_impl::<false>(keys, &mut [], scratch);
         label_runs(labels, m, |q| keys[q] != keys[q - 1]);
@@ -448,6 +452,23 @@ fn sort_keys_only(keys: &mut [u64], labels: &mut Vec<u64>, scratch: &mut SortScr
         lo = hi;
     }
     refine(labels, |q| keys[q] != keys[q - 1]);
+}
+
+/// Already ordered within each input class: refine its equal-key runs without
+/// radix work or copying an identity permutation over the caller's index.
+/// Most later product fields are constant within the classes formed earlier.
+fn refine_if_ordered(keys: &[u64], labels: &mut Vec<u64>) -> bool {
+    let ordered = if labels.is_empty() {
+        keys.windows(2).all(|w| w[0] <= w[1])
+    } else {
+        keys.windows(2).zip(labels.windows(2))
+            .all(|(k, l)| k[0] <= k[1] || l[0] != l[1])
+    };
+    if ordered {
+        if labels.is_empty() { label_runs(labels, keys.len(), |q| keys[q] != keys[q - 1]); }
+        else { refine(labels, |q| keys[q] != keys[q - 1]); }
+    }
+    ordered
 }
 
 /// Stable sort of one block by `keys`, `perm` moving with them. Blocks of 32 or fewer take an
@@ -800,6 +821,29 @@ mod tests {
             blocks.push(b);
         }
         vec![Vec::new(), vec![0; n], blocks, (0..n as u64).collect()]
+    }
+
+    #[test]
+    fn ordered_refinements_preserve_labels_and_stable_positions() {
+        // Each label class is ordered, but keys decrease across class boundaries.
+        // Non-identity source coordinates must stay in their original tie order.
+        for n in [0, 1, 2, 33, 257, 32769] {
+            let keys: Vec<u64> = (0..n).map(|i| (1u64 << 63) + ((i % 129) / 3) as u64).collect();
+            let labels: Vec<u64> = (0..n).map(|i| 7 + 9 * (i / 129) as u64).collect();
+            let mut stored = keys.clone();
+            stored.reverse();
+            let index: Vec<usize> = (0..n).rev().collect();
+            check(&Value::u64(stored), &labels, &index);
+            let mut sorted = keys;
+            sorted.sort();
+            check(&Value::u64(sorted.clone()), &[], &(0..n).collect::<Vec<_>>());
+            // A late inversion must still take the normal sort, without partially
+            // refining the labels before the fast path rejects the input.
+            if n > 3 {
+                sorted[n - 1] = 0;
+                check(&Value::u64(sorted), &labels, &(0..n).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]
