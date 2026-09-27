@@ -22,8 +22,9 @@ use crate::value::Value;
 ///   differently with worker count and inside `MapList`, so no row may see another.
 /// - **`Err` is fatal.** It is not an in-language failure: `eval_graph` panics on it, and
 ///   `is_total` counts a host call as total. Return `Err` only for a broken contract.
-/// - **No arguments: declare `Unit` input.** A `Prod` of no columns has no rows (`Value::len`
-///   reads its first column), so a kernel over it would never run; `Unit` carries its row count.
+/// - **Shapes must carry their row count.** `Value::len` of a `Prod` is its first field's, so a
+///   shape whose chain of first fields ends in an empty `Prod` has no rows. The adapter rejects
+///   such an input or output shape as a type error; a kernel with no arguments declares `Unit`.
 pub trait HostKernel: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn input(&self) -> &Shape;
@@ -47,6 +48,12 @@ impl std::hash::Hash for HostOp {
 impl HostOp {
     pub fn eval(&self, input: Value) -> Result<Value, String> {
         let k = &self.0;
+        // Checked before the zero-row return, so typing (`shape_of`) reports it.
+        for (what, s) in [("input", k.input()), ("output", k.output())] {
+            if !counts_rows(s) {
+                return Err(format!("{}: {what} shape {s} has no column that counts its rows (use Unit)", k.name()));
+            }
+        }
         let got = shape_of_value(&input);
         if &got != k.input() {
             return Err(format!("{}: expected input {}, got {}", k.name(), k.input(), got));
@@ -64,6 +71,15 @@ impl HostOp {
             return Err(format!("{}: {} rows in, {} rows out", k.name(), n, out.len()));
         }
         Ok(out)
+    }
+}
+
+/// Whether a value of shape `s` knows its row count: follow first fields (as `Value::len` does)
+/// down to a column that carries its own length.
+fn counts_rows(s: &Shape) -> bool {
+    match s {
+        Shape::Prod(fs) => fs.first().is_some_and(counts_rows),
+        Shape::Prim(_) | Shape::List(_) | Shape::Sum(_) | Shape::Unit => true,
     }
 }
 
@@ -119,6 +135,33 @@ mod tests {
         let cols = vals.into_prod("test").unwrap();
         assert_eq!(cols[0].as_u64("t").unwrap(), &[7, 7]);
         assert_eq!(cols[1].as_u64("t").unwrap(), &[0, 1]);
+    }
+
+    /// Input or output shapes that lose their row count are type errors, at typing time.
+    #[test]
+    fn shapes_without_a_row_count_are_type_errors() {
+        struct K(Shape, Shape);
+        impl HostKernel for K {
+            fn name(&self) -> &str { "k" }
+            fn input(&self) -> &Shape { &self.0 }
+            fn output(&self) -> &Shape { &self.1 }
+            fn eval(&self, input: Value) -> Result<Value, String> { Ok(input) }
+        }
+        let p = Shape::Prim(64);
+        let empty = Shape::Prod(vec![]);
+        let nested = Shape::Prod(vec![empty.clone(), p.clone()]);
+        let typed = |input: &Shape, output: &Shape| {
+            let mut b = Builder::<NumOp>::default();
+            let x = b.input();
+            let out = b.add(NumOp::Host(HostOp(Arc::new(K(input.clone(), output.clone())))), vec![x]);
+            shape_of(&b.finish(out), input)
+        };
+        assert!(typed(&empty, &p).is_err());
+        assert!(typed(&nested, &p).is_err());
+        assert!(typed(&p, &empty).is_err());
+        assert!(typed(&p, &nested).is_err());
+        assert_eq!(typed(&Shape::Unit, &p).unwrap(), p);
+        assert_eq!(typed(&Shape::Prod(vec![p.clone(), empty.clone()]), &p).unwrap(), p);
     }
 
     /// Two calls of one kernel on one input merge under CSE; calls of two kernels do not.
