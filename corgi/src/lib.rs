@@ -36,6 +36,7 @@ pub use effect::{is_total, lower_effects};
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;
+pub use ops::host::{HostKernel, HostOp};
 pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};
 pub use shape::{shape_of_value, Shape};

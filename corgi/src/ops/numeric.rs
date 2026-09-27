@@ -351,6 +351,8 @@ pub enum NumOp {
     Cmp(CmpOp),
     Arith(ArithOp),
     Text(TextOp),
+    /// A kernel supplied from outside corgi (`ops::host`).
+    Host(super::host::HostOp),
 }
 
 impl OpLike for NumOp {
@@ -360,12 +362,13 @@ impl OpLike for NumOp {
             NumOp::Cmp(c) => c.eval(input),
             NumOp::Arith(a) => a.eval(input),
             NumOp::Text(t) => t.eval(input),
+            NumOp::Host(h) => h.eval(input),
         }
     }
     fn children(&self) -> Vec<&Graph<NumOp>> {
         match self {
             NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
-            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) => Vec::new(),
+            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) => Vec::new(),
         }
     }
 }
