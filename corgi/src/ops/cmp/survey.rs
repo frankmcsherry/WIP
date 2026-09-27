@@ -157,12 +157,16 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
                 }
                 if first {
                     if g > f { lanes_level(&lanes, ia, ib, &cur, tree) } else { level(&ca[f], &cb[f], ia, ib, &cur, tree) }
-                    (cur, sa, sb) = tree.refined(&cur, ia, ib);
-                    first = false;
                 } else {
                     if g > f { lanes_level(&lanes, &sa[..], &sb[..], &cur, tree) } else { level(&ca[f], &cb[f], &sa[..], &sb[..], &cur, tree) }
-                    (cur, sa, sb) = tree.refined(&cur, &sa[..], &sb[..]);
                 }
+                // The report tree is already complete after the last field.
+                // Row lists and local offsets are only needed by a next field;
+                // an enclosing level reconstructs its own lists from the tree.
+                if next == ca.len() { break; }
+                (cur, sa, sb) = if first { tree.refined(&cur, ia, ib) }
+                    else { tree.refined(&cur, &sa[..], &sb[..]) };
+                first = false;
                 f = next;
             }
         }
@@ -697,6 +701,29 @@ mod tests {
             }
         }
         assert_eq!((ca, cb), (a.len(), b.len()));
+    }
+
+    #[test]
+    fn nested_product_reports_can_be_refined_by_an_enclosing_field() {
+        // A terminal product's reports may be consumed by an outer product,
+        // list, or sum. Their next refinement must reconstruct the right rows,
+        // including duplicates, rather than depend on the terminal's row lists.
+        for seed in 1..40u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let n = 24;
+            let nested = Value::Prod(vec![random_value(&mut rng, n, 3), Value::u8((0..n).map(|_| rng.below(3) as u8).collect())]);
+            for both in [
+                nested.clone(),
+                Value::Prod(vec![nested.clone(), Value::u8((0..n).map(|_| rng.below(3) as u8).collect())]),
+                Value::List(Bounds::Stride(2, n / 2), Box::new(nested.clone())),
+                Value::sum(vec![0; n], vec![nested]),
+            ] {
+                let (_, _, sorted) = sort_values(&[], &both);
+                let a = gather(&sorted, &(0..sorted.len() - 2).collect::<Vec<_>>());
+                let b = gather(&sorted, &(2..sorted.len()).collect::<Vec<_>>());
+                assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b), "seed={seed}");
+            }
+        }
     }
 
     /// the pairwise oracle: the old two-pointer walk with `compare_at`.
