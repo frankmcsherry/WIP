@@ -548,6 +548,18 @@ macro_rules! prim {
                 }
             }
 
+            /// Fold leaf hashes into an existing structural accumulator without materializing
+            /// a temporary hash column. The leaf encoding and hash are identical to `hashes`.
+            pub(crate) fn fold_hashes(&self, acc: &mut [u64], mut fold: impl FnMut(u64, u64) -> u64) {
+                match self {
+                    $( Prim::$V(v) => {
+                        for (a, &x) in acc.iter_mut().zip(v.iter()) {
+                            *a = fold(*a, crate::hash::mix64(x as u64));
+                        }
+                    } )+
+                }
+            }
+
             /// structural order of paired records: `out[k]` = sign of `self[ia[k]]` vs `other[ib[k]]`
             /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and scalar
             /// on NEON; the dense column-vs-column compare is [`Prim::rel`].
