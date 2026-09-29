@@ -169,12 +169,21 @@ pub mod arrange {
     /// order — block-stable, stable within a block — and `labels` is the dense refined partition
     /// in that order. Returns the permutation applied, `new_index[k] == old_index[perm[k]]`, so
     /// a parallel array can be moved the same way, and with `emit` the sorted rows as a column.
-    /// The subset never has to be gathered out first: this is the form a caller with a subset in
-    /// hand wants.
+    ///
+    /// The sort itself carries only rows. To return positions it sorts the positions of the
+    /// subset gathered out once; a caller that needs only the sorted rows, from an identity
+    /// index, has them from [`sort_blocks`] without that gather.
     pub fn sort_indexed(v: &Value, labels: &mut Vec<u64>, index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
-        let mut scratch = crate::ops::cmp::sort::SortScratch::default();
-        let emit = if emit { crate::ops::cmp::sort::Emit::Both } else { crate::ops::cmp::sort::Emit::Groups };
-        crate::ops::cmp::sort::sort_indexed(v, labels, index, emit, &mut scratch)
+        use crate::ops::cmp::sort::{sort_indexed, Emit, SortScratch};
+        let mut scratch = SortScratch::default();
+        let subset = gather(v, index);
+        let mut perm: Vec<usize> = (0..index.len()).collect();
+        let out = sort_indexed(&subset, labels, &mut perm, if emit { Emit::Both } else { Emit::Index }, &mut scratch);
+        let old = index.to_vec();
+        for (slot, &p) in index.iter_mut().zip(&perm) {
+            *slot = old[p];
+        }
+        (perm, out)
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
