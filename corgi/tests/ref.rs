@@ -1,10 +1,11 @@
-//! `Ref<T>`: a column of references. `ref` takes them (nothing copied), `clone` copies the rows
-//! out, `gather` (hence the capture family and `lit`) moves only refs, `Field` projects through a
-//! referenced product, and the readers `get`/`gather`/`find`/`slices`/`len` accept a referenced list. These
-//! tests pin that a referenced haystack answers exactly as the list it references, and that the two
-//! spellings of a capture — by value and by reference — agree.
+//! `Ref<List<T>>`: referenced list rows. `ref` takes them (nothing copied, through products and
+//! sums), `clone` copies the rows out, `gather` (hence the capture family and `lit`) and the merges
+//! move only spans, and the readers `get`/`gather`/`find`/`slices`/`len` accept a referenced list.
+//! These tests pin that a referenced haystack answers exactly as the list it references, that the two
+//! spellings of a capture — by value and by reference — agree, and that references stay references
+//! (over one arena) through the ops that move rows.
 
-use corgi::{eval_graph, lower_effects, parse_ml, show, Value};
+use corgi::{eval_graph, lower_effects, parse_ml, shape_of_value, show, Value};
 
 fn run(src: &str, input: Value) -> Value {
     let g = lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("parse {src:?}: {e}")));
@@ -26,9 +27,109 @@ fn ref_clone_round_trips_and_shows_as_the_rows() {
     let referenced = run("input ref", h.clone());
     assert_eq!(show(&referenced), format!("Ref <{}>", show(&h)));
     assert_eq!(run("input ref clone", h.clone()), h);
-    // a referenced non-list is row refs into an arena; still round-trips
+    // `ref` passes through a product: the list field is referenced, the scalar stays by value
     let p = Value::Prod(vec![Value::u64(vec![1, 2, 3]), h.clone()]);
+    assert_eq!(shape_of_value(&run("input ref", p.clone())).to_string(), "(U64, Ref<List<U64>>)");
     assert_eq!(run("input ref clone", p.clone()), p);
+    // and `clone` of a value with no references is the value
+    assert_eq!(run("input clone", p.clone()), p);
+}
+
+/// `clone` is deep: the references `slices` hands out on a referenced haystack come back as the
+/// lists `slices` copies out of a plain one.
+#[test]
+fn clone_removes_nested_references() {
+    let ranges = Value::List(
+        vec![2, 2, 3].into(),
+        Box::new(Value::Prod(vec![Value::u64(vec![0, 1, 0]), Value::u64(vec![2, 2, 1])])),
+    );
+    let arg = Value::Prod(vec![ranges, haystack()]);
+    let copied = run("let (r, h) = input in (r, h) slices", arg.clone());
+    let cloned = run("let (r, h) = input in (r, h ref) slices clone", arg);
+    assert_eq!(copied, cloned);
+}
+
+/// compare, sort, dedup and group read a referenced row as the list it names, and a sorted column of
+/// references is still references.
+#[test]
+fn order_reads_through_references() {
+    let ranges = Value::List(
+        vec![3, 5].into(),
+        Box::new(Value::Prod(vec![Value::u64(vec![1, 0, 1, 0, 0]), Value::u64(vec![2, 1, 2, 2, 1])])),
+    );
+    let h = Value::List(vec![2, 4].into(), Box::new(Value::u64(vec![7, 3, 3, 1])));
+    let arg = Value::Prod(vec![ranges, h]);
+    for op in ["sort", "dedup", "map (s -> (s, s)) group", "map (s -> (s, s) lt)"] {
+        let by_ref = run(&format!("let (r, h) = input in (r, h ref) slices {op}"), arg.clone());
+        let by_val = run(&format!("let (r, h) = input in (r, h) slices {op}"), arg.clone());
+        assert_eq!(corgi::hash(&by_ref), corgi::hash(&by_val), "{op}");
+        assert_eq!(run("input clone", by_ref), by_val, "{op}");
+    }
+    let sorted = run("let (r, h) = input in (r, h ref) slices sort", arg);
+    let Value::Sum(_, lanes) = &sorted else { panic!() };
+    let Value::List(_, inner) = &lanes[0] else { panic!() };
+    assert!(matches!(&**inner, Value::Ref(..)), "sorting references moves references");
+}
+
+/// merging reference columns over ONE arena moves spans only; over distinct arenas each arena is
+/// laid down once (never once per reference), and either way the rows are the rows.
+#[test]
+fn merges_keep_references() {
+    use corgi::arrange::gather_lanes;
+    use std::sync::Arc;
+    let arena = Arc::new(Value::u64(vec![1, 2, 3, 4]));
+    let a = Value::Ref(arena.clone(), Arc::new(vec![(0, 4), (1, 2)]));
+    let b = Value::Ref(arena.clone(), Arc::new(vec![(2, 4)]));
+    let (tags, off) = ([1, 0, 0], [0, 1, 0]);
+    let merged = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
+    let Value::Ref(p, spans) = &merged else { panic!("a merge of references is references") };
+    assert!(Arc::ptr_eq(p, &arena), "one arena: spans only");
+    assert_eq!(**spans, vec![(2, 4), (1, 2), (0, 4)]);
+
+    let other = Arc::new(Value::u64(vec![9, 8]));
+    let c = Value::Ref(other, Arc::new(vec![(0, 2), (0, 2), (1, 2)]));
+    let merged = gather_lanes(&[Some(&a), Some(&c)], &[1, 0, 1, 0, 1], &[0, 0, 1, 1, 2]);
+    let Value::Ref(p, _) = &merged else { panic!() };
+    assert_eq!(p.len(), 6, "two arenas, each laid down once");
+    let expect = Value::List(vec![2, 6, 8, 9, 10].into(), Box::new(Value::u64(vec![9, 8, 1, 2, 3, 4, 9, 8, 2, 8])));
+    assert_eq!(run("input clone", merged), expect);
+}
+
+/// a fold whose state is a reference keeps it a reference into the same arena, round after round:
+/// the state is overwritten span by span in place, never rebuilt from the rows it names.
+#[test]
+fn fold_state_stays_a_reference() {
+    use std::sync::Arc;
+    let arena = Arc::new(Value::u64(vec![5, 6, 7]));
+    let seed = Value::Ref(arena.clone(), Arc::new(vec![(0, 3), (1, 2)]));
+    let xs = Value::List(vec![3, 4].into(), Box::new(Value::u64(vec![0, 1, 0, 1])));
+    let out = run(
+        "let (s, xs) = input in (s, xs) fold ((acc, x) -> (x, acc, acc) select)",
+        Value::Prod(vec![seed.clone(), xs]),
+    );
+    let Value::Ref(p, _) = &out else { panic!("the fold's state is still a reference") };
+    assert!(Arc::ptr_eq(p, &arena));
+    assert_eq!(out, seed);
+}
+
+/// the codec carries a reference column as its spans and its payload once: same shape, same rows.
+#[test]
+fn bytes_round_trip_a_reference() {
+    use std::sync::Arc;
+    let r = Value::Prod(vec![
+        Value::u64(vec![1, 2]),
+        Value::Ref(Arc::new(Value::u64(vec![10, 11, 12])), Arc::new(vec![(0, 3), (1, 2)])),
+    ]);
+    let mut buf = Vec::new();
+    corgi::bytes::write_to(&r, &mut buf).unwrap();
+    assert_eq!(buf.len(), corgi::bytes::length_in_bytes(&r));
+    let (back, used) = corgi::bytes::read_from(&buf).unwrap();
+    assert_eq!((back, used), (r, buf.len()));
+    // a span past its payload is refused, not trusted
+    let bad = Value::Ref(Arc::new(Value::u64(vec![10])), Arc::new(vec![(0, 2)]));
+    let mut buf = Vec::new();
+    corgi::bytes::write_to(&bad, &mut buf).unwrap();
+    assert!(corgi::bytes::read_from(&buf).is_err());
 }
 
 /// every reader gives the same answer on `h ref` as on `h`.
@@ -105,9 +206,10 @@ fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
     assert_eq!(show(&by_ref), "Sum tags=[0] [List ends=[6] <[0, 0, 1, 1, 2, 2]>, ()x0]");
 }
 
-/// `Field` through a referenced product projects by reference; `clone` then copies just that field.
+/// `ref` of a product references its list fields, so `Field` is ordinary projection and a list
+/// field comes back referenced; `clone` then copies just that field.
 #[test]
-fn field_projects_through_a_referenced_product() {
+fn field_of_a_referenced_product() {
     let out = run(
         "let xs = input iota in let p = (xs, xs map (y -> y shr 1)) in let b = p ref in (b.1 clone, b.0 clone)",
         seed(6),
@@ -141,11 +243,10 @@ fn a_box_is_not_silently_materialized() {
 /// shared adjacency held by reference. The ref spelling agrees with the copying one.
 #[test]
 fn wco_step_searches_through_references() {
-    use corgi::Refs;
     use std::sync::Arc;
     let anchors = 4;
     let adj_vals: Vec<u64> = (0..40).collect();
-    let by_ref = Value::Ref(Arc::new(Value::u64(adj_vals)), Refs::Fat(Arc::new(vec![(0, 40); anchors])));
+    let by_ref = Value::Ref(Arc::new(Value::u64(adj_vals)), Arc::new(vec![(0, 40); anchors]));
     let ranges = Value::List(
         vec![1, 2, 3, 4].into(),
         Box::new(Value::Prod(vec![Value::u64(vec![0, 10, 20, 30]), Value::u64(vec![10, 20, 30, 40])])),

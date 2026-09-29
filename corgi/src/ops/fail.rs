@@ -20,7 +20,7 @@
 use crate::engine::gather;
 use crate::graph::OpLike;
 use crate::shape::shape_of_value;
-use crate::value::{Bounds, Prim, RowsRef, Tags, Value};
+use crate::value::{Bounds, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
 // --- the representation --------------------------------------------------------------------------
@@ -305,7 +305,7 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
         assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
         // the leaf fast path indexes the payload directly, so row 0 must BE the payload (a
         // partition); a referenced haystack takes the row-relative path.
-        ib.len() == 1 && matches!(hvals, Value::Prim(_)) && matches!(hb, RowsRef::Part(_))
+        ib.len() == 1 && matches!(hvals, Value::Prim(_)) && matches!(hb, Rows::Part(_))
     };
     if one_row_leaf {
         // One row over a leaf: validate and gather in the index buffer itself (an identity

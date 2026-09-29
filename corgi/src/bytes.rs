@@ -32,7 +32,13 @@
 //!   List  = 3, 0, n, u64*n, Value                    `Offsets` form: one end offset per row
 //!         | 3, 1, stride, rows, Value                `Stride` form: the uniform partition
 //!   Unit  = 4, n
+//!   Ref   = 5, n, (lo, hi)*n, Value                spans of the payload that follows: the arena
+//!                                                    goes once, however many rows reference it
 //! ```
+//!
+//! A `Ref` keeps its shape and its sharing across the wire: its payload is written whole, once,
+//! whatever the spans name of it (to ship only the named rows, `clone` first). Two `Ref` columns
+//! of one value that share an arena each carry a copy of it, and decode to separate arenas.
 
 use crate::value::{Bounds, Prim, Tags, Value};
 
@@ -52,8 +58,7 @@ pub fn length_in_bytes(v: &Value) -> usize {
         }
         Value::List(bounds, values) => 8 + bounds_len(bounds) + length_in_bytes(values),
         Value::Unit(_) => 16,
-        // the wire carries values: a reference column is sent as the rows it names.
-        Value::Ref(..) => length_in_bytes(&crate::engine::clone_ref(v.clone())),
+        Value::Ref(payload, spans) => 16 + 16 * spans.len() + length_in_bytes(payload),
     }
 }
 
@@ -86,7 +91,15 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
             word(writer, 4)?;
             word(writer, *n as u64)
         }
-        Value::Ref(..) => write_to(&crate::engine::clone_ref(v.clone()), writer),
+        Value::Ref(payload, spans) => {
+            word(writer, 5)?;
+            word(writer, spans.len() as u64)?;
+            for &(lo, hi) in spans.iter() {
+                word(writer, lo as u64)?;
+                word(writer, hi as u64)?;
+            }
+            write_to(payload, writer)
+        }
     }
 }
 
@@ -180,7 +193,7 @@ pub fn declared_rows(v: &Value) -> u64 {
             .max(bounds_total(bounds))
             .max(declared_rows(values)),
         Value::Unit(n) => *n as u64,
-        Value::Ref(_, refs) => refs.len() as u64,
+        Value::Ref(payload, spans) => (spans.len() as u64).max(declared_rows(payload)),
     }
 }
 
@@ -418,6 +431,19 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
             Ok(Value::List(bounds, Box::new(values)))
         }
         4 => Ok(Value::Unit(r.word()? as usize)),
+        5 => {
+            let n = r.count(16, "ref spans")?;
+            let mut spans = Vec::with_capacity(n);
+            for _ in 0..n {
+                spans.push((r.word()? as usize, r.word()? as usize));
+            }
+            let payload = r.nested(read_value)?;
+            let len = payload.len();
+            if let Some(&(lo, hi)) = spans.iter().find(|&&(lo, hi)| lo > hi || hi > len) {
+                return Err(format!("corgi::bytes: ref span ({lo}, {hi}) outside a payload of {len} values"));
+            }
+            Ok(Value::Ref(std::sync::Arc::new(payload), std::sync::Arc::new(spans)))
+        }
         other => Err(format!("corgi::bytes: bad value tag {other}")),
     }
 }

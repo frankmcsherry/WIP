@@ -33,7 +33,7 @@
 //! unreferenced (empty) lane's shape hash equal — every row's OBSERVABLE value is identical, so sharing an
 //! id is correct (and more stable than derived `PartialEq`, which would call them distinct).
 
-use crate::value::{Refs, Value};
+use crate::value::Value;
 
 /// splitmix64 finalizer — a full-avalanche 64-bit mix. The one bit-mixing primitive; both the leaf
 /// hashing ([`Prim::hashes`]) and the structural [`combine`] build on it.
@@ -110,40 +110,25 @@ pub fn hash(v: &Value) -> Vec<u64> {
         // partition, not its representation).
         Value::List(bounds, vals) => {
             let ch = hash(vals);
-            (0..bounds.len())
-                .map(|r| {
-                    let (s, e) = bounds.span(r);
-                    let mut a = combine(LIST, (e - s) as u64);
-                    for &x in &ch[s..e] {
-                        a = combine(a, x);
-                    }
-                    a
-                })
-                .collect()
+            (0..bounds.len()).map(|r| hash_span(&ch, bounds.span(r))).collect()
         }
 
         // unit = no payload; every row hashes to the same constant.
         Value::Unit(n) => vec![UNIT; *n],
 
-        // box = the referenced rows' hashes (a reference has the identity of what it names).
-        Value::Ref(arena, Refs::Thin(rows)) => {
-            let ah = hash(arena);
-            rows.iter().map(|&r| ah[r]).collect()
-        }
-        Value::Ref(payload, Refs::Fat(spans)) => {
+        // a referenced row hashes as the list row it names (a reference has the identity of what it
+        // names). The whole payload is hashed, even where the spans name little of it.
+        Value::Ref(payload, spans) => {
             let ch = hash(payload);
-            spans
-                .iter()
-                .map(|&(s, e)| {
-                    let mut a = combine(LIST, (e - s) as u64);
-                    for &x in &ch[s..e] {
-                        a = combine(a, x);
-                    }
-                    a
-                })
-                .collect()
+            spans.iter().map(|&span| hash_span(&ch, span)).collect()
         }
     }
+}
+
+/// one list row's hash: length first, then each element in order, over the span `(s, e)` of the
+/// element hashes `ch`.
+fn hash_span(ch: &[u64], (s, e): (usize, usize)) -> u64 {
+    ch[s..e].iter().fold(combine(LIST, (e - s) as u64), |a, &x| combine(a, x))
 }
 
 #[cfg(test)]
@@ -321,6 +306,12 @@ mod tests {
                     let (s, e) = bounds.span(r);
                     (s..e).fold(combine(LIST, (e - s) as u64), |a, i| {
                         combine(a, row(vals, i))
+                    })
+                }
+                Value::Ref(payload, spans) => {
+                    let (s, e) = spans[r];
+                    (s..e).fold(combine(LIST, (e - s) as u64), |a, i| {
+                        combine(a, row(payload, i))
                     })
                 }
             }

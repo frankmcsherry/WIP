@@ -124,8 +124,8 @@ impl CmpOp {
                 let (nb, nvals) = needle.into_list("Find needle")?;
                 // the haystack may be a referenced list (captured or sliced by reference): rows are
                 // read through `span`, and the search indexes the payload absolutely, so no copy.
-                let (hb, hvals) = haystack.into_rows("Find haystack")?;
-                same(&shape_of_value(&nvals), &shape_of_value(&hvals)).map_err(|e| format!("Find: {e}"))?;
+                let (hb, hvals) = haystack.rows_of("Find haystack")?;
+                same(&shape_of_value(&nvals), &shape_of_value(hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
@@ -144,8 +144,8 @@ impl CmpOp {
                 // batched search, different tie rule on `haystack[mid] vs needle`.
                 let mut lower = (lo.clone(), hi.clone());
                 let mut upper = (lo, hi);
-                batched_bound(&hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
-                batched_bound(&hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
+                batched_bound(hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);
+                batched_bound(hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
                 // row-relative: subtract each element's haystack row start, rewalked here.
                 let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
                 for r in 0..nb.len() {
