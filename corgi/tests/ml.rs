@@ -39,9 +39,9 @@ fn match_contact() {
 }
 
 #[test]
-fn const_via_lit_lambda() {
+fn const_in_lambda() {
     let src = "let (subj, vals) = input.1 transpose in \
-               vals map (v -> (v, v lit 1000) add)";
+               vals map (v -> (v, 1000u64) add)";
     assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[1100, 1200, 1300, 1400, 1500, 1600]>");
 }
 
@@ -61,7 +61,7 @@ fn let_sharing_beats_fanout_recompute() {
     // same join: `let t = transpose` shares the transpose once; inlining it fans out and recomputes.
     let shared = "let t = input.0 transpose in let r = (input.1, t.0) find in (r, t.1) slices";
     let inlined =
-        "((input.1, input.0 transpose field 0) find, input.0 transpose field 1) slices";
+        "((input.1, input.0 transpose .0) find, input.0 transpose .1) slices";
     let shared_nodes = parse_ml(shared).unwrap().node_count();
     let inlined_nodes = parse_ml(inlined).unwrap().node_count();
     assert!(shared_nodes < inlined_nodes, "shared {shared_nodes} should be < inlined {inlined_nodes}");
@@ -112,7 +112,7 @@ fn inject_by_name_carries_the_sum_shape() {
 fn branch_by_enum_and_named_match_arms() {
     let src = "enum Size = Lo | Hi in \
                let (subj, vals) = input.1 transpose in \
-               vals map (v -> (v, v gt 300) branch Size match (Lo (l -> l), Hi (h -> h add 1)))";
+               vals map (v -> (v, v gt 300) branch Size match (Lo (l -> l), Hi (h -> (h, 1u64) add)))";
     // `branch` is a FailOp now (demux Sum{Lo|Hi} with Oob in the err-mask), so the result is a Fail
     // column shown TRY'd; the match arms still align (the demux re-tags Lo=0, Hi=1) — Hi (>300) gets +1.
     assert_eq!(
@@ -129,13 +129,6 @@ fn lambda_destructures_pairs() {
 }
 
 #[test]
-fn binary_immediate_is_the_lit_pair() {
-    // `v add 1000` desugars to `(v, v lit 1000) add` — the same output as `const_via_lit_lambda`.
-    let src = "let (subj, vals) = input.1 transpose in vals map (v -> v add 1000)";
-    assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[1100, 1200, 1300, 1400, 1500, 1600]>");
-}
-
-#[test]
 fn errors_are_reported() {
     assert!(parse_ml("let x = input in y").is_err()); // unbound y
     assert!(parse_ml("input bogus").is_err());
@@ -148,8 +141,8 @@ fn errors_are_reported() {
 
 #[test]
 fn string_literal_broadcasts() {
-    // a string literal as a stage is a constant List<U8>, broadcast to the value.
-    assert_eq!(run_ml("input \"hi\"", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
+    // a string literal is a constant List<U8>, one per row of its scope's input.
+    assert_eq!(run_ml("\"hi\"", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
 }
 
 #[test]
@@ -185,6 +178,12 @@ fn typed_literals_are_checked() {
     assert!(err("(input, -3) add").contains("needs a type suffix"));
     assert!(err("(input, 1.5u64) add").contains("needs an f32 or f64 suffix"));
     assert!(err("(input, 5q8) add").contains("unknown literal suffix"));
+    // The spellings typed literals and `.N` replaced are gone, each with a pointer to its replacement.
+    assert!(err("input lit 5").contains("typed literal"));
+    assert!(err("input lit_i64 5").contains("typed literal"));
+    assert!(err("input sub 1").contains("(x, 1u64) sub"));
+    assert!(err("input field 1").contains(".N"));
+    assert!(err("input \"hi\"").contains("unexpected"));
     // Without a float suffix, `x.0.1` is still two projections.
     assert_eq!(run_ml("((input, (input, 7u64)), input).0.1.1", &u64(&[0])), "[7]");
 }

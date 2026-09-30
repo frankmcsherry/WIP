@@ -15,7 +15,7 @@
 //!   shape  = 'u8'|'u16'|'u32'|'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
 //!   pat    = IDENT | '_' | '(' pat (',' pat)* ')'      -- irrefutable: names, wildcards, tuples
-//!   pipe   = proj apply*                               -- juxtaposition; chain ends before `in`
+//!   pipe   = atom apply*                               -- juxtaposition; chain ends before `in`
 //!   apply  = 'map' '(' lambda ')'
 //!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
 //!          | 'map_variant' tag '(' lambda ')'
@@ -23,27 +23,25 @@
 //!          | 'inject' VARIANT                               -- sum construction (its enum fully shaped)
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
 //!          | 'split' STR                                    -- delimiter as a one-byte string
-//!          | BINARY NUM                                     -- immediate: `x sub 1` ≡ `(x, x lit 1) sub`
-//!          | '.' NUM                                        -- projection after any value
+//!          | '.' NUM                                        -- projection
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
-//!   proj   = atom ('.' NUM)*
 //!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root
 //!   LIT    = '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)? SUFFIX
 //!   SUFFIX = ('u'|'i') ('8'|'16'|'32'|'64') | 'f' ('32'|'64')   -- required: kind and width
 //!
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
-//! the scope. A bare NUM is an op's parameter (`field 1`, `shr 3`), never a value. `#` starts a
+//! the scope. A bare NUM is an op's parameter (`shr 3`, `branch 2`), never a value. `#` starts a
 //! comment to the end of the line.
 //!
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
-//!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
+//!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100u64) add))
 //!       enum Opt = None () | Some u64 in xs inject Some  -- tag xs into Some; None is an empty unit lane
 
-use super::{pair_imm, parse_kw, resolve, str_value, takes_num};
+use super::{parse_kw, resolve, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::numeric::{enc_f32, enc_f64};
 use crate::ops::{lit_value, Kind, NumOp, Op};
@@ -63,7 +61,7 @@ enum Tok {
     Eq,
     Bar, // | — the variant separator in an `enum` declaration
     Ident(String),
-    Num(u64),   // an op's numeric parameter: `field 1`, `shr 3`, `branch 2`
+    Num(u64),   // an op's numeric parameter: `shr 3`, `branch 2`
     Lit(Value), // a typed constant: `5u64`, `-3i64`, `0.7f64`
     Str(Vec<u8>),
 }
@@ -259,8 +257,7 @@ enum Pat {
 
 enum Apply {
     Op(String, Option<u64>),
-    BinImm(String, u64), // pair op + immediate: `x sub 1` desugars to `(x, x lit 1) sub`
-    Str(Vec<u8>),
+    Field(usize), // `.N`
     Map(Pat, Box<E>),
     Fold(Pat, Box<E>), // (B, List<A>) folded by a binary body; the lambda's tuple pattern is (acc, x)
     Scan(Pat, Box<E>), // (B, List<A>) scanned by a binary body; inclusive running accumulator
@@ -268,14 +265,13 @@ enum Apply {
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, Vec<Shape>),    // tag + the declared sum's lane shapes -> Op::Inject
-    Head, // `head`: sugar for `(lit 0, list) get` — the first element (an empty row errs)
+    Head, // `head`: sugar for `(0u64, list) get` — the first element (an empty row errs)
 }
 
 enum E {
     Var(String, String), // the name, and its source position for errors
     Lit(Value),          // a typed constant or a string, filled to the length of its scope's input
     Tuple(Vec<E>),
-    Proj(Box<E>, usize),
     Let(Pat, Box<E>, Box<E>),
     Pipe(Box<E>, Apply),
 }
@@ -470,7 +466,7 @@ impl P {
     }
 
     fn pipe(&mut self) -> Result<E, String> {
-        let mut e = self.proj()?;
+        let mut e = self.atom()?;
         // a value is followed by its stages by juxtaposition; the chain runs until a token that
         // cannot begin a stage — in particular the `let` body's `in`, the one identifier that can
         // legally follow a complete pipe without being an op.
@@ -481,11 +477,11 @@ impl P {
         Ok(e)
     }
 
-    /// whether the next token can begin a pipe stage — a string constant, a `.N` projection, or
-    /// any identifier other than the chain-terminating `in`.
+    /// whether the next token can begin a pipe stage — a `.N` projection, or any identifier
+    /// other than the chain-terminating `in`.
     fn starts_apply(&self) -> bool {
         match self.peek() {
-            Some(Tok::Str(_)) | Some(Tok::Dot) => true,
+            Some(Tok::Dot) => true,
             Some(Tok::Ident(k)) => k != "in",
             _ => false,
         }
@@ -495,12 +491,7 @@ impl P {
         // `.N` after any value projects field N.
         if let Some(Tok::Dot) = self.peek() {
             self.bump();
-            return Ok(Apply::Op("field".into(), Some(self.num()?)));
-        }
-        // a string literal as a stage is a constant, like `lit`: broadcast to the value.
-        if let Some(Tok::Str(_)) = self.peek() {
-            let Some(Tok::Str(bytes)) = self.bump() else { unreachable!() };
-            return Ok(Apply::Str(bytes));
+            return Ok(Apply::Field(self.num()? as usize));
         }
         let name = self.ident()?;
         match name.as_str() {
@@ -584,13 +575,14 @@ impl P {
                 };
                 Ok(Apply::Op(name, Some(lanes)))
             }
-            // a pair-eating binary followed by a number is the immediate form: `x sub 1` is the
-            // lit-pair idiom `(x, x lit 1) sub` spelled tight (a bare number can't begin a stage,
-            // so this claims unused syntax).
-            _ if pair_imm(&name) && matches!(self.peek(), Some(Tok::Num(_))) => {
-                Ok(Apply::BinImm(name, self.num()?))
-            }
             _ if takes_num(&name) => Ok(Apply::Op(name, Some(self.num()?))),
+            "field" => Err("projection is `.N`, as in x .1".into()),
+            _ if name == "lit" || name.starts_with("lit_") => {
+                Err("a constant is a typed literal, as in 5u64 or -3i64".into())
+            }
+            _ if matches!(self.peek(), Some(Tok::Num(_))) => {
+                Err(format!("'{name}' takes no number; a constant operand is a typed literal, as in (x, 1u64) {name}"))
+            }
             _ => Ok(Apply::Op(name, None)),
         }
     }
@@ -602,15 +594,6 @@ impl P {
         self.eat(&Tok::Arrow)?;
         let body = self.expr()?;
         Ok((x, body))
-    }
-
-    fn proj(&mut self) -> Result<E, String> {
-        let mut e = self.atom()?;
-        while self.peek() == Some(&Tok::Dot) {
-            self.bump();
-            e = E::Proj(Box::new(e), self.num()? as usize);
-        }
-        Ok(e)
     }
 
     fn atom(&mut self) -> Result<E, String> {
@@ -637,6 +620,7 @@ impl P {
                 let Some(Tok::Str(bytes)) = self.bump() else { unreachable!() };
                 Ok(E::Lit(str_value(bytes)))
             }
+            Some(Tok::Num(n)) => Err(format!("a constant needs a type suffix, as in {n}u64")),
             other => Err(format!("expected an expression, found {other:?}")),
         }
     }
@@ -697,10 +681,6 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let ids = es.iter().map(|x| lower(x, env, b)).collect::<Result<Vec<_>, _>>()?;
             Ok(b.tuple(ids))
         }
-        E::Proj(e, i) => {
-            let id = lower(e, env, b)?;
-            Ok(b.add(Op::Field(*i), vec![id]))
-        }
         E::Let(pat, bound, body) => {
             let id = lower(bound, env, b)?;
             let mut env2 = env.clone();
@@ -711,12 +691,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
-                Apply::BinImm(name, n) => {
-                    let lit = b.add(Op::Lit(Value::u64(vec![*n])), vec![id]);
-                    let pair = b.tuple(vec![id, lit]);
-                    Ok(b.add(resolve(name, None)?, vec![pair]))
-                }
-                Apply::Str(bytes) => Ok(b.add(Op::Lit(str_value(bytes.clone())), vec![id])),
+                Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
                 Apply::Fold(x, body) => Ok(b.add(Op::Fold(Box::new(lower_body(x, body)?)), vec![id])),
                 // scan IS foldscan: a body `(a,x) -> b` becomes `(a,x) -> (b, b)` (state = output), and

@@ -15,15 +15,15 @@ let ks = input iota in
 let nodes = ks map (k ->
     (k, k and 1) branch Node
     map_variant Lit (e -> e and 2)
-    map_variant Add (o -> (o sub 1 and 3, o add 1 and 7)))
+    map_variant Add (o -> ((o, 1u64) sub and 3, (o, 1u64) add and 7)))
 in
 let classid = (nodes, nodes dedup) find map ((lo, hi) -> lo) in
 let nodes2 = (classid, ks) cap_list map ((table, k) ->
     ((table, k), k and 1) branch Node
     map_variant Lit ((t, k) -> k and 2)
     map_variant Add ((t, k) ->
-        let l = k sub 1 and 3 in
-        let r = k add 1 and 7 in
+        let l = (k, 1u64) sub and 3 in
+        let r = (k, 1u64) add and 7 in
         ((l, t) get, (r, t) get)))
 in
 let canon = nodes2 dedup in

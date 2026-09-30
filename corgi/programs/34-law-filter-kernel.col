@@ -7,5 +7,5 @@
 let data = input iota in
 let mask = data map (x -> x and 1) in
 let fused = (data, mask) filter in
-let kernel = (data, mask) zip map (p -> (p.0, p.1) branch 2) unweave field 2 in
+let kernel = (data, mask) zip map (p -> (p.0, p.1) branch 2) unweave .2 in
 (fused, kernel) eq

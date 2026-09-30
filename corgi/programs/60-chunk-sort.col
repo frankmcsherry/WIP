@@ -3,4 +3,4 @@
 # packs to a u64 key). "dcba","ABCD" sort to "ABCD","dcba" — uppercase precedes lowercase in ASCII.
 # n = 1
 # = Sum tags=[0] [List ends=[2] <List ends=[4, 8] <[65, 66, 67, 68, 100, 99, 98, 97]>>, ()x0]
-input "dcbaABCD" chunk 4 sort
+"dcbaABCD" chunk 4 sort

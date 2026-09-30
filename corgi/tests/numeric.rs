@@ -126,15 +126,12 @@ fn grid_signed_is_order_preserving_at_any_width() {
 }
 
 #[test]
-fn no_float_literal_token() {
-    // `lit_f32 N` would store the raw bits N, not the float N.0 — `lit_value` only encodes integers.
-    // So a float-literal token is rejected (unknown op); the float path is `lit_uN K to_fN`.
-    assert!(parse_ml("input lit_f32 3").is_err());
-    assert!(parse_ml("input lit_f64 3").is_err());
-    // the integer literal tokens still resolve, and the documented float path parses.
-    assert!(parse_ml("input lit_u32 3").is_ok());
-    assert!(parse_ml("input lit_i16 3").is_ok());
-    assert!(parse_ml("input lit_u32 3 to_f32").is_ok());
+fn float_literals_encode_the_value() {
+    // A float literal is the float, in the total-order encoding `to_fN` produces from an integer.
+    for src in ["(3f32, 3u32 to_f32) eq", "(3f64, 3u64 to_f64) eq", "(-3i16, 3i16 neg_i16) eq"] {
+        let g = parse_ml(src).unwrap();
+        assert_eq!(eval_graph(&g, Value::u64(vec![0])), Value::u64(vec![1]), "{src}");
+    }
 }
 
 /// `Rem` on the unsigned row, including the total `x % 0 = x`. The zero divisor is

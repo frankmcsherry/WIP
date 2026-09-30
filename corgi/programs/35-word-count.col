@@ -4,7 +4,7 @@
 # (length first, then bytes; all equal-length here, so the order is lexicographic).
 # n = 1
 # = (List ends=[3] <List ends=[3, 6, 9] <[100, 111, 103, 102, 111, 120, 116, 104, 101]>>, List ends=[3] <[1, 1, 3]>)
-let words = input "the fox the dog the" split " " in
+let words = "the fox the dog the" split " " in
 let sorted = words sort in
 let keys = sorted dedup in
 let spans = (keys, sorted) find in

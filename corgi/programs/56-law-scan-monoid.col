@@ -5,5 +5,5 @@
 # n = 7
 # = ([1], [1])
 let xs = input iota in
-((xs scan_add, (xs lit 0, xs) scan ((a, x) -> (a, x) add)) eq,
- (xs scan_max, (xs lit 0, xs) scan ((a, x) -> (a, x) max)) eq)
+((xs scan_add, (0u64, xs) scan ((a, x) -> (a, x) add)) eq,
+ (xs scan_max, (0u64, xs) scan ((a, x) -> (a, x) max)) eq)

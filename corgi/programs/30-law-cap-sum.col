@@ -14,5 +14,5 @@ let used = xs map (x ->
     (x add_u64 100, (x, x and 1) branch 2) cap_sum
     match (0 (p -> (p.0, p.1) add), 1 (p -> p.1))) in
 let direct = xs map (x ->
-    (x, ((x lit 1, x and 1) sub, x add_u64 100) mul) add) in
+    (x, ((1u64, x and 1) sub, x add_u64 100) mul) add) in
 ((strip, sums) eq, (used, direct) eq) mul
