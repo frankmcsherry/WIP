@@ -1,5 +1,25 @@
 # corgi — notes & TODO
 
+## Goal
+
+corgi is a vectorized interpreter for algebraic data: products, sums and lists (and references
+into lists), defined at run time. A program is a term graph, and each op runs over whole columns,
+so interpretation costs per op rather than per row.
+
+- **Goals:** small enough to understand; interpreted throughout, with no code generation; near
+  hand-written Rust on bulk columnar work; failure as data.
+- **Non-goals:** matching per-row scalar loops (measured, not targeted); a user-facing language
+  inside the crate (front ends lower to the ML notation from outside).
+
+The motivation is datatoad, where idiom detection and a few columnar kernels are written by hand
+in Rust. corgi should let those be written as programs instead. The data there is often large, and
+most of the work is finding and collecting data rather than arithmetic.
+
+Judge additions against this section. Anything below that conflicts with it is stale; fix the
+text below, not this.
+
+## Overview
+
 A minimal **columnar, single-input term-graph IR** with a layered op vocabulary, a structural
 shape-checker, an `ml` front-end, and a small optimizer. Standalone lib crate (no deps).
 `cargo test` green; `cargo clippy --all-targets` clean; `cargo run --example tour` walks the
