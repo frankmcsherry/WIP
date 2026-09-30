@@ -36,6 +36,13 @@
 //! the scope. A bare NUM is an op's parameter (`shr 3`, `branch 2`), never a value. `#` starts a
 //! comment to the end of the line.
 //!
+//! A literal's suffix chooses how its bits are laid down: `u` as the value, `i` in the
+//! order-preserving signed encoding, `f` in the total-order float encoding. The encodings keep
+//! order, so sorting, comparison, `min`/`max` and `find` are right for every kind. Nothing tracks
+//! a kind past the literal: arithmetic takes its kind from the op's name (`add` is unsigned,
+//! `add_f64` is float), so `(1.5f64, 1.5f64) add` type-checks and adds the encodings. Checking
+//! kinds belongs to a language that lowers to this one.
+//!
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100u64) add))
