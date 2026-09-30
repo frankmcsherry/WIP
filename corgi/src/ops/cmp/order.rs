@@ -3,7 +3,6 @@
 //! which `Rel` and `find` reduce to), `mod labels` (the block-label vocabulary the sort speaks and
 //! `dedup`/`group` read), and `group_bounds`; the merge kernel is `super::survey`.
 
-use crate::engine::row_span;
 use crate::value::{Bounds, Value};
 use std::cmp::Ordering;
 
@@ -198,13 +197,16 @@ mod compare {
             // list = length-first: unequal-length pairs decided by length. Equal-length pairs expand
             // to their element index pairs, recurse ONCE (no per-position loop — `sort` needs that
             // refinement, `cmp` doesn't), then read each pair's first difference off its segment.
-            (Value::List(ba, va), Value::List(bb, vb)) => {
+            // A referenced list compares as the rows it names, read through its spans.
+            (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
+                let (ba, va) = a.rows_of("compare_idx").expect("a list");
+                let (bb, vb) = b.rows_of("compare_idx").expect("a list");
                 let mut ord = vec![0i8; m];
                 let (mut sia, mut sib) = (Vec::new(), Vec::new());
                 let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)
                 for (k, o) in ord.iter_mut().enumerate() {
                     let (i, j) = (pairs.left(k), pairs.right(k));
-                    let ((s_a, e_a), (s_b, e_b)) = (row_span(ba, i), row_span(bb, j));
+                    let ((s_a, e_a), (s_b, e_b)) = (ba.span(i), bb.span(j));
                     let (la, lb) = (e_a - s_a, e_b - s_b);
                     match la.cmp(&lb) {
                         Ordering::Equal if la > 0 => {
@@ -335,8 +337,8 @@ mod tests {
                 Ordering::Equal
             }
             (Value::List(ab, av), Value::List(bb, bv)) => {
-                let (si, ei) = row_span(ab, i);
-                let (sj, ej) = row_span(bb, j);
+                let (si, ei) = crate::engine::row_span(ab, i);
+                let (sj, ej) = crate::engine::row_span(bb, j);
                 let (li, lj) = (ei - si, ej - sj);
                 // length-first: shorter list sorts first; equal lengths compare element-wise.
                 match li.cmp(&lj) {

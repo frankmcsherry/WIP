@@ -19,7 +19,14 @@ src/
                segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
-  shape.rs     Shape (Prim(width) | Prod | Sum | List) + shape_of_value + Display.
+               Value::Ref(Arc<payload>, Arc<spans>) = referenced LIST ROWS (shape Ref<List<T>>, Rust's &[T]):
+               row j is the (lo,hi) span j of the shared payload. `ref` takes them (through products and sums;
+               bounded rows stay by value), `clone` copies out (deep; the only copy of referenced rows),
+               `gather` moves spans only; `gather_lanes` too over one arena, and over distinct arenas
+               copies the union of the picked spans once (live rows only, never once per reference).
+               `Rows` = the reader's borrowed view (List or Ref) via `rows_of`; `into_list` takes only a
+               List, so a Ref elsewhere is the shape error "clone first". Compare/sort read through refs.
+  shape.rs     Shape (Prim(width) | Prod | Sum | List | Ref) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
                passes are latent, not dead.
@@ -279,9 +286,28 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying
   that law, so gather chains become index math + one final gather. The lazy form (multiplicity View:
-  0 = filter, ≥1 = repeat, range = slice) stays OUT of the representation — collie's `Selector`
-  (4 variants × a composition matrix × per-op awareness) is the cautionary tale; laziness lives in
-  the pass, where corgi can see the whole chain.
+  0 = filter, ≥1 = repeat, range = slice) stays OUT of `List` — collie's `Selector` (4 variants × a
+  composition matrix × per-op awareness) is the cautionary tale. What IS in the representation is
+  the REFERENCE, as its own shape: `Ref<List<T>>` (`ref`/`clone`), because a List row is the only
+  unbounded-size row and capturing it by copy is `elements × length` where a closure pays `elements`
+  (perf-gaps.md family K: 2088× → 3.7×). Only list rows are referenced: a first cut also had thin
+  `&T` row refs into any column, whose one use (a referenced tuple read for its scalar, K2) is Field
+  pushdown's job; they come back with a consumer (the μ-type knot). The choice is explicit in the program — `(ctx ref, ys)
+  cap_list` is one reference per element, `(ctx, ys) cap_list` copies — and the only copy of
+  referenced data is `clone`. A first spike put the same spans inside `Bounds` with a second gather
+  and a second accessor deciding reference-vs-copy implicitly (branch `corgi-spans`); rejected as
+  sneaky. Next: Field pushdown through `cap_list`/`cap_sum`, then the mechanical closure-capture
+  pass (which inserts the `ref`/`clone`). What that pass should know: a reference pays for LOOKUP
+  (`get`/`gather`/`find`/`slices`), not ITERATION. A body that iterates a captured list (`map`,
+  `fold_add`, `cap_list` over it) must `clone` it per element, which is the by-copy cost, and reading
+  through spans would not change that: iterating per element is elements × length however the list
+  is held. The win there is HOISTING — an iteration that does not depend on the element (`c fold_add`)
+  runs once per owner row before the capture, and the scalar is captured instead — i.e. the pass
+  asks what the use needs and copies (or computes) only that. And the GROWING-STATE
+  fold (perf-gaps.md family L: a List accumulator is rebuilt per round, O(k²)/row, 4567× at k=4096): let
+  a `FoldScan` state hold a `Ref` into its own emitted-so-far output — append-only and immutable, so
+  the ref is stable and `get` through it is O(1) — which turns a self-referential recurrence / stack
+  machine into O(k) per row. (The unconditional collect already has the linear `foldscan` spelling.)
 - **Vectorized abstract machine — the CPS connection (to discuss).** The term graph with let-sharing
   is already ANF (the "essence of CPS", Flanagan et al.), so CPS's bookkeeping benefits — named
   intermediates, explicit order, local rewrites — are built in. The deeper half, control flow

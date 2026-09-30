@@ -16,6 +16,40 @@ pub enum Value {
     Unit(usize),                  // a length-carrying unit column: `n` rows, no payload. The terminal
                                   // object as a COLUMN (a fieldless `Prod` has no length witness); the
                                   // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
+    Ref(Arc<Value>, Arc<Vec<(usize, usize)>>),
+                                  // a column of REFERENCED LIST ROWS (`&[T]`): row `j` is the span
+                                  // `spans[j]` of the shared payload (the arena). `ref` takes them
+                                  // (O(rows), nothing copied), `clone` copies them out; `gather` on a
+                                  // Ref moves only the spans. The explicit "by reference, not by value"
+                                  // — a closure's `&ctx`, a `&str` into a shared text. Only a list row
+                                  // is unbounded, so only a list row is ever referenced: `ref` passes
+                                  // through products and sums and leaves bounded rows by value. (The
+                                  // spans sit behind an `Arc` like a leaf: a clone is a refcount bump.)
+}
+
+/// the rows of a haystack as a reader sees them: `span(i)` over one payload, whether the rows came
+/// as a `List` (a partition of its payload) or as a `Ref` (spans of a shared payload). The
+/// span-aware readers (`Get`/`Gather`/`Find`/`Slices`/`Len`) take this via `rows_of`; every other
+/// op takes `into_list`, which only accepts a `List` — a Ref is the shape error "clone first".
+#[derive(Clone, Copy)]
+pub(crate) enum Rows<'a> {
+    Part(&'a Bounds),
+    Spans(&'a [(usize, usize)]),
+}
+
+impl Rows<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Rows::Part(b) => b.len(),
+            Rows::Spans(s) => s.len(),
+        }
+    }
+    pub(crate) fn span(&self, i: usize) -> (usize, usize) {
+        match self {
+            Rows::Part(b) => b.span(i),
+            Rows::Spans(s) => s[i],
+        }
+    }
 }
 
 /// how a `List`'s flattened `values` partition into rows. `Offsets` is the general end-offset-per-row
@@ -671,6 +705,10 @@ impl Value {
             }
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
+            Shape::Ref(s) => match &**s {
+                Shape::List(t) => Value::Ref(Arc::new(Value::empty(t)), Arc::new(Vec::new())),
+                other => panic!("Value::empty: Ref<{other}> — only list rows are referenced"),
+            },
         }
     }
 
@@ -682,6 +720,7 @@ impl Value {
             Value::Sum(t, _) => t.len(),
             Value::List(b, _) => b.len(),
             Value::Unit(n) => *n,
+            Value::Ref(_, spans) => spans.len(),
         }
     }
 
@@ -717,6 +756,17 @@ impl Value {
         match self {
             Value::List(bounds, vals) => Ok((bounds, *vals)),
             other => Err(format!("{who}: expected a list, got {}", shape_of_value(&other))),
+        }
+    }
+
+    /// a haystack's rows over its payload: a `List` (partition) or a `Ref` (spans of the shared
+    /// payload), for the readers that address rows through `span(i)` and never need the payload to
+    /// be exactly the rows. Borrowed: every reader only indexes the payload.
+    pub(crate) fn rows_of(&self, who: &str) -> Result<(Rows<'_>, &Value), String> {
+        match self {
+            Value::List(bounds, vals) => Ok((Rows::Part(bounds), vals)),
+            Value::Ref(payload, spans) => Ok((Rows::Spans(spans), payload)),
+            other => Err(format!("{who}: expected a list (or a referenced list), got {}", shape_of_value(other))),
         }
     }
 
@@ -786,6 +836,7 @@ pub fn show(v: &Value) -> String {
         }
         Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
+        Value::Ref(..) => format!("Ref <{}>", show(&crate::engine::clone_ref(v.clone()))),
     }
 }
 

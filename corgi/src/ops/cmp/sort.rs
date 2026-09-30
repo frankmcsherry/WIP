@@ -86,6 +86,14 @@ pub(crate) fn sort_indexed(
         // a sum's lanes and a list's elements are read through the index after their sorts.
         Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit.keeping_index(), scratch),
         Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit.keeping_index(), scratch),
+        // a reference sorts as what it names: order a scratch clone of the referenced rows, then
+        // move the SPANS into that order, so the sorted column is still references. (A refs-aware
+        // sort would read through the arena instead; not needed yet.)
+        Value::Ref(..) => {
+            let owned = crate::engine::clone_ref(v.clone());
+            sort_indexed(&owned, labels, index, emit.keeping_index(), scratch);
+            emit.values().then(|| gather(v, index))
+        }
         Value::Unit(_) => {
             densify(labels, m);
             emit.values().then_some(Value::Unit(m))
@@ -685,6 +693,8 @@ pub(crate) fn contains_list(v: &Value) -> bool {
         Value::Prod(cols) => cols.iter().any(contains_list),
         Value::Sum(_, lanes) => lanes.iter().any(contains_list),
         Value::Prim(_) | Value::Unit(_) => false,
+        // a referenced row IS a list row (its sorted form gathers the spanned elements).
+        Value::Ref(..) => true,
     }
 }
 

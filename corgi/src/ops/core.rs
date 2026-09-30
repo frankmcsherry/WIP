@@ -3,11 +3,12 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, expand_ranges, fill, filter_mask, gather, gather_lanes, owner_ids, resolve_indices,
+    blend, clone_ref, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans,
+    resolve_indices, take_ref,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
-use crate::value::{Bounds, Prim, Tags, Value};
+use crate::value::{Bounds, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
@@ -19,7 +20,7 @@ use std::sync::Arc;
 /// whose rows differ in size) can't be slot-overwritten, so it falls back to the rebuild via
 /// two-source `gather_lanes` (correct, the prior behaviour; an uncommon accumulator shape).
 pub(crate) fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
-    if fixed_width(&acc) {
+    if fixed_width(&acc, &new) {
         scatter_fixed(&mut acc, active, &new);
         acc
     } else {
@@ -35,18 +36,21 @@ pub(crate) fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
 }
 
 /// every row occupies a constant byte slot — true for a leaf and a product of fixed-width fields,
-/// false once a `List` or `Sum` (variable-size rows) appears. Checked WHOLE before any mutation, so
-/// the in-place pass below can't half-write a value that turns out to be variable-width deeper down.
-fn fixed_width(v: &Value) -> bool {
-    match v {
-        Value::Prim(_) | Value::Unit(_) => true, // a unit row is a (zero-byte) constant slot
-        Value::Prod(cs) => cs.iter().all(fixed_width),
-        Value::List(..) | Value::Sum(..) => false,
+/// false once a `List` or `Sum` (variable-size rows) appears. A `Ref` row is a constant-size span,
+/// so it counts when `acc` and `new` reference ONE arena (a span of another arena can't be written
+/// into `acc`'s). Checked WHOLE before any mutation, so the in-place pass below can't half-write a
+/// value that turns out to be variable-width deeper down.
+fn fixed_width(acc: &Value, new: &Value) -> bool {
+    match (acc, new) {
+        (Value::Prim(_), _) | (Value::Unit(_), _) => true, // a unit row is a (zero-byte) constant slot
+        (Value::Prod(ca), Value::Prod(cn)) => ca.iter().zip(cn).all(|(a, n)| fixed_width(a, n)),
+        (Value::Ref(pa, _), Value::Ref(pn, _)) => Arc::ptr_eq(pa, pn),
+        _ => false,
     }
 }
 
-/// in-place scatter for a fixed-width `acc` (precondition: `fixed_width(acc)`), recursing products to
-/// the leaves where the actual write happens.
+/// in-place scatter for a fixed-width `acc` (precondition: `fixed_width(acc, new)`), recursing
+/// products to the leaves (and spans) where the actual write happens.
 fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
     match (acc, new) {
         (Value::Prim(d), Value::Prim(s)) => d.scatter_into(active, s),
@@ -56,7 +60,13 @@ fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
             }
         }
         (Value::Unit(_), Value::Unit(_)) => {} // no payload to overwrite (length is unchanged)
-        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod/Unit"),
+        (Value::Ref(_, sa), Value::Ref(_, sn)) => {
+            let sa = Arc::make_mut(sa);
+            for (slot, &r) in active.iter().enumerate() {
+                sa[r] = sn[slot];
+            }
+        }
+        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod/Unit/Ref"),
     }
 }
 
@@ -123,7 +133,16 @@ pub enum Op<L> {
                     // plain scan can't (running deltas, indexing, RLE). `Fold` is kept separate — the
                     // R=Unit specialization, ~3x cheaper than FoldScan (no output pair, no recording).
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
-                    // (né Broadcast); the list-side closure capture.
+                    // (né Broadcast); the list-side closure capture. Copies X per element unless X
+                    // is referenced — then it is one reference per element (a closure's `&ctx`).
+    // REF — referenced list rows. The explicit by-reference/by-value pair: everything that moves
+    // rows (`gather`, hence the capture family, `Lit`, and the merges) moves only spans on a Ref, and
+    // nothing copies referenced rows except `Clone`. The readers `Get`/`Gather`/`Find`/`Slices`/`Len`
+    // accept a referenced list haystack; every other op on a Ref is the shape error "clone first".
+    Ref,            // T -> T'           every top-level List<X> in T becomes Ref<List<X>> (through
+                    //                   products and sums; O(rows), nothing copied)
+    Clone,          // T -> T'           every Ref<List<X>> in T becomes List<X> (the ONLY copy of
+                    //                   referenced rows; `clone` undoes `ref`)
 
     // ---- structural isos: de-/re-structure between nestings the layout already stores; linear
     // bounds work at most, no per-element compute. Three pairs: List⊗Prod (Transpose/Zip),
@@ -220,6 +239,9 @@ impl<L: OpLike> Op<L> {
                 }
                 cols.swap_remove(*i)
             }
+
+            Op::Ref => take_ref(input),
+            Op::Clone => clone_ref(input),
 
             Op::Transpose => {
                 let (bounds, vals) = input.into_list("Transpose")?;
@@ -397,9 +419,8 @@ impl<L: OpLike> Op<L> {
 
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
-                let (bounds, _vals) = input.into_list("Len")?;
-                let mut prev = 0;
-                let lens = bounds.ends().map(|e| { let l = (e - prev) as u64; prev = e; l }).collect();
+                let (rows, _vals) = input.rows_of("Len")?;
+                let lens = (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as u64 }).collect();
                 Value::u64(lens)
             }
 
@@ -667,15 +688,21 @@ impl<L: OpLike> Op<L> {
 
             // materialize: replace each (lo,hi) range with the haystack-row slice it
             // names. List<(lo,hi)> -> List<List<T>>; reuses `gather`. A list-introducer.
+            // on a list haystack the ranges are copied out (List<List<T>>); on a REFERENCED haystack
+            // they are handed back as references (List<Ref<List<T>>>), O(ranges) — the per-anchor
+            // sub-list of a join/WCO plan without materializing it.
             Op::Slices => {
                 let (lohi, haystack) = input.into_pair("Slices")?;
                 let (lb, lvals) = lohi.into_list("Slices ranges")?;
-                let (hb, hvals) = haystack.into_list("Slices haystack")?;
+                let (hrows, hvals) = haystack.rows_of("Slices haystack")?;
                 let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
                 let (lo_c, hi_c) = (lo.as_u64("Slices lo")?, hi.as_u64("Slices hi")?);
-                assert_eq!(lb.len(), hb.len(), "Slices: row count");
-                let (idx, inner_bounds) = expand_ranges(&lb, lo_c, hi_c, &hb);
-                let inner = Value::List(inner_bounds.into(), Box::new(gather(&hvals, &idx)));
+                assert_eq!(lb.len(), hrows.len(), "Slices: row count");
+                let spans = range_spans(&lb, lo_c, hi_c, hrows);
+                let inner = match &haystack {
+                    Value::Ref(payload, _) => Value::Ref(payload.clone(), Arc::new(spans)), // same arena
+                    _ => materialize_spans(&spans, hvals),
+                };
                 Value::List(lb, Box::new(inner))
             }
 
@@ -684,26 +711,27 @@ impl<L: OpLike> Op<L> {
             Op::Get => {
                 let (idx, haystack) = input.into_pair("Get")?;
                 let idxs = idx.as_u64("Get index")?;
-                let (hb, hvals) = haystack.into_list("Get haystack")?;
+                let (hb, hvals) = haystack.rows_of("Get haystack")?;
                 assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
                 let mut abs = Vec::with_capacity(idxs.len());
-                let mut hs = 0;
-                for (r, he) in hb.ends().enumerate() {
-                    let x = idxs[r] as usize;
+                for (r, &x) in idxs.iter().enumerate() {
+                    let (hs, he) = hb.span(r);
+                    let x = x as usize;
                     assert!(x < he - hs, "Get: index {x} out of range for a row of {} elements", he - hs);
                     abs.push(hs + x);
-                    hs = he;
                 }
-                gather(&hvals, &abs)
+                gather(hvals, &abs)
             }
 
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather")?;
                 let (ib, ivals) = idx.into_list("Gather indices")?;
-                let (hb, hvals) = haystack.into_list("Gather haystack")?;
+                let (hb, hvals) = haystack.rows_of("Gather haystack")?;
                 assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
-                if ib.len() == 1 && hb.len() == 1 {
-                    if let Value::Prim(p) = &hvals {
+                // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
+                // payload (a partition); a referenced haystack takes the row-relative path below.
+                if ib.len() == 1 && hb.len() == 1 && matches!(hb, Rows::Part(_)) {
+                    if let Value::Prim(p) = hvals {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
                         // indexing in the gather supplies that check without a separate scan. This
                         // is the one path that CONSUMES the indices — it rewrites that buffer into
@@ -713,8 +741,8 @@ impl<L: OpLike> Op<L> {
                     }
                 }
                 let idxs = ivals.as_u64("Gather indices")?;
-                let abs = resolve_indices(&ib, idxs, &hb);
-                Value::List(ib, Box::new(gather(&hvals, &abs)))
+                let abs = resolve_indices(&ib, idxs, hb);
+                Value::List(ib, Box::new(gather(hvals, &abs)))
             }
 
             // total vector access: each index either names a haystack-row element (Found) or is out of
@@ -724,7 +752,7 @@ impl<L: OpLike> Op<L> {
             Op::GatherTry => {
                 let (idx, haystack) = input.into_pair("GatherTry")?;
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
-                let (hb, hvals) = haystack.into_list("GatherTry haystack")?;
+                let (hb, hvals) = haystack.rows_of("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
                 let idxs = ivals.as_u64("GatherTry indices")?;
                 // one pass routes each index AND records its within-lane offset — the size its
@@ -732,9 +760,9 @@ impl<L: OpLike> Op<L> {
                 let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
                 let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
                 let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
-                let (mut is, mut hs) = (0, 0);
                 for r in 0..ib.len() {
-                    let (ie, he) = (ib.end(r), hb.end(r));
+                    let (is, ie) = ib.span(r);
+                    let (hs, he) = hb.span(r);
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
@@ -747,10 +775,8 @@ impl<L: OpLike> Op<L> {
                             oob.push(x);
                         }
                     }
-                    is = ie;
-                    hs = he;
                 }
-                let lanes = vec![Value::u64(oob), gather(&hvals, &abs)];
+                let lanes = vec![Value::u64(oob), gather(hvals, &abs)];
                 let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
                 Value::List(ib, Box::new(sum))
             }
