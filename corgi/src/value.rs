@@ -162,6 +162,28 @@ impl Bounds {
         ends.iter().enumerate().all(|(i, &e)| e == (i + 1) * k).then_some(k)
     }
 
+    /// rows `c..` as their own partition (rebased to start at 0), leaving rows `..c`. Also returns
+    /// where the payload splits: the element count of the rows kept. See [`Value::split_off`].
+    pub(crate) fn split_off(&mut self, c: usize) -> (Bounds, usize) {
+        match self {
+            Bounds::Stride(k, rows) => {
+                let tail = Bounds::Stride(*k, *rows - c);
+                *rows = c;
+                (tail, c * *k)
+            }
+            Bounds::Offsets(ends) => {
+                let at = if c == 0 { 0 } else { ends[c - 1] };
+                let mut tail = split_arc(ends, c);
+                if at > 0 {
+                    for e in Arc::make_mut(&mut tail).iter_mut() {
+                        *e -= at;
+                    }
+                }
+                (Bounds::Offsets(tail), at)
+            }
+        }
+    }
+
     /// recover the uniform `Stride` form if this partition happens to be uniform. `From<Vec<usize>>`
     /// is this check applied at construction; this is it applied to a partition already in hand, so
     /// a caller that must rebuild a `Bounds` does not have to unwrap and re-wrap the buffer.
@@ -297,6 +319,45 @@ impl Tags {
     /// every row's discriminant, in row order.
     pub(crate) fn tags_iter(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len()).map(move |i| self.tag_at(i))
+    }
+
+    /// rows `c..` as their own assignment, leaving rows `..c`; also returns, per lane, how many of
+    /// its rows stay (`lens` holds each lane's row count). A lane's rows are packed in row order (a
+    /// row's offset is its rank among its lane's rows), so lane `l` keeps its first `keep[l]` rows
+    /// and the tail's offsets drop by `keep`. Only the tail's rows are read. Either side that lies
+    /// in one lane becomes `Const`. See [`Value::split_off`].
+    pub(crate) fn split_off(&mut self, c: usize, lens: &[usize]) -> (Tags, Vec<usize>) {
+        let n = self.len();
+        match self {
+            Tags::Const(t, rows) => {
+                let mut keep = vec![0; lens.len()];
+                keep[*t] = c;
+                let tail = Tags::Const(*t, n - c);
+                *rows = c;
+                (tail, keep)
+            }
+            Tags::Column(tags, offsets) => {
+                let tail_tags = tags.split_off(c);
+                let mut tail_offsets = split_arc(offsets, c);
+                let mut keep = lens.to_vec();
+                for i in 0..n - c {
+                    keep[tail_tags.usize_at(i)] -= 1;
+                }
+                let tail = match (0..lens.len()).find(|&l| lens[l] - keep[l] == n - c) {
+                    Some(l) => Tags::Const(l, n - c),
+                    None => {
+                        for (i, o) in Arc::make_mut(&mut tail_offsets).iter_mut().enumerate() {
+                            *o -= keep[tail_tags.usize_at(i)];
+                        }
+                        Tags::Column(tail_tags, tail_offsets)
+                    }
+                };
+                if let Some(l) = (0..lens.len()).find(|&l| keep[l] == c) {
+                    *self = Tags::Const(l, c);
+                }
+                (tail, keep)
+            }
+        }
     }
 }
 
@@ -578,17 +639,10 @@ macro_rules! prim {
                 }
             }
 
-            /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives the
-            /// buffer mutably when uniquely owned (the common case), or clones it once if shared. Touches
-            /// only the `active` rows; no allocation in the unique case. The leaf of [`scatter`].
-            pub(crate) fn scatter_into(&mut self, active: &[usize], src: &Prim) {
-                match (self, src) {
-                    $( (Prim::$V(dst), Prim::$V(s)) => {
-                        let dst = Arc::make_mut(dst);
-                        for (p, &r) in active.iter().enumerate() { dst[r] = s[p]; }
-                    } )+
-                    _ => panic!("scatter_into: prim width mismatch"),
-                }
+            /// rows `c..` moved out into a new leaf, leaving rows `..c` — the leaf of
+            /// [`Value::split_off`] (see [`split_arc`] for when this copies).
+            pub(crate) fn split_off(&mut self, c: usize) -> Prim {
+                match self { $( Prim::$V(v) => Prim::$V(split_arc(v, c)), )+ }
             }
 
             /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]` (all
@@ -756,6 +810,27 @@ prim! {
     U64 => u64,
 }
 
+/// `Vec::split_off` for a shared buffer: entries `c..` move to a new buffer and `v` keeps `..c`.
+/// A uniquely owned `v` is truncated in place and stays owned, so a later op can still write into
+/// it; a shared one is copied (both halves). Splitting at either end moves nothing: at `len` the
+/// tail is empty, at 0 the whole buffer is handed over as the tail.
+fn split_arc<T: Clone>(v: &mut Arc<Vec<T>>, c: usize) -> Arc<Vec<T>> {
+    if c == v.len() {
+        return Arc::new(Vec::new());
+    }
+    if c == 0 {
+        return std::mem::replace(v, Arc::new(Vec::new()));
+    }
+    match Arc::get_mut(v) {
+        Some(owned) => Arc::new(owned.split_off(c)),
+        None => {
+            let tail = Arc::new(v[c..].to_vec());
+            *v = Arc::new(v[..c].to_vec());
+            tail
+        }
+    }
+}
+
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in
 /// one cursor pass. A `Sum` carries this (see [`Value::sum`]).
 fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
@@ -817,6 +892,34 @@ impl Value {
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// rows `c..` moved out into a new column, leaving rows `..c` — `Vec::split_off` for a column,
+    /// through every shape. A `List` splits its payload where row `c` starts, a `Sum` each lane where
+    /// its kept rows end, a `Ref` its spans (both halves keep the arena). A uniquely owned buffer is
+    /// truncated in place and stays owned, so an op that writes in place still can; a shared one is
+    /// copied. Otherwise the work is the tail's size, not the column's.
+    pub(crate) fn split_off(&mut self, c: usize) -> Value {
+        debug_assert!(c <= self.len(), "split_off: row {c} of {}", self.len());
+        match self {
+            Value::Prim(p) => Value::Prim(p.split_off(c)),
+            Value::Prod(fields) => Value::Prod(fields.iter_mut().map(|f| f.split_off(c)).collect()),
+            Value::Sum(tags, lanes) => {
+                let lens: Vec<usize> = lanes.iter().map(Value::len).collect();
+                let (tail, keep) = tags.split_off(c, &lens);
+                Value::Sum(tail, lanes.iter_mut().zip(keep).map(|(lane, k)| lane.split_off(k)).collect())
+            }
+            Value::List(bounds, vals) => {
+                let (tail, at) = bounds.split_off(c);
+                Value::List(tail, Box::new(vals.split_off(at)))
+            }
+            Value::Unit(n) => {
+                let tail = Value::Unit(*n - c);
+                *n = c;
+                tail
+            }
+            Value::Ref(payload, spans) => Value::Ref(payload.clone(), split_arc(spans, c)),
+        }
+    }
 }
 
 /// a `Sum` taken apart: its lane assignment and its lanes.

@@ -11,80 +11,179 @@ use crate::shape::{same, shape_of_value, Shape};
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
-/// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
-/// `gather`, the accumulator update for `Fold`/`Scan`.
-///
-/// FIXED-WIDTH `acc` (a leaf, or a product of leaves) is mutated IN PLACE: each row has a constant
-/// slot, so we overwrite only the `active` rows, reusing the buffer round-to-round — no per-round
-/// allocation, no copying of the unchanged rows. VARIABLE-WIDTH `acc` (containing a `List`/`Sum`,
-/// whose rows differ in size) can't be slot-overwritten, so it falls back to the rebuild via
-/// two-source `gather_lanes` (correct, the prior behaviour; an uncommon accumulator shape).
-pub(crate) fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
-    if fixed_width(&acc, &new) {
-        scatter_fixed(&mut acc, active, &new);
-        acc
-    } else {
-        let n = acc.len();
-        let mut tags = vec![0usize; n];
-        let mut off: Vec<usize> = (0..n).collect();
-        for (slot, &r) in active.iter().enumerate() {
-            tags[r] = 1;
-            off[r] = slot;
+/// the lockstep schedule of a `Fold`/`FoldScan`, built once per fold: the rows ranked by length,
+/// longest first (a stable order), so the rows still running at any round are the ranks `0..alive`
+/// — a prefix. Each round's accumulator is then the previous round's output cut to its first
+/// `alive` rows (no gather, no scatter, no work list), and the rows that finish are that output's
+/// tail, split off once.
+struct Schedule {
+    /// the number of rows.
+    rows: usize,
+    /// rank -> row, or `None` when that is the identity: lengths already non-increasing, which
+    /// every uniform (stride-bound) list is.
+    order: Option<Vec<usize>>,
+    /// the distinct non-zero lengths and how many rows have each, longest first. A group's rows
+    /// hold the ranks just after those of the groups before it, and finish after round `len - 1`.
+    groups: Vec<(usize, usize)>,
+    /// how many groups (from the front) still have rows running.
+    pending: usize,
+    /// rank -> flat position of that row's next element, for the running ranks: its length is the
+    /// running count.
+    next: Vec<usize>,
+}
+
+impl Schedule {
+    fn new(bounds: &Bounds) -> Schedule {
+        let rows = bounds.len();
+        // uniform rows: identity order, one group.
+        if let Some(k) = bounds.strided() {
+            let groups = if k > 0 && rows > 0 { vec![(k, rows)] } else { Vec::new() };
+            let next = if k > 0 { (0..rows).map(|r| r * k).collect() } else { Vec::new() };
+            return Schedule { rows, order: None, pending: groups.len(), groups, next };
         }
-        gather_lanes(&[Some(&acc), Some(&new)], &tags, &off)
-    }
-}
-
-/// every row occupies a constant byte slot — true for a leaf and a product of fixed-width fields,
-/// false once a `List` or `Sum` (variable-size rows) appears. A `Ref` row is a row number, so it
-/// counts when `acc` and `new` reference ONE arena (a row of another arena can't be named in
-/// `acc`'s). Checked WHOLE before any mutation, so the in-place pass below can't half-write a
-/// value that turns out to be variable-width deeper down.
-fn fixed_width(acc: &Value, new: &Value) -> bool {
-    match (acc, new) {
-        (Value::Prim(_), _) | (Value::Unit(_), _) => true, // a unit row is a (zero-byte) constant slot
-        (Value::Prod(ca), Value::Prod(cn)) => ca.iter().zip(cn).all(|(a, n)| fixed_width(a, n)),
-        (Value::Ref(pa, _), Value::Ref(pn, _)) => Arc::ptr_eq(pa, pn),
-        _ => false,
-    }
-}
-
-/// in-place scatter for a fixed-width `acc` (precondition: `fixed_width(acc, new)`), recursing
-/// products to the leaves (and row numbers) where the actual write happens.
-fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
-    match (acc, new) {
-        (Value::Prim(d), Value::Prim(s)) => d.scatter_into(active, s),
-        (Value::Prod(ca), Value::Prod(cn)) => {
-            for (fa, fb) in ca.iter_mut().zip(cn) {
-                scatter_fixed(fa, active, fb);
+        let lens: Vec<usize> = (0..rows).map(|r| { let (s, e) = bounds.span(r); e - s }).collect();
+        // already longest first (uniform lengths stored as offsets, among others): no permutation.
+        let order = if lens.windows(2).all(|w| w[0] >= w[1]) {
+            None
+        } else {
+            let max = lens.iter().copied().max().unwrap_or(0);
+            Some(if max <= 4 * rows {
+                // a counting sort on length, longest first: one pass to count, one to place.
+                let mut at = vec![0usize; max + 1];
+                for &l in &lens {
+                    at[l] += 1;
+                }
+                let mut acc = 0;
+                for l in (0..=max).rev() {
+                    let c = at[l];
+                    at[l] = acc;
+                    acc += c;
+                }
+                let mut order = vec![0usize; rows];
+                for (r, &l) in lens.iter().enumerate() {
+                    order[at[l]] = r;
+                    at[l] += 1;
+                }
+                order
+            } else {
+                // a few very long rows: a bucket per length would outweigh the rows, so sort them.
+                let mut order: Vec<usize> = (0..rows).collect();
+                order.sort_by_key(|&r| std::cmp::Reverse(lens[r]));
+                order
+            })
+        };
+        let row = |q: usize| order.as_ref().map_or(q, |o| o[q]);
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut next = Vec::with_capacity(rows);
+        for q in 0..rows {
+            let r = row(q);
+            if lens[r] == 0 {
+                break; // the rows with no elements come last
             }
-        }
-        (Value::Unit(_), Value::Unit(_)) => {} // no payload to overwrite (length is unchanged)
-        (Value::Ref(_, sa), Value::Ref(_, sn)) => {
-            let sa = Arc::make_mut(sa);
-            for (slot, &r) in active.iter().enumerate() {
-                sa[r] = sn[slot];
+            match groups.last_mut() {
+                Some((len, count)) if *len == lens[r] => *count += 1,
+                _ => groups.push((lens[r], 1)),
             }
+            next.push(bounds.span(r).0);
         }
-        _ => unreachable!("scatter_fixed: fixed_width guarantees Prim/Prod/Unit/Ref"),
+        Schedule { rows, order, pending: groups.len(), groups, next }
     }
-}
 
-/// the lockstep work-list for `Fold`/`Scan`, maintained incrementally. `(row, start, len)` for each
-/// non-empty row, in row order. A row stays until round `len`; after each round the caller `retain`s
-/// `len > t`, so the per-round cost tracks the *active* rows, not all N (the win for ragged lengths —
-/// vs rescanning every row's bounds each round, which was O(N·maxlen)). `row`/`start` give the gather
-/// targets: row `r`'s round-`t` element is at flat index `start + t`.
-pub(crate) fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
-    let mut v = Vec::with_capacity(bounds.len());
-    let mut start = 0;
-    for (r, end) in bounds.ends().enumerate() {
-        if end > start {
-            v.push((r, start, end - start));
-        }
-        start = end;
+    /// the rows still running.
+    fn running(&self) -> usize {
+        self.next.len()
     }
-    v
+
+    /// the row at rank `q`.
+    fn row(&self, q: usize) -> usize {
+        self.order.as_ref().map_or(q, |o| o[q])
+    }
+
+    /// the round-0 accumulator (the seed of the running rows, in rank order), and where the rows with
+    /// no elements find their final value: row `r` is row `r - base` of the returned column.
+    /// Identity order moves the seed rather than gathering it.
+    fn split_seed(&self, seed: Value) -> (Value, (Value, usize)) {
+        let running = self.running();
+        match &self.order {
+            None => {
+                let mut acc = seed;
+                let empty = acc.split_off(running);
+                (acc, (empty, running))
+            }
+            Some(order) => (gather(&seed, &order[..running]), (seed, 0)),
+        }
+    }
+
+    /// the bookkeeping after round `t`: the rows whose last element that was (length `t + 1`) are
+    /// the tail of `acc` — split them off into `done` — and the survivors step to their next
+    /// element. Returns whether any row is still running.
+    fn finish_round(&mut self, t: usize, acc: &mut Value, done: &mut Vec<Value>) -> bool {
+        if self.pending > 0 && self.groups[self.pending - 1].0 == t + 1 {
+            self.pending -= 1;
+            let alive = self.running() - self.groups[self.pending].1;
+            done.push(acc.split_off(alive));
+            self.next.truncate(alive);
+        }
+        for p in self.next.iter_mut() {
+            *p += 1;
+        }
+        !self.next.is_empty()
+    }
+
+    /// the final values in row order, from what the rounds split off: `done[i]` holds (in rank
+    /// order) the rows of the `i`-th shortest length, and `empty` the rows with no elements (see
+    /// `split_seed`). One `gather_lanes` — or none, when one piece holds every row in order.
+    fn assemble(&self, empty: (Value, usize), done: Vec<Value>) -> Value {
+        let (empty, base) = empty;
+        if self.order.is_none() && empty.is_empty() && done.len() == 1 {
+            return done.into_iter().next().unwrap();
+        }
+        let (mut tags, mut off) = (vec![0usize; self.rows], vec![0usize; self.rows]);
+        let mut q = 0;
+        // groups are longest first and `done` shortest first; source 0 is `empty`.
+        for (g, &(_, count)) in self.groups.iter().enumerate() {
+            let src = done.len() - g;
+            for i in 0..count {
+                let r = self.row(q + i);
+                tags[r] = src;
+                off[r] = i;
+            }
+            q += count;
+        }
+        for q in q..self.rows {
+            let r = self.row(q);
+            off[r] = r - base; // and tags[r] is already 0
+        }
+        let mut srcs: Vec<Option<&Value>> = vec![Some(&empty)];
+        srcs.extend(done.iter().map(Some));
+        gather_lanes(&srcs, &tags, &off)
+    }
+
+    /// a `FoldScan`'s output values in the list's own order, from the per-round outputs:
+    /// `chunks[t]` holds round `t`'s outputs in rank order, so row `r`'s `t`-th output is row
+    /// `rank(r)` of chunk `t`.
+    fn stitch(&self, bounds: &Bounds, chunks: Vec<Value>) -> Value {
+        if self.order.is_none() && chunks.len() == 1 {
+            return chunks.into_iter().next().unwrap(); // every row has at most one element
+        }
+        let rank: Option<Vec<usize>> = self.order.as_ref().map(|order| {
+            let mut rank = vec![0usize; self.rows];
+            for (q, &r) in order.iter().enumerate() {
+                rank[r] = q;
+            }
+            rank
+        });
+        let total = bounds.total();
+        let (mut tags, mut off) = (Vec::with_capacity(total), Vec::with_capacity(total));
+        for r in 0..self.rows {
+            let (s, e) = bounds.span(r);
+            let q = rank.as_ref().map_or(r, |rank| rank[r]);
+            tags.extend(0..e - s);
+            off.extend(std::iter::repeat_n(q, e - s));
+        }
+        let srcs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+        gather_lanes(&srcs, &tags, &off)
+    }
 }
 
 /// the core op vocabulary: structure only — comparison/order is the `cmp` bucket (`ops::cmp`) and
@@ -575,10 +674,10 @@ impl<L: OpLike> Op<L> {
                 Value::List(bounds, Box::new(try_eval_graph(body, inner)?))
             }
 
-            // seeded left fold, vectorized across rows. `acc` is a column of one accumulator per row
-            // (starts as the seed). Round t pairs every still-long-enough row's acc with its t-th
-            // element, runs the body once over those active rows, scatters the results back. Rounds =
-            // the longest row; empty rows never become active, so it is total (empty list -> seed).
+            // seeded left fold, vectorized across rows: round t runs the body once over every row
+            // that has a t-th element. Rows run longest first (see `Schedule`), so the running rows
+            // are a prefix: round t's output, minus the tail of rows that just finished, is round
+            // t+1's accumulator. Rounds = the longest row; an empty row keeps its seed, so it is total.
             Op::Fold(body) => {
                 let (seed, list) = input.into_pair("Fold")?;
                 let (bounds, vals) = list.into_list("Fold list")?;
@@ -594,48 +693,27 @@ impl<L: OpLike> Op<L> {
                     check(&z)?;
                     return Ok(seed);
                 }
-                // Strided fast path: every row has length k, so every row is active in every
-                // round — no worklist, no per-round accumulator gather/scatter (the whole
-                // accumulator IS the active set); one strided element gather per round.
-                if let Some(k) = bounds.strided() {
-                    let n = bounds.len();
-                    let mut acc = seed;
-                    let mut elem: Vec<usize> = Vec::with_capacity(n);
-                    for t in 0..k {
-                        elem.clear();
-                        elem.extend((0..n).map(|r| r * k + t));
-                        let elt = gather(&vals, &elem);
-                        let updated = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
-                        if t == 0 {
-                            check(&updated)?;
-                        }
-                        assert_eq!(updated.len(), n, "Fold body changed the row count");
-                        acc = updated;
-                    }
-                    return Ok(acc);
-                }
-                let mut acc = seed;
-                let mut active = init_active(&bounds);
-                let mut t = 0;
-                while !active.is_empty() {
-                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
-                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
-                    let acc_active = gather(&acc, &rows);
-                    let elt = gather(&vals, &elem);
-                    let updated = try_eval_graph(body, Value::Prod(vec![acc_active, elt]))?;
+                let mut sched = Schedule::new(&bounds);
+                let (mut acc, empty) = sched.split_seed(seed);
+                let mut done = Vec::new();
+                for t in 0.. {
+                    let running = sched.running();
+                    let elt = gather(&vals, &sched.next);
+                    acc = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
                     if t == 0 {
-                        check(&updated)?;
+                        check(&acc)?;
                     }
-                    assert_eq!(updated.len(), rows.len(), "Fold body changed the row count");
-                    acc = scatter(acc, &rows, updated);
-                    t += 1;
-                    active.retain(|&(_, _, len)| len > t); // rows that just ran out drop here
+                    assert_eq!(acc.len(), running, "Fold body changed the row count");
+                    if !sched.finish_round(t, &mut acc, &mut done) {
+                        break;
+                    }
                 }
-                acc
+                sched.assemble(empty, done)
             }
 
-            // mapAccumL: the body returns a PAIR (new state, output R). We thread field 0
-            // (the state) into `acc` and record field 1 (R) into the chunks; return (final state, [R]).
+            // mapAccumL: the body returns a PAIR (new state, output R). The state is threaded as in
+            // `Fold`; round t's outputs (in rank order) are kept whole and stitched into the output
+            // list at the end. Returns (final state, [R]).
             Op::FoldScan(body) => {
                 let (seed, list) = input.into_pair("FoldScan")?;
                 let (bounds, vals) = list.into_list("FoldScan list")?;
@@ -644,80 +722,35 @@ impl<L: OpLike> Op<L> {
                 let check = |state: &Value| {
                     same(&seed_shape, &shape_of_value(state)).map(drop).map_err(|e| format!("FoldScan body: {e}"))
                 };
-                let total = vals.len();
-                // Strided fast path — as in `Fold`: no worklist, no scatter; round t's outputs
-                // land at positions r*k + t, chunk t, slot r.
-                if let Some(k) = bounds.strided() {
-                    let n = bounds.len();
-                    let mut acc = seed;
-                    let mut chunks: Vec<Value> = Vec::with_capacity(k);
-                    let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
-                    let mut elem: Vec<usize> = Vec::with_capacity(n);
-                    for t in 0..k {
-                        elem.clear();
-                        elem.extend((0..n).map(|r| r * k + t));
-                        let elt = gather(&vals, &elem);
-                        let (new_state, r) =
-                            try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
-                        if t == 0 {
-                            check(&new_state)?;
-                        }
-                        assert_eq!(new_state.len(), n, "FoldScan body changed the row count");
-                        for (slot, &pos) in elem.iter().enumerate() {
-                            tags[pos] = t;
-                            off[pos] = slot;
-                        }
-                        acc = new_state;
-                        chunks.push(r);
-                    }
-                    let out_vals = if chunks.is_empty() {
-                        let z = try_eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
-                        let (state, r) = z.into_pair("FoldScan body")?;
-                        check(&state)?;
-                        r
-                    } else {
-                        let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
-                        gather_lanes(&refs, &tags, &off)
-                    };
-                    return Ok(Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))]));
-                }
-                let mut acc = seed;
-                let mut chunks: Vec<Value> = Vec::new();
-                let (mut tags, mut off) = (vec![0usize; total], vec![0usize; total]);
-                let mut active = init_active(&bounds);
-                let mut t = 0;
-                while !active.is_empty() {
-                    let rows: Vec<usize> = active.iter().map(|&(r, _, _)| r).collect();
-                    let elem: Vec<usize> = active.iter().map(|&(_, s, _)| s + t).collect();
-                    let acc_active = gather(&acc, &rows);
-                    let elt = gather(&vals, &elem);
-                    let (new_state, r) =
-                        try_eval_graph(body, Value::Prod(vec![acc_active, elt]))?.into_pair("FoldScan body")?;
-                    if t == 0 {
-                        check(&new_state)?;
-                    }
-                    assert_eq!(new_state.len(), rows.len(), "FoldScan body changed the row count");
-                    for (slot, &pos) in elem.iter().enumerate() {
-                        tags[pos] = chunks.len();
-                        off[pos] = slot;
-                    }
-                    acc = scatter(acc, &rows, new_state);
-                    chunks.push(r);
-                    t += 1;
-                    active.retain(|&(_, _, len)| len > t);
-                }
-                // empty (no rounds): an empty R-shaped column, obtained by running the body on zero rows
-                // (R may differ from the state, so we can't reuse `acc`). Else stitch the recorded chunks.
-                let out_vals = if chunks.is_empty() {
-                    let z = try_eval_graph(body, Value::Prod(vec![gather(&acc, &[]), gather(&vals, &[])]))?;
+                // no rounds: an empty R-shaped column, obtained by running the body on zero rows (R
+                // may differ from the state, so the seed can't stand in for it).
+                if bounds.total() == 0 {
+                    let z = try_eval_graph(body, Value::Prod(vec![gather(&seed, &[]), gather(&vals, &[])]))?;
                     let (state, r) = z.into_pair("FoldScan body")?;
                     check(&state)?;
-                    r
-                } else {
-                    let refs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
-                    gather_lanes(&refs, &tags, &off)
-                };
-                Value::Prod(vec![acc, Value::List(bounds, Box::new(out_vals))])
+                    return Ok(Value::Prod(vec![seed, Value::List(bounds, Box::new(r))]));
+                }
+                let mut sched = Schedule::new(&bounds);
+                let (mut acc, empty) = sched.split_seed(seed);
+                let (mut done, mut chunks) = (Vec::new(), Vec::new());
+                for t in 0.. {
+                    let running = sched.running();
+                    let elt = gather(&vals, &sched.next);
+                    let (state, r) =
+                        try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
+                    if t == 0 {
+                        check(&state)?;
+                    }
+                    assert_eq!(state.len(), running, "FoldScan body changed the row count");
+                    assert_eq!(r.len(), running, "FoldScan body changed the row count");
+                    acc = state;
+                    chunks.push(r);
+                    if !sched.finish_round(t, &mut acc, &mut done) {
+                        break;
+                    }
+                }
+                let out_vals = sched.stitch(&bounds, chunks);
+                Value::Prod(vec![sched.assemble(empty, done), Value::List(bounds, Box::new(out_vals))])
             }
 
             Op::MapSum(arms) => {

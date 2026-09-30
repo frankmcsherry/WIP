@@ -525,8 +525,8 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
 ///
 /// A FIXED-WIDTH level blends LANE-WISE: one pass reading both sides at the same position, which is
 /// a select instruction. A VARIABLE-WIDTH level (a `List` row is a span, a `Sum` row is a lane
-/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`]
-/// — the same split `scatter` makes, and for the same reason. The split is per LEVEL, not per value:
+/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`].
+/// The split is per LEVEL, not per value:
 /// a product blends each leaf field directly and only gathers the fields that need it.
 pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
     match (then, els) {

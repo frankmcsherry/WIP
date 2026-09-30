@@ -35,7 +35,7 @@ fn best(units: usize, batches: usize, mut f: impl FnMut()) -> f64 {
 
 fn run(p: &Program, input: &Value, units: usize, batches: usize) -> f64 {
     best(units, batches, || {
-        black_box(p.run_partial(black_box(input.clone())));
+        black_box(p.run(black_box(input.clone())));
     })
 }
 
@@ -69,7 +69,7 @@ fn main() {
     let add = compile("(0u64, input) fold ((a, x) -> (a, x) add)");
     let ident = compile("(0u64, input) fold ((a, x) -> a)");
     let scan = compile("(0u64, input) foldscan ((a, x) -> let b = (a, x) add in (b, b))");
-    let pair = compile("((0u64, 0u64), input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))");
+    let pair = compile("((0u64, 0u64), input) fold ((acc, x) -> ((acc.0, x) add, (acc.1, 1u64) add))");
     let collect = compile("(0u64 iota, input) fold ((acc, x) -> (acc, x enlist) append)");
     let four = compile("(4u64 iota, input) fold ((acc, x) -> (x, acc) cap_list map ((x, a) -> (a, x) add))");
     let fallible = compile("(0u64, input) fold ((a, x) -> ((x and 7, 8u64 iota) get, a) add)");
@@ -133,8 +133,8 @@ fn main() {
     }
 
     println!("-- Jaro-Winkler, 1,000 ASCII pairs over five letters: ns per pair --");
-    let direct = compile(include_str!("../examples/jaro_winkler/direct.col"));
-    let by_byte = compile(include_str!("../examples/jaro_winkler/by_byte.col"));
+    let direct = compile(include_str!("../algorithms/jaro_winkler_direct.col"));
+    let by_byte = compile(include_str!("../algorithms/jaro_winkler_by_byte.col"));
     for max in [16u64, 64] {
         let mut next = rng(0x2545_F491_4F6C_DD1D ^ max);
         let pairs = if smoke { 8 } else { 1_000 };
