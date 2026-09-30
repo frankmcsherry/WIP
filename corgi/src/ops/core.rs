@@ -49,22 +49,8 @@ impl Schedule {
         let mut lens = Vec::with_capacity(rows);
         lens.extend(ends.first());
         lens.extend(ends.windows(2).map(|w| w[1] - w[0]));
-        // already longest first (uniform lengths stored as offsets, among others): no permutation,
-        // the groups are runs of equal lengths, and the positions are the row starts.
-        if lens.windows(2).all(|w| w[0] >= w[1]) {
-            let mut groups: Vec<(usize, usize)> = Vec::new();
-            for &l in lens.iter().take_while(|&&l| l > 0) {
-                match groups.last_mut() {
-                    Some((len, count)) if *len == l => *count += 1,
-                    _ => groups.push((l, 1)),
-                }
-            }
-            let running: usize = groups.iter().map(|g| g.1).sum();
-            let next = (0..running).map(start).collect();
-            return Schedule { rows, order: None, pending: groups.len(), groups, next };
-        }
         let max = lens.iter().copied().max().unwrap_or(0);
-        if max > 4 * rows {
+        let (order, groups, next) = if max > 4 * rows {
             // a few very long rows: a bucket per length would outweigh the rows, so sort them.
             let mut order: Vec<usize> = (0..rows).collect();
             order.sort_by_key(|&r| std::cmp::Reverse(lens[r]));
@@ -77,34 +63,38 @@ impl Schedule {
                 }
                 next.push(start(r));
             }
-            return Schedule { rows, order: Some(order), pending: groups.len(), groups, next };
-        }
-        // a counting sort on length, longest first. The counts are the groups; the pass that
-        // places each row at its rank also records where its elements start.
-        let mut at = vec![0usize; max + 1];
-        for &l in &lens {
-            at[l] += 1;
-        }
-        let groups: Vec<(usize, usize)> = (1..=max).rev().filter(|&l| at[l] > 0).map(|l| (l, at[l])).collect();
-        let running = rows - at[0];
-        let mut acc = 0;
-        for l in (0..=max).rev() {
-            let c = at[l];
-            at[l] = acc;
-            acc += c;
-        }
-        let (mut order, mut next) = (vec![0usize; rows], vec![0usize; running]);
-        let mut s = 0;
-        for (r, &l) in lens.iter().enumerate() {
-            let q = at[l];
-            at[l] += 1;
-            order[q] = r;
-            if l > 0 {
-                next[q] = s;
+            (order, groups, next)
+        } else {
+            // a counting sort on length, longest first. The counts are the groups; the pass that
+            // places each row at its rank also records where its elements start.
+            let mut at = vec![0usize; max + 1];
+            for &l in &lens {
+                at[l] += 1;
             }
-            s += l;
-        }
-        Schedule { rows, order: Some(order), pending: groups.len(), groups, next }
+            let groups: Vec<(usize, usize)> = (1..=max).rev().filter(|&l| at[l] > 0).map(|l| (l, at[l])).collect();
+            let mut acc = 0;
+            for l in (0..=max).rev() {
+                let c = at[l];
+                at[l] = acc;
+                acc += c;
+            }
+            // the empty rows rank last, so `at[0]` (their first rank) counts the running rows.
+            let (mut order, mut next) = (vec![0usize; rows], vec![0usize; at[0]]);
+            let mut s = 0;
+            for (r, &l) in lens.iter().enumerate() {
+                let q = at[l];
+                at[l] += 1;
+                order[q] = r;
+                if l > 0 {
+                    next[q] = s;
+                }
+                s += l;
+            }
+            (order, groups, next)
+        };
+        // lengths already longest first (and trailing empty rows): no permutation to carry.
+        let order = (!order.iter().enumerate().all(|(q, &r)| q == r)).then_some(order);
+        Schedule { rows, order, pending: groups.len(), groups, next }
     }
 
     /// this round's elements for the running rows, in rank order.
