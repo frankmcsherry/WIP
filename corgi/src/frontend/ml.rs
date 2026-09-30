@@ -4,11 +4,17 @@
 //! sums are built/eliminated via `inject`/`match`. A stage-chain runs until a token that can't begin a
 //! stage — notably the `let` body's `in`, the one identifier allowed to follow a complete chain.
 //!
+//! This surface is a notation for the core graph, not a language over it. A construct belongs here
+//! when it lowers to core nodes fixed by its syntax alone, adds no work the text doesn't show, and
+//! is not a second way to write something already writable. Anything that decides which op to use
+//! from shapes or kinds, or inserts ops the text doesn't name, belongs to a language that lowers
+//! to this one.
+//!
 //!   expr   = 'let' pat '=' expr 'in' expr
 //!          | 'enum' IDENT '=' IDENT shape? ('|' IDENT shape?)* 'in' expr  -- a compile-time table; names ERASE here
 //!   shape  = 'u8'|'u16'|'u32'|'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
-//!   pat    = IDENT | '(' IDENT (',' IDENT)* ')'
+//!   pat    = IDENT | '_' | '(' pat (',' pat)* ')'      -- irrefutable: names, wildcards, tuples
 //!   pipe   = proj apply*                               -- juxtaposition; chain ends before `in`
 //!   apply  = 'map' '(' lambda ')'
 //!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
@@ -18,20 +24,29 @@
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
 //!          | 'split' STR                                    -- delimiter as a one-byte string
 //!          | BINARY NUM                                     -- immediate: `x sub 1` ≡ `(x, x lit 1) sub`
+//!          | '.' NUM                                        -- projection after any value
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
 //!   proj   = atom ('.' NUM)*
-//!   atom   = '(' expr (',' expr)* ')' | IDENT          -- 'input' is the root
+//!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root
+//!   LIT    = '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)? SUFFIX
+//!   SUFFIX = ('u'|'i') ('8'|'16'|'32'|'64') | 'f' ('32'|'64')   -- required: kind and width
+//!
+//! A literal is a column of one constant, as long as the input of the scope it appears in (a
+//! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
+//! the scope. A bare NUM is an op's parameter (`field 1`, `shr 3`), never a value. `#` starts a
+//! comment to the end of the line.
 //!
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
 //!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> h add 100))
 //!       enum Opt = None () | Some u64 in xs inject Some  -- tag xs into Some; None is an empty unit lane
 
-use super::{pair_imm, resolve, str_value, takes_num};
+use super::{pair_imm, parse_kw, resolve, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::{NumOp, Op};
+use crate::ops::numeric::{enc_f32, enc_f64};
+use crate::ops::{lit_value, Kind, NumOp, Op};
 use crate::shape::Shape;
 use crate::value::Value;
 use std::collections::HashMap;
@@ -48,45 +63,93 @@ enum Tok {
     Eq,
     Bar, // | — the variant separator in an `enum` declaration
     Ident(String),
-    Num(u64),
+    Num(u64),   // an op's numeric parameter: `field 1`, `shr 3`, `branch 2`
+    Lit(Value), // a typed constant: `5u64`, `-3i64`, `0.7f64`
     Str(Vec<u8>),
 }
 
-fn lex(s: &str) -> Result<Vec<Tok>, String> {
+/// `line:column` of char offset `at` in `cs`, both 1-based, for error messages.
+fn position(cs: &[char], at: usize) -> String {
+    let before = &cs[..at.min(cs.len())];
+    let line = before.iter().filter(|&&c| c == '\n').count() + 1;
+    let col = before.iter().rev().take_while(|&&c| c != '\n').count() + 1;
+    format!("{line}:{col}")
+}
+
+/// a typed constant from its text: `digits` (with an optional leading `-`, and for floats a
+/// fraction or exponent) and a suffix naming its kind and width. The suffix is required and says
+/// how the bits are laid down: `u` as the value, `i` in the order-preserving signed encoding, `f`
+/// in the total-order float encoding.
+fn typed_lit(digits: &str, suffix: &str) -> Result<Value, String> {
+    let (kind, width) = parse_kw(suffix).ok_or_else(|| format!("unknown literal suffix '{suffix}'"))?;
+    let bad = || format!("'{digits}{suffix}' is not a {suffix}");
+    match kind {
+        Kind::F => {
+            let x: f64 = digits.parse().map_err(|_| bad())?;
+            Ok(if width == 32 { Value::u32(vec![enc_f32(x as f32)]) } else { Value::u64(vec![enc_f64(x)]) })
+        }
+        Kind::U | Kind::I => {
+            let v: i128 = digits.parse().map_err(|_| bad())?;
+            let (lo, hi) = match kind {
+                Kind::U => (0i128, (1i128 << width) - 1),
+                _ => (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1),
+            };
+            if v < lo || v > hi {
+                return Err(format!("{v} does not fit in {suffix}"));
+            }
+            // two's complement truncated to the width; `lit_value` applies the kind's encoding.
+            Ok(lit_value(kind, width, v as u64))
+        }
+    }
+}
+
+/// the tokens of `s`, and the char offset where each begins. `#` starts a comment to end of line.
+fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
     let cs: Vec<char> = s.chars().collect();
     let mut toks = Vec::new();
+    let mut starts = Vec::new();
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
-        match c {
-            c if c.is_whitespace() => i += 1,
+        let start = i;
+        let tok = match c {
+            c if c.is_whitespace() => {
+                i += 1;
+                continue;
+            }
+            '#' => {
+                while i < cs.len() && cs[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
             '-' if cs.get(i + 1) == Some(&'>') => {
-                toks.push(Tok::Arrow);
                 i += 2;
+                Tok::Arrow
             }
             '.' => {
-                toks.push(Tok::Dot);
                 i += 1;
+                Tok::Dot
             }
             '(' => {
-                toks.push(Tok::LParen);
                 i += 1;
+                Tok::LParen
             }
             ')' => {
-                toks.push(Tok::RParen);
                 i += 1;
+                Tok::RParen
             }
             ',' => {
-                toks.push(Tok::Comma);
                 i += 1;
+                Tok::Comma
             }
             '=' => {
-                toks.push(Tok::Eq);
                 i += 1;
+                Tok::Eq
             }
             '|' => {
-                toks.push(Tok::Bar);
                 i += 1;
+                Tok::Bar
             }
             '"' => {
                 i += 1; // opening quote
@@ -101,18 +164,72 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                             bytes.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
                             i += 1;
                         }
-                        None => return Err("unterminated string literal".to_string()),
+                        None => return Err(format!("{}: unterminated string literal", position(&cs, start))),
                     }
                 }
-                toks.push(Tok::Str(bytes));
+                Tok::Str(bytes)
             }
-            c if c.is_ascii_digit() => {
-                let mut n = 0u64;
-                while i < cs.len() && cs[i].is_ascii_digit() {
-                    n = n * 10 + cs[i].to_digit(10).unwrap() as u64;
+            c if c.is_ascii_digit() || (c == '-' && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit())) => {
+                let digit = |j: usize| cs.get(j).is_some_and(|d| d.is_ascii_digit());
+                let mut text = String::from(c);
+                i += 1;
+                while digit(i) {
+                    text.push(cs[i]);
                     i += 1;
                 }
-                toks.push(Tok::Num(n));
+                // A fraction or exponent makes a float, and only counts when an `f` suffix follows:
+                // otherwise `x.0.1` would read `0.1` as a number rather than two projections.
+                let mut j = i;
+                let mut float = String::new();
+                if cs.get(j) == Some(&'.') && digit(j + 1) {
+                    float.push('.');
+                    j += 1;
+                    while digit(j) {
+                        float.push(cs[j]);
+                        j += 1;
+                    }
+                }
+                if matches!(cs.get(j), Some('e') | Some('E'))
+                    && (digit(j + 1) || (matches!(cs.get(j + 1), Some('+') | Some('-')) && digit(j + 2)))
+                {
+                    float.push('e');
+                    j += 1;
+                    if !digit(j) {
+                        float.push(cs[j]);
+                        j += 1;
+                    }
+                    while digit(j) {
+                        float.push(cs[j]);
+                        j += 1;
+                    }
+                }
+                if !float.is_empty() {
+                    match cs.get(j) {
+                        Some('f') => {
+                            text.push_str(&float);
+                            i = j;
+                        }
+                        Some(c) if c.is_ascii_alphabetic() => {
+                            let at = position(&cs, start);
+                            return Err(format!("{at}: '{text}{float}' has a fraction, so needs an f32 or f64 suffix"));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut suffix = String::new();
+                while i < cs.len() && cs[i].is_ascii_alphanumeric() {
+                    suffix.push(cs[i]);
+                    i += 1;
+                }
+                let at = position(&cs, start);
+                if suffix.is_empty() {
+                    let n: u64 = text
+                        .parse()
+                        .map_err(|_| format!("{at}: '{text}' needs a type suffix, such as {text}i64"))?;
+                    Tok::Num(n)
+                } else {
+                    Tok::Lit(typed_lit(&text, &suffix).map_err(|e| format!("{at}: {e}"))?)
+                }
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let mut w = String::new();
@@ -120,19 +237,24 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                     w.push(cs[i]);
                     i += 1;
                 }
-                toks.push(Tok::Ident(w));
+                Tok::Ident(w)
             }
-            _ => return Err(format!("unexpected character '{c}'")),
-        }
+            _ => return Err(format!("{}: unexpected character '{c}'", position(&cs, start))),
+        };
+        toks.push(tok);
+        starts.push(start);
     }
-    Ok(toks)
+    Ok((toks, starts))
 }
 
 // ----- AST ---------------------------------------------------------------
 
+/// an irrefutable pattern: a name, `_`, or a tuple of patterns. Refutable matching (a sum's lane)
+/// is `match`'s job, never a pattern's.
 enum Pat {
     Name(String),
-    Tuple(Vec<String>),
+    Wild,
+    Tuple(Vec<Pat>),
 }
 
 enum Apply {
@@ -150,7 +272,8 @@ enum Apply {
 }
 
 enum E {
-    Var(String),
+    Var(String, String), // the name, and its source position for errors
+    Lit(Value),          // a typed constant or a string, filled to the length of its scope's input
     Tuple(Vec<E>),
     Proj(Box<E>, usize),
     Let(Pat, Box<E>, Box<E>),
@@ -162,6 +285,9 @@ enum E {
 struct P {
     toks: Vec<Tok>,
     i: usize,
+    src: Vec<char>,
+    starts: Vec<usize>, // char offset of each token
+    seen: std::cell::Cell<usize>, // the last token looked at, where a parse error is reported
     // the `enum` declarations' compile-time tables — names resolve HERE and erase from the AST,
     // so the core stays positional. Variant names are global (one table), hence unique program-wide.
     variants: HashMap<String, (usize, String)>,   // variant name -> (tag, its enum)
@@ -170,9 +296,11 @@ struct P {
 
 impl P {
     fn peek(&self) -> Option<&Tok> {
+        self.seen.set(self.i);
         self.toks.get(self.i)
     }
     fn bump(&mut self) -> Option<Tok> {
+        self.seen.set(self.i);
         let t = self.toks.get(self.i).cloned();
         if t.is_some() {
             self.i += 1;
@@ -241,19 +369,25 @@ impl P {
         }
     }
 
-    /// a binding pattern: a name, or a tuple of names (used by `let` and lambda parameters alike).
+    /// the source position of token `k` (or of the end of input).
+    fn at(&self, k: usize) -> String {
+        position(&self.src, self.starts.get(k).copied().unwrap_or(self.src.len()))
+    }
+
+    /// a binding pattern, used by `let` and lambda parameters alike.
     fn pat(&mut self) -> Result<Pat, String> {
         if self.peek() == Some(&Tok::LParen) {
             self.bump();
-            let mut names = vec![self.ident()?];
+            let mut pats = vec![self.pat()?];
             while self.peek() == Some(&Tok::Comma) {
                 self.bump();
-                names.push(self.ident()?);
+                pats.push(self.pat()?);
             }
             self.eat(&Tok::RParen)?;
-            Ok(Pat::Tuple(names))
+            Ok(Pat::Tuple(pats))
         } else {
-            Ok(Pat::Name(self.ident()?))
+            let name = self.ident()?;
+            Ok(if name == "_" { Pat::Wild } else { Pat::Name(name) })
         }
     }
 
@@ -347,17 +481,22 @@ impl P {
         Ok(e)
     }
 
-    /// whether the next token can begin a pipe stage — a string constant, or any identifier other
-    /// than the chain-terminating `in`.
+    /// whether the next token can begin a pipe stage — a string constant, a `.N` projection, or
+    /// any identifier other than the chain-terminating `in`.
     fn starts_apply(&self) -> bool {
         match self.peek() {
-            Some(Tok::Str(_)) => true,
+            Some(Tok::Str(_)) | Some(Tok::Dot) => true,
             Some(Tok::Ident(k)) => k != "in",
             _ => false,
         }
     }
 
     fn apply(&mut self) -> Result<Apply, String> {
+        // `.N` after any value projects field N.
+        if let Some(Tok::Dot) = self.peek() {
+            self.bump();
+            return Ok(Apply::Op("field".into(), Some(self.num()?)));
+        }
         // a string literal as a stage is a constant, like `lit`: broadcast to the value.
         if let Some(Tok::Str(_)) = self.peek() {
             let Some(Tok::Str(bytes)) = self.bump() else { unreachable!() };
@@ -486,7 +625,18 @@ impl P {
                 self.eat(&Tok::RParen)?;
                 Ok(if es.len() == 1 { es.pop().unwrap() } else { E::Tuple(es) })
             }
-            Some(Tok::Ident(_)) => Ok(E::Var(self.ident()?)),
+            Some(Tok::Ident(_)) => {
+                let at = self.at(self.i);
+                Ok(E::Var(self.ident()?, at))
+            }
+            Some(Tok::Lit(_)) => {
+                let Some(Tok::Lit(v)) = self.bump() else { unreachable!() };
+                Ok(E::Lit(v))
+            }
+            Some(Tok::Str(_)) => {
+                let Some(Tok::Str(bytes)) = self.bump() else { unreachable!() };
+                Ok(E::Lit(str_value(bytes)))
+            }
             other => Err(format!("expected an expression, found {other:?}")),
         }
     }
@@ -496,17 +646,22 @@ impl P {
 
 type Env = HashMap<String, usize>;
 
-/// bind a pattern to a node: a name binds the node itself; a tuple pattern binds each name to a
-/// `Field` projection of it.
+/// The environment key of the scope's input, which constants are filled to the length of. It
+/// can't collide with a name: identifiers never contain a space.
+const ROOT: &str = " root";
+
+/// bind a pattern to a node: a name binds the node itself, `_` binds nothing, and a tuple pattern
+/// binds each sub-pattern to a `Field` projection of it.
 fn bind(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
     match pat {
         Pat::Name(x) => {
             env.insert(x.clone(), id);
         }
-        Pat::Tuple(names) => {
-            for (i, name) in names.iter().enumerate() {
+        Pat::Wild => {}
+        Pat::Tuple(pats) => {
+            for (i, sub) in pats.iter().enumerate() {
                 let fid = b.add(Op::Field(i), vec![id]);
-                env.insert(name.clone(), fid);
+                bind(sub, fid, env, b);
             }
         }
     }
@@ -517,6 +672,7 @@ fn lower_body(pat: &Pat, body: &E) -> Result<Graph<NumOp>, String> {
     let mut bb = Builder::default();
     let bin = bb.input();
     let mut benv = Env::new();
+    benv.insert(ROOT.to_string(), bin);
     bind(pat, bin, &mut benv, &mut bb);
     let bout = lower(body, &benv, &mut bb)?;
     Ok(bb.finish(bout))
@@ -533,7 +689,10 @@ fn dup_output(mut g: Graph<NumOp>) -> Graph<NumOp> {
 
 fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
     match e {
-        E::Var(name) => env.get(name).copied().ok_or_else(|| format!("unbound variable '{name}'")),
+        E::Var(name, at) => env.get(name).copied().ok_or_else(|| format!("{at}: unbound variable '{name}'")),
+        // A body is closed, so every value in it has the length of the body's input: filling a
+        // constant to that length is always right.
+        E::Lit(v) => Ok(b.add(Op::Lit(v.clone()), vec![env[ROOT]])),
         E::Tuple(es) => {
             let ids = es.iter().map(|x| lower(x, env, b)).collect::<Result<Vec<_>, _>>()?;
             Ok(b.tuple(ids))
@@ -597,16 +756,25 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
 
 /// parse an ML-flavoured expression into a `Graph` (with `input` bound to the root).
 pub fn parse_ml(src: &str) -> Result<Graph<NumOp>, String> {
-    let toks = lex(src)?;
-    let mut p = P { toks, i: 0, variants: HashMap::new(), enums: HashMap::new() };
-    let e = p.expr()?;
+    let (toks, starts) = lex(src)?;
+    let mut p = P {
+        toks,
+        i: 0,
+        src: src.chars().collect(),
+        starts,
+        seen: std::cell::Cell::new(0),
+        variants: HashMap::new(),
+        enums: HashMap::new(),
+    };
+    let e = p.expr().map_err(|e| format!("{}: {e}", p.at(p.seen.get())))?;
     if p.i != p.toks.len() {
-        return Err(format!("trailing tokens from index {}", p.i));
+        return Err(format!("{}: unexpected {:?}", p.at(p.i), p.toks[p.i]));
     }
     let mut b = Builder::default();
     let input = b.input();
     let mut env = Env::new();
     env.insert("input".to_string(), input);
+    env.insert(ROOT.to_string(), input);
     let out = lower(&e, &env, &mut b)?;
     Ok(b.finish(out))
 }

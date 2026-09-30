@@ -160,3 +160,126 @@ fn head_sugar_is_a_failop() {
     assert_eq!(run_ml("input add_u64 1 iota head", &u64(&[3])), "Sum tags=[0] [[0], ()x0]");
     assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[1] [[], ()x1]");
 }
+
+#[test]
+fn typed_literals_are_expressions() {
+    // A suffixed constant is an expression, filled to the length of its scope's input: here the
+    // map body's, so it needs no anchor.
+    assert_eq!(run_ml("input iota map (x -> (x, 100u64) add)", &u64(&[3])), "List ends=[3] <[100, 101, 102]>");
+    // The suffix picks the encoding, so signed and float constants compare and compute correctly.
+    assert_eq!(run_ml("((-3i64, 5i64) lt, (5i64, -3i64) lt)", &u64(&[0])), "([1], [0])");
+    assert_eq!(run_ml("((-3i64, 5i64) add_i64, 2i64) eq", &u64(&[0])), "[1]");
+    assert_eq!(run_ml("((0.5f64, 0.25f64) add_f64, 0.75f64) eq", &u64(&[0])), "[1]");
+    assert_eq!(run_ml("((1.5e2f32, 2f32) div_f32, 75f32) eq", &u64(&[0])), "[1]");
+    assert_eq!(run_ml("(255u8, 65535u16, 7u32)", &u64(&[0])), "([255], [65535], [7])");
+    // A string is an expression too.
+    assert_eq!(run_ml("(\"hi\", input) .0", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
+}
+
+#[test]
+fn typed_literals_are_checked() {
+    let err = |src: &str| parse_ml(src).err().unwrap_or_else(|| panic!("{src} parsed"));
+    assert!(err("(input, 256u8) add").contains("does not fit"), "{}", err("256u8"));
+    assert!(err("(input, -1u64) add").contains("does not fit"));
+    assert!(err("(input, 128i8) add").contains("does not fit"));
+    assert!(err("(input, -3) add").contains("needs a type suffix"));
+    assert!(err("(input, 1.5u64) add").contains("needs an f32 or f64 suffix"));
+    assert!(err("(input, 5q8) add").contains("unknown literal suffix"));
+    // Without a float suffix, `x.0.1` is still two projections.
+    assert_eq!(run_ml("((input, (input, 7u64)), input).0.1.1", &u64(&[0])), "[7]");
+}
+
+#[test]
+fn nested_patterns_and_wildcards() {
+    let src = "let ((a, _), b) = ((input, (input, 1u64) add), (input, 10u64) add) in (a, b) add";
+    assert_eq!(run_ml(src, &u64(&[5])), "[20]");
+    let src = "input iota map (x -> ((x, x), x)) map (((a, _), c) -> (a, c) mul)";
+    assert_eq!(run_ml(src, &u64(&[4])), "List ends=[4] <[0, 1, 4, 9]>");
+}
+
+#[test]
+fn projection_after_any_stage() {
+    // `flatten` returns (ranges, values); `.1` after the stage takes the values.
+    assert_eq!(run_ml("input iota map (x -> x iota) flatten .1", &u64(&[4])), "List ends=[6] <[0, 0, 1, 0, 1, 2]>");
+}
+
+#[test]
+fn comments_and_error_positions() {
+    let src = "# the identity\ninput # stays as it is\n";
+    assert_eq!(run_ml(src, &u64(&[3])), "[3]");
+    let err = parse_ml("let x = input in\n  (x, y) add").err().unwrap();
+    assert!(err.starts_with("2:7: unbound variable 'y'"), "{err}");
+    let err = parse_ml("input\n  map (x ->").err().unwrap();
+    assert!(err.starts_with("2:"), "{err}");
+    let err = parse_ml("input ?").err().unwrap();
+    assert!(err.starts_with("1:7: unexpected character"), "{err}");
+}
+
+/// Jaro-Winkler over bytes, written plainly: the reference the two example programs must match
+/// bit for bit (it follows `strsim::jaro_winkler`, which agrees with it on ASCII).
+fn jaro_winkler_reference(a: &[u8], b: &[u8]) -> f64 {
+    let (la, lb) = (a.len(), b.len());
+    if la == 0 && lb == 0 {
+        return 1.0;
+    }
+    if la == 0 || lb == 0 {
+        return 0.0;
+    }
+    let d = (la.max(lb) / 2).saturating_sub(1);
+    let (mut fa, mut fb) = (vec![false; la], vec![false; lb]);
+    let mut m = 0usize;
+    for i in 0..la {
+        for j in i.saturating_sub(d)..lb.min(i + d + 1) {
+            if a[i] == b[j] && !fb[j] {
+                fa[i] = true;
+                fb[j] = true;
+                m += 1;
+                break;
+            }
+        }
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    let mut bs = (0..lb).filter(|&j| fb[j]);
+    let t = (0..la).filter(|&i| fa[i]).filter(|&i| a[i] != b[bs.next().unwrap()]).count() / 2;
+    let sim = ((m as f64 / la as f64) + (m as f64 / lb as f64) + ((m - t) as f64 / m as f64)) / 3.0;
+    if sim > 0.7 {
+        let p = a.iter().take(4).zip(b).take_while(|(x, y)| x == y).count();
+        sim + 0.1 * p as f64 * (1.0 - sim)
+    } else {
+        sim
+    }
+}
+
+#[test]
+fn jaro_winkler_examples_match_the_reference() {
+    // Short strings over five letters, so matches, transpositions and prefixes are all common.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut string = move || (0..next() % 16).map(|_| b'a' + (next() % 5) as u8).collect::<Vec<u8>>();
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = [("MARTHA", "MARHTA"), ("DIXON", "DICKSONX"), ("", ""), ("abc", "")]
+        .iter()
+        .map(|(a, b)| (a.as_bytes().to_vec(), b.as_bytes().to_vec()))
+        .collect();
+    pairs.extend((0..2000).map(|_| (string(), string())));
+    let column = |xs: Vec<&Vec<u8>>| {
+        let ends: Vec<usize> = xs.iter().scan(0, |e, x| { *e += x.len(); Some(*e) }).collect();
+        Value::List(ends.into(), Box::new(Value::u8(xs.into_iter().flatten().copied().collect())))
+    };
+    let input = Value::Prod(vec![column(pairs.iter().map(|p| &p.0).collect()), column(pairs.iter().map(|p| &p.1).collect())]);
+    let decode = |u: u64| f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u });
+    for src in [include_str!("../examples/jaro_winkler/direct.col"), include_str!("../examples/jaro_winkler/by_byte.col")] {
+        let p = Program::compile_ml(src).expect("parse error");
+        assert!(p.is_total());
+        let out = p.run(input.clone()).unwrap().into_u64("similarity").unwrap();
+        for ((a, b), u) in pairs.iter().zip(out) {
+            assert_eq!(decode(u).to_bits(), jaro_winkler_reference(a, b).to_bits(), "{a:?} {b:?}");
+        }
+    }
+}
