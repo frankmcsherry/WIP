@@ -27,66 +27,89 @@ struct Schedule {
     groups: Vec<(usize, usize)>,
     /// how many groups (from the front) still have rows running.
     pending: usize,
-    /// rank -> flat position of that row's next element, for the running ranks: its length is the
-    /// running count.
+    /// rank -> flat position of that row's element for the current round, for the running ranks:
+    /// its length is the running count.
     next: Vec<usize>,
 }
 
 impl Schedule {
     fn new(bounds: &Bounds) -> Schedule {
-        let rows = bounds.len();
-        // uniform rows: identity order, one group.
-        if let Some(k) = bounds.strided() {
+        let (ends, stride) = match bounds {
+            Bounds::Stride(k, rows) => (&[][..], Some((*k, *rows))),
+            Bounds::Offsets(ends) => (&ends[..], Bounds::uniform(ends).map(|k| (k, ends.len()))),
+        };
+        // uniform rows (however stored): identity order, one group.
+        if let Some((k, rows)) = stride {
             let groups = if k > 0 && rows > 0 { vec![(k, rows)] } else { Vec::new() };
             let next = if k > 0 { (0..rows).map(|r| r * k).collect() } else { Vec::new() };
             return Schedule { rows, order: None, pending: groups.len(), groups, next };
         }
-        let lens: Vec<usize> = (0..rows).map(|r| { let (s, e) = bounds.span(r); e - s }).collect();
-        // already longest first (uniform lengths stored as offsets, among others): no permutation.
-        let order = if lens.windows(2).all(|w| w[0] >= w[1]) {
-            None
-        } else {
-            let max = lens.iter().copied().max().unwrap_or(0);
-            Some(if max <= 4 * rows {
-                // a counting sort on length, longest first: one pass to count, one to place.
-                let mut at = vec![0usize; max + 1];
-                for &l in &lens {
-                    at[l] += 1;
+        let rows = ends.len();
+        let start = |r: usize| if r == 0 { 0 } else { ends[r - 1] };
+        let mut lens = Vec::with_capacity(rows);
+        lens.extend(ends.first());
+        lens.extend(ends.windows(2).map(|w| w[1] - w[0]));
+        // already longest first (uniform lengths stored as offsets, among others): no permutation,
+        // the groups are runs of equal lengths, and the positions are the row starts.
+        if lens.windows(2).all(|w| w[0] >= w[1]) {
+            let mut groups: Vec<(usize, usize)> = Vec::new();
+            for &l in lens.iter().take_while(|&&l| l > 0) {
+                match groups.last_mut() {
+                    Some((len, count)) if *len == l => *count += 1,
+                    _ => groups.push((l, 1)),
                 }
-                let mut acc = 0;
-                for l in (0..=max).rev() {
-                    let c = at[l];
-                    at[l] = acc;
-                    acc += c;
-                }
-                let mut order = vec![0usize; rows];
-                for (r, &l) in lens.iter().enumerate() {
-                    order[at[l]] = r;
-                    at[l] += 1;
-                }
-                order
-            } else {
-                // a few very long rows: a bucket per length would outweigh the rows, so sort them.
-                let mut order: Vec<usize> = (0..rows).collect();
-                order.sort_by_key(|&r| std::cmp::Reverse(lens[r]));
-                order
-            })
-        };
-        let row = |q: usize| order.as_ref().map_or(q, |o| o[q]);
-        let mut groups: Vec<(usize, usize)> = Vec::new();
-        let mut next = Vec::with_capacity(rows);
-        for q in 0..rows {
-            let r = row(q);
-            if lens[r] == 0 {
-                break; // the rows with no elements come last
             }
-            match groups.last_mut() {
-                Some((len, count)) if *len == lens[r] => *count += 1,
-                _ => groups.push((lens[r], 1)),
-            }
-            next.push(bounds.span(r).0);
+            let running: usize = groups.iter().map(|g| g.1).sum();
+            let next = (0..running).map(start).collect();
+            return Schedule { rows, order: None, pending: groups.len(), groups, next };
         }
-        Schedule { rows, order, pending: groups.len(), groups, next }
+        let max = lens.iter().copied().max().unwrap_or(0);
+        if max > 4 * rows {
+            // a few very long rows: a bucket per length would outweigh the rows, so sort them.
+            let mut order: Vec<usize> = (0..rows).collect();
+            order.sort_by_key(|&r| std::cmp::Reverse(lens[r]));
+            let mut groups: Vec<(usize, usize)> = Vec::new();
+            let mut next = Vec::with_capacity(rows);
+            for &r in order.iter().take_while(|&&r| lens[r] > 0) {
+                match groups.last_mut() {
+                    Some((len, count)) if *len == lens[r] => *count += 1,
+                    _ => groups.push((lens[r], 1)),
+                }
+                next.push(start(r));
+            }
+            return Schedule { rows, order: Some(order), pending: groups.len(), groups, next };
+        }
+        // a counting sort on length, longest first. The counts are the groups; the pass that
+        // places each row at its rank also records where its elements start.
+        let mut at = vec![0usize; max + 1];
+        for &l in &lens {
+            at[l] += 1;
+        }
+        let groups: Vec<(usize, usize)> = (1..=max).rev().filter(|&l| at[l] > 0).map(|l| (l, at[l])).collect();
+        let running = rows - at[0];
+        let mut acc = 0;
+        for l in (0..=max).rev() {
+            let c = at[l];
+            at[l] = acc;
+            acc += c;
+        }
+        let (mut order, mut next) = (vec![0usize; rows], vec![0usize; running]);
+        let mut s = 0;
+        for (r, &l) in lens.iter().enumerate() {
+            let q = at[l];
+            at[l] += 1;
+            order[q] = r;
+            if l > 0 {
+                next[q] = s;
+            }
+            s += l;
+        }
+        Schedule { rows, order: Some(order), pending: groups.len(), groups, next }
+    }
+
+    /// this round's elements for the running rows, in rank order.
+    fn elements(&self, vals: &Value) -> Value {
+        gather(vals, &self.next)
     }
 
     /// the rows still running.
@@ -115,8 +138,9 @@ impl Schedule {
     }
 
     /// the bookkeeping after round `t`: the rows whose last element that was (length `t + 1`) are
-    /// the tail of `acc` — split them off into `done` — and the survivors step to their next
-    /// element. Returns whether any row is still running.
+    /// the tail of `acc`, so split them off into `done`; the others step to their next element.
+    /// Returns whether any row is still running. (Stepping is its own pass: fusing it into the
+    /// element gather measured slower at 100k rows.)
     fn finish_round(&mut self, t: usize, acc: &mut Value, done: &mut Vec<Value>) -> bool {
         if self.pending > 0 && self.groups[self.pending - 1].0 == t + 1 {
             self.pending -= 1;
@@ -132,15 +156,27 @@ impl Schedule {
 
     /// the final values in row order, from what the rounds split off: `done[i]` holds (in rank
     /// order) the rows of the `i`-th shortest length, and `empty` the rows with no elements (see
-    /// `split_seed`). One `gather_lanes` — or none, when one piece holds every row in order.
+    /// `split_seed`). Nothing to do when one piece holds every row in order. A fixed-width state
+    /// whose seed was kept whole writes each piece into the seed at its rows; any other takes one
+    /// `gather_lanes` over the pieces.
     fn assemble(&self, empty: (Value, usize), done: Vec<Value>) -> Value {
-        let (empty, base) = empty;
+        let (mut empty, base) = empty;
         if self.order.is_none() && empty.is_empty() && done.len() == 1 {
             return done.into_iter().next().unwrap();
         }
+        // groups are longest first and `done` shortest first.
+        let piece = |g: usize| &done[done.len() - 1 - g];
+        if let (Some(order), true) = (&self.order, fixed_width(&empty)) {
+            let mut q = 0;
+            for (g, &(_, count)) in self.groups.iter().enumerate() {
+                write_rows(&mut empty, &order[q..q + count], piece(g));
+                q += count;
+            }
+            return empty;
+        }
         let (mut tags, mut off) = (vec![0usize; self.rows], vec![0usize; self.rows]);
         let mut q = 0;
-        // groups are longest first and `done` shortest first; source 0 is `empty`.
+        // source 0 is `empty`, source 1 + i is `done[i]`.
         for (g, &(_, count)) in self.groups.iter().enumerate() {
             let src = done.len() - g;
             for i in 0..count {
@@ -161,7 +197,7 @@ impl Schedule {
 
     /// a `FoldScan`'s output values in the list's own order, from the per-round outputs:
     /// `chunks[t]` holds round `t`'s outputs in rank order, so row `r`'s `t`-th output is row
-    /// `rank(r)` of chunk `t`.
+    /// `rank(r)` of chunk `t`. (Fixed-width outputs skip this: see `FoldScan`.)
     fn stitch(&self, bounds: &Bounds, chunks: Vec<Value>) -> Value {
         if self.order.is_none() && chunks.len() == 1 {
             return chunks.into_iter().next().unwrap(); // every row has at most one element
@@ -183,6 +219,31 @@ impl Schedule {
         }
         let srcs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
         gather_lanes(&srcs, &tags, &off)
+    }
+}
+
+/// every row a constant-size slot: a leaf, a unit, or a product of those. Such a column can be
+/// written row by row in place (`write_rows`); a `List`, `Sum` or `Ref` row cannot.
+fn fixed_width(v: &Value) -> bool {
+    match v {
+        Value::Prim(_) | Value::Unit(_) => true,
+        Value::Prod(fields) => fields.iter().all(fixed_width),
+        Value::List(..) | Value::Sum(..) | Value::Ref(..) => false,
+    }
+}
+
+/// overwrite `dst`'s rows `pos[i]` with `src`'s rows `i`, in place (a shared buffer is copied
+/// once). Both fixed-width, of one shape.
+fn write_rows(dst: &mut Value, pos: &[usize], src: &Value) {
+    match (dst, src) {
+        (Value::Prim(d), Value::Prim(s)) => d.scatter_into(pos, s),
+        (Value::Prod(ds), Value::Prod(ss)) => {
+            for (d, s) in ds.iter_mut().zip(ss) {
+                write_rows(d, pos, s);
+            }
+        }
+        (Value::Unit(_), Value::Unit(_)) => {}
+        _ => unreachable!("write_rows: fixed-width columns of one shape"),
     }
 }
 
@@ -698,7 +759,7 @@ impl<L: OpLike> Op<L> {
                 let mut done = Vec::new();
                 for t in 0.. {
                     let running = sched.running();
-                    let elt = gather(&vals, &sched.next);
+                    let elt = sched.elements(&vals);
                     acc = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
                     if t == 0 {
                         check(&acc)?;
@@ -732,24 +793,33 @@ impl<L: OpLike> Op<L> {
                 }
                 let mut sched = Schedule::new(&bounds);
                 let (mut acc, empty) = sched.split_seed(seed);
-                let (mut done, mut chunks) = (Vec::new(), Vec::new());
+                // a fixed-width output is written straight to its place in the output list: round
+                // t's output for a running row goes where that row's round-t element is. Any other
+                // output is kept per round and stitched at the end.
+                let (mut done, mut chunks, mut out) = (Vec::new(), Vec::new(), None);
                 for t in 0.. {
                     let running = sched.running();
-                    let elt = gather(&vals, &sched.next);
+                    let elt = sched.elements(&vals);
                     let (state, r) =
                         try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
                     if t == 0 {
                         check(&state)?;
+                        if fixed_width(&r) {
+                            out = Some(fill(&gather(&r, &[0]), vals.len()));
+                        }
                     }
                     assert_eq!(state.len(), running, "FoldScan body changed the row count");
                     assert_eq!(r.len(), running, "FoldScan body changed the row count");
                     acc = state;
-                    chunks.push(r);
+                    match &mut out {
+                        Some(out) => write_rows(out, &sched.next, &r),
+                        None => chunks.push(r),
+                    }
                     if !sched.finish_round(t, &mut acc, &mut done) {
                         break;
                     }
                 }
-                let out_vals = sched.stitch(&bounds, chunks);
+                let out_vals = out.unwrap_or_else(|| sched.stitch(&bounds, chunks));
                 Value::Prod(vec![sched.assemble(empty, done), Value::List(bounds, Box::new(out_vals))])
             }
 

@@ -152,7 +152,7 @@ impl Bounds {
     }
 
     /// the uniform stride of `ends`, if the partition is uniform (`ends[i] == (i+1)*k`).
-    fn uniform(ends: &[usize]) -> Option<usize> {
+    pub(crate) fn uniform(ends: &[usize]) -> Option<usize> {
         let &last = ends.last()?;
         let n = ends.len();
         if last % n != 0 {
@@ -636,6 +636,18 @@ macro_rules! prim {
                             Arc::new(v.iter().map(|&x| x ^ m).collect())
                         })
                     } )+
+                }
+            }
+
+            /// overwrite rows `pos[i]` of `self` with `src`'s row `i`, in place: `make_mut` gives the
+            /// buffer mutably when uniquely owned (the common case), or copies it once if shared.
+            pub(crate) fn scatter_into(&mut self, pos: &[usize], src: &Prim) {
+                match (self, src) {
+                    $( (Prim::$V(dst), Prim::$V(s)) => {
+                        let dst = Arc::make_mut(dst);
+                        for (&p, &x) in pos.iter().zip(s.iter()) { dst[p] = x; }
+                    } )+
+                    _ => panic!("scatter_into: prim width mismatch"),
                 }
             }
 
