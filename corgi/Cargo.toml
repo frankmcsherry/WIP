@@ -37,3 +37,7 @@ harness = false   # ClickBench queries in corgi, checked against DuckDB's answer
 name = "tpch"
 path = "benches/tpch/main.rs"
 harness = false   # TPC-H queries (joins) in corgi, checked against DuckDB's answers (see prepare.py)
+
+[[bench]]
+name = "fold"
+harness = false   # Fold/FoldScan per-element cost across row-length regimes, plus Jaro-Winkler
