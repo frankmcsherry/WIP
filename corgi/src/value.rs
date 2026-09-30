@@ -346,8 +346,10 @@ impl Tags {
                 let tail = match (0..lens.len()).find(|&l| lens[l] - keep[l] == n - c) {
                     Some(l) => Tags::Const(l, n - c),
                     None => {
-                        for (i, o) in Arc::make_mut(&mut tail_offsets).iter_mut().enumerate() {
-                            *o -= keep[tail_tags.usize_at(i)];
+                        if keep.iter().any(|&k| k > 0) {
+                            for (i, o) in Arc::make_mut(&mut tail_offsets).iter_mut().enumerate() {
+                                *o -= keep[tail_tags.usize_at(i)];
+                            }
                         }
                         Tags::Column(tail_tags, tail_offsets)
                     }

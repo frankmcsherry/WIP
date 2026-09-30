@@ -244,32 +244,46 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
   *Reuse policy:* an op that is elementwise AND same-width (`Shr`/`And`, `bin_into`, `neg_into`,
-  `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
+  `lane_pick`, `xor_signbit`) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
   fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, `cast` = re-width, `rel`/`cmp_idx`/
   the sort's pulled keys = a differently-typed result) allocate *by necessity*, not oversight — the access pattern
   or output type rules reuse out. (Cross-op intermediate elimination is the separate DPS backlog item.)
-- **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
-  sequential *within* a row but vectorized *across* rows: round `t` folds in every still-active row's
-  `t`-th element in one body call, so `#rounds = the longest row`, not the element count. The active
-  set is maintained incrementally (`init_active` + per-round `retain(len > t)`), so per-round cost
-  tracks the *active* rows — total work `O(total elements)`, asymptotically optimal (each element
-  touched a constant number of times). The accumulator is scattered back **in place** for fixed-width
-  `B` (a leaf or product of leaves); a `List`/`Sum` `B` falls back to the `gather_lanes` rebuild.
+  `Fold`/`FoldScan` keep their accumulator owned from round to round (the finished rows are split off
+  its tail with `Value::split_off`, which truncates in place), so the body's elementwise ops keep
+  writing into one buffer.
+- **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`, in length-ordered rounds.** A general
+  (non-associative) fold is sequential *within* a row but vectorized *across* rows: round `t` folds in
+  every still-running row's `t`-th element in one body call, so `#rounds = the longest row`, not the
+  element count. Each fold first ranks its rows by length, longest first (a stable counting sort;
+  none when lengths are already non-increasing, which covers every uniform list), so the rows running
+  at round `t` are always a PREFIX of the ranks. The body's output is then the next round's
+  accumulator as it stands: the rows that just finished are its tail, split off once
+  (`Value::split_off`) — no per-round accumulator gather, no scatter, no work list, and a `List`/
+  `Sum`/`Ref` state is only ever touched for running rows. Each round's elements are one gather
+  through a per-rank position column that steps by one (laying the elements out round by round once
+  and copying each round's run measured no faster: a leaf column can't be a view). At the end the
+  finished pieces go back to row order: written into the seed column for a fixed-width state, one
+  `gather_lanes` otherwise, nothing when one piece already holds every row in order (uniform rows).
+  A fixed-width `FoldScan` output is written each round straight to its place in the output list
+  (round `t`'s output for a row goes where its `t`-th element is); others are kept per round and
+  stitched. `tests/fold.rs` checks both ops against a per-row loop on ragged inputs of every state
+  shape; `benches/fold.rs` times them.
 - **`FoldScan` (mapAccumL) is the scan kernel; `Fold` is its R=Unit specialization, kept for cost.**
   `FoldScan : (T,List<A>)->(T,List<R>)` by `(T,A)->(T,R)` threads a state and emits an output stream;
   `scan` lowers to it (body `(a,x)->(b,b)`, take field 1) — measured identical to a dedicated scan.
   `Fold` does NOT lower to it: `FoldScan` with `R=Unit, .0` measured ~3.4x slower, because the body is
   forced to emit a `(state, output)` PAIR each round (extra `Prod` build/teardown + it breaks the
-  body's in-place accumulator mutation) and the lockstep records output positions even for a dead
-  `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
-  the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
+  body's in-place accumulator mutation) and the lockstep then recorded output positions even for a
+  dead `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold`
+  is the no-pair/no-recording path. (Measured before the length-ordered rounds, which dropped the
+  recording for fixed-width outputs, `Unit` among them; see the fold section above.) (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. The
-  all-active fast path (move `acc` through the body, skip the identity acc-gather + scatter) is built,
-  but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
-  all ragged input, take the general per-round gather and scatter.
+  uniform-length regime (every row running every round) needs no path of its own: it is the
+  identity-order, one-group case of the length-ordered rounds, and it replaced the separate strided
+  path that used to serve it.
 
 ## Failure as data, threaded by a rewrite
 
@@ -364,7 +378,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   use) — that's reuse *discovered* at runtime; DPS makes it *intentional* (explicit destination →
   guaranteed in-place, AND it threads through a chain, which is what unlocks fusion; per-op reuse
   already works, so the new value is specifically cross-op intermediate elimination). The `None`
-  destination = "output is dead" idiom collapses `FoldScan -> Fold` (skip the tags/off recording + DCE
+  destination = "output is dead" idiom collapses `FoldScan -> Fold` (skip the output writes + DCE
   the dead output), which would retire `Op::Fold` the way `Op::Scan` was retired. THE fork to settle
   first is the ownership model: a true destination can't be a shared `Arc`, so DPS pressures the hot
   spine toward a linear/owned tile buffer (giving up free `Arc`-clone fan-out there) vs staying

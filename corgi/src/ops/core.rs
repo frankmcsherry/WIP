@@ -145,7 +145,8 @@ impl Schedule {
         if self.pending > 0 && self.groups[self.pending - 1].0 == t + 1 {
             self.pending -= 1;
             let alive = self.running() - self.groups[self.pending].1;
-            done.push(acc.split_off(alive));
+            // the last rows to finish take the whole accumulator, and the rounds are over.
+            done.push(if alive == 0 { std::mem::replace(acc, Value::Unit(0)) } else { acc.split_off(alive) });
             self.next.truncate(alive);
         }
         for p in self.next.iter_mut() {
@@ -773,8 +774,7 @@ impl<L: OpLike> Op<L> {
             }
 
             // mapAccumL: the body returns a PAIR (new state, output R). The state is threaded as in
-            // `Fold`; round t's outputs (in rank order) are kept whole and stitched into the output
-            // list at the end. Returns (final state, [R]).
+            // `Fold`; each round's outputs go into the output list (below). Returns (final state, [R]).
             Op::FoldScan(body) => {
                 let (seed, list) = input.into_pair("FoldScan")?;
                 let (bounds, vals) = list.into_list("FoldScan list")?;
