@@ -20,7 +20,7 @@ pub enum Shape {
     Sum(Vec<Shape>), // one shape per variant lane (a lane no row carries is an empty column of it)
     List(Box<Shape>),
     Unit, // the length-carrying unit (payload-free); `None` of `Option = Sum{Unit | T}`.
-    Ref(Box<Shape>), // referenced list rows `&[T]` (shown `Ref<List<T>>`); holds the ELEMENT shape `T`
+    Ref(Box<Shape>), // references to rows of the named shape; today only `Ref<List<T>>` (`&[T]`), made by `ref`
 }
 
 /// the one shape two merging operands must share: their common shape, or the type error.
@@ -36,7 +36,7 @@ pub fn shape_of_value(v: &Value) -> Shape {
         Value::Sum(_, variants) => Shape::Sum(variants.iter().map(shape_of_value).collect()),
         Value::List(_, vals) => Shape::List(Box::new(shape_of_value(vals))),
         Value::Unit(_) => Shape::Unit,
-        Value::Ref(payload, _) => Shape::Ref(Box::new(shape_of_value(payload))),
+        Value::Ref(payload, _) => Shape::Ref(Box::new(Shape::List(Box::new(shape_of_value(payload))))),
     }
 }
 
@@ -54,7 +54,7 @@ impl std::fmt::Display for Shape {
             }
             Shape::List(t) => write!(f, "List<{t}>"),
             Shape::Unit => write!(f, "()"),
-            Shape::Ref(t) => write!(f, "Ref<List<{t}>>"),
+            Shape::Ref(t) => write!(f, "Ref<{t}>"),
         }
     }
 }

@@ -71,8 +71,9 @@ fn order_reads_through_references() {
     assert!(matches!(&**inner, Value::Ref(..)), "sorting references moves references");
 }
 
-/// merging reference columns over ONE arena moves spans only; over distinct arenas each arena is
-/// laid down once (never once per reference), and either way the rows are the rows.
+/// merging reference columns over ONE arena moves spans only; over distinct arenas each arena
+/// contributes the union of its picked spans, once (never once per reference, never its dead
+/// elements), and either way the rows are the rows.
 #[test]
 fn merges_keep_references() {
     use corgi::arrange::gather_lanes;
@@ -86,11 +87,11 @@ fn merges_keep_references() {
     assert!(Arc::ptr_eq(p, &arena), "one arena: spans only");
     assert_eq!(**spans, vec![(2, 4), (1, 2), (0, 4)]);
 
-    let other = Arc::new(Value::u64(vec![9, 8]));
+    let other = Arc::new(Value::u64(vec![9, 8, 7, 6, 5]));
     let c = Value::Ref(other, Arc::new(vec![(0, 2), (0, 2), (1, 2)]));
     let merged = gather_lanes(&[Some(&a), Some(&c)], &[1, 0, 1, 0, 1], &[0, 0, 1, 1, 2]);
     let Value::Ref(p, _) = &merged else { panic!() };
-    assert_eq!(p.len(), 6, "two arenas, each laid down once");
+    assert_eq!(p.len(), 6, "a's [0, 4) and c's [0, 2), each once; c's unreferenced [2, 5) left behind");
     let expect = Value::List(vec![2, 6, 8, 9, 10].into(), Box::new(Value::u64(vec![9, 8, 1, 2, 3, 4, 9, 8, 2, 8])));
     assert_eq!(run("input clone", merged), expect);
 }
@@ -267,4 +268,22 @@ fn wco_step_searches_through_references() {
         show(&a),
         "Sum tags=[0, 0, 0, 0] [List ends=[2, 4, 6, 8] <([3, 9, 0, 5, 5, 9, 0, 10], [4, 10, 1, 6, 6, 10, 1, 10])>, ()x0]"
     );
+}
+
+/// a fold whose state is rebuilt as a fresh reference every round, over ragged rows (lengths 1 and
+/// n): each round merges the finished row's state with the running row's new one, over distinct
+/// arenas. The merge keeps only the rows still referenced, so the state's arena holds the live
+/// rows — O(n) total, as by value — rather than accumulating every round's arena (O(n²)).
+#[test]
+fn fold_state_across_arenas_holds_only_live_rows() {
+    let n = 2000;
+    let seed = Value::List(vec![1, 2].into(), Box::new(Value::u64(vec![0, 0])));
+    let xs = Value::List(vec![1, 1 + n].into(), Box::new(Value::u64(vec![3; 1 + n])));
+    let out = run(
+        "let (s, xs) = input in (s ref, xs) fold ((acc, x) -> x iota ref)",
+        Value::Prod(vec![seed, xs]),
+    );
+    let Value::Ref(payload, _) = &out else { panic!("the fold's state is still a reference") };
+    assert!(payload.len() <= 6, "the state's arena holds {} elements for 2 rows of 3", payload.len());
+    assert_eq!(show(&run("input clone", out)), "List ends=[3, 6] <[0, 1, 2, 0, 1, 2]>");
 }

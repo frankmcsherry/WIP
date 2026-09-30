@@ -32,7 +32,7 @@ pub enum Value {
 /// span-aware readers (`Get`/`Gather`/`Find`/`Slices`/`Len`) take this via `rows_of`; every other
 /// op takes `into_list`, which only accepts a `List` — a Ref is the shape error "clone first".
 #[derive(Clone, Copy)]
-pub enum Rows<'a> {
+pub(crate) enum Rows<'a> {
     Part(&'a Bounds),
     Spans(&'a [(usize, usize)]),
 }
@@ -705,7 +705,10 @@ impl Value {
             }
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
-            Shape::Ref(s) => Value::Ref(Arc::new(Value::empty(s)), Arc::new(Vec::new())),
+            Shape::Ref(s) => match &**s {
+                Shape::List(t) => Value::Ref(Arc::new(Value::empty(t)), Arc::new(Vec::new())),
+                other => panic!("Value::empty: Ref<{other}> — only list rows are referenced"),
+            },
         }
     }
 
@@ -759,7 +762,7 @@ impl Value {
     /// a haystack's rows over its payload: a `List` (partition) or a `Ref` (spans of the shared
     /// payload), for the readers that address rows through `span(i)` and never need the payload to
     /// be exactly the rows. Borrowed: every reader only indexes the payload.
-    pub fn rows_of(&self, who: &str) -> Result<(Rows<'_>, &Value), String> {
+    pub(crate) fn rows_of(&self, who: &str) -> Result<(Rows<'_>, &Value), String> {
         match self {
             Value::List(bounds, vals) => Ok((Rows::Part(bounds), vals)),
             Value::Ref(payload, spans) => Ok((Rows::Spans(spans), payload)),

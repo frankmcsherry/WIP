@@ -290,10 +290,13 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
-        // pick spans, never elements. Sources over ONE arena (by pointer) merge refs-only — the case
-        // of a loop state or a branch that keeps what it was handed. Distinct arenas are laid end to
-        // end once and the spans rebased: each arena is copied once, never once per reference. (An
-        // empty source names no rows, so its arena — often a fresh `Value::empty` — does not count.)
+        // pick spans, never elements. Sources over ONE arena (by pointer) merge spans only — the
+        // case of a loop state or a branch that keeps what it was handed. Over distinct arenas, each
+        // arena contributes only what the result still references: the union of its picked spans,
+        // copied once and rebased. So the result holds live rows only (a fold rebuilding its state
+        // every round does not accumulate dead arenas), and a row referenced many times is still
+        // copied once. (An empty span names nothing, so neither it nor an empty source's arena —
+        // often a fresh `Value::empty` — counts.)
         Value::Ref(..) => {
             let parts: Vec<_> = filled
                 .iter()
@@ -302,6 +305,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
+            let picked = |i: usize| parts[tags[i]].1[off[i]];
             let mut arenas: Vec<&Arc<Value>> = Vec::new();
             let mut arena_of = vec![0usize; parts.len()];
             for (k, (p, s)) in parts.iter().enumerate() {
@@ -313,27 +317,48 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                     arenas.len() - 1
                 });
             }
-            let (payload, base) = match arenas.len() {
-                0 => (parts[0].0.clone(), vec![0]),
-                1 => (arenas[0].clone(), vec![0]),
-                _ => {
-                    let (mut atags, mut aoff, mut base) = (Vec::new(), Vec::new(), Vec::new());
-                    for (a, arena) in arenas.iter().enumerate() {
-                        base.push(atags.len());
-                        atags.extend(std::iter::repeat_n(a, arena.len()));
-                        aoff.extend(0..arena.len());
-                    }
-                    let srcs: Vec<Option<&Value>> = arenas.iter().map(|a| Some(&***a)).collect();
-                    (Arc::new(gather_lanes(&srcs, &atags, &aoff)), base)
+            if arenas.len() <= 1 {
+                let payload = arenas.first().copied().unwrap_or(parts[0].0).clone();
+                return Value::Ref(payload, Arc::new((0..tags.len()).map(picked).collect()));
+            }
+            // per arena, the union of the picked non-empty spans as disjoint sorted intervals.
+            let mut used: Vec<Vec<(usize, usize)>> = vec![Vec::new(); arenas.len()];
+            for i in 0..tags.len() {
+                let (lo, hi) = picked(i);
+                if lo < hi {
+                    used[arena_of[tags[i]]].push((lo, hi));
                 }
-            };
-            let spans = tags
-                .iter()
-                .zip(off)
-                .map(|(&t, &o)| {
-                    let (lo, hi) = parts[t].1[o];
-                    let b = base[arena_of[t]];
-                    (b + lo, b + hi)
+            }
+            // each interval's elements are gathered into the new payload; `(lo, hi, base)` rebases.
+            let (mut atags, mut aoff) = (Vec::new(), Vec::new());
+            let mut kept: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(arenas.len());
+            for (a, spans) in used.iter_mut().enumerate() {
+                spans.sort_unstable();
+                let mut ivs: Vec<(usize, usize, usize)> = Vec::new();
+                for &(lo, hi) in spans.iter() {
+                    match ivs.last_mut() {
+                        Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                        _ => ivs.push((lo, hi, 0)),
+                    }
+                }
+                for iv in ivs.iter_mut() {
+                    iv.2 = atags.len();
+                    atags.extend(std::iter::repeat_n(a, iv.1 - iv.0));
+                    aoff.extend(iv.0..iv.1);
+                }
+                kept.push(ivs);
+            }
+            let srcs: Vec<Option<&Value>> = arenas.iter().map(|a| Some(&***a)).collect();
+            let payload = Arc::new(gather_lanes(&srcs, &atags, &aoff));
+            let spans = (0..tags.len())
+                .map(|i| {
+                    let (lo, hi) = picked(i);
+                    if lo == hi {
+                        return (0, 0);
+                    }
+                    let ivs = &kept[arena_of[tags[i]]];
+                    let (ilo, _, base) = ivs[ivs.partition_point(|iv| iv.0 <= lo) - 1];
+                    (base + lo - ilo, base + hi - ilo)
                 })
                 .collect();
             Value::Ref(payload, Arc::new(spans))
