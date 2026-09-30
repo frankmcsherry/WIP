@@ -21,7 +21,8 @@ text below, not this.
 ## Overview
 
 A minimal **columnar, single-input term-graph IR** with a layered op vocabulary, a structural
-shape-checker, an `ml` front-end, and a small optimizer. Standalone lib crate (no deps).
+shape-checker, an `ml` front-end, and a small optimizer. Standalone lib crate (no dependencies;
+`serde` is optional).
 `cargo test` green; `cargo clippy --all-targets` clean; `cargo run --example tour` walks the
 language; `cargo bench --bench eval` measures throughput.
 
@@ -34,9 +35,10 @@ src/
                lane assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
   engine.rs    row-movement primitives: gather, concat, fill + index generators
                (filter_mask / owner_ids / resolve_indices / expand_ranges).
-  cmp.rs       the order machinery: compare_idx (bulk structural order over index pairs; compare_cols
-               is the diagonal case) + the linear discrimination sort (sort_blocks / run_layout /
-               segment_labels). compare2 is the scalar reference, now test-only. Consumers are the cmp ops.
+  lib.rs       re-exports, plus `arrange`: the sort/find/survey surface DDIR's backend calls.
+  bytes.rs     the byte codec: a column to and from a self-describing, 8-byte-aligned byte string,
+               for shipping columns between processes.
+  hash.rs      structural hashing, one stable u64 per row, over the same structure the comparator reads.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
                Value::Ref(Arc<payload>, Arc<spans>) = referenced LIST ROWS (shape Ref<List<T>>, Rust's &[T]):
@@ -73,6 +75,11 @@ src/
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
+    cmp/       the order machinery the cmp ops reduce to. order.rs: compare_idx (bulk structural
+               order over index pairs; compare_cols is the diagonal case), block labels, group_bounds.
+               sort.rs: the indexed discrimination sort (dev/indexed-sort.md). survey.rs: the merge
+               kernel, rank at a time (dev/lane-survey.md).
+    host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
@@ -84,11 +91,14 @@ src/
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
-tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text   (no Builder-demo file —
+    program.rs `Program`: parse, lower effects, type and run in one path (compile_ml / run /
+               run_partial / is_total).
+tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text · effect · kernel · ref ·
+        fail_allocations   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
            an equivalence via `(A, B) eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
-examples/tour.rs   benches/eval.rs   dev/*-kickoff.md
+examples/ (tour.rs, jaro_winkler/)   benches/ (eval, gaps, stride)   dev/ (design notes)
 ```
 
 ## Structural completeness — the functor commutation table
@@ -152,8 +162,8 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   win: no NaN-poisons-comparison surprise. *Arithmetic stays IEEE* (NaN/inf propagate; `x/0 -> ±inf`,
   `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
   via `to_f32`/`to_f64` or a float literal (`1.5f64`, the same encoding); the typed grid is reached by
-  suffix (`add_i32`, `div_f64`, `signed`), and literals carry kind and width (`-3i16`, `7u8`). Integer `div` is deferred (no NEON
-  op; div-by-zero would panic) — `eval` rejects it.
+  suffix (`add_i32`, `div_f64`, `signed`), and literals carry kind and width (`-3i16`, `7u8`). Integer `div` truncates and is total:
+  `x/0 = 0`, and signed `MIN/-1` wraps.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
 - **List rows carry a stride-aware `Bounds`.** `Value::List` holds `Bounds { Stride(stride, rows) |
