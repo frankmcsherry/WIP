@@ -276,8 +276,11 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   forced to emit a `(state, output)` PAIR each round (extra `Prod` build/teardown + it breaks the
   body's in-place accumulator mutation) and the lockstep then recorded output positions even for a
   dead `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold`
-  is the no-pair/no-recording path. (Measured before the length-ordered rounds, which dropped the
-  recording for fixed-width outputs, `Unit` among them; see the fold section above.) (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
+  is the no-pair/no-recording path. (That was measured before the length-ordered rounds, which
+  write fixed-width outputs in place and so record nothing for a `Unit` stream. Re-measured
+  2026-09-30 on an M4, `((0u64, xs) foldscan ((a, x) -> ((a, x) add, x unit))) .0` against the same
+  `fold`: 1.13 vs 1.09 ns/element at 1,000 rows x 64, equal at 100,000 ragged rows of 0..20. The
+  cost argument for keeping `Fold` separate is now about 5%, not 3.4x.) (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. The
