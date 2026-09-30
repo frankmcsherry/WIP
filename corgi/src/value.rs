@@ -529,14 +529,18 @@ macro_rules! prim {
 
             /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]` (all
             /// same width). The leaf of [`crate::engine::gather_lanes`]; `gather` is the 1-source case.
-            pub(crate) fn gather_lanes(srcs: &[&Prim], tags: &[usize], off: &[usize]) -> Prim {
+            /// The tags may be a `Sum`'s own `u8` discriminants, read in place, or any `usize` column.
+            pub(crate) fn gather_lanes<T: Copy>(srcs: &[&Prim], tags: &[T], off: &[usize]) -> Prim
+            where
+                usize: From<T>,
+            {
                 match srcs[0] {
                     $( Prim::$V(_) => {
                         let cols: Vec<&[$t]> = srcs.iter().map(|s| match s {
                             Prim::$V(v) => v.as_slice(),
                             _ => panic!("gather_lanes: prim width mismatch"),
                         }).collect();
-                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[t][o]).collect()))
+                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)][o]).collect()))
                     } )+
                 }
             }

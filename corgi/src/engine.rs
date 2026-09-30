@@ -195,6 +195,39 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     }
 }
 
+/// `Unwrap` for lanes made of leaves (a leaf, or products of leaves): each row read from its lane
+/// with the sum's own `u8` discriminants, in place, rather than widened into a `usize` column first.
+/// `None` when a lane holds a list, sum, reference or unit, which take [`gather_lanes`].
+pub(crate) fn unwrap_leaves(lanes: &[&Value], tags: &[u8], off: &[usize]) -> Option<Value> {
+    match lanes[0] {
+        Value::Prim(_) => {
+            let prims: Vec<&Prim> = lanes
+                .iter()
+                .map(|v| match v {
+                    Value::Prim(p) => Some(p),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            Some(Value::Prim(Prim::gather_lanes(&prims, tags, off)))
+        }
+        Value::Prod(c0) => {
+            let mut fields = Vec::with_capacity(c0.len());
+            for f in 0..c0.len() {
+                let lanes_f: Vec<&Value> = lanes
+                    .iter()
+                    .map(|v| match v {
+                        Value::Prod(c) => c.get(f),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?;
+                fields.push(unwrap_leaves(&lanes_f, tags, off)?);
+            }
+            Some(Value::Prod(fields))
+        }
+        _ => None,
+    }
+}
+
 /// multi-source gather: result row `i` is row `off[i]` of source `srcs[tags[i]]` — all sources sharing
 /// one shape. The multi-source generalisation of [`gather`] (the 1-source case) and the fused
 /// inverse of `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from
