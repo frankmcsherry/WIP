@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# casts between `u64` words and narrower unsigned lanes, for word-backed integer columns (`words.rs`).
+bytemuck = "1"
 # optional: `Shape` (de)serializes, so a host can carry corgi types inside its own serialized IR.
 serde = { version = "1", features = ["derive"], optional = true }
 

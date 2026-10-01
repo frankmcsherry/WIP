@@ -22,8 +22,8 @@
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
 //!
 //! `Int` (the [`int`] module) is a second leaf kind beside `Prim`: integers as values, whose width
-//! is a per-column storage choice rather than part of the shape (`dev/integers.md`). The only
-//! `unsafe` in the crate is the word-to-lane view in `words.rs` that its storage reads through.
+//! is a per-column storage choice rather than part of the shape (`dev/integers.md`). Its storage is
+//! `u64` words viewed at narrower widths through `bytemuck` (`words.rs`); corgi has no `unsafe`.
 
 #![deny(unsafe_code)]
 

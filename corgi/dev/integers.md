@@ -27,9 +27,8 @@ existing kernel that takes a leaf. `Prim`, every existing op's behaviour, and ev
 are unchanged.
 
 - `src/words.rs` (113 lines): word-backed storage. A buffer of `u64` words read and written as a
-  slice of `u8`/`u16`/`u32`/`u64`. The crate's only `unsafe`: two slice casts, with the soundness
-  argument in the module doc; the crate is otherwise `#![deny(unsafe_code)]`. Miri finds nothing
-  in the view, narrowing, and decode-in-place tests.
+  slice of `u8`/`u16`/`u32`/`u64`, through `bytemuck::cast_slice`. corgi has no `unsafe`
+  (`#![deny(unsafe_code)]`); `bytemuck` is its one dependency besides the optional `serde`.
 - `src/int.rs` (about 1,130 lines plus 145 of tests): the `Int` column. Construction with
   narrowing (from host `u64`s, packed in place in the host vector's own allocation; from `i64`s;
   from `i128`s), adoption of host `u64`s untouched, constants that store nothing, re-encoding and
@@ -76,8 +75,7 @@ Why:
 - A column can be a window of another's buffer, which the decode uses and which would also give
   zero-copy slicing of a leaf.
 
-The cost of the cast is two lines of `unsafe`. Reading lanes out of words without one is not a
-substitute: shifting and masking, or `to_le_bytes`, measured 1.5 to 5 times slower on dense loops
+The cast is `bytemuck`'s. Reading lanes out of words without a cast is not a substitute: shifting and masking, or `to_le_bytes`, measured 1.5 to 5 times slower on dense loops
 (summing a column of bytes: 0.015 ns/row through a view, 0.078 without; adding two 16-bit columns
 into 32 bits: 0.19 against 0.29 to 0.36), and 1.1 to 1.5 times slower on random gathers. The view
 itself is as fast as a native `Vec<uN>`.
@@ -99,8 +97,9 @@ Rejected:
   windows. It is the fallback if `unsafe` and a dependency are both unwelcome: every kernel in the
   prototype takes a slice and would work unchanged.
 - **A flat byte buffer.** Rejected before for alignment, and still.
-- **`bytemuck`.** Equivalent (`cast_slice` makes the same argument). I wrote the two casts instead to
-  keep corgi free of dependencies; swapping them for `bytemuck` changes no caller.
+- **Two hand-written `unsafe` casts.** What the spike first did, to keep corgi free of dependencies.
+  `bytemuck::cast_slice` makes the same argument; Frank chose it (2026-09-30), so corgi stays free
+  of `unsafe`.
 
 ## 2. Sign: frame of reference, so there is no sign
 
@@ -338,12 +337,15 @@ and packing in place, 0.324 (0.331); Rust converting to a fresh `Vec<u32>` with 
 ## For you to decide
 
 1. Whether integers as values become a first-class leaf beside the bits leaf, with the semantic
-   split that brings: `Int` arithmetic widens and errors, `Prim` arithmetic wraps.
-2. Word-backed storage with two casts of `unsafe` (or `bytemuck` in their place), against
-   per-width vectors with a frame (no `unsafe`, no decoding in place).
-3. Whether a bare `5` should be the integer literal.
+   split that brings: `Int` arithmetic widens and errors, `Prim` arithmetic wraps. (Frank,
+   2026-09-30: seems a good idea.)
+2. Word-backed storage, against per-width vectors with a frame (no decoding in place). (Frank:
+   word-backed, through `bytemuck`; done.)
+3. Whether a bare `5` should be the integer literal. (Frank: `5int` for now; eventually the
+   default integer should be arbitrary precision.)
 4. Independently of the rest: whether the sort should pack `Prim` fields by measured range (about
-   half the three-field sort time on narrow-valued `u64` data, for a max pass per field).
+   half the three-field sort time on narrow-valued `u64` data, for a max pass per field). (Frank:
+   possibly moot once values are `Int`; not now.)
 
 ## If you pursue it
 

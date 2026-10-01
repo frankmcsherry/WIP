@@ -1,5 +1,5 @@
 //! Word-backed storage: a buffer of `u64` words read and written as a slice of narrower unsigned
-//! integers. The one place corgi reinterprets memory, and the only `unsafe` in the crate.
+//! integers. The one place corgi reinterprets memory.
 //!
 //! Why words: a column stored in `u64` words can be viewed at any of the four widths, so one
 //! allocation can hold a column at whatever width its values need, can be narrowed in place, and
@@ -8,20 +8,13 @@
 //! 1-aligned. (`dev/integers.md` measures what this buys and what reading words without a cast
 //! would cost instead.)
 //!
-//! Why this is sound. For `T` one of `u8`, `u16`, `u32`, `u64` (the sealed [`Lane`] trait):
-//!   * alignment: a `u64` buffer is 8-aligned, and `align_of::<T>()` divides 8;
-//!   * size: `n` words are exactly `8n` bytes, which is `8n / size_of::<T>()` whole `T`s;
-//!   * validity: every bit pattern is a valid `T`, and every byte of a `u64` is initialized;
-//!   * aliasing: the view borrows the words, shared for shared and exclusive for exclusive, for
-//!     exactly the borrow's lifetime, so no other access can overlap it.
+//! The views are `bytemuck::cast_slice`/`cast_slice_mut` from `u64` to a narrower unsigned lane:
+//! a `u64` buffer is 8-aligned, `n` words are exactly `8n` bytes, and every bit pattern is a valid
+//! lane, so the cast always succeeds. corgi itself has no `unsafe`.
 //!
 //! Which `T` lands in which word depends on the target's byte order. Within one process that is
 //! invisible (a column is always read at the width it was written); the codec's wire format is
 //! little-endian, so viewing a received buffer in place is little-endian only (see `bytes.rs`).
-//! `bytemuck::cast_slice` is the same operation with the same argument behind it; this module
-//! exists so that corgi keeps no dependencies, and can be swapped for it without changing callers.
-
-#![allow(unsafe_code)]
 
 mod sealed {
     pub trait Sealed {}
@@ -32,7 +25,7 @@ mod sealed {
 }
 
 /// An unsigned lane that word-backed storage can be viewed at: `u8`, `u16`, `u32` or `u64`.
-pub(crate) trait Lane: sealed::Sealed + Copy + Ord + Default + std::fmt::Debug + Into<u64> + 'static {
+pub(crate) trait Lane: sealed::Sealed + bytemuck::Pod + Ord + Default + std::fmt::Debug + Into<u64> + 'static {
     /// the lane's width in bits.
     const BITS: u32;
     /// `x` truncated to the lane (callers only pass values that fit).
@@ -53,18 +46,13 @@ lane!(u8, u16, u32, u64);
 /// `words` read as `T`s: `8 * words.len() / size_of::<T>()` of them.
 #[inline]
 pub(crate) fn view<T: Lane>(words: &[u64]) -> &[T] {
-    let n = words.len() * (64 / T::BITS as usize);
-    // SAFETY: see the module documentation; `T` is one of the four sealed lanes.
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const T, n) }
+    bytemuck::cast_slice(words)
 }
 
 /// `words` written as `T`s.
 #[inline]
 pub(crate) fn view_mut<T: Lane>(words: &mut [u64]) -> &mut [T] {
-    let n = words.len() * (64 / T::BITS as usize);
-    // SAFETY: see the module documentation; the exclusive borrow of the words is moved into the
-    // returned slice, so nothing else can read or write them while it lives.
-    unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut T, n) }
+    bytemuck::cast_slice_mut(words)
 }
 
 /// how many words hold `n` lanes of `bits` bits (0 for `bits == 0`: nothing is stored).
