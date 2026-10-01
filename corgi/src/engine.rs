@@ -4,6 +4,7 @@
 
 use crate::shape::shape_of_value;
 use std::sync::Arc;
+use crate::int::Int;
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
 
 pub(crate) use generators::*;
@@ -21,6 +22,8 @@ pub(crate) fn fill(row: &Value, n: usize) -> Value {
         // to describe an index that is constant. (`Op::Lit` is the caller, and a literal is
         // overwhelmingly a leaf or a product of them.)
         Value::Prim(p) => Value::Prim(p.repeat(0, n)),
+        // an integer constant broadcasts to a column that stores nothing: its value is its base.
+        Value::Int(c) => Value::Int(c.repeat(0, n)),
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| fill(c, n)).collect()),
         Value::Unit(_) => Value::Unit(n),
         // a VARIABLE-WIDTH row (a `List` span, a `Sum` lane) is a row move, which is what a
@@ -42,7 +45,7 @@ pub(crate) fn take_ref(v: Value) -> Value {
         }
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(take_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(take_ref).collect()),
-        bounded @ (Value::Prim(_) | Value::Unit(_) | Value::Ref(..)) => bounded,
+        bounded @ (Value::Prim(_) | Value::Int(_) | Value::Unit(_) | Value::Ref(..)) => bounded,
     }
 }
 
@@ -55,7 +58,7 @@ pub(crate) fn clone_ref(v: Value) -> Value {
         Value::List(bounds, vals) => Value::List(bounds, Box::new(clone_ref(*vals))),
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(clone_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(clone_ref).collect()),
-        leaf @ (Value::Prim(_) | Value::Unit(_)) => leaf,
+        leaf @ (Value::Prim(_) | Value::Int(_) | Value::Unit(_)) => leaf,
     }
 }
 
@@ -153,6 +156,7 @@ mod generators {
 pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     match v {
         Value::Prim(p) => Value::Prim(p.gather(idx)),
+        Value::Int(c) => Value::Int(c.gather(idx)),
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather(c, idx)).collect()),
         Value::List(bounds, vals) => {
             let mut elem = Vec::new();
@@ -215,6 +219,17 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 })
                 .collect();
             Value::Prim(Prim::gather_lanes(&prims, tags, off))
+        }
+        // integer sources may sit in different frames; the leaf brings them to one first.
+        Value::Int(_) => {
+            let ints: Vec<&Int> = filled
+                .iter()
+                .map(|v| match v {
+                    Value::Int(c) => c,
+                    _ => panic!("gather_lanes: shape mismatch"),
+                })
+                .collect();
+            Value::Int(Int::gather_lanes(&ints, tags, off))
         }
         Value::Prod(c0) => Value::Prod(
             (0..c0.len())
@@ -377,6 +392,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
 pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
     match (then, els) {
         (Value::Prim(t), Value::Prim(e)) => Value::Prim(t.blend(e, mask)),
+        (Value::Int(t), Value::Int(e)) => Value::Int(t.blend(e, mask)),
         (Value::Prod(ts), Value::Prod(es)) => {
             Value::Prod(ts.into_iter().zip(es).map(|(t, e)| blend(mask, t, e)).collect())
         }
@@ -404,6 +420,16 @@ pub(crate) fn concat(parts: &[Value]) -> Value {
                 })
                 .collect();
             Value::Prim(Prim::concat(&prims))
+        }
+        Value::Int(_) => {
+            let ints: Vec<&Int> = parts
+                .iter()
+                .map(|p| match p {
+                    Value::Int(c) => c,
+                    _ => panic!("concat: shape mismatch"),
+                })
+                .collect();
+            Value::Int(Int::concat(&ints))
         }
         Value::Prod(c0) => Value::Prod(
             (0..c0.len())

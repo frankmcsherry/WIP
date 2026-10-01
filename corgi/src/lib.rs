@@ -20,6 +20,12 @@
 //! Layers: [`value`] (the data) → [`engine`] (`gather`/`concat` + index gen) →
 //! [`ops`] (the vocabulary; `ops::cmp` carries its own `compare_idx`/structural-order
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
+//!
+//! `Int` (the [`int`] module) is a second leaf kind beside `Prim`: integers as values, whose width
+//! is a per-column storage choice rather than part of the shape (`dev/integers.md`). The only
+//! `unsafe` in the crate is the word-to-lane view in `words.rs` that its storage reads through.
+
+#![deny(unsafe_code)]
 
 pub mod bytes;
 pub(crate) mod effect;
@@ -27,15 +33,18 @@ pub(crate) mod engine;
 pub(crate) mod frontend;
 pub(crate) mod graph;
 pub(crate) mod hash;
+pub mod int;
 pub(crate) mod ops;
 pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
+pub(crate) mod words;
 
 pub use effect::{is_total, lower_effects};
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;
+pub use int::{int_bin, Int, IntBin, Width};
 pub use ops::host::{HostKernel, HostOp};
 pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};

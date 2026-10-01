@@ -118,6 +118,12 @@ mod compare {
                 Pairs::Diagonal(n) => pa.cmp_dense(pb, n, 0),
                 Pairs::Adjacent(n) => pa.cmp_dense(pb, n, 1),
             },
+            // integers: their offsets when the two columns share an encoding, their values when not.
+            (Value::Int(ca), Value::Int(cb)) => match pairs {
+                Pairs::Explicit(ia, ib) => ca.cmp_idx(ia, ib, cb),
+                Pairs::Diagonal(n) => ca.cmp_dense(cb, n, 0),
+                Pairs::Adjacent(n) => ca.cmp_dense(cb, n, 1),
+            },
 
             // single-field product: the field's order IS the order — skip the fold + tie vec.
             (Value::Prod(ca), Value::Prod(cb)) if ca.len() == 1 && cb.len() == 1 => {
@@ -327,6 +333,7 @@ mod tests {
         match (a, b) {
             // i8 sign back to the oracle's `Ordering` (the one i8→Ordering boundary, test-only).
             (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(&[i], &[j], pb)[0].cmp(&0),
+            (Value::Int(ca), Value::Int(cb)) => ca.get(i).cmp(&cb.get(j)),
             (Value::Prod(ca), Value::Prod(cb)) => {
                 for (x, y) in ca.iter().zip(cb) {
                     match compare2(x, i, y, j) {

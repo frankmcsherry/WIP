@@ -79,7 +79,7 @@ impl HostOp {
 fn counts_rows(s: &Shape) -> bool {
     match s {
         Shape::Prod(fs) => fs.first().is_some_and(counts_rows),
-        Shape::Prim(_) | Shape::List(_) | Shape::Sum(_) | Shape::Unit | Shape::Ref(_) => true,
+        Shape::Prim(_) | Shape::Int | Shape::List(_) | Shape::Sum(_) | Shape::Unit | Shape::Ref(_) => true,
     }
 }
 

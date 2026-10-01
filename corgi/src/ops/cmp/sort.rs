@@ -11,6 +11,7 @@
 //! kernel, the label and position helpers.
 
 use crate::engine::gather;
+use crate::int::Int;
 use crate::value::{Bounds, Prim, Tags, Value};
 
 /// Buffers reused across every block and level of one call, so that a refinement pass producing
@@ -82,6 +83,7 @@ pub(crate) fn sort_indexed(
     }
     match v {
         Value::Prim(p) => sort_leaf(p, labels, index, emit, scratch),
+        Value::Int(c) => sort_int(c, labels, index, emit, scratch),
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
         // a sum's lanes and a list's elements are read through the index after their sorts.
         Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit.keeping_index(), scratch),
@@ -155,6 +157,28 @@ fn sort_leaf(
     out
 }
 
+/// An integer leaf: its offsets are the keys (they keep the values' order), and the sorted keys
+/// are the column, in the same encoding.
+fn sort_int(
+    c: &Int,
+    labels: &mut Vec<u64>,
+    index: &mut [usize],
+    emit: Emit,
+    scratch: &mut SortScratch,
+) -> Option<Value> {
+    let mut keys = std::mem::take(&mut scratch.keys);
+    keys.clear();
+    c.pull_u64(index, &mut keys);
+    if emit == Emit::Values {
+        sort_keys_only(&mut keys, labels, scratch);
+    } else {
+        sort_keys(&mut keys, labels, index, scratch);
+    }
+    let out = emit.values().then(|| Value::Int(c.with_keys(keys.len(), keys.iter().copied())));
+    scratch.keys = keys;
+    out
+}
+
 /// A product: its fields in turn, at the same positions, under the labels the fields before
 /// refined. Consecutive leaf fields whose declared widths fit one `u64` sort as one packed key
 /// ([`sort_packed`]). A field's output is final when emitted, since later fields permute only
@@ -184,7 +208,7 @@ fn sort_prod(
             continue;
         }
         let (out, next) = match &cols[f] {
-            Value::Prim(_) => sort_packed(cols, f, labels, index, emit, scratch),
+            Value::Prim(_) | Value::Int(_) => sort_packed(cols, f, labels, index, emit, scratch),
             c => {
                 // only the last segment may leave the index behind
                 let mode = if f + 1 == cols.len() { emit } else { emit.keeping_index() };
@@ -198,9 +222,11 @@ fn sort_prod(
     emit.values().then_some(Value::Prod(outs))
 }
 
-/// The leaf fields of `cols` from `f` on, as many as fit one `u64` by their declared widths,
-/// sorted as one key, most significant field first: one set of passes and one refinement for
-/// the run. Returns one column per field with `emit`, and the index of the first field not taken.
+/// The leaf fields of `cols` from `f` on, as many as fit one `u64`, sorted as one key, most
+/// significant field first: one set of passes and one refinement for the run. A `Prim` field takes
+/// its declared width; an `Int` field takes the bits of its span, so integers built from narrow
+/// data pack by what they hold rather than how they are stored (and a constant takes none).
+/// Returns one column per field with `emit`, and the index of the first field not taken.
 fn sort_packed(
     cols: &[Value],
     f: usize,
@@ -209,25 +235,41 @@ fn sort_packed(
     emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<Value>, usize) {
-    let leaf = |c: &Value| match c {
-        Value::Prim(p) => p.clone(),
-        _ => unreachable!("sort_packed: a leaf field"),
+    let bits = |c: &Value| match c {
+        Value::Prim(p) => Some(p.bits()),
+        Value::Int(n) => Some(n.key_bits()),
+        _ => None,
     };
     let mut g = f;
     let mut used = 0u32;
     while g < cols.len() {
-        let Value::Prim(p) = &cols[g] else { break };
-        if used + p.bits() > 64 {
+        let Some(b) = bits(&cols[g]) else { break };
+        if used + b > 64 && g > f {
             break;
         }
-        used += p.bits();
+        used += b;
         g += 1;
     }
     let mut keys = std::mem::take(&mut scratch.keys);
-    keys.clear();
-    leaf(&cols[f]).pull_u64(index, &mut keys);
-    for c in &cols[f + 1..g] {
-        leaf(c).pack_u64(index, &mut keys);
+    // the first field with any bits is pulled (fields before it, constants, contribute nothing),
+    // each later one packed below it.
+    let mut acc = 0u32;
+    for c in &cols[f..g] {
+        let b = bits(c).expect("a leaf field");
+        match (c, acc) {
+            (Value::Prim(p), 0) => {
+                keys.clear();
+                p.pull_u64(index, &mut keys)
+            }
+            (Value::Int(n), 0) => {
+                keys.clear();
+                n.pull_u64(index, &mut keys)
+            }
+            (Value::Prim(p), _) => p.pack_u64(index, &mut keys),
+            (Value::Int(n), _) => n.pack_u64(index, &mut keys),
+            _ => unreachable!("sort_packed: a leaf field"),
+        }
+        acc += b;
     }
     if emit == Emit::Values && g == cols.len() {
         sort_keys_only(&mut keys, labels, scratch);
@@ -238,10 +280,15 @@ fn sort_packed(
     if emit.values() {
         let mut shift = used;
         for c in &cols[f..g] {
-            let p = leaf(c);
-            shift -= p.bits();
-            let mask = if p.bits() == 64 { u64::MAX } else { (1u64 << p.bits()) - 1 };
-            outs.push(Value::Prim(p.like_from(keys.iter().map(|&k| (k >> shift) & mask))));
+            let b = bits(c).expect("a leaf field");
+            shift -= b;
+            let mask = if b == 64 { u64::MAX } else { (1u64 << b) - 1 };
+            let it = keys.iter().map(|&k| if b == 0 { 0 } else { (k >> shift) & mask });
+            outs.push(match c {
+                Value::Prim(p) => Value::Prim(p.like_from(it)),
+                Value::Int(n) => Value::Int(n.with_keys(keys.len(), it)),
+                _ => unreachable!("sort_packed: a leaf field"),
+            });
         }
     }
     scratch.keys = keys;
@@ -692,7 +739,7 @@ pub(crate) fn contains_list(v: &Value) -> bool {
         Value::List(..) => true,
         Value::Prod(cols) => cols.iter().any(contains_list),
         Value::Sum(_, lanes) => lanes.iter().any(contains_list),
-        Value::Prim(_) | Value::Unit(_) => false,
+        Value::Prim(_) | Value::Int(_) | Value::Unit(_) => false,
         // a referenced row IS a list row (its sorted form gathers the spanned elements).
         Value::Ref(..) => true,
     }

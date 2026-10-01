@@ -42,7 +42,7 @@ pub(crate) fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
 /// value that turns out to be variable-width deeper down.
 fn fixed_width(acc: &Value, new: &Value) -> bool {
     match (acc, new) {
-        (Value::Prim(_), _) | (Value::Unit(_), _) => true, // a unit row is a (zero-byte) constant slot
+        (Value::Prim(_), _) | (Value::Int(_), _) | (Value::Unit(_), _) => true, // a unit row is a (zero-byte) constant slot
         (Value::Prod(ca), Value::Prod(cn)) => ca.iter().zip(cn).all(|(a, n)| fixed_width(a, n)),
         (Value::Ref(pa, _), Value::Ref(pn, _)) => Arc::ptr_eq(pa, pn),
         _ => false,
@@ -54,6 +54,8 @@ fn fixed_width(acc: &Value, new: &Value) -> bool {
 fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
     match (acc, new) {
         (Value::Prim(d), Value::Prim(s)) => d.scatter_into(active, s),
+        // an integer accumulator re-encodes first if the new rows fall outside its frame
+        (Value::Int(d), Value::Int(s)) => d.scatter_into(active, s),
         (Value::Prod(ca), Value::Prod(cn)) => {
             for (fa, fb) in ca.iter_mut().zip(cn) {
                 scatter_fixed(fa, active, fb);
@@ -312,7 +314,15 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
                 }
                 let (tb, tv) = cols.pop().ok_or("Weave expects (List<U64> tags, List<A>, ..)")?.into_list("Weave tags")?;
-                let tags = tv.as_u64("Weave tags")?;
+                // the tags arrive as a `U64` column or as an integer column, whose values they are
+                let int_tags;
+                let tags: &[u64] = match &tv {
+                    Value::Int(c) => {
+                        int_tags = crate::int::to_u64s(c)?;
+                        &int_tags
+                    }
+                    _ => tv.as_u64("Weave tags")?,
+                };
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
@@ -374,6 +384,9 @@ impl<L: OpLike> Op<L> {
             Op::Cast(bits) => {
                 if !matches!(*bits, 8 | 16 | 32 | 64) {
                     return Err(format!("Cast: unsupported width {bits}"));
+                }
+                if let Value::Int(_) = input {
+                    return Err("Cast: an Int has no width to change (to_u64 converts one to U64 bits)".into());
                 }
                 Value::Prim(input.into_prim("Cast")?.cast(*bits))
             }

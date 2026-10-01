@@ -64,6 +64,8 @@ impl CmpOp {
                     // order-flags ONCE here (sign `-1`/`0`/`+1`), so `rel`'s lane loop is branchless.
                     (Value::Prim(pa), Value::Prim(pb)) =>
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
+                    // integers: brought to one encoding (a side already in it is not copied).
+                    (Value::Int(ca), Value::Int(cb)) => ca.rel(cb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
@@ -74,6 +76,10 @@ impl CmpOp {
             CmpOp::Min | CmpOp::Max => {
                 let take_max = matches!(self, CmpOp::Max);
                 let (a, b) = input.into_pair("min/max")?;
+                if let (Value::Int(ca), Value::Int(cb)) = (&a, &b) {
+                    assert_eq!(ca.len(), cb.len(), "min/max: operands at different strata");
+                    return Ok(Value::Int(ca.clone().lane_pick(cb.clone(), take_max)));
+                }
                 let (pa, pb) = (a.into_prim("min/max lhs")?, b.into_prim("min/max rhs")?);
                 if pa.bits() != pb.bits() {
                     return Err(format!("min/max expects two equal-width leaves, got U{} and U{}", pa.bits(), pb.bits()));
@@ -83,6 +89,10 @@ impl CmpOp {
             }
 
             CmpOp::Gt(c) => {
+                // an integer column compares against the constant's offset in its frame, once.
+                if let Value::Int(n) = &input {
+                    return Ok(Value::u64(n.gt_const(*c as i128)));
+                }
                 let xs = input.as_u64("Gt")?;
                 Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
             }
@@ -121,7 +131,7 @@ impl CmpOp {
             // search, see `batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find")?;
-                let (nb, nvals) = needle.into_list("Find needle")?;
+                let (nb, mut nvals) = needle.into_list("Find needle")?;
                 // the haystack may be a referenced list (captured or sliced by reference): rows are
                 // read through `span`, and the search indexes the payload absolutely, so no copy.
                 let (hb, hvals) = haystack.rows_of("Find haystack")?;
@@ -142,6 +152,21 @@ impl CmpOp {
                 }
                 // lower = first haystack pos NOT less than the needle; upper = first GREATER. Same
                 // batched search, different tie rule on `haystack[mid] vs needle`.
+                // integer keys: the needles are re-encoded in the haystack's encoding, so the search
+                // compares offsets at the haystack's width and never copies the haystack. A needle
+                // outside the haystack's frame equals nothing there: its range is empty at the
+                // start of its row (below) or the end (above), and it takes no part in the search.
+                if let (Value::Int(nc), Value::Int(hc)) = (&nvals, hvals) {
+                    let (enc, places) = nc.needles_in(hc);
+                    for (k, p) in places.iter().enumerate() {
+                        match p {
+                            crate::int::Place::Below => hi[k] = lo[k],
+                            crate::int::Place::Above => lo[k] = hi[k],
+                            crate::int::Place::In => {}
+                        }
+                    }
+                    nvals = Value::Int(enc);
+                }
                 let mut lower = (lo.clone(), hi.clone());
                 let mut upper = (lo, hi);
                 batched_bound(hvals, &nvals, &mut lower.0, &mut lower.1, |o| o < 0);

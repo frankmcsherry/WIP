@@ -66,6 +66,8 @@ fn combine(acc: u64, x: u64) -> u64 {
 pub fn hash(v: &Value) -> Vec<u64> {
     match v {
         Value::Prim(p) => p.hashes(),
+        // by value, whatever the encoding: an integer in 0..2^64 hashes as the u64 leaf would.
+        Value::Int(c) => c.hashes(),
 
         // product = fold the fields in order, each seeded from the PROD salt. A fieldless product has
         // no length witness (`len` is 0), so this is empty — consistent with `Value::len`.
@@ -76,6 +78,7 @@ pub fn hash(v: &Value) -> Vec<u64> {
                 // only to consume them here adds a full-width temporary per field.
                 match c {
                     Value::Prim(p) => p.fold_hashes(&mut acc, combine),
+                    Value::Int(c) => c.fold_hashes(&mut acc, combine),
                     Value::Unit(n) => {
                         for a in acc.iter_mut().take(*n) {
                             *a = combine(*a, UNIT);
@@ -293,6 +296,7 @@ mod tests {
                     Prim::U32(v) => v[r] as u64,
                     Prim::U64(v) => v[r],
                 }),
+                Value::Int(c) => crate::int::hash_value(c.get(r)),
                 Value::Prod(cols) => cols.iter().fold(PROD, |a, c| combine(a, row(c, r))),
                 Value::Unit(_) => UNIT,
                 Value::Sum(tags, lanes) => {

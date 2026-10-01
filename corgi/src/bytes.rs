@@ -34,13 +34,22 @@
 //!   Unit  = 4, n
 //!   Ref   = 5, n, (lo, hi)*n, Value                spans of the payload that follows: the arena
 //!                                                    goes once, however many rows reference it
+//!   Int   = 6, base_lo, base_hi, span, bits, len,  an integer column's frame (an i128 base and a
+//!           payload[len * bits/8]                   bound on the offsets), then its offsets at
+//!                                                    their stored width, padded to a word
 //! ```
+//!
+//! An `Int` leaf's offsets are word-backed, so [`read_from_words`] decodes a message held in `u64`
+//! words without copying them: each `Int` leaf is a window of the message's buffer. Everything
+//! else (bounds, sum offsets, `Prim` leaves) is still copied out, as by [`read_from`].
 //!
 //! A `Ref` keeps its shape and its sharing across the wire: its payload is written whole, once,
 //! whatever the spans name of it (to ship only the named rows, `clone` first). Two `Ref` columns
 //! of one value that share an arena each carry a copy of it, and decode to separate arenas.
 
+use crate::int;
 use crate::value::{Bounds, Prim, Tags, Value};
+use std::sync::Arc;
 
 /// Round a byte count up to a whole number of 64-bit words.
 #[inline]
@@ -50,6 +59,7 @@ fn pad8(n: usize) -> usize { (n + 7) & !7 }
 pub fn length_in_bytes(v: &Value) -> usize {
     match v {
         Value::Prim(p) => 24 + pad8(prim_payload_len(p)),
+        Value::Int(c) => 8 + int::encoded_len(c),
         Value::Prod(cols) => 16 + cols.iter().map(length_in_bytes).sum::<usize>(),
         Value::Sum(tags, lanes) => {
             8 + tags_len(tags)                          // the Sum word, then the assignment
@@ -68,6 +78,10 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
         Value::Prim(p) => {
             word(writer, 0)?;
             write_prim(p, writer)
+        }
+        Value::Int(c) => {
+            word(writer, 6)?;
+            int::write_int(c, writer)
         }
         Value::Prod(cols) => {
             word(writer, 1)?;
@@ -136,7 +150,19 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
 ///   message is *supposed* to have — for the DDIR container that is the time column, and its
 ///   decoder checks all four columns agree.
 pub fn read_from(bytes: &[u8]) -> Result<(Value, usize), String> {
-    let mut r = Reader { bytes, at: 0, depth: 0 };
+    let mut r = Reader { bytes, at: 0, depth: 0, shared: None };
+    let v = read_value(&mut r)?;
+    Ok((v, r.at))
+}
+
+/// [`read_from`] over a message held in `u64` words (as written, little-endian), sharing rather
+/// than copying: every `Int` leaf in the result is a window of `words`, which it keeps alive. The
+/// leaves' offsets are still checked against their declared spans (a read pass, no copy), so the
+/// result is as well-formed as [`read_from`]'s. Big-endian targets copy instead.
+pub fn read_from_words(words: &Arc<Vec<u64>>) -> Result<(Value, usize), String> {
+    let bytes: &[u8] = crate::words::view::<u8>(words);
+    let shared = cfg!(target_endian = "little").then_some(words);
+    let mut r = Reader { bytes, at: 0, depth: 0, shared };
     let v = read_value(&mut r)?;
     Ok((v, r.at))
 }
@@ -186,6 +212,7 @@ pub const MAX_DEPTH: usize = 128;
 pub fn declared_rows(v: &Value) -> u64 {
     match v {
         Value::Prim(p) => prim_len(p) as u64,
+        Value::Int(c) => c.len() as u64,
         Value::Prod(cols) => cols.iter().map(declared_rows).max().unwrap_or(0),
         Value::Sum(tags, lanes) => (tags.len() as u64)
             .max(lanes.iter().map(declared_rows).max().unwrap_or(0)),
@@ -322,6 +349,7 @@ struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
     depth: usize,
+    shared: Option<&'a Arc<Vec<u64>>>, // the words `bytes` views, when `Int` leaves may share them
 }
 
 impl<'a> Reader<'a> {
@@ -431,6 +459,7 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
             Ok(Value::List(bounds, Box::new(values)))
         }
         4 => Ok(Value::Unit(r.word()? as usize)),
+        6 => Ok(Value::Int(read_int(r)?)),
         5 => {
             let n = r.count(16, "ref spans")?;
             let mut spans = Vec::with_capacity(n);
@@ -548,6 +577,27 @@ fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// an `Int` leaf: its frame, then its offsets, viewed in place when the reader holds the
+/// message's words and copied otherwise.
+fn read_int(r: &mut Reader) -> Result<int::Int, String> {
+    let head = [r.word()?, r.word()?, r.word()?, r.word()?, r.word()?];
+    let (base, span, width, len) = int::read_header(head)?;
+    if width == int::Width::W0 {
+        // like `Unit`, a constant column names its rows without spending bytes on them.
+        return Ok(int::Int::constant(base, len));
+    }
+    let lane = width.bits() as usize / 8;
+    if len > r.remaining() / lane {
+        return Err(format!("corgi::bytes: Int leaf claims {len} rows but only {} fit", r.remaining() / lane));
+    }
+    let byte_at = r.at;
+    let payload = r.payload(len * lane)?;
+    match r.shared {
+        Some(words) => int::read_viewed(base, span, width, len, words, byte_at),
+        None => int::read_copied(base, span, width, len, payload),
+    }
 }
 
 fn read_prim(r: &mut Reader) -> Result<Prim, String> {

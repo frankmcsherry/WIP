@@ -2,12 +2,16 @@
 //! is a single `T0 -> T1` on one element, lifted 1:1 across the column; all
 //! cardinality change lives *inside* a `List`.
 
+use crate::int::Int;
 use crate::shape::{shape_of_value, Shape};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     Prim(Prim),                   // a leaf column at one byte width
+    Int(Int),                     // a leaf column of integers, as values: the width each row is
+                                  // stored at is the column's own choice, not part of its shape
+                                  // (`crate::int`, `dev/integers.md`)
     Prod(Vec<Value>),             // parallel columns, equal length
     Sum(Tags, Vec<Value>),        // per-row discriminant + within-variant offset (see `Tags`) + one
                                   // packed lane per variant (a variant no row carries is an empty
@@ -679,6 +683,12 @@ impl Value {
     pub fn u32(xs: Vec<u32>) -> Value { Value::Prim(Prim::U32(Arc::new(xs))) }
     pub fn u64(xs: Vec<u64>) -> Value { Value::Prim(Prim::U64(Arc::new(xs))) }
 
+    /// integer-column constructors: host data narrowed to the width its range needs (`int_u64`
+    /// packs in place, reusing the vector's allocation), or adopted as 64-bit words untouched.
+    pub fn int_u64(xs: Vec<u64>) -> Value { Value::Int(Int::from_u64s(xs)) }
+    pub fn int_i64(xs: &[i64]) -> Value { Value::Int(Int::from_i64s(xs)) }
+    pub fn int_adopt(xs: Vec<u64>) -> Value { Value::Int(Int::adopt_u64s(xs)) }
+
     /// a Sum from its discriminant `tags` (stored as a u8 leaf column — ≤256 variants) and the
     /// per-variant columns (every lane present; a variant no row carries is an empty column). The
     /// one place tags cross from `usize` into the `Prim` fold. The within-variant offset is computed
@@ -699,6 +709,7 @@ impl Value {
     pub fn empty(shape: &Shape) -> Value {
         match shape {
             Shape::Prim(w) => Value::Prim(Prim::empty(*w)),
+            Shape::Int => Value::Int(Int::empty()),
             Shape::Prod(ss) => Value::Prod(ss.iter().map(Value::empty).collect()),
             Shape::Sum(ss) => {
                 Value::Sum(Tags::constant(0, 0), ss.iter().map(Value::empty).collect())
@@ -716,6 +727,7 @@ impl Value {
     pub fn len(&self) -> usize {
         match self {
             Value::Prim(p) => p.len(),
+            Value::Int(n) => n.len(),
             Value::Prod(c) => c.first().map_or(0, |c| c.len()),
             Value::Sum(t, _) => t.len(),
             Value::List(b, _) => b.len(),
@@ -817,6 +829,20 @@ impl Value {
         }
     }
 
+    pub fn into_int(self, who: &str) -> Result<Int, String> {
+        match self {
+            Value::Int(n) => Ok(n),
+            other => Err(format!("{who}: expected Int, got {}", shape_of_value(&other))),
+        }
+    }
+
+    pub fn as_int(&self, who: &str) -> Result<&Int, String> {
+        match self {
+            Value::Int(n) => Ok(n),
+            other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
+        }
+    }
+
     pub fn into_prim(self, who: &str) -> Result<Prim, String> {
         match self {
             Value::Prim(p) => Ok(p),
@@ -829,6 +855,7 @@ impl Value {
 pub fn show(v: &Value) -> String {
     match v {
         Value::Prim(p) => p.show(),
+        Value::Int(n) => n.show(),
         Value::Prod(c) => format!("({})", c.iter().map(show).collect::<Vec<_>>().join(", ")),
         Value::Sum(t, vs) => {
             let lanes: Vec<String> = vs.iter().map(show).collect();

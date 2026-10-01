@@ -138,6 +138,12 @@ impl Rows for &[usize] {
 fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
     match (a, b) {
         (Value::Prim(pa), Value::Prim(pb)) => leaf(pa, pb, ia, ib, open, tree),
+        // integers: merge on offsets in one encoding (the pair is brought to one first; a side
+        // already in it is not copied), or on values if their spread will not fit one.
+        (Value::Int(ca), Value::Int(cb)) => match crate::int::Int::unify(ca, cb) {
+            Some((ua, ub)) => int_leaf(&ua, &ub, ia, ib, open, tree),
+            None => merge(|j| ca.get(ia.row(j)), |j| cb.get(ib.row(j)), open, tree),
+        },
         (Value::Unit(_), Value::Unit(_)) => merge(|_| 0u8, |_| 0u8, open, tree),
         (Value::Prod(ca), Value::Prod(cb)) => {
             assert_eq!(ca.len(), cb.len(), "survey: product arity");
@@ -272,6 +278,19 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
         };
     }
     go!(U8, U16, U32, U64)
+}
+
+/// An integer level, the two columns in one encoding: the merge over their offsets at their width.
+fn int_leaf<IA: Rows, IB: Rows>(a: &crate::int::Int, b: &crate::int::Int, ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
+    use crate::int::View;
+    match (a.view(), b.view()) {
+        (View::U8(va), View::U8(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree),
+        (View::U16(va), View::U16(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree),
+        (View::U32(va), View::U32(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree),
+        (View::U64(va), View::U64(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree),
+        // both constant at one base: every row is the same value
+        _ => merge(|_| 0u8, |_| 0u8, open, tree),
+    }
 }
 
 /// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
