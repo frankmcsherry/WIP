@@ -677,7 +677,7 @@ fn dup_output(mut g: Graph<NumOp>) -> Graph<NumOp> {
     let out = g.output;
     let tup = g.nodes.len();
     g.nodes.push(Node { kind: NodeKind::Tuple, inputs: vec![out, out] });
-    Graph { nodes: g.nodes, output: tup }
+    Graph::new(g.nodes, tup)
 }
 
 fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
