@@ -10,7 +10,8 @@ pub(crate) mod program;
 pub use ml::parse_ml;
 pub use program::Program;
 
-use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
+use crate::int::IntBin;
+use crate::ops::{ArithOp, BinOp, CmpOp, IntOp, Kind, NumOp, Op, Pred, Red, TextOp};
 use crate::value::Value;
 
 /// a string literal as a `List<U8>` value (one list of its UTF-8 bytes). `"…"` lowers to `Op::Lit`
@@ -149,6 +150,17 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "scan_max" => ArithOp::Scan(Red::Max).into(), // the running maximum
         "scan_all" => ArithOp::Scan(Red::All).into(),
         "scan_any" => ArithOp::Scan(Red::Any).into(),
+        // integers whose width is an encoding (`ops::int`): arithmetic that widens instead of
+        // wrapping, and the conversions to and from fixed-width bits.
+        "add_int" => IntOp::Bin(IntBin::Add).into(),
+        "sub_int" => IntOp::Bin(IntBin::Sub).into(),
+        "mul_int" => IntOp::Bin(IntBin::Mul).into(),
+        "narrow" => IntOp::Narrow.into(),
+        "to_int" => IntOp::FromBits { signed: false }.into(),
+        "to_int_signed" => IntOp::FromBits { signed: true }.into(),
+        "to_u64" => IntOp::ToU64.into(),
+        "unweave_int" => IntOp::Unweave.into(),
+        "fold_add_int" => IntOp::FoldAdd.into(),
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
         "parse_u64" => TextOp::ParseU64.into(),

@@ -12,7 +12,7 @@
 //!
 //!   expr   = 'let' pat '=' expr 'in' expr
 //!          | 'enum' IDENT '=' IDENT shape? ('|' IDENT shape?)* 'in' expr  -- a compile-time table; names ERASE here
-//!   shape  = 'u8'|'u16'|'u32'|'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
+//!   shape  = 'u8'|'u16'|'u32'|'u64' | 'int' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
 //!   pat    = IDENT | '_' | '(' pat (',' pat)* ')'      -- irrefutable: names, wildcards, tuples
 //!   pipe   = atom apply*                               -- juxtaposition; chain ends before `in`
@@ -30,6 +30,7 @@
 //!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root
 //!   LIT    = '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)? SUFFIX
 //!   SUFFIX = ('u'|'i') ('8'|'16'|'32'|'64') | 'f' ('32'|'64')   -- required: kind and width
+//!          | 'int'                                   -- an integer whose width is the column's own
 //!
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
@@ -86,6 +87,11 @@ fn position(cs: &[char], at: usize) -> String {
 /// how the bits are laid down: `u` as the value, `i` in the order-preserving signed encoding, `f`
 /// in the total-order float encoding.
 fn typed_lit(digits: &str, suffix: &str) -> Result<Value, String> {
+    // an integer, not a bit pattern: no width to fit, and a column that stores nothing.
+    if suffix == "int" {
+        let v: i128 = digits.parse().map_err(|_| format!("'{digits}{suffix}' is not an integer"))?;
+        return Ok(Value::Int(crate::int::Int::constant(v, 1)));
+    }
     let (kind, width) = parse_kw(suffix).ok_or_else(|| format!("unknown literal suffix '{suffix}'"))?;
     let bad = || format!("'{digits}{suffix}' is not a {suffix}");
     match kind {
@@ -437,6 +443,7 @@ impl P {
                 "u16" => Ok(Shape::Prim(16)),
                 "u32" => Ok(Shape::Prim(32)),
                 "u64" => Ok(Shape::Prim(64)),
+                "int" => Ok(Shape::Int),
                 "List" => {
                     self.eat(&Tok::LParen)?;
                     let inner = self.shape()?;

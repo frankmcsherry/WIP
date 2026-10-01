@@ -1,0 +1,8 @@
+# integers whose width is an encoding, not a type: `to_int` reads iota's u64s as integers (stored
+# 8 bits wide, since they fit), arithmetic widens instead of wrapping (250 + 7 is 257, past a
+# byte), a negative constant is just a different base, and `sort` reads the stored offsets as it
+# reads any leaf. A constant like `250int` is a column that stores nothing.
+# n = 8
+# = (List ends=[8] <[250, 251, 252, 253, 254, 255, 256, 257]>, List ends=[8] <[979, 982, 985, 988, 991, 994, 997, 1000]>)
+let xs = input iota map (x -> x to_int) in
+(xs map (x -> (x, 250int) add_int), xs map (x -> ((x, -3int) mul_int, 1000int) add_int) sort)

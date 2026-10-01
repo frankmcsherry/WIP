@@ -353,6 +353,8 @@ pub enum NumOp {
     Text(TextOp),
     /// A kernel supplied from outside corgi (`ops::host`).
     Host(super::host::HostOp),
+    /// Integer columns whose width is an encoding (`ops::int`).
+    Int(super::int::IntOp),
 }
 
 impl OpLike for NumOp {
@@ -363,12 +365,13 @@ impl OpLike for NumOp {
             NumOp::Arith(a) => a.eval(input),
             NumOp::Text(t) => t.eval(input),
             NumOp::Host(h) => h.eval(input),
+            NumOp::Int(i) => i.eval(input),
         }
     }
     fn children(&self) -> Vec<&Graph<NumOp>> {
         match self {
             NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
-            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) => Vec::new(),
+            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) | NumOp::Int(_) => Vec::new(),
         }
     }
 }
@@ -387,6 +390,11 @@ impl From<CmpOp> for NumOp {
 impl From<ArithOp> for NumOp {
     fn from(a: ArithOp) -> Self {
         NumOp::Arith(a)
+    }
+}
+impl From<super::int::IntOp> for NumOp {
+    fn from(i: super::int::IntOp) -> Self {
+        NumOp::Int(i)
     }
 }
 impl From<TextOp> for NumOp {

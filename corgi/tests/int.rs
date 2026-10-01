@@ -4,7 +4,7 @@
 //! shared buffer, at a constant — since the encoding must never be observable.
 
 use corgi::bytes::{read_from, read_from_words, write_to};
-use corgi::{hash, show, Bounds, Int, Program, Value, Width};
+use corgi::{hash, show, Bounds, Int, Program, Shape, Value, Width};
 use std::sync::Arc;
 
 struct Rng(u64);
@@ -185,6 +185,101 @@ fn find_across_encodings() {
 }
 
 #[test]
+fn arithmetic_through_programs() {
+    let mut rng = Rng(77);
+    for &(la, ra) in FRAMES {
+        for &(lb, rb) in FRAMES {
+            let n = 64;
+            let (a, b) = (draw(&mut rng, n, la, ra), draw(&mut rng, n, lb, rb));
+            for (name, f) in [("add_int", i128::checked_add as fn(i128, i128) -> Option<i128>), ("sub_int", i128::checked_sub), ("mul_int", i128::checked_mul)] {
+                let want: Option<Vec<i128>> = (0..n).map(|i| f(a[i], b[i])).collect();
+                let fits = want.as_ref().is_some_and(|w| Int::from_i128s(w).is_ok());
+                let p = Program::compile_ml(&format!("input {name}")).unwrap();
+                for va in encodings(&a).into_iter().take(2) {
+                    for vb in encodings(&b).into_iter().take(2) {
+                        // an op's error panics out of `eval_graph`; the message is what is checked
+                        let input = Value::Prod(vec![va.clone(), vb.clone()]);
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.run(input).unwrap()));
+                        match (fits, r) {
+                            (true, Ok(v)) => assert_eq!(ints(&v), *want.as_ref().unwrap(), "{name} {la}+{ra} {lb}+{rb}"),
+                            (false, Err(e)) => {
+                                let msg = e.downcast_ref::<String>().cloned().unwrap_or_default();
+                                assert!(msg.contains("2^64"), "{msg}");
+                            }
+                            (fits, r) => panic!("{name} {la}+{ra} {lb}+{rb}: fits {fits}, got {:?}", r.map(|v| show(&v))),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn literals_and_constants() {
+    // a literal is a constant column: it stores nothing, and adding it moves the base.
+    let xs = run("input iota map (x -> x to_int)", Value::u64(vec![6]));
+    assert_eq!(list_ints(&xs), (0..6).collect::<Vec<_>>());
+    let out = run("input iota map (x -> ((x to_int, -3int) mul_int, 1000int) add_int) sort", Value::u64(vec![6]));
+    assert_eq!(list_ints(&out), vec![985, 988, 991, 994, 997, 1000]);
+    // comparisons against a constant, and across encodings
+    let out = run("input iota map (x -> (x to_int, 2int) lt)", Value::u64(vec![4]));
+    assert_eq!(show(&out), "List ends=[4] <[1, 1, 0, 0]>");
+    let out = run("input iota map (x -> x to_int gt 1)", Value::u64(vec![4]));
+    assert_eq!(show(&out), "List ends=[4] <[0, 0, 1, 1]>");
+    // the typer sees `Int`, never a width
+    let p = Program::compile_ml("input iota map (x -> (x to_int, 1int) add_int)").unwrap();
+    assert_eq!(p.shape(&Shape::Prim(64)).unwrap(), Shape::List(Box::new(Shape::Int)));
+    // widening instead of wrapping: u8's 255 + 1 is 256
+    let out = run("(input to_int, 1int) add_int", Value::u8(vec![255, 0]));
+    assert_eq!(ints(&out), vec![256, 1]);
+    let out = run("input to_int_signed", Value::Prim(match corgi::Value::u8(vec![0x80 ^ 0xfd, 0x80 ^ 5]) { Value::Prim(p) => p, _ => unreachable!() }));
+    assert_eq!(ints(&out), vec![-3, 5]);
+    assert_eq!(show(&run("input to_int to_u64", Value::u16(vec![7, 9]))), "[7, 9]");
+}
+
+#[test]
+fn unweave_hands_back_tags_unwidened() {
+    let mut rng = Rng(9);
+    for rows in [1usize, 3, 50] {
+        let n = 1000;
+        let tags: Vec<usize> = (0..n).map(|_| rng.below(3) as usize).collect();
+        let lanes: Vec<Value> = (0..3).map(|t| Value::u64(tags.iter().filter(|&&x| x == t).map(|_| rng.below(100)).collect())).collect();
+        let sum = Value::sum(tags.clone(), lanes);
+        let mut ends: Vec<usize> = (1..rows).map(|_| rng.below(n as u64) as usize).collect();
+        ends.push(n);
+        ends.sort();
+        let input = Value::List(Bounds::offsets(ends), Box::new(sum));
+        let old = run("input unweave", input.clone());
+        let new = run("input unweave_int", input.clone());
+        let (Value::Prod(old), Value::Prod(new)) = (old, new) else { panic!() };
+        // same lanes, same tags as values; the tags 8 bits wide
+        assert_eq!(old[1..], new[1..]);
+        let Value::List(_, t) = &new[0] else { panic!() };
+        let Value::Int(c) = &**t else { panic!() };
+        assert_eq!(c.width(), Width::W8);
+        assert_eq!(c.values(), tags.iter().map(|&t| t as i128).collect::<Vec<_>>());
+        // the lane is the same whichever unweave produced it
+        let back = run("input unweave_int .2 fold_add", input.clone());
+        let back_old = run("input unweave .2 fold_add", input.clone());
+        assert_eq!(back, back_old);
+        // and `weave` (kernel-only) takes the integer tags back to the sum
+        let mut b = corgi::Builder::<corgi::NumOp>::default();
+        let i = b.input();
+        let u = b.add(corgi::IntOp::Unweave, vec![i]);
+        let w = b.add(corgi::Op::Weave, vec![u]);
+        let g = b.finish(w);
+        assert_eq!(corgi::eval_graph(&g, input.clone()), input);
+    }
+    // a one-variant sum's tags are a constant column
+    let one = Value::List(Bounds::offsets(vec![4]), Box::new(Value::sum(vec![1, 1, 1, 1], vec![Value::u64(vec![]), Value::u64(vec![1, 2, 3, 4])])));
+    let Value::Prod(out) = run("input unweave_int", one) else { panic!() };
+    let Value::List(_, t) = &out[0] else { panic!() };
+    let Value::Int(c) = &**t else { panic!() };
+    assert_eq!((c.width(), c.values()), (Width::W0, vec![1, 1, 1, 1]));
+}
+
+#[test]
 fn codec_round_trips_and_views() {
     let mut rng = Rng(3);
     for &(lo, range) in FRAMES {
@@ -245,6 +340,15 @@ fn select_and_minmax_across_encodings() {
     assert_eq!(ints(&out), vec![-5, 3, 4, 7]);
     assert_eq!(ints(&run("input min", Value::Prod(vec![a.clone(), b.clone()]))), vec![-5, 3, 4, 7]);
     assert_eq!(ints(&run("input max", Value::Prod(vec![a, b]))), vec![70_000, 10, 300, 7]);
+}
+
+#[test]
+fn a_fold_accumulator_outgrows_its_frame() {
+    // each round's sums fall outside the accumulator's frame, which re-encodes to hold them
+    let xs = Value::List(Bounds::offsets(vec![3, 5]), Box::new(Value::int_i64(&[1, 1000, -70_000, 5, 6])));
+    let out = run("(0int, input) fold ((a, x) -> (a, x) add_int)", xs.clone());
+    assert_eq!(ints(&out), vec![-68_999, 11]);
+    assert_eq!(ints(&run("input fold_add_int", xs)), vec![-68_999, 11]);
 }
 
 #[test]

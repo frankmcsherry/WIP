@@ -1093,6 +1093,30 @@ fn check_span(c: &Int) -> Result<(), String> {
     Ok(())
 }
 
+/// the u8 discriminants of a sum as an integer column `0..arity`: one byte per row, copied into
+/// word storage (the tags themselves are not word-backed yet; see `dev/integers.md`).
+pub(crate) fn from_u8_tags(tags: &[u8], arity: usize) -> Int {
+    let n = tags.len();
+    let span = arity.saturating_sub(1) as u64;
+    if span == 0 {
+        return Int::constant(0, n);
+    }
+    let words = alloc::<u8>(n, |o| o.copy_from_slice(tags));
+    Int::from_parts(0, span, Width::W8, n, words, 0)
+}
+
+/// the offsets of an unsigned leaf of any width as an integer column: the leaf's values are the
+/// integers. Narrowed.
+pub(crate) fn from_unsigned<T: Lane>(v: &[T]) -> Int {
+    let Some((lo, hi)) = v.iter().fold(None, |m: Option<(u64, u64)>, &x| {
+        let x: u64 = x.into();
+        Some(m.map_or((x, x), |(a, b)| (a.min(x), b.max(x))))
+    }) else {
+        return Int::empty();
+    };
+    Int::from_offsets(lo as i128, hi - lo, v.len(), |i| Into::<u64>::into(v[i]) - lo)
+}
+
 /// a column back to `u64`s, if every value is in `0..2^64`.
 pub(crate) fn to_u64s(c: &Int) -> Result<Vec<u64>, String> {
     if c.base < 0 || top(c.base, c.span) > u64::MAX as i128 {
