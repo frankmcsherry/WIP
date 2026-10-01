@@ -18,3 +18,7 @@ harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see
 [[bench]]
 name = "stride"
 harness = false   # stride-detection spike: ragged vs dense sort of uniform-width keys
+
+[[bench]]
+name = "ints"
+harness = false   # integer columns whose width is an encoding (dev/integers.md)
