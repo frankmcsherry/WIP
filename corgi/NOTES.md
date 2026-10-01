@@ -222,9 +222,10 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
-  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Remaining
-  constant-factor lever (unbuilt): the all-active fast path (move `acc` through the body, skip the
-  identity acc-gather + scatter) for the uniform-length regime where every row is active every round.
+  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. The
+  all-active fast path (move `acc` through the body, skip the identity acc-gather + scatter) is built,
+  but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
+  all ragged input, take the general per-round gather and scatter.
 
 ## Totality — partiality as data, threaded by a rewrite
 
@@ -309,9 +310,10 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   the dead output), which would retire `Op::Fold` the way `Op::Scan` was retired. THE fork to settle
   first is the ownership model: a true destination can't be a shared `Arc`, so DPS pressures the hot
   spine toward a linear/owned tile buffer (giving up free `Arc`-clone fan-out there) vs staying
-  `Arc`-shared (free clones, no fusion). First spike: compile ONE stratum-stable run (e.g. `iota ; add
-  ; mul ; gt`) to a single-tile DPS kernel and measure vs the per-op passes — that forces the ownership
-  decision on a small surface before committing the convention.
+  `Arc`-shared (free clones, no fusion). First spike: run ONE stratum-stable run (e.g. `iota ; add
+  ; mul ; gt`) a tile at a time through the existing kernels into reused buffers, and measure vs the
+  per-op passes — that forces the ownership decision on a small surface before committing the
+  convention. (Composing existing kernels, not generating code: see Goal.)
 - **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
   is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying

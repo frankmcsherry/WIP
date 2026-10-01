@@ -129,7 +129,7 @@ Those rows are why navigating by the old map was unsafe: it was directionally wr
 
 1. **group-by on a low-cardinality key, 49–82×.** corgi has only the general structural `group`, which sorts; a 256-bucket sum is one O(n) accumulate pass. The missing piece is a narrow-key fast path, the same lever collie added to its `group`.
 2. **the single-key join, 5.3–6.3×.** With both sides sorted the Rust ceiling is a two-pointer merge; corgi's `find` does an independent search per probe and then `slices` materializes. A relational-op gap, not fusion. (`arrange::survey` already *is* the merge kernel — it is the surface `join` that does not reach it.)
-3. **`mul`/`sub` by a constant cost a full extra column.** A constant operand, `(x, 3u64) mul`, is a literal broadcast to an n-element column and paired into a product, where `AddU64`/`Shr`/`And`/`Gt` have immediate kernels that touch neither. Cheap and local; A3's tax is 1.6–2.8× and this is most of it.
+3. **`mul`/`sub` by a constant cost a full extra column.** A constant operand, `(x, 3u64) mul`, was a literal broadcast to an n-element column and paired into a product. Closed by #45: `Program` rewrites a pair holding a literal into an op that carries the constant (`corgi::immediates`). A3 was measured before that, and runs here through `eval_graph` without the rewrite.
 
 **The aggregation controls were 8–12× off the ceiling they are named for, and the mechanism was a copy.**
 `C1 fold_add` and `C2 fold_max` measured 12.1× and 8.0× at 1 M under a harness that shares the input
