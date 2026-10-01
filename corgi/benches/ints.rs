@@ -188,7 +188,7 @@ fn arith_section(n: usize, reps: u32) {
     let chain_w = Value::Prod(cols.iter().map(|c| Value::u64(c.clone())).collect());
     let chain_i = Value::Prod(cols.iter().map(|c| Value::int_u64(c.clone())).collect());
     cases.push(("b=15: three adds, U64".into(), &chain, chain_w, 24));
-    cases.push(("b=15: three adds, Int (16 -> 32 -> 32 -> 32 bits)".into(), &chain_int, chain_i, 12));
+    cases.push(("b=15: three adds, Int (results 16, 32, 32 bits)".into(), &chain_int, chain_i, 10));
     let mut best = vec![Duration::MAX; cases.len()];
     for _ in 0..reps {
         for (k, (_, g, arg, _)) in cases.iter().enumerate() {
