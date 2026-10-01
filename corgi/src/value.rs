@@ -334,6 +334,12 @@ macro_rules! prim {
                 match self { $( Prim::$V(v) => v[i] as usize, )+ }
             }
 
+            /// row `i`'s stored bits, zero-extended to a `u64`: how a literal's value is read. Not
+            /// `usize_at`, which truncates to 32 bits where `usize` is 32 bits (WebAssembly).
+            #[inline]
+            pub(crate) fn u64_at(&self, i: usize) -> u64 {
+                match self { $( Prim::$V(v) => v[i] as u64, )+ }
+            }
 
             /// re-width every record to `bits`, kind-blind: read it zero-extended to u64,
             /// then keep the low bytes. (Signed/sign-extending widen is a numeric-layer job.)

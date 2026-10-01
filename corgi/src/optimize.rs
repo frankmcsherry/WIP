@@ -214,7 +214,7 @@ pub fn immediates(g: &Graph<NumOp>) -> Graph<NumOp> {
             return None;
         }
         let literal = |i: usize| match &built[pair.inputs[i]].kind {
-            NodeKind::Op(NumOp::Core(Op::Lit(Value::Prim(p)))) if p.len() == 1 => Some((p.bits(), p.usize_at(0) as u64)),
+            NodeKind::Op(NumOp::Core(Op::Lit(Value::Prim(p)))) if p.len() == 1 => Some((p.bits(), p.u64_at(0))),
             _ => None,
         };
         let (x, (w, c), left) = match (literal(1), literal(0)) {
@@ -282,5 +282,14 @@ mod tests {
             assert!(!any_node(&g, &lit), "{src}: a literal is left");
             assert!(any_node(&g, &imm), "{src}: no immediate");
         }
+    }
+
+    /// an immediate keeps every bit of its literal, where `usize` is 32 bits too (WebAssembly).
+    #[test]
+    fn immediates_keep_wide_literals() {
+        let big = (3u64 << 46) + 5;
+        let g = dce(&immediates(&parse_ml(&format!("input map (x -> (x, {big}u64) add)")).unwrap()));
+        let wide = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Arith(ArithOp::BinImm(_, _, 64, c))) if *c == big);
+        assert!(any_node(&g, &wide), "the immediate lost its high bits");
     }
 }
