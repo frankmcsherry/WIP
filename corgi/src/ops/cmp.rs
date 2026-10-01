@@ -44,8 +44,11 @@ impl Pred {
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
     Gt(u64),   // X -> U64 mask    (x > c) as 0/1   — the column-vs-immediate sugar form
+    RelImm(Pred, u32, u64), // X -> U64 mask   `x pred c`, `c` a constant's stored bits at width w
     Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
     Max,       // (X, X) -> X   lane-wise maximum
+    MinImm(u32, u64), // X -> X   lane-wise min with a constant (stored bits at width w), in place
+    MaxImm(u32, u64), // X -> X   lane-wise max with a constant
     SortList,  // List<X> -> List<X>   structural order
     DedupList, // List<X> -> List<X>   distinct, per row (sorted)
     GroupKey,  // List<(K,V)> -> List<(K, List<V>)>   group by key, per row (sorted)
@@ -80,6 +83,22 @@ impl CmpOp {
                 }
                 assert_eq!(pa.len(), pb.len(), "min/max: operands at different strata");
                 Value::Prim(pa.lane_pick(pb, take_max))
+            }
+
+            CmpOp::RelImm(pred, w, c) => {
+                let p = input.into_prim("compare with a constant")?;
+                if p.bits() != *w {
+                    return Err(format!("compare with a U{w} constant expects U{w}, got U{}", p.bits()));
+                }
+                Value::u64(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
+            }
+
+            CmpOp::MinImm(w, c) | CmpOp::MaxImm(w, c) => {
+                let p = input.into_prim("min/max with a constant")?;
+                if p.bits() != *w {
+                    return Err(format!("min/max with a U{w} constant expects U{w}, got U{}", p.bits()));
+                }
+                Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
             }
 
             CmpOp::Gt(c) => {

@@ -3,7 +3,8 @@
 //! matches core `Field`/`Tuple`, so it reaches through `NumOp::Core`.
 
 use crate::graph::{Graph, Node, NodeKind};
-use crate::ops::{NumOp, Op};
+use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred};
+use crate::value::Value;
 use std::collections::HashMap;
 
 /// recurse a body-bearing core op's sub-graphs through a pass.
@@ -195,8 +196,91 @@ pub fn cancel_isos(g: &Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
+/// constant operands become immediates: a binary op whose input is a pair with a one-row leaf
+/// literal in it runs as one op carrying the constant (`ArithOp::BinImm`, `CmpOp::RelImm`,
+/// `CmpOp::MinImm`/`MaxImm`) on the other side, so `(x, 4u64) add` builds no column of 4s. Exact,
+/// because the immediate kernels share the pair kernels' lane bodies and take the literal's stored
+/// bits. A literal on the left converts where the order of operands doesn't matter (integer
+/// `add`/`mul`, `eq`, `ne`, `min`, `max`) and for the other comparisons, which flip; `(c, x) sub`,
+/// `div` and `rem`, and float `(c, x) add`/`mul` (whose NaN payloads can depend on the order), stay
+/// pairs. A width that disagrees with the op stays a pair too, so it fails where it did. The pair and
+/// the literal remain while anything else reads them; [`dce`] sweeps them otherwise. `Program` runs
+/// this, then `dce`, on every program; the ML notation has no spelling of its own for these ops.
+pub fn immediates(g: &Graph<NumOp>) -> Graph<NumOp> {
+    rewrite_graph(g, immediates, |kind, inputs, built, _| {
+        let NodeKind::Op(op) = kind else { return None };
+        let pair = &built[*inputs.first()?];
+        if !matches!(pair.kind, NodeKind::Tuple) || pair.inputs.len() != 2 {
+            return None;
+        }
+        let literal = |i: usize| match &built[pair.inputs[i]].kind {
+            NodeKind::Op(NumOp::Core(Op::Lit(Value::Prim(p)))) if p.len() == 1 => Some((p.bits(), p.usize_at(0) as u64)),
+            _ => None,
+        };
+        let (x, (w, c), left) = match (literal(1), literal(0)) {
+            (Some(l), _) => (pair.inputs[0], l, false),
+            (None, Some(l)) => (pair.inputs[1], l, true),
+            (None, None) => return None,
+        };
+        let flip = |p: Pred| match p {
+            Pred::Lt => Pred::Gt,
+            Pred::Le => Pred::Ge,
+            Pred::Gt => Pred::Lt,
+            Pred::Ge => Pred::Le,
+            same => same,
+        };
+        let imm = match op {
+            NumOp::Arith(ArithOp::Bin(b, k, bw)) => {
+                let either_side = matches!(b, BinOp::Add | BinOp::Mul) && !matches!(k, Kind::F);
+                if *bw != w || (left && !either_side) {
+                    return None;
+                }
+                NumOp::Arith(ArithOp::BinImm(*b, *k, *bw, c))
+            }
+            NumOp::Cmp(CmpOp::Rel(p)) => NumOp::Cmp(CmpOp::RelImm(if left { flip(*p) } else { *p }, w, c)),
+            NumOp::Cmp(CmpOp::Min) => NumOp::Cmp(CmpOp::MinImm(w, c)),
+            NumOp::Cmp(CmpOp::Max) => NumOp::Cmp(CmpOp::MaxImm(w, c)),
+            _ => return None,
+        };
+        Some(Rewrite::Replace(Node { kind: NodeKind::Op(imm), inputs: vec![x] }))
+    })
+}
+
 /// run the passes together: peephole and iso-cancellation expose dead/foldable structure, map fusion
 /// collapses adjacent list passes, then cse → dce sweep.
 pub fn optimize(g: &Graph<NumOp>) -> Graph<NumOp> {
-    dce(&cse(&fuse_maps(&cancel_isos(&peephole(g)))))
+    dce(&cse(&fuse_maps(&immediates(&cancel_isos(&peephole(g))))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parse_ml;
+
+    /// does any node of `g`, or of any body inside it, satisfy `f`?
+    fn any_node(g: &Graph<NumOp>, f: &dyn Fn(&NodeKind<NumOp>) -> bool) -> bool {
+        g.nodes.iter().any(|n| {
+            f(&n.kind)
+                || match &n.kind {
+                    NodeKind::Op(NumOp::Core(Op::MapList(b) | Op::Fold(b) | Op::FoldScan(b))) => any_node(b, f),
+                    NodeKind::Op(NumOp::Core(Op::MapSum(arms))) => arms.iter().any(|(_, b)| any_node(b, f)),
+                    _ => false,
+                }
+        })
+    }
+
+    #[test]
+    fn immediates_reach_into_bodies() {
+        for src in [
+            "input iota map (x -> (x, 1u64) sub)",
+            "(input, input iota) fold ((a, x) -> ((a, x) add, 3u64) mul)",
+            "input iota map (x -> (x, x and 1) branch 2 match (0 (e -> (e, 100u64) add), 1 (o -> o)))",
+        ] {
+            let g = dce(&immediates(&parse_ml(src).unwrap()));
+            let lit = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Core(Op::Lit(_))));
+            let imm = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Arith(ArithOp::BinImm(..))));
+            assert!(!any_node(&g, &lit), "{src}: a literal is left");
+            assert!(any_node(&g, &imm), "{src}: no immediate");
+        }
+    }
 }

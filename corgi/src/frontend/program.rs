@@ -10,6 +10,7 @@ use super::parse_ml;
 use crate::effect::{is_total, lower_effects};
 use crate::graph::{eval_graph, shape_of, Graph};
 use crate::ops::NumOp;
+use crate::optimize::{dce, immediates};
 use crate::shape::Shape;
 use crate::value::Value;
 
@@ -27,8 +28,10 @@ impl Program {
     }
 
     /// wrap an already-built graph — from the `Builder`, the optimizer, or a host's own lowering.
+    /// What runs is the graph with constant operands made immediates and unreachable nodes dropped
+    /// (both exact), then effect-lowered; `graph()` is the program as written.
     pub fn from_graph(graph: Graph<NumOp>) -> Program {
-        let lowered = lower_effects(&graph);
+        let lowered = lower_effects(&dce(&immediates(&graph)));
         Program { graph, lowered }
     }
 

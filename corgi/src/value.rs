@@ -467,6 +467,24 @@ macro_rules! prim {
                 }
             }
 
+            /// lane-wise min (or max, with `take_max`) against the constant `c`, given as stored
+            /// bits that fit this width. Kind-blind, like `lane_pick`; in place when uniquely owned.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn pick_imm(self, c: u64, take_max: bool) -> Prim {
+                match self {
+                    $( Prim::$V(mut a) => {
+                        let c = c as $t;
+                        let pick = |x: $t| if take_max { x.max(c) } else { x.min(c) };
+                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
+                            for x in dst.iter_mut() { *x = pick(*x); }
+                            a
+                        } else {
+                            Arc::new(a.iter().map(|&x| pick(x)).collect())
+                        })
+                    } )+
+                }
+            }
+
             /// lane-wise blend of two same-width columns by a 0/1 selector: `out[i]` is `self[i]`
             /// where `pick[i]` is nonzero, else `other[i]`. KIND-BLIND — it moves stored bytes and
             /// never interprets them — and BRANCHLESS: the lane body is an unconditional select, so
@@ -622,6 +640,29 @@ macro_rules! prim {
                         })
                         .collect(), )+
                     _ => panic!("cmp_dense: prim width mismatch"),
+                }
+            }
+
+            /// `rel` against the constant `c` (stored bits that fit this width): the mask of rows
+            /// whose comparison with `c` lands in the chosen order flags.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+                match self {
+                    // one loop per predicate: a single compare per lane, where folding the three
+                    // order flags into the body measured ~20% slower on a `gt` filter.
+                    $( Prim::$V(a) => {
+                        let y = c as $t;
+                        match (lt, eq, gt) {
+                            (true, false, false) => a.iter().map(|&x| (x < y) as u64).collect(),
+                            (true, true, false) => a.iter().map(|&x| (x <= y) as u64).collect(),
+                            (false, true, false) => a.iter().map(|&x| (x == y) as u64).collect(),
+                            (true, false, true) => a.iter().map(|&x| (x != y) as u64).collect(),
+                            (false, false, true) => a.iter().map(|&x| (x > y) as u64).collect(),
+                            (false, true, true) => a.iter().map(|&x| (x >= y) as u64).collect(),
+                            // no flag or every flag: the predicate is constant
+                            (all, _, _) => vec![all as u64; a.len()],
+                        }
+                    } )+
                 }
             }
 
