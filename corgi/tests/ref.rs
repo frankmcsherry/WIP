@@ -1,5 +1,5 @@
 //! `Ref<List<T>>`: referenced list rows. `ref` takes them (nothing copied, through products and
-//! sums), `clone` copies the rows out, `gather` (hence the capture family and `lit`) and the merges
+//! sums), `clone` copies the rows out, `gather` (hence the capture family and literals) and the merges
 //! move only spans, and the readers `get`/`gather`/`find`/`slices`/`len` accept a referenced list.
 //! These tests pin that a referenced haystack answers exactly as the list it references, that the two
 //! spellings of a capture — by value and by reference — agree, and that references stay references
@@ -255,7 +255,7 @@ fn wco_step_searches_through_references() {
     let small = Value::List(vec![2, 4, 6, 8].into(), Box::new(Value::u64(vec![3, 9, 10, 15, 25, 29, 30, 99])));
     let prog = |adj: &str| {
         format!(
-            "let (small, ranges, adj) = input in let hay = (ranges len sub 1, (ranges, {adj}) slices) get in (small, hay) find"
+            "let (small, ranges, adj) = input in let hay = ((ranges len, 1u64) sub, (ranges, {adj}) slices) get in (small, hay) find"
         )
     };
     let arg = Value::Prod(vec![small, ranges, by_ref]);

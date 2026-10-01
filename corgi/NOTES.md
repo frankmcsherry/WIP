@@ -131,8 +131,8 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   and equals itself bit-for-bit; `-0 != +0` (distinct bits — no canonicalization, by choice). The
   win: no NaN-poisons-comparison surprise. *Arithmetic stays IEEE* (NaN/inf propagate; `x/0 -> ±inf`,
   `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
-  via `to_f32`/`to_f64` (no float literal token: a constant is `lit_uN K to_fN`); the typed grid is
-  reached by suffix (`add_i32`, `div_f64`, `lit_i16 N`, `signed`). Integer `div` is deferred (no NEON
+  via `to_f32`/`to_f64` or a float literal (`1.5f64`, the same encoding); the typed grid is reached by
+  suffix (`add_i32`, `div_f64`, `signed`), and literals carry kind and width (`-3i16`, `7u8`). Integer `div` is deferred (no NEON
   op; div-by-zero would panic) — `eval` rejects it.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
@@ -332,7 +332,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
   naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
-  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and pair-eating binaries accept an immediate (`x sub 1` ≡ `(x, x lit 1) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are untouched).
+  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are typed literals (`(x, 1u64) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are ops with a parameter, `x shr 3`).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).

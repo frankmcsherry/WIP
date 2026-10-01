@@ -5,5 +5,5 @@
 # n = 8
 # = ([0], [3], [12])
 let xs = input iota map (x -> x and 3) in
-let seed = (xs lit 999, xs lit 0, xs lit 0) in
+let seed = (999u64, 0u64, 0u64) in
 (seed, xs) fold ((acc, x) -> ((acc.0, x) min, (acc.1, x) max, (acc.2, x) add))

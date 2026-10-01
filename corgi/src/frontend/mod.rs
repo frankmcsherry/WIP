@@ -22,12 +22,12 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "chunk")
-        || name.starts_with("lit_") // typed literals `lit_<k><w> N`
+    matches!(name, "gt" | "add_u64" | "shr" | "and" | "cast" | "chunk")
 }
 
 /// parse a `<kind><width>` suffix like `i32` / `u8` / `f64` into `(Kind, width)`, validating the
-/// width (and that floats are only 32/64). The basis for the typed-arithmetic surface (`add_i32`, …).
+/// width (and that floats are only 32/64). The basis for the typed-arithmetic surface (`add_i32`, …)
+/// and for typed literals (`5i32`).
 fn parse_kw(suf: &str) -> Option<(Kind, u32)> {
     let kind = match suf.as_bytes().first()? {
         b'u' => Kind::U,
@@ -43,20 +43,10 @@ fn parse_kw(suf: &str) -> Option<(Kind, u32)> {
     ok.then_some((kind, width))
 }
 
-/// the typed-arithmetic surface: `<op>_<k><w>` (`add_i32`, `div_f64`, `neg_u8`, …) and `lit_<k><w> N`,
-/// surfacing the (op × kind × width) grid. Returns `None` for a name that isn't a typed form, so
-/// `resolve` falls through to its fixed table. Width/kind validity is enforced by `parse_kw`.
-fn typed_arith(name: &str, arg: Option<u64>) -> Option<NumOp> {
-    if let Some(suf) = name.strip_prefix("lit_") {
-        let (k, w) = parse_kw(suf)?;
-        // no float literal token: `lit_f32 3` would store the raw bits 3, not 3.0 (`lit_value` only
-        // encodes integers). Reject `F` so it's an unknown op, not a silent NaN; the float path is
-        // `lit_uN K to_fN` (a literal integer, then the documented encode).
-        if matches!(k, Kind::F) {
-            return None;
-        }
-        return Some(Op::Lit(crate::ops::lit_value(k, w, arg?)).into());
-    }
+/// the typed-arithmetic surface: `<op>_<k><w>` (`add_i32`, `div_f64`, `neg_u8`, …), surfacing the
+/// (op × kind × width) grid. Returns `None` for a name that isn't a typed form, so `resolve` falls
+/// through to its fixed table. Width/kind validity is enforced by `parse_kw`.
+fn typed_arith(name: &str) -> Option<NumOp> {
     let (base, suf) = name.rsplit_once('_')?;
     let (k, w) = parse_kw(suf)?;
     let bin = |op| Some(ArithOp::Bin(op, k, w).into());
@@ -72,22 +62,13 @@ fn typed_arith(name: &str, arg: Option<u64>) -> Option<NumOp> {
     }
 }
 
-/// which op idents are pair-eating binaries that accept an optional immediate: `x sub 1` is sugar
-/// for `(x, x lit 1) sub`. (`and`/`shr`/`gt`/`add_u64` above are the core's immediate KERNELS and
-/// always take their number; these desugar at the surface and the core sees the lit-pair graph.)
-pub(crate) fn pair_imm(name: &str) -> bool {
-    matches!(name, "add" | "sub" | "mul" | "min" | "max" | "eq" | "ne" | "lt" | "le")
-}
-
 /// the op-name -> `NumOp` table the front-end lowers through. `map` / `map_variant` are NOT here:
 /// they carry sub-graphs and are built by the surface itself.
 pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     let n = || arg.ok_or_else(|| format!("op '{name}' needs a numeric argument"));
     Ok(match name {
-        "field" => Op::Field(n()? as usize).into(),
         "gt" => CmpOp::Gt(n()?).into(), // column vs immediate (the threshold-filter sugar)
         "cast" => Op::Cast(n()? as u32).into(),
-        "lit" => Op::Lit(Value::u64(vec![n()?])).into(),
         "transpose" => Op::Transpose.into(),
         // One name per fallible method — each is its TOTAL per-row `Try*` form (a row that would trip
         // the kernel's assert lands in Err); `effect::lower_effects` threads the Err lane past the
@@ -143,8 +124,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "min" => CmpOp::Min.into(), // kind-blind lane min/max — order ops, in `cmp` not the arith grid
         "max" => CmpOp::Max.into(),
         "neg" => ArithOp::Neg(Kind::U, 64).into(),
-        // the typed grid (signed/float/narrow) is reached by suffix: `add_i32`, `div_f64`, `lit_u8 N`,
-        // … — see `typed_arith`. Plus the two kind conversions:
+        // the typed grid (signed/float/narrow) is reached by suffix: `add_i32`, `div_f64`, … — see
+        // `typed_arith`. Plus the two kind conversions:
         "signed" => ArithOp::ToSigned.into(), // unsigned <-> signed encoding (XOR sign bit; involution)
         "to_f32" => ArithOp::ToFloat(32).into(), // unsigned int -> f32 (how iota becomes floats)
         "to_f64" => ArithOp::ToFloat(64).into(),
@@ -171,8 +152,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
         "parse_u64" => TextOp::ParseU64.into(),
-        // the typed-arithmetic grid by suffix (`add_i32`, `mul_f64`, `lit_u8 N`, …); falls through to
-        // an error only if it's neither a fixed op above nor a well-formed typed form.
-        other => return typed_arith(other, arg).ok_or_else(|| format!("unknown op '{other}'")),
+        // the typed-arithmetic grid by suffix (`add_i32`, `mul_f64`, …); falls through to an error
+        // only if it's neither a fixed op above nor a well-formed typed form.
+        other => return typed_arith(other).ok_or_else(|| format!("unknown op '{other}'")),
     })
 }

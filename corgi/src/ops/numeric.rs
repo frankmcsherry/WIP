@@ -78,14 +78,14 @@ pub enum Kind {
 /// IEEE-bits <-> total-order encoding for f32 (and f64 below): negatives flip all bits, non-negatives
 /// flip just the sign bit, so the unsigned byte order is the float total order (`f64::total_cmp`). The
 /// kind-blind comparator then sorts/compares floats correctly with no special case.
-fn enc_f32(f: f32) -> u32 {
+pub(crate) fn enc_f32(f: f32) -> u32 {
     let b = f.to_bits();
     if b >> 31 == 1 { !b } else { b ^ (1 << 31) }
 }
 fn dec_f32(u: u32) -> f32 {
     f32::from_bits(if u >> 31 == 1 { u ^ (1 << 31) } else { !u })
 }
-fn enc_f64(f: f64) -> u64 {
+pub(crate) fn enc_f64(f: f64) -> u64 {
     let b = f.to_bits();
     if b >> 63 == 1 { !b } else { b ^ (1 << 63) }
 }

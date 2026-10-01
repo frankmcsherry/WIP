@@ -11,5 +11,5 @@ let sums = input iota map (x ->
     map_variant Odd (o -> o and 3 iota))
 in
 let sorted = sums sort in
-let needle = input lit 2 inject Even enlist in
+let needle = 2u64 inject Even enlist in
 (needle, sorted) find

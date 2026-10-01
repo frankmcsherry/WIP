@@ -281,7 +281,7 @@ mod tests {
         assert!(!is_total(&parse_ml("input iota head").unwrap()));
         assert_eq!(run("input iota head try", 0), "Sum tags=[1] [[], ()x1]");
         // matching on the revealed sum is ordinary pure code again.
-        let src = "input iota head try match (0 (x -> x add_u64 100), 1 (u -> u lit 7))";
+        let src = "input iota head try match (0 (x -> x add_u64 100), 1 (u -> 7u64))";
         assert_eq!(run(src, 0), "[7]");
         assert_eq!(run(src, 5), "[100]");
     }
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn fold_with_a_fallible_body_errs_the_row() {
         // fold over [0..n): the body reads element `x` of a length-3 list, so x >= 3 errs the row.
-        let src = "(input lit 0, input iota) fold ((acc, x) -> ((x, x lit 3 iota) get, acc) add)";
+        let src = "(0u64, input iota) fold ((acc, x) -> ((x, 3u64 iota) get, acc) add)";
         assert_eq!(run(src, 3), "Sum tags=[0] [[3], ()x0]"); // 0+1+2
         assert_eq!(run(src, 4), "Sum tags=[1] [[], ()x1]"); // x=3 out of range
     }

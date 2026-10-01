@@ -263,7 +263,7 @@ fn family_a(n: usize, reps: u32) {
     row_chain("A2 add_chain8", n, ck, rk, r1);
 
     // A3 mixed_chain — 4 heterogeneous kernels: (((x+5)*3)-2)>>1.
-    let g = compile("input add_u64 5 mul 3 sub 2 shr 1");
+    let g = compile("((input add_u64 5, 3u64) mul, 2u64) sub shr 1");
     let ck = corgi_t(&g, &lf, reps);
     let rk = rust_t(reps, || {
         let s = black_box(&src);
@@ -290,7 +290,7 @@ fn family_a(n: usize, reps: u32) {
     row_chain("A3 mixed_chain", n, ck, rk, r1);
 
     // A4 map_then_reduce — sum of 2x. Fusion folds the map into the reduce (no intermediate column).
-    let g = compile("let xs = input in xs map (e -> e mul 2) fold_add");
+    let g = compile("let xs = input in xs map (e -> (e, 2u64) mul) fold_add");
     let li = one_list(n);
     let ck = corgi_t(&g, &li, reps);
     let r1 = rust_t(reps, || {
@@ -337,7 +337,7 @@ fn family_b(n: usize, reps: u32) {
 
     // B2 select/blend — min(x+7, 3x) via cmp + branchless select. corgi: add,mul,cmp,select passes.
     let g = compile(
-        "input map (x -> let a = x add_u64 7 in let b = x mul 3 in ((a, b) lt, a, b) select)",
+        "input map (x -> let a = x add_u64 7 in let b = (x, 3u64) mul in ((a, b) lt, a, b) select)",
     );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -410,7 +410,7 @@ fn family_c(n: usize, reps: u32) {
     );
 
     // C4 scan — inclusive prefix sum. Sequential within the row; rust is a tight cumsum loop.
-    let g = compile("let xs = input in (xs lit 0, xs) scan ((a, x) -> (a, x) add)");
+    let g = compile("let xs = input in (0u64, xs) scan ((a, x) -> (a, x) add)");
     let c = corgi_t(&g, &li, reps.min(3)); // ~hundreds of ns/row; few reps suffice and save minutes
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -457,7 +457,7 @@ fn family_c(n: usize, reps: u32) {
     );
 
     // C5 fold (sum, count) — heterogeneous accumulator, non-monoid shape.
-    let g = compile("let seed = (input lit 0, input lit 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))");
+    let g = compile("let seed = (0u64, 0u64) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))");
     let c = corgi_t(&g, &li, reps.min(3));
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -684,7 +684,7 @@ fn family_g(m: usize, reps: u32) {
     // one pass over the bytes, atoi at each comma, accumulate (no pre-parsed shortcut).
     let (csv, csv_bytes) = csv_text(m);
     let g = compile(
-        "input split \",\" map (w -> w parse_u64 map_variant 0 (e -> e lit 0) unwrap) fold_add",
+        "input split \",\" map (w -> w parse_u64 map_variant 0 (e -> 0u64) unwrap) fold_add",
     );
     let c = corgi_t(&g, &csv, reps);
     let r = rust_t(reps, || {

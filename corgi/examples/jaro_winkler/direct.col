@@ -1,0 +1,36 @@
+# Jaro-Winkler similarity over bytes, as `strsim::jaro_winkler` computes it on ASCII.
+# Input `(s1, s2)`, two `List<U8>`. Output a float (`f64` in corgi's total-order encoding).
+let (s1, s2) = input in
+let (l1, l2) = (s1 len, s2 len) in
+# The match window: max(l1, l2) / 2 - 1, saturating at zero.
+let d = ((((l1, l2) max shr 1), 1u64) max, 1u64) sub in
+# Number the bytes: s1 as (i, c), s2 as (j, c, matched).
+let s1x = ((0u64, s1) foldscan ((i, c) -> (i add_u64 1, (i, c)))) .1 in
+let s2x = ((0u64, s2) foldscan ((j, c) -> (j add_u64 1, (j, c, 0u64)))) .1 in
+# The greedy match: for each byte of s1, take the first unmatched equal byte of s2 in the window.
+let matching = ((d, s2x), s1x) foldscan (((d, st), (i, c)) ->
+    let jm = ((d, i, c), st) cap_list map (((d, i, c), (j, ch, m)) ->
+        let ok = (((ch, c) eq, (m, 0u64) eq) mul, ((i, (j, d) add) le, (j, (i, d) add) le) mul) mul in
+        (ok, j, 1000000000u64) select) fold_min in
+    let st2 = (jm, st) cap_list map ((jm, (j, ch, m)) -> (j, ch, (m, (j, jm) eq) max)) in
+    let same = ((i, c), st) cap_list map (((i, c), (j, ch, _)) -> ((i, j) eq, (c, ch) eq) mul) fold_max in
+    ((d, st2), ((jm, 1000000000u64) lt, same, (i, 4u64) lt, c))) in
+let ((_, s2m), per1) = matching in
+let m = per1 map ((hit, _, _, _) -> hit) fold_add in
+# Transpositions: rank the matched bytes of each string, then compare equal ranks.
+let rank2 = ((0u64, s2m) foldscan ((k, (_, ch, mm)) -> let k2 = (k, mm) add in (k2, (ch, mm, k2)))) .1 in
+let rank1 = ((0u64, per1) foldscan ((k, (hit, _, _, c)) -> let k2 = (k, hit) add in (k2, (c, hit, k2)))) .1 in
+let t2 = (rank2, rank1) cap_list map ((rank2, (c, hit, k)) ->
+    let mis = ((c, k), rank2) cap_list map (((c, k), (ch, mm, k2)) -> ((mm, (k2, k) eq) mul, (ch, c) ne) mul) fold_max in
+    (mis, hit) mul) fold_add in
+let t = t2 shr 1 in
+# The common prefix, up to four bytes.
+let prefix = (((0u64, 1u64), per1) fold (((p, alive), (_, same, lt4, _)) ->
+    let a2 = ((alive, same) mul, lt4) mul in
+    ((p, a2) add, a2))) .0 in
+let fm = m to_f64 in
+let jaro = ((((fm, l1 to_f64) div_f64, (fm, l2 to_f64) div_f64) add_f64, ((fm, t to_f64) sub_f64, fm) div_f64) add_f64, 3f64) div_f64 in
+let jaro = ((m, 0u64) eq, 0f64, jaro) select in
+let sim = (((l1, l2) add, 0u64) eq, 1f64, jaro) select in
+let jw = (sim, ((0.1f64, prefix to_f64) mul_f64, (1f64, sim) sub_f64) mul_f64) add_f64 in
+((0.7f64, sim) lt, jw, sim) select
