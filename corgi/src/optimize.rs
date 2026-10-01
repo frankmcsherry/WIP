@@ -60,7 +60,7 @@ fn rewrite_graph(
             }
         };
     }
-    Graph { nodes: built, output: remap[g.output] }
+    Graph::new(built, remap[g.output])
 }
 
 /// hash-consing: fold structurally-identical nodes into one.
@@ -82,7 +82,7 @@ pub fn cse(g: &Graph<NumOp>) -> Graph<NumOp> {
         };
         remap[old] = id;
     }
-    Graph { nodes: new_nodes, output: remap[g.output] }
+    Graph::new(new_nodes, remap[g.output])
 }
 
 /// dead-node elimination: keep only nodes reachable from the output.
@@ -105,7 +105,7 @@ pub fn dce(g: &Graph<NumOp>) -> Graph<NumOp> {
         remap[old] = new_nodes.len();
         new_nodes.push(Node { kind: map_kind(&node.kind, dce), inputs });
     }
-    Graph { nodes: new_nodes, output: remap[g.output] }
+    Graph::new(new_nodes, remap[g.output])
 }
 
 /// peephole: `Field(i)` applied to a `Tuple` is just the tuple's i-th input, and a pattern of n
