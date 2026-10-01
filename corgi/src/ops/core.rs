@@ -4,7 +4,7 @@
 
 use crate::engine::{
     blend, clone_ref, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans,
-    resolve_indices, take_ref,
+    resolve_indices, take_ref, unwrap_leaves,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
@@ -277,24 +277,41 @@ impl<L: OpLike> Op<L> {
             Op::Unweave => {
                 let (bounds, vals) = input.into_list("Unweave")?;
                 let (tags, lanes) = vals.into_sum("Unweave")?;
-                let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
-                let mut counts = vec![0usize; lanes.len()];
-                let mut start = 0;
-                for end in bounds.ends() {
-                    for i in start..end {
-                        counts[tags.tag_at(i)] += 1;
+                // each lane's bounds: per row, how many of its elements the lane holds, as
+                // running ends. One row owns every element, so its counts are the lane lengths;
+                // one tag throughout gives that lane every row's elements and the others none.
+                // A sum's tag column is always one byte per row (every constructor and the codec
+                // make it so).
+                let lane_bounds: Vec<Vec<usize>> = match &tags {
+                    _ if bounds.len() == 1 => lanes.iter().map(|l| vec![l.len()]).collect(),
+                    Tags::Const(t, _) => (0..lanes.len())
+                        .map(|l| if l == *t { bounds.ends().collect() } else { vec![0; bounds.len()] })
+                        .collect(),
+                    Tags::Column(Prim::U8(ts), _) => {
+                        let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
+                        let mut counts = vec![0usize; lanes.len()];
+                        let mut start = 0;
+                        for end in bounds.ends() {
+                            for &t in &ts[start..end] {
+                                counts[t as usize] += 1;
+                            }
+                            for (lb, &c) in lane_bounds.iter_mut().zip(&counts) {
+                                lb.push(c);
+                            }
+                            start = end;
+                        }
+                        lane_bounds
                     }
-                    for (lb, &c) in lane_bounds.iter_mut().zip(&counts) {
-                        lb.push(c);
-                    }
-                    start = end;
-                }
+                    Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
+                };
                 // the tag column widens ONCE, into the U64 list this op exists to produce — it is
                 // the output, not a decode of the input on the way to it.
-                let tag_list = Value::List(
-                    bounds,
-                    Box::new(Value::u64(tags.tags_iter().map(|t| t as u64).collect())),
-                );
+                let wide: Vec<u64> = match &tags {
+                    Tags::Const(t, rows) => vec![*t as u64; *rows],
+                    Tags::Column(Prim::U8(ts), _) => ts.iter().map(|&t| t as u64).collect(),
+                    Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
+                };
+                let tag_list = Value::List(bounds, Box::new(Value::u64(wide)));
                 let mut out = vec![tag_list];
                 for (lane, lb) in lanes.into_iter().zip(lane_bounds) {
                     out.push(Value::List(lb.into(), Box::new(lane)));
@@ -483,9 +500,16 @@ impl<L: OpLike> Op<L> {
                 if let Some(t) = tags.const_tag() {
                     return Ok(variants.into_iter().nth(t).expect("tag names a lane"));
                 }
-                let Tags::Column(_, os) = &tags else { unreachable!("const handled above") };
-                // the carried offsets are already the `&[usize]` `gather_lanes` wants; only the u8
-                // discriminants widen, and only here, where every row is read exactly once anyway.
+                let Tags::Column(tp, os) = &tags else { unreachable!("const handled above") };
+                // lanes of leaves read each row with the u8 discriminants in place.
+                if let Prim::U8(t8) = tp {
+                    let lanes: Vec<&Value> = variants.iter().collect();
+                    if let Some(v) = unwrap_leaves(&lanes, t8, os) {
+                        return Ok(v);
+                    }
+                }
+                // otherwise the carried offsets are already the `&[usize]` `gather_lanes` wants;
+                // only the u8 discriminants widen.
                 let ts: Vec<usize> = tags.tags_iter().collect();
                 let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
                 gather_lanes(&refs, &ts, os)

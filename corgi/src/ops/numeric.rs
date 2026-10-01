@@ -96,6 +96,9 @@ fn dec_f64(u: u64) -> f64 {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ArithOp {
     Bin(BinOp, Kind, u32), // binary leaf arithmetic at a bit-width
+    BinImm(BinOp, Kind, u32, u64), // the same with a constant right operand: `x op c`, where `c` is the
+                           // constant's stored bits at that width (its kind's encoding). One pass over
+                           // `x`, in place when it is uniquely owned; no column of `c` is built.
     Neg(Kind, u32),        // unary negate
     ToSigned,              // leaf -> leaf  XOR the sign bit (any width): unsigned <-> signed encoding,
                            // the kind-conversion `signed` (an involution; how a column enters Kind::I)
@@ -138,6 +141,47 @@ fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) ->
     }
 }
 
+/// apply a binary lane op `f` against the constant `c`, in place when `a` is uniquely owned, else
+/// fresh. The immediate sibling of `bin_into`: `f(x, c)` is exactly what `bin_into` computes when
+/// every row of the right operand is `c`.
+fn imm_into<T: Copy>(mut a: Arc<Vec<T>>, c: T, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+    if let Some(dst) = Arc::get_mut(&mut a) {
+        for x in dst.iter_mut() { *x = f(*x, c); }
+        a
+    } else {
+        Arc::new(a.iter().map(|&x| f(x, c)).collect())
+    }
+}
+
+/// the integer (kind × op) lane bodies, written once: `$apply($($arg),*, body)` for the body of the
+/// cell `($kind, $op)` at unsigned type `$u` and signed type `$i`. `int_bin` applies them to two
+/// columns and `int_imm` to a column and a constant, so the two can't disagree.
+macro_rules! int_arms {
+    ($u:ty, $i:ty, $kind:expr, $op:expr, $apply:ident($($arg:expr),*)) => {
+        match ($kind, $op) {
+            (Kind::U, BinOp::Add) => $apply($($arg,)* |x: $u, y: $u| x.wrapping_add(y)),
+            (Kind::U, BinOp::Sub) => $apply($($arg,)* |x: $u, y: $u| x.wrapping_sub(y)),
+            (Kind::U, BinOp::Mul) => $apply($($arg,)* |x: $u, y: $u| x.wrapping_mul(y)),
+            (Kind::I, BinOp::Add) => $apply($($arg,)* |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
+            (Kind::I, BinOp::Sub) => $apply($($arg,)* |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
+            (Kind::I, BinOp::Mul) => $apply($($arg,)* |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
+            (Kind::U, BinOp::Rem) => $apply($($arg,)* |x: $u, y: $u| if y == 0 { x } else { x % y }),
+            // `wrapping_rem` for the MIN % -1 overflow; the zero divisor is the total `x % 0 = x`.
+            (Kind::I, BinOp::Rem) => $apply($($arg,)* |x: $u, y: $u| {
+                let m = !(<$u>::MAX >> 1);
+                if (y ^ m) as $i == 0 { x } else { swiz!($u, $i, x, y, wrapping_rem) }
+            }),
+            (Kind::U, BinOp::Div) => $apply($($arg,)* |x: $u, y: $u| if y == 0 { 0 } else { x / y }),
+            (Kind::I, BinOp::Div) => $apply($($arg,)* |x: $u, y: $u| {
+                let m = !(<$u>::MAX >> 1);
+                if (y ^ m) as $i == 0 { m } else { swiz!($u, $i, x, y, wrapping_div) }
+            }),
+            // float is dispatched by `bin_eval`/`imm_eval` before reaching here.
+            (Kind::F, _) => unreachable!("int arithmetic: float dispatched by bin_eval/imm_eval"),
+        }
+    };
+}
+
 /// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh.
 fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
@@ -156,28 +200,16 @@ macro_rules! grid {
     ($($V:ident => $u:ty : $i:ty),+ $(,)?) => {
         fn int_bin(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
             match (a, b) {
-                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(match (kind, op) {
-                    (Kind::U, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_add(y)),
-                    (Kind::U, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_sub(y)),
-                    (Kind::U, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| x.wrapping_mul(y)),
-                    (Kind::I, BinOp::Add) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
-                    (Kind::I, BinOp::Sub) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
-                    (Kind::I, BinOp::Mul) => bin_into(av, bv, |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
-                    (Kind::U, BinOp::Rem) => bin_into(av, bv, |x: $u, y: $u| if y == 0 { x } else { x % y }),
-                    // `wrapping_rem` for the MIN % -1 overflow; the zero divisor is the total `x % 0 = x`.
-                    (Kind::I, BinOp::Rem) => bin_into(av, bv, |x: $u, y: $u| {
-                        let m = !(<$u>::MAX >> 1);
-                        if (y ^ m) as $i == 0 { x } else { swiz!($u, $i, x, y, wrapping_rem) }
-                    }),
-                    (Kind::U, BinOp::Div) => bin_into(av, bv, |x: $u, y: $u| if y == 0 { 0 } else { x / y }),
-                    (Kind::I, BinOp::Div) => bin_into(av, bv, |x: $u, y: $u| {
-                        let m = !(<$u>::MAX >> 1);
-                        if (y ^ m) as $i == 0 { m } else { swiz!($u, $i, x, y, wrapping_div) }
-                    }),
-                    // float is dispatched by `bin_eval` before reaching here.
-                    (Kind::F, _) => unreachable!("int_bin: float dispatched by bin_eval"),
-                }), )+
+                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(int_arms!($u, $i, kind, op, bin_into(av, bv))), )+
                 _ => panic!("arith: operand width mismatch"),
+            }
+        }
+
+        // `c` is the constant's stored bits; at a narrow width they fit (the front end checks).
+        #[allow(clippy::unnecessary_cast)]
+        fn int_imm(op: BinOp, kind: Kind, a: Prim, c: u64) -> Prim {
+            match a {
+                $( Prim::$V(av) => Prim::$V(int_arms!($u, $i, kind, op, imm_into(av, c as $u))), )+
             }
         }
 
@@ -203,6 +235,14 @@ fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
     match kind {
         Kind::F => float_bin(op, a, b),
         _ => int_bin(op, kind, a, b),
+    }
+}
+
+/// `x op c` with `c` the constant's stored bits, dispatching float to `float_imm`.
+fn imm_eval(op: BinOp, kind: Kind, a: Prim, c: u64) -> Prim {
+    match kind {
+        Kind::F => float_imm(op, a, c),
+        _ => int_imm(op, kind, a, c),
     }
 }
 
@@ -234,6 +274,22 @@ fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
     }
 }
 
+/// float `x op c` on the encoded leaf: the constant decodes once, each lane as in `float_bin`.
+fn float_imm(op: BinOp, a: Prim, c: u64) -> Prim {
+    macro_rules! f { ($V:ident, $dec:ident, $enc:ident, $av:ident, $c:expr) => {{
+        let y = $dec($c);
+        Prim::$V(imm_into($av, $c, |x, _| { let x = $dec(x); $enc(match op {
+            BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
+            BinOp::Rem => unreachable!("float Rem is rejected before dispatch"),
+        })}))
+    }}}
+    match a {
+        Prim::U32(av) => f!(U32, dec_f32, enc_f32, av, c as u32),
+        Prim::U64(av) => f!(U64, dec_f64, enc_f64, av, c),
+        _ => panic!("float arith expects f32/f64 (width 32/64)"),
+    }
+}
+
 impl ArithOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
         Ok(match self {
@@ -251,6 +307,19 @@ impl ArithOp {
                 }
                 assert_eq!(pa.len(), pb.len(), "binary arith: operands at different strata");
                 Value::Prim(bin_eval(*op, *kind, pa, pb))
+            }
+            ArithOp::BinImm(op, kind, w, c) => {
+                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
+                    return Err(format!("float arith only at width 32/64, got {w}"));
+                }
+                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
+                    return Err("rem is integer-only".into());
+                }
+                let p = input.into_prim("arith with a constant")?;
+                if p.bits() != *w {
+                    return Err(format!("arith with a U{w} constant expects U{w}, got U{}", p.bits()));
+                }
+                Value::Prim(imm_eval(*op, *kind, p, *c))
             }
             ArithOp::Neg(kind, w) => {
                 if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {

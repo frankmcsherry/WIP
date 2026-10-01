@@ -34,7 +34,9 @@
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
 //! the scope. A bare NUM is an op's parameter (`shr 3`, `branch 2`), never a value. `#` starts a
-//! comment to the end of the line.
+//! comment to the end of the line. (What runs is not always what is written here: `Program` turns a
+//! binary op on a pair holding a literal, `(x, 1u64) sub`, into one op that carries the constant, so
+//! no column of the constant is built; see `corgi::immediates`.)
 //!
 //! A literal's suffix chooses how its bits are laid down: `u` as the value, `i` in the
 //! order-preserving signed encoding, `f` in the total-order float encoding. The encodings keep

@@ -467,6 +467,24 @@ macro_rules! prim {
                 }
             }
 
+            /// lane-wise min (or max, with `take_max`) against the constant `c`, given as stored
+            /// bits that fit this width. Kind-blind, like `lane_pick`; in place when uniquely owned.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn pick_imm(self, c: u64, take_max: bool) -> Prim {
+                match self {
+                    $( Prim::$V(mut a) => {
+                        let c = c as $t;
+                        let pick = |x: $t| if take_max { x.max(c) } else { x.min(c) };
+                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
+                            for x in dst.iter_mut() { *x = pick(*x); }
+                            a
+                        } else {
+                            Arc::new(a.iter().map(|&x| pick(x)).collect())
+                        })
+                    } )+
+                }
+            }
+
             /// lane-wise blend of two same-width columns by a 0/1 selector: `out[i]` is `self[i]`
             /// where `pick[i]` is nonzero, else `other[i]`. KIND-BLIND — it moves stored bytes and
             /// never interprets them — and BRANCHLESS: the lane body is an unconditional select, so
@@ -529,14 +547,18 @@ macro_rules! prim {
 
             /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]` (all
             /// same width). The leaf of [`crate::engine::gather_lanes`]; `gather` is the 1-source case.
-            pub(crate) fn gather_lanes(srcs: &[&Prim], tags: &[usize], off: &[usize]) -> Prim {
+            /// The tags may be a `Sum`'s own `u8` discriminants, read in place, or any `usize` column.
+            pub(crate) fn gather_lanes<T: Copy>(srcs: &[&Prim], tags: &[T], off: &[usize]) -> Prim
+            where
+                usize: From<T>,
+            {
                 match srcs[0] {
                     $( Prim::$V(_) => {
                         let cols: Vec<&[$t]> = srcs.iter().map(|s| match s {
                             Prim::$V(v) => v.as_slice(),
                             _ => panic!("gather_lanes: prim width mismatch"),
                         }).collect();
-                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[t][o]).collect()))
+                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)][o]).collect()))
                     } )+
                 }
             }
@@ -618,6 +640,29 @@ macro_rules! prim {
                         })
                         .collect(), )+
                     _ => panic!("cmp_dense: prim width mismatch"),
+                }
+            }
+
+            /// `rel` against the constant `c` (stored bits that fit this width): the mask of rows
+            /// whose comparison with `c` lands in the chosen order flags.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+                match self {
+                    // one loop per predicate: a single compare per lane, where folding the three
+                    // order flags into the body measured ~20% slower on a `gt` filter.
+                    $( Prim::$V(a) => {
+                        let y = c as $t;
+                        match (lt, eq, gt) {
+                            (true, false, false) => a.iter().map(|&x| (x < y) as u64).collect(),
+                            (true, true, false) => a.iter().map(|&x| (x <= y) as u64).collect(),
+                            (false, true, false) => a.iter().map(|&x| (x == y) as u64).collect(),
+                            (true, false, true) => a.iter().map(|&x| (x != y) as u64).collect(),
+                            (false, false, true) => a.iter().map(|&x| (x > y) as u64).collect(),
+                            (false, true, true) => a.iter().map(|&x| (x >= y) as u64).collect(),
+                            // no flag or every flag: the predicate is constant
+                            (all, _, _) => vec![all as u64; a.len()],
+                        }
+                    } )+
                 }
             }
 
