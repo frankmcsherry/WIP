@@ -154,10 +154,10 @@ pub enum Op<L> {
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
     Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>  materialize each range —
                     // Flatten's inverse and the range form of Gather.
-    Unweave,        // List<Sum{A|B|..}> -> (tags:List<U64>, List<A>, List<B>, ..)  destructure a
+    Unweave,        // List<Sum{A|B|..}> -> (tags:List<U8>, List<A>, List<B>, ..)  destructure a
                     // sum column: the tag list plus each lane re-sliced per outer row. Lanes are
                     // already stored packed in row order, so only bounds are computed.
-    Weave,          // (tags:List<U64>, List<A>, List<B>, ..) -> List<Sum{A|B|..}>  Unweave's
+    Weave,          // (tags:List<U8>, List<A>, List<B>, ..) -> List<Sum{A|B|..}>  Unweave's
                     // inverse: interleave the lanes per the tags. Per-row tag counts must match
                     // each lane's row length (asserted); the lanes' flat storage is the Sum's.
 
@@ -304,14 +304,14 @@ impl<L: OpLike> Op<L> {
                     }
                     Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
                 };
-                // the tag column widens ONCE, into the U64 list this op exists to produce — it is
-                // the output, not a decode of the input on the way to it.
-                let wide: Vec<u64> = match &tags {
-                    Tags::Const(t, rows) => vec![*t as u64; *rows],
-                    Tags::Column(Prim::U8(ts), _) => ts.iter().map(|&t| t as u64).collect(),
+                // the tags are a byte per row, and stay one: the sum's own tag column is shared,
+                // not copied, so a program that projects the tags away pays nothing for them.
+                let narrow = match &tags {
+                    Tags::Const(t, rows) => Prim::U8(Arc::new(vec![*t as u8; *rows])),
+                    Tags::Column(p @ Prim::U8(_), _) => p.clone(),
                     Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
                 };
-                let tag_list = Value::List(bounds, Box::new(Value::u64(wide)));
+                let tag_list = Value::List(bounds, Box::new(Value::Prim(narrow)));
                 let mut out = vec![tag_list];
                 for (lane, lb) in lanes.into_iter().zip(lane_bounds) {
                     out.push(Value::List(lb.into(), Box::new(lane)));
@@ -328,8 +328,8 @@ impl<L: OpLike> Op<L> {
                 if rest.is_empty() || rest.len() > 256 {
                     return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
                 }
-                let (tb, tv) = cols.pop().ok_or("Weave expects (List<U64> tags, List<A>, ..)")?.into_list("Weave tags")?;
-                let tags = tv.as_u64("Weave tags")?;
+                let (tb, tv) = cols.pop().ok_or("Weave expects (List<U8> tags, List<A>, ..)")?.into_list("Weave tags")?;
+                let tags = tv.as_u8("Weave tags")?;
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
@@ -346,7 +346,7 @@ impl<L: OpLike> Op<L> {
                 for (r, end) in tb.ends().enumerate() {
                     for &t in &tags[start..end] {
                         assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
-                        tag8.push(t as u8);
+                        tag8.push(t);
                         off.push(counts[t as usize]);
                         counts[t as usize] += 1;
                     }
