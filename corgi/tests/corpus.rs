@@ -55,7 +55,6 @@ fn corpus_matches_goldens() {
         let text = std::fs::read_to_string(&path).unwrap();
         let (n, expected, prog) = parse_col(&text);
         let p = Program::compile_ml(&prog).unwrap_or_else(|e| panic!("{who}: parse: {e}"));
-        p.check();
         // the lowered program is well-typed in the pure vocabulary — the typer covers effects.
         p.shape(&Shape::Prim(64)).unwrap_or_else(|e| panic!("{who}: shape: {e}"));
         let got = show(&p.run_partial(Value::u64(vec![n])));

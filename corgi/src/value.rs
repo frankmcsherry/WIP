@@ -202,11 +202,6 @@ pub enum Tags {
 }
 
 impl Tags {
-    /// every one of `rows` rows carries `tag` — the uniform assignment, stored in two words.
-    pub fn constant(tag: usize, rows: usize) -> Tags {
-        Tags::Const(tag, rows)
-    }
-
     /// the general assignment from a discriminant column and its within-lane offsets. Compacts to
     /// `Const` when every row carries one tag (the offsets are then forced to be the identity), the
     /// same construction-time check `Bounds::from` makes.
@@ -752,7 +747,7 @@ impl Value {
             Shape::Prim(w) => Value::Prim(Prim::empty(*w)),
             Shape::Prod(ss) => Value::Prod(ss.iter().map(Value::empty).collect()),
             Shape::Sum(ss) => {
-                Value::Sum(Tags::constant(0, 0), ss.iter().map(Value::empty).collect())
+                Value::Sum(Tags::Const(0, 0), ss.iter().map(Value::empty).collect())
             }
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
@@ -858,13 +853,6 @@ impl Value {
             // move the buffer out if this is the last holder, else clone (shared leaf).
             Value::Prim(Prim::U64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
             other => Err(format!("{who}: expected U64, got {}", shape_of_value(&other))),
-        }
-    }
-
-    pub fn into_u8(self, who: &str) -> Result<Vec<u8>, String> {
-        match self {
-            Value::Prim(Prim::U8(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
-            other => Err(format!("{who}: expected U8, got {}", shape_of_value(&other))),
         }
     }
 

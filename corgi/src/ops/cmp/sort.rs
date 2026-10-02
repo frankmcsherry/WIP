@@ -267,7 +267,7 @@ fn sort_sum(
         return out.map(|sorted| {
             let mut ls: Vec<Value> = lanes.iter().map(|l| gather(l, &[])).collect();
             ls[t] = sorted;
-            Value::sum_tagged(Tags::constant(t, m), ls)
+            Value::sum_tagged(Tags::Const(t, m), ls)
         });
     }
     let Tags::Column(tag_col, within) = tags else { unreachable!("const handled above") };

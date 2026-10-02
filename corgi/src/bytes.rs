@@ -491,7 +491,7 @@ fn read_tags(r: &mut Reader) -> Result<Tags, String> {
         1 => {
             let tag = r.word()? as usize;
             let rows = r.word()? as usize;
-            Ok(Tags::constant(tag, rows))
+            Ok(Tags::Const(tag, rows))
         }
         other => Err(format!("corgi::bytes: bad sum tag form {other}")),
     }
@@ -629,7 +629,7 @@ mod test {
             // a lane no row uses: an empty column of its shape, which must survive as such
             Value::sum(vec![0, 0], vec![Value::u64(vec![1, 2]), Value::u16(vec![])]),
             // the `Const` assignment: every row one tag, so neither witness column is on the wire
-            Value::sum_tagged(Tags::constant(1, 3), vec![Value::u64(vec![]), Value::u16(vec![4, 5, 6])]),
+            Value::sum_tagged(Tags::Const(1, 3), vec![Value::u64(vec![]), Value::u16(vec![4, 5, 6])]),
             // nesting: the recursion has to keep alignment across every level
             Value::Prod(vec![
                 Value::List(Bounds::offsets(vec![2, 3]), Box::new(Value::Prod(vec![
