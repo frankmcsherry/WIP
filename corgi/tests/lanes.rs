@@ -70,8 +70,8 @@ fn unweave_counts_each_rows_elements_per_lane() {
             let input = Value::List(Bounds::offsets(ends.clone()), Box::new(inner));
             let got = run("input unweave", input);
             let mut expect = Vec::new();
-            let tag_list: Vec<u64> = want.iter().map(|&(t, _)| t as u64).collect();
-            expect.push(Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u64(tag_list))));
+            let tag_list: Vec<u8> = want.iter().map(|&(t, _)| t as u8).collect();
+            expect.push(Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u8(tag_list))));
             for l in 0..lanes {
                 let (mut lb, mut vals, mut start) = (Vec::new(), Vec::new(), 0);
                 for &end in &ends {
