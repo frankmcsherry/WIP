@@ -7,7 +7,8 @@
 //! a value, not a crash.
 
 
-use crate::value::Value;
+use crate::value::{Prim, Tags, Value};
+use std::sync::Arc;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum TextOp {
@@ -62,27 +63,41 @@ impl TextOp {
             TextOp::ParseU64 => {
                 let (ends, vals) = input.into_list("ParseU64")?;
                 let bytes = vals.as_u8("ParseU64 bytes")?;
-                let mut tags = Vec::with_capacity(ends.len());
-                let mut oks = Vec::new();
+                // the tags are written only once a row fails (every row before it parsed); while
+                // none has, the assignment is the constant one and costs nothing per row.
+                let mut tags: Option<Vec<u8>> = None;
+                let mut oks = Vec::with_capacity(ends.len());
                 let (mut err_ends, mut err_bytes) = (Vec::new(), Vec::new());
                 let mut start = 0;
                 for end in ends.ends() {
                     let row = &bytes[start..end];
                     match parse_u64(row) {
                         Some(v) => {
-                            tags.push(1);
+                            if let Some(t) = &mut tags {
+                                t.push(1);
+                            }
                             oks.push(v);
                         }
                         None => {
-                            tags.push(0);
+                            tags.get_or_insert_with(|| vec![1; oks.len()]).push(0);
                             err_bytes.extend_from_slice(row);
                             err_ends.push(err_bytes.len());
                         }
                     }
                     start = end;
                 }
-                Value::sum(
-                    tags,
+                let rows = oks.len() + err_ends.len();
+                let assignment = match tags {
+                    None if rows > 0 => Tags::Const(1, rows),
+                    tags => {
+                        let tags = tags.unwrap_or_default();
+                        let mut count = [0usize; 2];
+                        let off = tags.iter().map(|&t| { let p = count[t as usize]; count[t as usize] += 1; p }).collect();
+                        Tags::column(Prim::U8(Arc::new(tags)), off)
+                    }
+                };
+                Value::sum_tagged(
+                    assignment,
                     vec![Value::List(err_ends.into(), Box::new(Value::u8(err_bytes))), Value::u64(oks)],
                 )
             }

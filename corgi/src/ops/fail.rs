@@ -322,18 +322,34 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
             None => fail(&[true], Value::List(Bounds::offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
         });
     }
+    // one pass checks each row and resolves its indices to haystack positions, so a clean input is
+    // gathered from those positions without reading the indices again; a failing row takes the
+    // general path, which re-reads them.
     let mut err = Vec::new();
+    let mut pos = Vec::new();
     {
         let (idx, haystack) = pair_of(&input, "TryGather")?;
         let (ib, ivals) = list_of(idx, "TryGather indices")?;
         let (hb, _) = haystack.rows_of("TryGather haystack")?;
         let idxs = ivals.as_u64("TryGather indices")?;
+        pos.reserve(idxs.len());
         for r in 0..ib.len() {
             let (is, ie) = ib.span(r);
             let (hs, he) = hb.span(r);
             let rowlen = (he - hs) as u64;
-            err.push(!idxs[is..ie].iter().all(|&x| x < rowlen));
+            let mut ok = true;
+            for &x in &idxs[is..ie] {
+                ok &= x < rowlen;
+                pos.push(hs.wrapping_add(x as usize));
+            }
+            err.push(!ok);
         }
+    }
+    if !err.contains(&true) {
+        let (idx, haystack) = input.into_pair("TryGather")?;
+        let (ib, _) = idx.into_list("TryGather indices")?;
+        let (_, hvals) = haystack.rows_of("TryGather haystack")?;
+        return Ok(lift(Value::List(ib, Box::new(gather(hvals, &pos)))));
     }
     per_row_try(&err, &super::core::Op::<L>::Gather, input)
 }

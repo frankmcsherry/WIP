@@ -24,7 +24,7 @@ pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
 /// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
 /// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
 /// single-column analogue of the equal-key boundaries a survey reveals across two runs, and the
-/// `Value`-column counterpart of [`run_layout`]'s `ends` (which reads a precomputed labels vector).
+/// `Value`-column counterpart of the run ends [`run_starts`] implies (it reads a precomputed labels vector).
 pub fn group_bounds(keys: &Value) -> Vec<usize> {
     let n = keys.len();
     if n == 0 {
@@ -268,26 +268,17 @@ mod labels {
         labels
     }
 
-    /// the run structure of non-decreasing `labels` (e.g. a sort's refined labels): `ends[i]` is the
-    /// exclusive end of run `i`, `firsts[i]` its first index. Runs are maximal equal-label spans — equal
-    /// value within a block. `group` reads `ends` as inner bounds and the representatives at `firsts`;
-    /// `dedup` keeps `firsts`; `uniq -c` reads the run lengths.
-    pub fn run_layout(labels: &[u64]) -> (Vec<usize>, Vec<usize>) {
-        let n = labels.len();
-        let mut ends = Vec::new();
-        let mut firsts = Vec::new();
-        if n == 0 {
-            return (ends, firsts);
+    /// the first index of each run of equal labels in non-decreasing `labels` (e.g. a sort's refined
+    /// labels), ascending. Runs are maximal equal-label spans — equal value within a block. A run ends
+    /// where the next begins (the last at `labels.len()`): `group` reads those ends as inner bounds,
+    /// `dedup` keeps the starts.
+    pub fn run_starts(labels: &[u64]) -> Vec<usize> {
+        if labels.is_empty() {
+            return Vec::new();
         }
-        firsts.push(0);
-        for k in 1..n {
-            if labels[k] != labels[k - 1] {
-                ends.push(k);
-                firsts.push(k);
-            }
-        }
-        ends.push(n);
-        (ends, firsts)
+        let mut firsts = vec![0];
+        firsts.extend((1..labels.len()).filter(|&k| labels[k] != labels[k - 1]));
+        firsts
     }
 
     /// project run starts onto outer rows: `out[r]` is the count of run firsts strictly before
@@ -572,10 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn run_layout_reads_runs() {
+    fn run_starts_reads_runs() {
         // labels [0,0,1,2,2] → 3 runs: [0,2), [2,3), [3,5)
-        let (ends, firsts) = run_layout(&[0, 0, 1, 2, 2]);
-        assert_eq!(ends, vec![2, 3, 5]);
-        assert_eq!(firsts, vec![0, 2, 3]);
+        assert_eq!(run_starts(&[0, 0, 1, 2, 2]), vec![0, 2, 3]);
     }
 }

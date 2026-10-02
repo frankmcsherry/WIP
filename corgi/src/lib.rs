@@ -267,10 +267,8 @@ pub mod arrange {
             assert_eq!(group_bounds(&Value::u64(vec![1, 2, 3])), vec![1, 2, 3]);
             assert_eq!(group_bounds(&Value::u64(vec![4, 4, 4])), vec![3]);
             assert!(group_bounds(&Value::u64(vec![])).is_empty());
-            // agrees with run_layout's ends over the same value column read as its own labels.
-            let keys = Value::u64(vec![10, 10, 20, 20, 20, 30]);
-            let labels = vec![0u64, 0, 1, 1, 1, 2];
-            assert_eq!(group_bounds(&keys), crate::ops::cmp::order::run_layout(&labels).0);
+            // the runs of a column with repeats.
+            assert_eq!(group_bounds(&Value::u64(vec![10, 10, 20, 20, 20, 30])), vec![2, 5, 6]);
         }
     }
 }
