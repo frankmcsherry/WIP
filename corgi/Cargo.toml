@@ -16,5 +16,9 @@ name = "gaps"
 harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see benches/gaps.rs
 
 [[bench]]
+name = "idioms"
+harness = false   # idiomatic corgi against idiomatic Rust; the rows of performance.md gaps.rs does not measure
+
+[[bench]]
 name = "stride"
 harness = false   # stride-detection spike: ragged vs dense sort of uniform-width keys
