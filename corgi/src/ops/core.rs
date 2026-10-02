@@ -796,6 +796,23 @@ impl<L: OpLike> Op<L> {
                 let (hb, hvals) = haystack.rows_of("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
                 let idxs = ivals.as_u64("GatherTry indices")?;
+                // the clean case first: one branch-free pass resolves every index and notes whether
+                // any is out of its row. Only when one is does the routing below run.
+                let mut pos = Vec::with_capacity(idxs.len());
+                let mut ok = true;
+                for r in 0..ib.len() {
+                    let (is, ie) = ib.span(r);
+                    let (hs, he) = hb.span(r);
+                    let rowlen = (he - hs) as u64;
+                    for &x in &idxs[is..ie] {
+                        ok &= x < rowlen;
+                        pos.push(hs.wrapping_add(x as usize));
+                    }
+                }
+                if ok && !pos.is_empty() {
+                    let found = Value::sum_tagged(Tags::Const(1, pos.len()), vec![Value::u64(Vec::new()), gather(hvals, &pos)]);
+                    return Ok(Value::List(ib, Box::new(found)));
+                }
                 // one pass routes each index AND records its within-lane offset — the size its
                 // lane had when it arrived — so the assignment needs no second pass to derive.
                 let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));

@@ -1,6 +1,6 @@
 //! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `Gt` (a column
 //! vs a constant, the immediate-form sugar) — plus the list ops `SortList`/`DedupList`/`GroupKey`
-//! (discrimination via `sort_blocks`/`run_layout`) and `Find` (batched binary search via `compare_idx`). All are
+//! (discrimination via `sort_blocks`/`run_starts`) and `Find` (batched binary search via `compare_idx`). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
 //! The structural-order engine these ops reduce to is the private [`order`] submodule.
@@ -10,7 +10,7 @@ pub(crate) mod sort;
 pub(crate) mod survey;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_layout, runs_per_row, segment_labels};
+use order::{compare_cols, compare_idx, run_starts, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
@@ -116,7 +116,7 @@ impl CmpOp {
             CmpOp::DedupList => {
                 // distinct, per row: sort, then keep one representative per run.
                 let (bounds, vals) = input.into_list("DedupList")?;
-                let (kept, _ends, firsts, _perm) = representatives(&row_labels(&bounds), &vals, false);
+                let (kept, firsts, _perm) = representatives(&row_labels(&bounds), &vals, false);
                 // outer bounds: cumulative distinct count per row (runs never cross rows).
                 let nb = runs_per_row(&bounds, &firsts);
                 Value::List(nb.into(), Box::new(kept))
@@ -128,7 +128,9 @@ impl CmpOp {
                 // permutation; the keys are one representative per run.
                 let (bounds, vals) = input.into_list("GroupKey")?;
                 let (k_col, v_col) = vals.into_pair("GroupKey values")?;
-                let (keys, ends, firsts, perm) = representatives(&row_labels(&bounds), &k_col, true);
+                let (keys, firsts, perm) = representatives(&row_labels(&bounds), &k_col, true);
+                // a run ends where the next begins, the last at the column's end.
+                let ends: Vec<usize> = firsts.iter().skip(1).copied().chain((!firsts.is_empty()).then_some(k_col.len())).collect();
                 let v_sorted = gather(&v_col, &perm);
                 let inner = Value::List(ends.into(), Box::new(v_sorted));
                 // outer bounds: cumulative #groups per row.
@@ -187,25 +189,25 @@ fn row_labels(bounds: &Bounds) -> Vec<u64> {
     if bounds.len() == 1 { Vec::new() } else { segment_labels(bounds) }
 }
 
-/// Sort within `labels`' blocks and keep one row per run of equal rows: `(kept, run ends, run
-/// starts, the sort's permutation)`, the permutation empty unless `with_perm`. A leaf or a
-/// product of leaves comes straight out of the sort, sorted, and the runs are read off it in
-/// ascending order; a shape with a `List` in it has a sorted form that is itself a gather of
-/// every element, so there the kept rows alone are gathered from the source.
-fn representatives(labels: &[u64], v: &Value, with_perm: bool) -> (Value, Vec<usize>, Vec<usize>, Vec<usize>) {
+/// Sort within `labels`' blocks and keep one row per run of equal rows: `(kept, run starts, the
+/// sort's permutation)`, the permutation empty unless `with_perm`. A leaf or a product of leaves
+/// comes straight out of the sort, sorted, and the runs are read off it in ascending order; a shape
+/// with a `List` in it has a sorted form that is itself a gather of every element, so there the kept
+/// rows alone are gathered from the source.
+fn representatives(labels: &[u64], v: &Value, with_perm: bool) -> (Value, Vec<usize>, Vec<usize>) {
     if contains_list(v) {
         let (perm, refined) = sort_blocks(labels, v);
-        let (ends, firsts) = run_layout(&refined);
+        let firsts = run_starts(&refined);
         let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
-        (gather(v, &idx), ends, firsts, perm)
+        (gather(v, &idx), firsts, perm)
     } else if with_perm {
         let (perm, refined, sorted) = sort_values(labels, v);
-        let (ends, firsts) = run_layout(&refined);
-        (gather(&sorted, &firsts), ends, firsts, perm)
+        let firsts = run_starts(&refined);
+        (gather(&sorted, &firsts), firsts, perm)
     } else {
         let (refined, sorted) = sort_values_only(labels, v);
-        let (ends, firsts) = run_layout(&refined);
-        (gather(&sorted, &firsts), ends, firsts, Vec::new())
+        let firsts = run_starts(&refined);
+        (gather(&sorted, &firsts), firsts, Vec::new())
     }
 }
 
