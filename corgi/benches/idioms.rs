@@ -72,7 +72,7 @@ fn tags(rows: usize, pct: u64, rng: &mut Rng) -> Vec<usize> {
 }
 
 /// `Result<u64, u64>` rows and the same rows as a corgi sum (Ok in lane 0, Err in lane 1). Values
-/// are at least 10, so subtracting one never underflows (corgi's `sub` checks; Rust's wraps).
+/// are at least 10, so Rust's `x - 1` never underflows (it would panic in a debug build).
 fn results(rows: usize, pct: u64, modulus: u64, rng: &mut Rng) -> (Vec<Result<u64, u64>>, Value) {
     let t = tags(rows, pct, rng);
     let vals: Vec<u64> = (0..rows).map(|_| rng.next() % modulus + 10).collect();
