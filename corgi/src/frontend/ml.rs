@@ -46,7 +46,7 @@
 //! kinds belongs to a language that lowers to this one.
 //!
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
-//!       e match (0 (lo -> lo), 1 (hi -> hi add_u64 100))   -- exhaustive ⇒ Unwrap types it
+//!       e match (0 (lo -> lo), 1 (hi -> (hi, 100u64) add))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100u64) add))
 //!       enum Opt = None () | Some u64 in xs inject Some  -- tag xs into Some; None is an empty unit lane
 

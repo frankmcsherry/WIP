@@ -112,7 +112,7 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
 /// * **Framing.** Every read is bounds-checked; every length is checked against the bytes that
 ///   remain before it is believed, so no size arithmetic can wrap and no reservation can exceed
 ///   what the buffer could possibly hold.
-/// * **Depth.** The recursion is capped ([`MAX_DEPTH`]). A short message of nested headers cannot
+/// * **Depth.** The recursion is capped at 128 levels. A short message of nested headers cannot
 ///   exhaust the stack.
 /// * **Structure.** The returned `Value` satisfies the invariants the rest of corgi indexes by: a
 ///   `Prod`'s fields agree on length, a `Sum`'s tags name its lanes and its offsets land
@@ -171,7 +171,7 @@ pub fn read_from(bytes: &[u8]) -> Result<(Value, usize), String> {
 /// derived `Drop` recurses, and so do `len`, `shape_of_value`, `hash` and `PartialEq`. Lifting
 /// the ceiling means making all of them iterative, which is a corgi-wide change with its own
 /// payoff (arbitrarily deep shapes) — not something a codec can do on its own.
-pub const MAX_DEPTH: usize = 128;
+pub(crate) const MAX_DEPTH: usize = 128;
 
 /// The largest row count declared anywhere in `v`, saturating.
 ///

@@ -74,7 +74,7 @@ pub fn eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Value {
 }
 
 /// [`eval_graph`] with the shape error surfaced: the form the typer and body-bearing ops use.
-pub fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Value, String> {
+pub(crate) fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Value, String> {
     let mut uses = vec![0usize; g.nodes.len()];
     for node in &g.nodes { for &i in &node.inputs { uses[i] += 1; } }
     uses[g.output] += 1; // the returned value is a use too, so a consumer can't move it out first

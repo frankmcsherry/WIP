@@ -251,9 +251,9 @@ mod tests {
 
     #[test]
     fn get_then_lifted_add() {
-        // `head` fails on the empty row; the `add_u64` downstream runs on the Ok lane only.
-        assert_eq!(run("input iota head add_u64 10", 3), "Sum tags=[0] [[10], ()x0]");
-        assert_eq!(run("input iota head add_u64 10", 0), "Sum tags=[1] [[], ()x1]");
+        // `head` fails on the empty row; the `add` downstream runs on the Ok lane only.
+        assert_eq!(run("(input iota head, 10u64) add", 3), "Sum tags=[0] [[10], ()x0]");
+        assert_eq!(run("(input iota head, 10u64) add", 0), "Sum tags=[1] [[], ()x1]");
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
         let src = "input iota map (x -> x iota head)";
         assert_eq!(run(src, 0), "Sum tags=[0] [List ends=[0] <[]>, ()x0]"); // no elements: Ok
         assert_eq!(run(src, 3), "Sum tags=[1] [List ends=[] <[]>, ()x1]"); // element 0 errs
-        let src = "input add_u64 1 iota map (x -> x add_u64 1 iota head)";
+        let src = "(input, 1u64) add iota map (x -> (x, 1u64) add iota head)";
         assert_eq!(run(src, 2), "Sum tags=[0] [List ends=[3] <[0, 0, 0]>, ()x0]");
     }
 
@@ -281,7 +281,7 @@ mod tests {
         assert!(!is_total(&parse_ml("input iota head").unwrap()));
         assert_eq!(run("input iota head try", 0), "Sum tags=[1] [[], ()x1]");
         // matching on the revealed sum is ordinary pure code again.
-        let src = "input iota head try match (0 (x -> x add_u64 100), 1 (u -> 7u64))";
+        let src = "input iota head try match (0 (x -> (x, 100u64) add), 1 (u -> 7u64))";
         assert_eq!(run(src, 0), "[7]");
         assert_eq!(run(src, 5), "[100]");
     }

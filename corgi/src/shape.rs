@@ -24,7 +24,7 @@ pub enum Shape {
 }
 
 /// the one shape two merging operands must share: their common shape, or the type error.
-pub fn same(a: &Shape, b: &Shape) -> Result<Shape, String> {
+pub(crate) fn same(a: &Shape, b: &Shape) -> Result<Shape, String> {
     if a == b { Ok(a.clone()) } else { Err(format!("shapes differ: {a} vs {b}")) }
 }
 

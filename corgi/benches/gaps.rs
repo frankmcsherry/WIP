@@ -19,7 +19,7 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{Bounds,
-    arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
+    arrange, eval_graph, lower_effects, parse_ml, ArithOp, BinOp, Builder, Graph, Kind, NumOp,
     Op, Program, Value,
 };
 use std::env;
@@ -223,13 +223,13 @@ fn csv_text(m: usize) -> (Value, Vec<u8>) {
     )
 }
 
-/// a chain of `k` in-place `AddU64` passes — each link its own pass over memory (interior links mutate
+/// a chain of `k` in-place add-a-constant passes — each link its own pass over memory (interior links mutate
 /// the moved buffer). The pure fusion headroom: `k` passes a single fused loop collapses to one.
 fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
     let mut cur = b.input();
     for _ in 0..k {
-        cur = b.add(ArithOp::AddU64(7), vec![cur]);
+        cur = b.add(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7), vec![cur]);
     }
     b.finish(cur)
 }
@@ -242,7 +242,7 @@ fn family_a(n: usize, reps: u32) {
     let src = scrambled(n);
 
     // A1 add_const — the 1-pass ceiling control. Expect ~1x: a single SIMD pass is already at bandwidth.
-    let g = compile("input add_u64 7");
+    let g = compile("(input, 7u64) add");
     let c = corgi_t(&g, &lf, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -270,7 +270,7 @@ fn family_a(n: usize, reps: u32) {
     row_chain("A2 add_chain8", n, ck, rk, r1);
 
     // A3 mixed_chain — 4 heterogeneous kernels: (((x+5)*3)-2)>>1.
-    let g = compile("((input add_u64 5, 3u64) mul, 2u64) sub shr 1");
+    let g = compile("(((input, 5u64) add, 3u64) mul, 2u64) sub shr 1");
     let ck = corgi_t(&g, &lf, reps);
     let rk = rust_t(reps, || {
         let s = black_box(&src);
@@ -322,7 +322,7 @@ fn family_b(n: usize, reps: u32) {
     let t = 0x8000_0000u64; // ~half pass the threshold (32-bit-masked inputs)
 
     // B1 filter — keep values > T. corgi: mask pass + `filter_mask` scalar gather. rust: predicated push.
-    let g = compile("let xs = input in (xs, xs map (e -> e gt 2147483648)) filter");
+    let g = compile("let xs = input in (xs, xs map (e -> (e, 2147483648u64) gt)) filter");
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -344,7 +344,7 @@ fn family_b(n: usize, reps: u32) {
 
     // B2 select/blend — min(x+7, 3x) via cmp + branchless select. corgi: add,mul,cmp,select passes.
     let g = compile(
-        "input map (x -> let a = x add_u64 7 in let b = (x, 3u64) mul in ((a, b) lt, a, b) select)",
+        "input map (x -> let a = (x, 7u64) add in let b = (x, 3u64) mul in ((a, b) lt, a, b) select)",
     );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -464,7 +464,7 @@ fn family_c(n: usize, reps: u32) {
     );
 
     // C5 fold (sum, count) — heterogeneous accumulator, non-monoid shape.
-    let g = compile("let seed = (0u64, 0u64) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))");
+    let g = compile("let seed = (0u64, 0u64) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, (acc.1, 1u64) add))");
     let c = corgi_t(&g, &li, reps.min(3));
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -603,7 +603,7 @@ fn family_f(n: usize, reps: u32) {
 
     // F1 branch+match — parity dispatch (50/50, unpredictable). corgi: mask+partition+per-lane+recombine.
     let g = compile(
-        "input map (x -> (x, x and 1) branch 2 match (0 (e -> e add_u64 3), 1 (o -> o add_u64 7)))",
+        "input map (x -> (x, x and 1) branch 2 match (0 (e -> (e, 3u64) add), 1 (o -> (o, 7u64) add)))",
     );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -717,7 +717,7 @@ fn family_g(m: usize, reps: u32) {
 }
 
 /// R — arrangement substrate. These are representative kernels called directly by a
-/// differential-dataflow backend: stable argsort, batched compare, and two-source gather. The
+/// differential-dataflow backend: stable argsort and two-source gather. The
 /// ceilings return the same materialized products (permutations/comparisons/columns).
 fn family_arrange(n: usize, reps: u32) {
     let src = scrambled(n);
@@ -834,28 +834,6 @@ fn family_arrange(n: usize, reps: u32) {
         row("R10 arrange_sort_list_seg", rows * 4, c, r, "List arm under per-row labels (a block per row) vs a stable Rust sort per row");
     }
 
-    let mut sorted = src.clone();
-    sorted.sort_unstable();
-    let sorted_col = Value::u64(sorted.clone());
-    let c = rust_t(reps, || {
-        black_box(arrange::compare_adjacent(black_box(&sorted_col)));
-    });
-    let r = rust_t(reps, || {
-        black_box(
-            black_box(&sorted)
-                .windows(2)
-                .map(|w| w[0].cmp(&w[1]) as i8)
-                .collect::<Vec<i8>>(),
-        );
-    });
-    row(
-        "R2 arrange_compare",
-        n.saturating_sub(1).max(1),
-        c,
-        r,
-        "batched adjacent compare vs direct leaf compare",
-    );
-
     let left: Vec<u64> = (0..n.div_ceil(2) as u64).map(|x| x * 2).collect();
     let right: Vec<u64> = (0..(n / 2) as u64).map(|x| x * 2 + 1).collect();
     let tags: Vec<usize> = (0..n).map(|i| i & 1).collect();
@@ -951,8 +929,8 @@ fn family_safety(n: usize, reps: u32) {
     let idx_rand: Vec<u64> = scrambled(n).iter().map(|&x| x % n as u64).collect();
     let idx_seq: Vec<u64> = (0..n as u64).collect();
     let g_plain = compile("input gather");
-    let g_add = compile("input gather map (v -> v add_u64 7)");
-    let g_chain = compile("input gather map (v -> v add_u64 7 shr 1 and 255)");
+    let g_add = compile("input gather map (v -> (v, 7u64) add)");
+    let g_chain = compile("input gather map (v -> (v, 7u64) add shr 1 and 255)");
     type GatherCase<'a> = (&'a str, &'a Graph<NumOp>, fn(u64) -> u64);
     let cases: [GatherCase<'_>; 3] = [
         ("gather", &g_plain, |v| v),

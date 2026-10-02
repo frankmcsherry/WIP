@@ -106,7 +106,7 @@ Small batches are otherwise a non-goal; this row holds the line.
 
 | work | verdict | corgi |
 |---|---|---|
-| one run of a tiny program | Keep | about 90 ns for one op, plus about 27 ns per further op (with #50/#51: about 95 ns, plus about 14 ns per op) |
+| one run of a tiny program | Keep | about 60–70 ns for one add of a constant, plus about 19 ns per further add |
 
 ## 11. Kernels a host calls directly
 

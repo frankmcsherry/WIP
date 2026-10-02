@@ -224,7 +224,7 @@ impl Tags {
     }
 
     /// the single tag every row carries, if there is one — the O(1) uniformity test.
-    pub fn const_tag(&self) -> Option<usize> {
+    pub(crate) fn const_tag(&self) -> Option<usize> {
         match self {
             Tags::Const(t, _) => Some(*t),
             Tags::Column(..) => None,
@@ -270,7 +270,7 @@ impl Tags {
     }
 
     /// every row's discriminant, in row order.
-    pub fn tags_iter(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn tags_iter(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len()).map(move |i| self.tag_at(i))
     }
 }
@@ -799,7 +799,7 @@ pub type SumParts = (Tags, Vec<Value>);
 // the typer reports (an op's eval is `shape_of` when run on zero rows). `into_*` consume `self` and
 // move the buffers out.
 impl Value {
-    pub fn into_pair(self, who: &str) -> Result<(Value, Value), String> {
+    pub(crate) fn into_pair(self, who: &str) -> Result<(Value, Value), String> {
         match self {
             Value::Prod(mut cols) if cols.len() == 2 => {
                 let b = cols.pop().unwrap();
@@ -847,7 +847,7 @@ impl Value {
     /// `into_u64` forces ownership, and ownership is a full column COPY whenever anyone else still
     /// holds the buffer: a graph node with fan-out 2, or a caller that keeps its input. Measured on
     /// a one-pass `fold_add` at 1M rows, that copy was 7.9x the whole operation. Reading needs none
-    /// of it; only an op that rewrites its operand in place (`AddU64`, `Shr`, `And`, `Scan`) has to
+    /// of it; only an op that rewrites its operand in place (`Shr`, `And`, `Scan`) has to
     /// consume it.
     pub fn as_u64(&self, who: &str) -> Result<&[u64], String> {
         match self {
@@ -875,7 +875,7 @@ impl Value {
         }
     }
 
-    pub fn into_prim(self, who: &str) -> Result<Prim, String> {
+    pub(crate) fn into_prim(self, who: &str) -> Result<Prim, String> {
         match self {
             Value::Prim(p) => Ok(p),
             other => Err(format!("{who}: expected a leaf, got {}", shape_of_value(&other))),

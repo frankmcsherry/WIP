@@ -4,4 +4,4 @@
 # the partition; for a cheap body like this, select wins. Reads like the scalar code, runs as a blend.
 # n = 8
 # = List ends=[8] <[0, 1, 2, 3, 4, 5, 5, 5]>
-input iota map (x -> (x gt 5, 5u64, x) select)
+input iota map (x -> ((x, 5u64) gt, 5u64, x) select)
