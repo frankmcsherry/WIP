@@ -78,9 +78,9 @@ fn optimize_preserves_eval_everywhere() {
     let cases: &[Case] = &[
         ("input.1 transpose .1 fold_add", sample),
         ("(input.0, input.1 transpose .1) cap_list map (p -> p add)", sample),
-        ("input.2 map_variant 1 (h -> h add_u64 1000000) unwrap", sample),
+        ("input.2 map_variant 1 (h -> (h, 1000000u64) add) unwrap", sample),
         // map fusion: a three-deep MapList chain must collapse without changing the result.
-        ("input.1 transpose .1 map (x -> x add_u64 1) map (x -> x shr 1) map (x -> x add_u64 5)", sample),
+        ("input.1 transpose .1 map (x -> (x, 1u64) add) map (x -> x shr 1) map (x -> (x, 5u64) add)", sample),
         // iso cancellation under composition with a real op between the pair.
         ("input.1 transpose zip map (p -> p.0)", sample),
         (INLINED_JOIN, join_input),
@@ -96,7 +96,7 @@ fn optimize_preserves_eval_everywhere() {
 fn fuse_maps_collapses_adjacent_passes() {
     // two passes over the same list become one. The fused graph has fewer nodes (one MapList, one
     // composed body) and the same result.
-    let g = parse_ml("input.1 transpose .1 map (x -> x add_u64 1) map (x -> x add_u64 10)").unwrap();
+    let g = parse_ml("input.1 transpose .1 map (x -> (x, 1u64) add) map (x -> (x, 10u64) add)").unwrap();
     let fused = dce(&fuse_maps(&g)); // fusion orphans the producer MapList; dce sweeps it
     assert!(fused.node_count() < g.node_count(), "fusion should drop the intermediate MapList node");
     assert_eq!(eval_str(&fused, &sample()), eval_str(&g, &sample()));

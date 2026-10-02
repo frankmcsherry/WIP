@@ -84,13 +84,6 @@ pub mod arrange {
         crate::ops::cmp::sort::sort_blocks(&[], v).0
     }
 
-    /// Adjacent structural compare: `out[k]` = sign of row `k` of `v` vs row `k+1` (`v.len() - 1`
-    /// results). The run-boundary scan over a sorted column — `out[k] != 0` marks a boundary after
-    /// `k`, which is what [`group_bounds`] turns into segment ends.
-    pub fn compare_adjacent(v: &Value) -> Vec<i8> {
-        crate::ops::cmp::order::compare_adjacent(v)
-    }
-
     /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given
     /// per-row `labels` marking segments (non-decreasing — segment `s` is the maximal run of rows
     /// sharing a label; empty for one segment), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
@@ -106,28 +99,6 @@ pub mod arrange {
     /// positions the caller indexed by.
     pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
         crate::ops::cmp::sort::sort_blocks(labels, v)
-    }
-
-    /// The indexed sort: order the rows `index[..]` of `v` within the blocks of `labels`
-    /// (`labels[k]` is position `k`'s block; non-decreasing, or empty for one block). On return `index` is in sorted
-    /// order — block-stable, stable within a block — and `labels` is the dense refined partition
-    /// in that order. Returns the permutation applied, `new_index[k] == old_index[perm[k]]`, so
-    /// a parallel array can be moved the same way, and with `emit` the sorted rows as a column.
-    ///
-    /// The sort itself carries only rows. To return positions it sorts the positions of the
-    /// subset gathered out once; a caller that needs only the sorted rows, from an identity
-    /// index, has them from [`sort_blocks`] without that gather.
-    pub fn sort_indexed(v: &Value, labels: &mut Vec<u64>, index: &mut [usize], emit: bool) -> (Vec<usize>, Option<Value>) {
-        use crate::ops::cmp::sort::{sort_indexed, Emit, SortScratch};
-        let mut scratch = SortScratch::default();
-        let subset = gather(v, index);
-        let mut perm: Vec<usize> = (0..index.len()).collect();
-        let out = sort_indexed(&subset, labels, &mut perm, if emit { Emit::Both } else { Emit::Index }, &mut scratch);
-        let old = index.to_vec();
-        for (slot, &p) in index.iter_mut().zip(&perm) {
-            *slot = old[p];
-        }
-        (perm, out)
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
@@ -242,21 +213,6 @@ pub mod arrange {
             // the ML op.
             let theirs = crate::ops::cmp::CmpOp::SortList.eval(list).unwrap();
             assert_eq!(ours, theirs);
-        }
-
-        #[test]
-        fn sort_indexed_moves_a_parallel_array() {
-            let v = Value::Prod(vec![Value::u64(vec![9, 3, 3, 7, 1, 3]), Value::u64(vec![0, 2, 1, 0, 0, 0])]);
-            let mut index = vec![5, 1, 4, 2]; // rows (3,0) (3,2) (1,0) (3,1)
-            let mut labels = vec![0, 0, 0, 0];
-            let mut payload = vec!["e", "b", "d", "c"];
-            let (perm, out) = super::sort_indexed(&v, &mut labels, &mut index, true);
-            assert_eq!(index, vec![4, 5, 2, 1]); // (1,0) (3,0) (3,1) (3,2)
-            assert_eq!(labels, vec![0, 1, 2, 3]);
-            let moved: Vec<&str> = perm.iter().map(|&p| payload[p]).collect();
-            payload = moved;
-            assert_eq!(payload, vec!["d", "e", "c", "b"]);
-            assert_eq!(out.unwrap(), gather(&v, &index));
         }
 
         #[test]

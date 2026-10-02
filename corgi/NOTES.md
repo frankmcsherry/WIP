@@ -101,14 +101,14 @@ src/
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
-    cmp.rs     CmpOp: Rel(Pred) + Gt + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
+    cmp.rs     CmpOp: Rel(Pred) + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
     cmp/       the order machinery the cmp ops reduce to. order.rs: compare_idx (bulk structural
                order over index pairs; compare_cols is the diagonal case), block labels, group_bounds.
                sort.rs: the indexed discrimination sort (dev/indexed-sort.md). survey.rs: the merge
                kernel, rank at a time (dev/lane-survey.md).
     host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
-               (op × kind × width) grid + AddU64/ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+               (op × kind × width) grid + ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
                per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
@@ -125,7 +125,7 @@ tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · te
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
            an equivalence via `(A, B) eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
-examples/ (tour.rs, jaro_winkler/)   benches/ (eval, gaps, stride)   dev/ (design notes)
+examples/ (tour.rs, jaro_winkler/)   benches/ (eval, gaps, idioms)   dev/ (design notes)
 ```
 
 ## Structural completeness — the functor commutation table
@@ -223,10 +223,10 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
   *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
-  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`AddU64` does).
+  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`Shr` does).
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
-  *Reuse policy:* an op that is elementwise AND same-width (`AddU64`/`Shr`/`And`, `bin_into`, `neg_into`,
+  *Reuse policy:* an op that is elementwise AND same-width (`Shr`/`And`, `bin_into`, `neg_into`,
   `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
   fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, `cast` = re-width, `rel`/`cmp_idx`/

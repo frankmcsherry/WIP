@@ -43,7 +43,6 @@ impl Pred {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
-    Gt(u64),   // X -> U64 mask    (x > c) as 0/1   — the column-vs-immediate sugar form
     RelImm(Pred, u32, u64), // X -> U64 mask   `x pred c`, `c` a constant's stored bits at width w
     Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
     Max,       // (X, X) -> X   lane-wise maximum
@@ -99,11 +98,6 @@ impl CmpOp {
                     return Err(format!("min/max with a U{w} constant expects U{w}, got U{}", p.bits()));
                 }
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
-            }
-
-            CmpOp::Gt(c) => {
-                let xs = input.as_u64("Gt")?;
-                Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
             }
 
             // the sort produces the sorted column itself; nothing is gathered afterwards.

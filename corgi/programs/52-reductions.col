@@ -4,5 +4,5 @@
 # make them correct for signed/float too); sum/prod are unsigned; all/any are the 0/1-mask AND/OR.
 # n = 5
 # = ([15], [120], [1], [5], [1])
-let xs = input iota map (x -> x add_u64 1) in
+let xs = input iota map (x -> (x, 1u64) add) in
 (xs fold_add, xs fold_mul, xs fold_min, xs fold_max, xs fold_all)

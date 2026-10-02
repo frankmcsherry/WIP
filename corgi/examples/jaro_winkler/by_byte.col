@@ -5,8 +5,8 @@ let (s1, s2) = input in
 let (l1, l2) = (s1 len, s2 len) in
 let d = ((((l1, l2) max shr 1), 1u64) max, 1u64) sub in
 # Positions grouped by byte: List<(byte, List<position>)>.
-let g1 = ((0u64, s1) foldscan ((i, c) -> (i add_u64 1, (c, i)))) .1 group in
-let g2 = ((0u64, s2) foldscan ((j, c) -> (j add_u64 1, (c, j)))) .1 group in
+let g1 = ((0u64, s1) foldscan ((i, c) -> ((i, 1u64) add, (c, i)))) .1 group in
+let g2 = ((0u64, s2) foldscan ((j, c) -> ((j, 1u64) add, (c, j)))) .1 group in
 # For each byte of s1, the s2 positions holding it (empty if none).
 let bs = ((g1 map ((c, _) -> c), g2 map ((c, _) -> c)) find, g2 map ((_, js) -> js)) slices try
     match (0 (ok -> ok map (x -> x flatten .1)), 1 (_ -> 0u64 iota map (z -> z iota))) in

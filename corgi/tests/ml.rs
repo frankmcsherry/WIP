@@ -33,7 +33,7 @@ fn sum_scores_with_destructure() {
 
 #[test]
 fn match_contact() {
-    let src = "input.2 map_variant 1 (p -> p add_u64 1000000) unwrap";
+    let src = "input.2 map_variant 1 (p -> (p, 1000000u64) add) unwrap";
     assert_eq!(run_ml(src, &sample()), "[1111, 1002222, 3333]");
 }
 
@@ -48,7 +48,7 @@ fn const_in_lambda() {
 fn juxtaposition_stops_at_let_in() {
     // the juxtaposed chain `input.1 transpose` must terminate at the `let` body's `in`, not read it
     // as an op; then a bare lambda maps over the result.
-    let src = "let (subj, vals) = input.1 transpose in subj map (v -> v add_u64 1)";
+    let src = "let (subj, vals) = input.1 transpose in subj map (v -> (v, 1u64) add)";
     assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[2, 3, 4, 5, 6, 7]>");
 }
 
@@ -78,7 +78,7 @@ fn workhorse_products_sums_lists() {
     let src = "let scores = input.1 transpose in \
                let totals = scores.1 fold_add in \
                let id_plus = (input.0, totals) add in \
-               let contact = input.2 map_variant 0 (e -> e add_u64 1000000) unwrap in \
+               let contact = input.2 map_variant 0 (e -> (e, 1000000u64) add) unwrap in \
                (id_plus, contact)";
     assert_eq!(run_ml(src, &sample()), "([310, 320, 1530], [1001111, 2222, 1003333])");
 }
@@ -88,7 +88,7 @@ fn enum_names_resolve_and_erase() {
     // the declaration is a compile-time table: `Phone` resolves to tag 1 and erases, so this is
     // the same graph as `match_contact`.
     let src = "enum Contact = Email | Phone in \
-               input.2 map_variant Phone (p -> p add_u64 1000000) unwrap";
+               input.2 map_variant Phone (p -> (p, 1000000u64) add) unwrap";
     assert_eq!(run_ml(src, &sample()), "[1111, 1002222, 3333]");
 }
 
@@ -111,7 +111,7 @@ fn inject_by_name_carries_the_sum_shape() {
 fn branch_by_enum_and_named_match_arms() {
     let src = "enum Size = Lo | Hi in \
                let (subj, vals) = input.1 transpose in \
-               vals map (v -> (v, v gt 300) branch Size match (Lo (l -> l), Hi (h -> (h, 1u64) add)))";
+               vals map (v -> (v, (v, 300u64) gt) branch Size match (Lo (l -> l), Hi (h -> (h, 1u64) add)))";
     // `branch` is a FailOp now (demux Sum{Lo|Hi} with Oob in the err-mask), so the result is a Fail
     // column shown TRY'd; the match arms still align (the demux re-tags Lo=0, Hi=1) — Hi (>300) gets +1.
     assert_eq!(
@@ -147,9 +147,9 @@ fn string_literal_broadcasts() {
 #[test]
 fn head_sugar_is_a_failop() {
     // `head` is the get FailOp: a non-empty row -> Found(first), an EMPTY row -> Oob — both carried in
-    // the err-mask, shown TRY'd as Sum{T | Unit}. No panic, no total/unchecked split. (`input add_u64 1
+    // the err-mask, shown TRY'd as Sum{T | Unit}. No panic, no total/unchecked split. (`(input, 1u64) add
     // iota` is [0..n+1); `input iota` at n=0 is the empty row.)
-    assert_eq!(run_ml("input add_u64 1 iota head", &u64(&[3])), "Sum tags=[0] [[0], ()x0]");
+    assert_eq!(run_ml("(input, 1u64) add iota head", &u64(&[3])), "Sum tags=[0] [[0], ()x0]");
     assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[1] [[], ()x1]");
 }
 

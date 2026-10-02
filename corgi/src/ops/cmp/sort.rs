@@ -784,7 +784,7 @@ mod tests {
     /// them unique), same labels, and the emitted column is the rows gathered; and the public
     /// form's permutation.
     fn check(v: &Value, labels: &[u64], index: &[usize]) {
-        let (perm_ref, rows_ref, labels_ref) = reference(v, labels, index);
+        let (_, rows_ref, labels_ref) = reference(v, labels, index);
         for emit in [Emit::Index, Emit::Both] {
             let (mut l, mut i) = (labels.to_vec(), index.to_vec());
             let mut scratch = SortScratch::default();
@@ -802,13 +802,6 @@ mod tests {
         let out = sort_indexed(v, &mut l, &mut i, Emit::Values, &mut scratch);
         assert_eq!(out.unwrap(), gather(v, &rows_ref), "values only\n{}", crate::value::show(v));
         assert_eq!(l, labels_ref, "values-only labels\n{}", crate::value::show(v));
-        // the public form: the permutation that moves a parallel array
-        let (mut l, mut i) = (labels.to_vec(), index.to_vec());
-        let (perm, out) = crate::arrange::sort_indexed(v, &mut l, &mut i, true);
-        assert_eq!(perm, perm_ref, "perm\n{}", crate::value::show(v));
-        assert_eq!(i, rows_ref, "public rows\n{}", crate::value::show(v));
-        assert_eq!(l, labels_ref, "public labels\n{}", crate::value::show(v));
-        assert_eq!(out.unwrap(), gather(v, &rows_ref), "public values\n{}", crate::value::show(v));
     }
 
     /// dense non-decreasing labels over `n` positions: one block, blocks of random size, or a

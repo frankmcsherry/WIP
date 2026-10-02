@@ -218,7 +218,7 @@ fn sum_wide(rows: usize, pct: u64, param: &str) {
     let small: Vec<u64> = msgs.iter().filter_map(|m| if let Msg::Small(x) = m { Some(*x) } else { None }).collect();
     let big: Vec<Value> = (0..7).map(|k| Value::u64(msgs.iter().filter_map(|m| if let Msg::Big(a) = m { Some(a[k]) } else { None }).collect())).collect();
     let input = Value::sum(t, vec![Value::u64(small), Value::Prod(big)]);
-    let p = corgi("input map_variant 0 (x -> x add_u64 1)");
+    let p = corgi("input map_variant 0 (x -> (x, 1u64) add)");
     let mut v = msgs.clone();
     let r = best(rows, || {
         for m in black_box(&mut v).iter_mut() {
@@ -240,7 +240,7 @@ fn list_reduce(rows: usize, max: u64) {
         black_box(black_box(&ls).iter().map(|l| l.iter().sum::<u64>()).collect::<Vec<u64>>());
     });
     report("list_sum", rows, &param, r, corgi_t(rows, &p, &input), "each row's list summed");
-    let p = corgi("input map (x -> x gt 500) fold_add");
+    let p = corgi("input map (x -> (x, 500u64) gt) fold_add");
     let r = best(rows, || {
         black_box(black_box(&ls).iter().map(|l| l.iter().filter(|&&x| x > 500).count() as u64).collect::<Vec<u64>>());
     });
@@ -312,7 +312,7 @@ fn dispatch() {
     for k in [1usize, 2, 4, 8, 16, 32] {
         let mut src = String::from("let x = input in ");
         for _ in 0..k {
-            src.push_str("let x = x add_u64 1 in ");
+            src.push_str("let x = (x, 1u64) add in ");
         }
         src.push('x');
         let p = corgi(&src);

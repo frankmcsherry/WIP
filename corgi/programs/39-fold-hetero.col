@@ -5,4 +5,4 @@
 # n = 5
 # = ([10], [5])
 let seed = (0u64, 0u64) in
-(seed, input iota) fold ((acc, x) -> ((acc.0, x) add, acc.1 add_u64 1))
+(seed, input iota) fold ((acc, x) -> ((acc.0, x) add, (acc.1, 1u64) add))

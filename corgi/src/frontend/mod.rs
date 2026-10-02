@@ -22,7 +22,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "gt" | "add_u64" | "shr" | "and" | "cast" | "chunk")
+    matches!(name, "shr" | "and" | "cast" | "chunk")
 }
 
 /// parse a `<kind><width>` suffix like `i32` / `u8` / `f64` into `(Kind, width)`, validating the
@@ -67,7 +67,6 @@ fn typed_arith(name: &str) -> Option<NumOp> {
 pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     let n = || arg.ok_or_else(|| format!("op '{name}' needs a numeric argument"));
     Ok(match name {
-        "gt" => CmpOp::Gt(n()?).into(), // column vs immediate (the threshold-filter sugar)
         "cast" => Op::Cast(n()? as u32).into(),
         "transpose" => Op::Transpose.into(),
         // One name per fallible method — each is its TOTAL per-row `Try*` form (a row that would trip
@@ -110,12 +109,14 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
         "hash" => Op::Hash.into(), // X -> U64  stable structural content hash (the boundary id fn)
-        // relational compares: two equal-width leaf columns -> 0/1 mask. `gt`/`ge` are these with
-        // the operands swapped, and the column-vs-constant `gt N` is the separate sugar above.
+        // relational compares: two equal-width leaf columns -> 0/1 mask. A constant on either side
+        // becomes an immediate (`optimize::immediates`), so `(x, 2u64) gt` builds no column of 2s.
         "eq" => CmpOp::Rel(Pred::Eq).into(),
         "ne" => CmpOp::Rel(Pred::Ne).into(),
         "lt" => CmpOp::Rel(Pred::Lt).into(),
         "le" => CmpOp::Rel(Pred::Le).into(),
+        "gt" => CmpOp::Rel(Pred::Gt).into(),
+        "ge" => CmpOp::Rel(Pred::Ge).into(),
         // numeric layer — the kind-blind front-end reaches the u64-unsigned row of the grid:
         "add" => ArithOp::Bin(BinOp::Add, Kind::U, 64).into(),
         "sub" => ArithOp::Bin(BinOp::Sub, Kind::U, 64).into(),
@@ -131,7 +132,6 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "to_f64" => ArithOp::ToFloat(64).into(),
         // branchless blend: (mask, then, else) -> picked column (the SIMD bitselect, see Op::Select)
         "select" => Op::Select.into(),
-        "add_u64" => ArithOp::AddU64(n()?).into(),
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
         // named monoid reductions, each `fold_<binop>` (fold_add = sum, fold_mul = product):

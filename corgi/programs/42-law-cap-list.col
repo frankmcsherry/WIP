@@ -10,5 +10,5 @@
 let ctx = input in
 let ys = input iota in
 let strip = ((ctx, ys) cap_list map (p -> p.1), ys) eq in
-let natural = ((ctx, ys map (y -> y add_u64 1)) cap_list, (ctx, ys) cap_list map (p -> (p.0, p.1 add_u64 1))) eq in
+let natural = ((ctx, ys map (y -> (y, 1u64) add)) cap_list, (ctx, ys) cap_list map (p -> (p.0, (p.1, 1u64) add))) eq in
 (strip, natural) mul

@@ -28,7 +28,7 @@ pub fn dec_i64(u: u64) -> i64 {
 /// a typed scalar literal: the value `n` encoded for `kind` at `width` — raw for `U`, sign-swizzled
 /// for `I` (the order-preserving form the leaf stores). The surface `lit_<k><w> N` lowers to
 /// `Op::Lit` of this.
-pub fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
+pub(crate) fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
     let raw = match width {
         8 => Prim::U8(Arc::new(vec![n as u8])),
         16 => Prim::U16(Arc::new(vec![n as u16])),
@@ -104,7 +104,6 @@ pub enum ArithOp {
                            // the kind-conversion `signed` (an involution; how a column enters Kind::I)
     ToFloat(u32),          // U-int leaf -> float leaf (w in {32,64}): each unsigned int -> the float of
                            // the same width, total-order encoded. `to_f32`/`to_f64`: how iota becomes floats.
-    AddU64(u64),           // U64 -> U64   x + c   (sugar)
     Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
     And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
     Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
@@ -337,13 +336,7 @@ impl ArithOp {
                 (64, Prim::U64(v)) => Prim::U64(neg_into(v, |x| enc_f64(x as f64))),
                 (w, p) => return Err(format!("to_float expects a U{w} leaf (w in 32/64), got U{}", p.bits())),
             }),
-            ArithOp::AddU64(c) => {
-                // in place when uniquely owned: `into_u64` moves the buffer out at refcount 1, else clones.
-                let mut xs = input.into_u64("AddU64")?;
-                xs.iter_mut().for_each(|x| *x = x.wrapping_add(*c));
-                Value::u64(xs)
-            }
-            // in place, like AddU64. Both vectorize (vector shift / vector AND) — the SIMD forms of
+            // in place when uniquely owned. Both vectorize (vector shift / vector AND) — the SIMD forms of
             // divide / modulo by a power of two, which general integer div/mod lack on NEON.
             ArithOp::Shr(k) => {
                 let mut xs = input.into_u64("Shr")?;
