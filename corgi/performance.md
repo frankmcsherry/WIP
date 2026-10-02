@@ -1,164 +1,130 @@
 # corgi's performance surface
 
 What corgi does well and must keep doing well, what it does badly and could do better, and what it
-does badly and may keep doing badly. This replaces `perf-gaps.md`. It is meant to be backed by one
-benchmark cohort that measures every row below in one run; until that exists, the rows come from
-the harnesses listed under "Where the numbers come from".
+does badly and may keep doing badly. Every row is idiomatic corgi against the idiomatic Rust for the
+same task, and every row is reproduced by a benchmark in this crate: `benches/gaps.rs` or
+`benches/idioms.rs`. A claim without a reproduction here does not belong in this file.
 
-Each row is a kind of work, written as a corgi program, timed against:
-- **columnar Rust**: the honest hand-written ceiling (a fused loop, a predicated push, a two-pointer
-  merge, a bucket loop);
-- **row-at-a-time Rust**: what someone would naturally write (`Vec<enum>`, `Vec<Vec<_>>`,
-  `HashSet`); this is where corgi should win;
-- other targets where they were measured: single-threaded ParlayLib, the Mac GPU through Metal,
-  corgi built for WebAssembly.
+The Rust side is what a programmer would write for the task: a loop, an iterator chain, a
+`Vec<enum>` or `Vec<Vec<_>>`, a `HashSet`, `sort_unstable`, `partition_point`. It is not Rust
+written to follow corgi's own algorithm, which would only measure interpretation.
 
-Ratios are "takes N× as long as" the named target; below 1 means corgi is faster. Ranges run over
-1M and 8M rows unless a size is given. "With #50/#51" is master with those two open PRs merged in.
+Ratios are "takes N× as long as" the Rust; below 1 means corgi is faster. Ranges run over 1M and
+8M rows for `gaps.rs` and are at 1M rows for `idioms.rs`, unless a size is given. Figures are for
+master; "with #50/#51" is master with those two open PRs merged in, where it differs.
 
 Verdicts:
-- **Keep:** at or better than the target. A change that makes it worse needs a reason.
+- **Keep:** at or better than the Rust. A change that makes it worse needs a reason.
 - **Improve:** behind, with a known or suspected cause that fits the goals.
-- **Accept:** behind, and closing it would cost a goal (per-row scalar loops, code generation),
-  so it may stay behind.
+- **Accept:** behind, and closing it would cost a goal (code generation, or per-row scalar
+  loops), so it may stay behind.
 
-## 1. Streaming chains
+## 1. Chains of element-wise ops
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| one element-wise op over a column | Keep | 1.1–1.24× columnar Rust; 1.73× at 8K rows (fixed cost) |
-| sum and max of a column | Keep | 1.00–1.04× |
-| eight adds in a chain | Accept | 3.4–3.7× one fused loop; each pass is at the Rust ceiling (1.0× eight un-fused Rust passes), so the whole gap is fusion |
-| map then reduce | Improve, then Accept | 5.8–7.2× one fused loop on master, 2.8–3.5× with #50/#51 (the pool); already 0.51–0.55× un-fused Rust, the rest is fusion |
-| a chain with constant operands | Keep | 1.5–1.8× one fused loop; 1.04–1.15× the same passes in Rust |
-| the block chain `x*3+1`, compare, compress, sum (16M) | Keep | in 64K blocks 0.71 ns per element against 0.67 for plain Rust doing the same passes (*older*, #50's measurement) |
+| one element-wise op over a column | Keep | 1.1–1.24× a loop (an upper bound: the harness keeps its input alive, so this in-place op copies it first) |
+| a chain against one fused loop | Accept | eight adds 3.4–3.7×; four ops with constants 1.5–1.8×; map then sum 5.8–7.2× (2.8–3.5× with #50/#51): one pass per op against one loop |
 
-## 2. Selection and partition
+## 2. Selection
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| compress by a mask | Keep | 1.3× a plain loop at 50% kept; ParlayLib's `pack` takes 7.7× as long |
-| filter by a computed comparison | Keep | 1.3–2.3× one predicated-push loop on master, 1.2–1.6× with #50/#51; the rest is the separate compare pass |
-| compare-then-select | Accept | 3.4–4.0× one fused loop (2.6–3.6× with #50/#51): four passes against one |
-| partition into lanes (`branch`) | Improve | 4.8–5.1× ParlayLib, 5.6–6.1× plain Rust at 16M (count, size exactly, write once) |
+| filter by a comparison | Accept | 1.3–2.3× one predicated-push loop (1.2–1.6× with #50/#51): compare, then compress, against one loop |
+| compare-then-select | Accept | 3.4–3.5× one fused loop (2.6× with #50/#51): four passes against one |
 
 ## 3. Reductions, scans, grouping, folds
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| prefix sum (the monoid scan kernel) | Keep | 0.96–1.43× columnar Rust; ParlayLib's scan takes 1.5–2× as long |
-| group by a small integer key and sum | Improve | 54–59× a Rust bucket loop (16× at 8K rows); needs a counting partition or a scatter with a combine |
-| scatter | Improve | none in corgi; spelled through `group`, 29× ParlayLib at 256 buckets |
-| a general scan over one long row | Improve | 445–1,130× a cumsum loop (370–920× with #50/#51): one round per element, the body re-run each round |
-| fold with a (sum, count) accumulator over one long row | Improve | 3,150–6,550× a plain loop (2,460–4,950× with #50/#51): same cause |
-| fold over rows of very different lengths | Improve | 47–66× when 1% of rows are long (fold unrolled per position); 1.65–3.75× with a per-row loop and the list by reference (*older*) |
-| a general sequential recurrence (affine scan `y = 31y + x`, 1M) | Accept | 246× ParlayLib, 494× a plain loop: a per-element scalar loop, which is a non-goal |
+| sum and max of a column | Keep | 1.00–1.02× |
+| prefix sum | Keep | 0.99–1.23× a cumsum loop (an upper bound: an in-place op on a kept input) |
+| group by a small integer key and sum | Improve | 57–59× a 256-bucket loop (16× at 8K rows): corgi sorts where Rust indexes buckets |
+| fold with a (sum, count) accumulator over one long row | Improve | 3,150–5,030× a loop (2,460–3,940× with #50/#51): the fold interprets its body once per element; a tuple of monoids could instead become two reductions |
+| a general scan over one long row | Accept | 445–640× a cumsum loop (370–530× with #50/#51): the body is interpreted once per element, which is a per-element scalar loop |
 
 ## 4. Ordering
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| sort of `u64` values | Keep | 0.64–0.85× Rust's `sort_unstable` |
-| dedup | Keep | 0.90–1.16× sort then dedup in Rust |
-| argsort of `u64` | Keep | 0.39–0.69× a stable Rust sort with cached keys |
-| sort of sums and of short lists | Keep | 0.26–0.59× the matching Rust sort; 0.61–1.05× row-at-a-time Rust on lists |
-| sort and dedup as words over the sort's own state | Keep | 0.96–1.06× and 0.80–1.14× today's built-in ops (*older*) |
-| distinct pairs (sort-based) | Keep | 0.64× a Rust `HashSet` |
-| sort of `Result` rows | Improve | 1.7× row-at-a-time Rust |
-| integer sort of pairs, 16M | Improve | 3.6× ParlayLib (16.3 against 4.6 ns per element: top digit first, passes in cache, payload carried) |
-| sort under many small segments (a block per four rows) | Improve | 3.0–4.8× a Rust sort per row: fixed cost per segment |
-| adjacent compare (`arrange::compare_adjacent`) | Improve | 3.3–3.5× a direct leaf compare |
+| sort of `u64` values | Keep | 0.64–0.85× `sort_unstable` (values below 2^32, so the radix sort makes four passes) |
+| dedup | Keep | 0.91–1.16× `sort_unstable` then `dedup` |
+| distinct pairs, counted | Keep | 0.64× a `HashSet` |
+| sort of a column of short lists | Keep | 0.89× sorting a `Vec<Vec<u64>>` of up to 2 elements, 1.04× up to 4 |
+| sort of a column of longer lists | Improve | 1.71× sorting a `Vec<Vec<u64>>` of up to 16 elements |
+| sort of a column of `Result<u64, u64>` | Improve | 1.75× sorting a `Vec<Result<u64, u64>>` |
 
-## 5. Search and merge
+## 5. Search and join
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| `find` with many needles (#51, held) | Keep once landed | 7.2 ns per needle at 16M sorted needles against 103 for Rust's `partition_point`; 0.97–1.46× the best plain Rust loop at 4,096 needles or more (*older*: the `find` comparison earlier on 2026-10-02) |
-| single-key join of sorted inputs (find then slices) | Improve | 2.5–2.6× a two-pointer merge on master, 2.0–2.2× with #51 |
-| merge of two sorted columns, equal sizes | Improve | 5.6× ParlayLib, 6.9× plain Rust at 16M (block copies, branch-free merge) |
-| merge kernel `survey_groups` alone | unmeasured | needs a row |
+| equal ranges of many needles in a sorted column | Improve (Keep once #51 lands) | 5.7–6.5× `partition_point` on master; 0.27–0.35× with #51 |
+| single-key join of a sorted column (dedup the probes, find, slices) | Improve | 2.5–2.6× a two-pointer merge (2.0–2.2× with #51); corgi's dedup sorts probes that Rust dedups in one pass |
 
 ## 6. Sums
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| a sum whose variants differ in size | Keep | 0.04–0.36× row-at-a-time Rust |
-| one field of a wide struct | Keep | 0.08× row-at-a-time Rust |
-| a match whose arms are one op | Keep | 0.41–0.45× row-at-a-time Rust; 1.14× when one variant is rare |
-| a match with heavier arms | Keep | 0.98–1.46× |
-| reading the errors out of a `Result` column (`unweave`) | Improve (minor) | 1.6–1.8× row-at-a-time Rust; was 12–13× on 2026-09-30, before #45 read tags in place |
-| merging lanes back by tag | Improve | 2.5–3.0× row-at-a-time Rust |
-| a match over several shapes | Improve | 3.4–3.7× row-at-a-time Rust |
-| build a sum then unweave it | Improve | 3.0–3.3× a one-pass partition |
-| a two-arm arithmetic match that Rust turns into a blend | Accept | 12–16.5×; `select` is the spelling for this, `match` pays off when lanes differ |
+| an enum with one small and one 56-byte variant, the small one updated | Keep | 0.04× at 50% each, 0.34× when the wide variant is 5%: corgi touches only the small lane |
+| one field of an eight-field struct, summed | Keep | 0.08×: corgi reads one column |
+| a match whose arms are one op | Keep | 1.10–1.17× a `Vec<Result>` map |
+| a match with a few ops per arm | Accept | 1.38–1.46×: a pass per op against one loop |
+| the sum of a `Result` column's `Err` payloads | Improve (minor) | 1.56–1.82×, though corgi reads only the `Err` lane |
+| a match whose arms merge into one column | Improve | 2.9× (2.4× with #50/#51) |
+| a two-variant match in `f64`, merged into one column | Improve | 3.85× (3.47× with #50/#51): floats go through the order-preserving encoding on every op |
+| build a sum, then unweave it | Improve | 3.1–3.3× a one-pass partition into two vectors |
+| a two-arm arithmetic match that Rust turns into a blend | Accept | 13–16.5×; `select` is the spelling for this, `match` pays off when lanes differ |
 
-## 7. Nested lists
+## 7. Nested lists and gathers
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| sum of each row's list | Keep | 0.95–0.99× row-at-a-time Rust |
-| count of each row's list, length 4 | Keep | 1.0× |
-| count of each row's list, length 64 | Improve | 2.6× row-at-a-time Rust |
-| gather, bounds-checked | Keep | 0.49–1.49× unchecked Rust; 0.82–1.03× columnar Rust; two gathers 1.0–1.19× |
-| gather from two sources | Keep | 1.2–1.36× |
-| ranges into one column, rows of 16 | Improve | 3.3× ParlayLib at 16M (9.7× at 1M); 2.6–2.9× plain Rust |
-| per-row work on short rows | Improve | rows of 16 cost 0.5 ns per element more than one long list: kernels loop per row instead of treating bounds as data (*older*) |
-| filter and slices rebuilt as positions then gather | Improve | 1.1–2.3× the built-in ops: row-relative positions, ranges expanded per element, an extra checking pass (*older*) |
+| each row's list summed | Keep | 0.92–0.98× a `Vec<Vec<u64>>` |
+| each row's elements above a threshold, counted | Accept | 0.98× for rows up to 4 elements, 1.40× up to 16, 2.63× up to 64: the comparison is a column of its own before the per-row sum |
+| gather, bounds-checked | Keep | 0.44–1.17× Rust's `.get()` collected into an `Option` (the same total semantics); 0.59–1.46× indexing, which panics |
+| two gathers in a row | Keep | 1.07–1.16× |
 
-## 8. Indirection and capture
+## 8. Indirection
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| pointer chasing, many chains at once | Keep | 0.09–0.13× a serial chase; 0.28–0.33× row-at-a-time Rust |
-| a body reading a value from its enclosing row | unmeasured | the copying trap: without sharing, the value is copied once per element |
-| fold with the list passed by value | Improve | 3.9–42×: every round copies every active row's list (*older*) |
+| pointer chasing, many chains at once | Keep | 0.09–0.13× a serial chase per chain: corgi steps every chain at once |
+| a body reading a value from its enclosing row | unmeasured | the copying trap: without sharing, the value is copied once per element; needs a case |
 
-## 9. Text and bytes
+## 9. Text
 
-| work | verdict | corgi against targets |
+| work | verdict | corgi against Rust |
 |---|---|---|
-| word count | Keep | 0.72× slice-sort plus run count |
-| parse and sum a CSV column | Keep | 1.5–1.7× hand-written atoi |
-| decode from serialized bytes, touched columns only | spike only | 0.03–0.18 ns per row with borrowed columns (prototype, not on master) |
-| per-pair string distance on short strings | Accept | 13–90× Rust at 100K pairs: per-row scalar work (*older*) |
+| word count | Keep | 0.72–0.74× splitting, sorting byte slices and counting runs |
+| parse and sum a CSV column | Keep | 1.5–1.7× a hand-written atoi loop |
 
 ## 10. Small batches
 
-| work | verdict | corgi against targets |
+Small batches are otherwise a non-goal; this row holds the line.
+
+| work | verdict | corgi |
 |---|---|---|
-| fixed cost per run | Improve | 375 ns with #50 (514 before); sets the smallest useful block at about 16K elements (*older*) |
-| one element-wise op at 8K rows | Improve | 1.73× columnar Rust, against 1.1–1.24× at 1M |
-| one needle per `find` call | Accept | 350–520 ns against 65–130 ns in Rust: per-call cost dominates single-row use (*older*) |
+| one run of a tiny program | Keep | about 80–90 ns for one op, plus about 27 ns per further op (with #50/#51: 92–100 ns, plus about 15 ns per op) |
 
-## 11. Whole workloads
+## 11. Kernels a host calls directly
 
-| work | verdict | corgi against targets |
+DDIR calls these from Rust rather than through a program.
+
+| work | verdict | corgi against Rust |
 |---|---|---|
-| datatoad's GALEN, all corgi | Improve | 77.8 s against datatoad's 11.0 s; 10.8 s with six Rust kernels doing the hot loops (*older*) |
-| DDIR operators | Keep (corgi's part) | DDIR's 3.3–7.7× gap to compiled code (August) is in DD's time machinery; corgi's value work is near zero (*older*) |
+| argsort of `u64` | Keep | 0.39–0.69× a stable sort with cached keys |
+| sort of sums and of short lists | Keep | 0.26–0.59× the matching stable Rust sort |
+| sort under many small segments (a block per four rows) | Improve | 3.0–4.8× a Rust sort per row: a fixed cost per segment |
+| gather from two sources by tag | Keep | 1.2–1.36× |
 
-## Where the numbers come from
+## How it's measured
 
-- **Columnar Rust rows:** `cargo bench --bench gaps`, on 2026-10-02 at `16ec7f8` and with #50/#51
-  merged in, two alternated rounds on an idle Apple M4 mini, best corgi time per version against the
-  best Rust time over all runs. Each program runs through `Program`, the path a user's program
-  takes. The harness keeps its input alive, so ops that rewrite their operand in place (one
-  element-wise op, the chain of adds, the prefix sum) copy it first and are upper bounds. Ratios
-  under about 1.1× are within run-to-run noise.
-- **Row-at-a-time Rust rows:** a small comparison crate outside the repo (`corgi-wins`), same
-  machine, versions and rounds; it moves into the cohort.
-- **ParlayLib rows:** ParlayLib built single-threaded against corgi with #49/#50/#51 and plain Rust,
-  2026-10-02; the harness is outside the repo.
-- **Rows marked *older*:** earlier spikes, not re-run: local branches `corgi-alloc-spike` (the
-  pool), `corgi-blocks-spike` (blocks and per-row cost), `scratch-kernel-words` (words over the
-  sort's state, folds), `corgi-find-spike` (`find`), `corgi-serialized` (decoding),
-  `corgi-toad-hosted` (GALEN), `corgi-gpu-spike`, `corgi-wasm-spike`; and DDIR's August
-  performance matrix.
+`cargo bench --bench gaps` and `cargo bench --bench idioms` on an idle Apple M4 mini, 2026-10-02:
+master at `16ec7f8`, and master with #50/#51 merged in, alternated over two rounds. `gaps.rs` runs
+each program through `Program`; `idioms.rs` ran each case in three fresh processes per round, and
+each figure is the best over all of them.
 
-## Other targets, where measured
-
-- **GPU (Metal):** streaming kernels at 100–105 GB/s against 60–95 GB/s for one core, so 1.1–1.5×
-  faster than a good single thread; sort, search and scatter win outright. Each kernel step in a
-  submission costs about 4.5 µs and each submission 90 µs or more, so only large batches pay.
-- **WebAssembly:** element-wise ops, gather, scan, sort and `find` at 0.94–1.18× native. Outliers:
-  unsigned 64-bit compares (split into scalar lanes), the 64-bit multiply, unrolled reductions.
+Fresh processes matter: the same program on the same data can run up to 2× slower in one process
+than in another, and stay that way for the life of the process (the enum update took 0.10 ns per
+row at best and 0.19–0.20 at worst; the `Err` sum 0.28 and 0.40; the Rust sides vary too). Report
+the best and the worst over several processes, and treat a ratio under about 1.1× as noise.
