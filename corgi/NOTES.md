@@ -35,7 +35,7 @@ src/
                lane assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
   engine.rs    row-movement primitives: gather, concat, fill + index generators
                (filter_mask / owner_ids / resolve_indices / expand_ranges).
-  lib.rs       re-exports, plus `arrange`: the sort/find/survey surface DDIR's backend calls.
+  lib.rs       re-exports, plus `arrange`: the sort/survey/gather surface DDIR's backend calls.
   bytes.rs     the byte codec: a column to and from a self-describing, 8-byte-aligned byte string,
                for shipping columns between processes.
   hash.rs      structural hashing, one stable u64 per row, over the same structure the comparator reads.
