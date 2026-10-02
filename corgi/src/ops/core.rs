@@ -414,26 +414,38 @@ impl<L: OpLike> Op<L> {
             Op::Hash => Value::u64(crate::hash::hash(&input)),
 
             Op::Filter => {
-                let (bounds, pairs) = input.into_list("Filter")?;
-                let (mask, vals) = pairs.into_pair("Filter element")?;
+                // the kept values go back into the list's own box.
+                let Value::List(bounds, mut vals) = input else {
+                    return Err(format!("Filter: expected a list, got {}", shape_of_value(&input)));
+                };
+                let (mask, data) = std::mem::replace(&mut *vals, Value::Unit(0)).into_pair("Filter element")?;
                 let m = mask.as_u64("Filter mask")?;
                 // leaves (and products of them) compress in one pass each; the new row ends are a
                 // count of each row's kept elements. Lists, sums and references build positions
                 // and gather them.
-                match compress(&vals, m) {
+                match compress(&data, m) {
                     Some(kept) => {
-                        let mut nb = Vec::with_capacity(bounds.len());
-                        let (mut acc, mut start) = (0usize, 0usize);
-                        for end in bounds.ends() {
-                            acc += m[start..end].iter().filter(|&&b| b != 0).count();
-                            nb.push(acc);
-                            start = end;
-                        }
-                        Value::List(nb.into(), Box::new(kept))
+                        let nb = if bounds.len() == 1 {
+                            // one row: its end is the kept count, and a one-row partition is a
+                            // stride (what `From<Vec<usize>>` makes of `[k]`), so no vector.
+                            Bounds::Stride(kept.len(), 1)
+                        } else {
+                            let mut nb = Vec::with_capacity(bounds.len());
+                            let (mut acc, mut start) = (0usize, 0usize);
+                            for end in bounds.ends() {
+                                acc += m[start..end].iter().filter(|&&b| b != 0).count();
+                                nb.push(acc);
+                                start = end;
+                            }
+                            nb.into()
+                        };
+                        *vals = kept;
+                        Value::List(nb, vals)
                     }
                     None => {
                         let (idx, nb) = filter_mask(&bounds, m);
-                        Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+                        *vals = gather(&data, &idx);
+                        Value::List(nb.into(), vals)
                     }
                 }
             }
@@ -561,8 +573,12 @@ impl<L: OpLike> Op<L> {
             }
 
             Op::MapList(body) => {
-                let (bounds, inner) = input.into_list("MapList")?;
-                Value::List(bounds, Box::new(try_eval_graph(body, inner)?))
+                // the body's result goes back into the list's own box: no new one per map.
+                let Value::List(bounds, mut vals) = input else {
+                    return Err(format!("MapList: expected a list, got {}", shape_of_value(&input)));
+                };
+                *vals = try_eval_graph(body, std::mem::replace(&mut *vals, Value::Unit(0)))?;
+                Value::List(bounds, vals)
             }
 
             // seeded left fold, vectorized across rows. `acc` is a column of one accumulator per row
