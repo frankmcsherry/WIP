@@ -994,7 +994,11 @@ mod test {
     /// useless: the expensive column is the nested one.
     #[test]
     fn declared_rows_sees_through_nesting() {
+        // as large as `usize` allows on the target: 2^40 natively, 2^28 where it is 32 bits.
+        #[cfg(target_pointer_width = "64")]
         let huge = 1usize << 40;
+        #[cfg(not(target_pointer_width = "64"))]
+        let huge = 1usize << 28;
 
         // A one-row sum whose lane names a trillion rows.
         let hidden_in_a_lane = Value::sum_tagged(
@@ -1016,7 +1020,8 @@ mod test {
 
         // And it does not overflow on a stride that would.
         let overflowing = Value::List(Bounds::Stride(usize::MAX, usize::MAX), Box::new(Value::Unit(0)));
-        assert_eq!(declared_rows(&overflowing), u64::MAX);
+        // (u64::MAX where `usize` is 64 bits; where it is 32 bits the product fits in a u64.)
+        assert_eq!(declared_rows(&overflowing), (usize::MAX as u64).saturating_mul(usize::MAX as u64));
 
         // On ordinary columns it agrees with `len`.
         for v in corpus() {
