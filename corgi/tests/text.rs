@@ -6,7 +6,6 @@ use corgi::{shape_of_value, show, Program, Shape, Value};
 
 fn run(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
-    p.check();
     let out = p.run(arg.clone()).expect("shape error");
     let inferred = p.shape(&shape_of_value(arg)).expect("type error");
     assert_eq!(inferred, shape_of_value(&out), "typer disagrees with evaluator");

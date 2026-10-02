@@ -172,7 +172,7 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             if let Some(t) = tags.const_tag() {
                 let mut lanes: Vec<Value> = variants.iter().map(|v| gather(v, &[])).collect();
                 lanes[t] = gather(&variants[t], idx);
-                return Value::Sum(Tags::constant(t, idx.len()), lanes);
+                return Value::Sum(Tags::Const(t, idx.len()), lanes);
             }
             // Otherwise build the result's assignment in the SAME pass that routes the rows: a row's
             // new offset is the size its lane had when the row arrived, so nothing is recomputed

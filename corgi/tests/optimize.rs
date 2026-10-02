@@ -13,7 +13,6 @@ fn u64(xs: &[u64]) -> Value {
 
 fn eval_str(g: &Graph<NumOp>, arg: &Value) -> String {
     let p = Program::from_graph(g.clone());
-    p.check();
     show(&p.run_partial(arg.clone()))
 }
 

@@ -533,7 +533,7 @@ impl<L: OpLike> Op<L> {
                 variants[*tag] = input;
                 // a constant tag run: the assignment is two words, and the within-lane offset IS
                 // the row index — neither column is materialised (see `Tags::Const`).
-                Value::sum_tagged(Tags::constant(*tag, n), variants)
+                Value::sum_tagged(Tags::Const(*tag, n), variants)
             }
 
             Op::MapList(body) => {

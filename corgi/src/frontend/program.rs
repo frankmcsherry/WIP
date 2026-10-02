@@ -21,39 +21,24 @@ pub struct Program {
 }
 
 impl Program {
-    /// compile an `ml` source string into a runnable program (a parse — use [`Program::check`] for
-    /// structural validation and [`Program::shape`] to type-check it against an input shape).
+    /// compile an `ml` source string into a runnable program (a parse — use [`Program::shape`] to
+    /// type-check it against an input shape).
     pub fn compile_ml(src: &str) -> Result<Program, String> {
         Ok(Program::from_graph(parse_ml(src)?))
     }
 
     /// wrap an already-built graph — from the `Builder`, the optimizer, or a host's own lowering.
     /// What runs is the graph with constant operands made immediates and unreachable nodes dropped
-    /// (both exact), then effect-lowered; `graph()` is the program as written.
+    /// (both exact), then effect-lowered.
     pub fn from_graph(graph: Graph<NumOp>) -> Program {
         let lowered = lower_effects(&dce(&immediates(&graph)));
         Program { graph, lowered }
-    }
-
-    /// the underlying graph, for inspection or optimization.
-    pub fn graph(&self) -> &Graph<NumOp> {
-        &self.graph
-    }
-
-    /// structural well-formedness (panics on a malformed graph — a parser/builder bug, not a user error).
-    pub fn check(&self) {
-        self.graph.check();
     }
 
     /// the output shape for a given input shape — the typer, over the lowered program: a fallible
     /// stage's downstream types as running on its Ok lane, and an un-`try`'d output as `Sum{T | Unit}`.
     pub fn shape(&self, input: &Shape) -> Result<Shape, String> {
         shape_of(&self.lowered, input)
-    }
-
-    /// the lowered graph — the pure-vocabulary program that [`Program::run_partial`] evaluates.
-    pub fn lowered(&self) -> &Graph<NumOp> {
-        &self.lowered
     }
 
     /// run a TOTAL program to its value. A partial program (an un-`try`'d fallible stage) is an `Err`

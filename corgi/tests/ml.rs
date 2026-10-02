@@ -11,7 +11,6 @@ fn u64(xs: &[u64]) -> Value {
 /// (an un-`TRY`'d `FailOp`) shows its result TRY'd to a `Sum{T | Unit}`.
 fn run_ml(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
-    p.check();
     show(&p.run_partial(arg.clone()))
 }
 

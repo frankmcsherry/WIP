@@ -32,7 +32,7 @@ use std::sync::Arc;
 pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
     if !err.iter().any(|&e| e) {
         debug_assert_eq!(ok.len(), err.len(), "fail: Ok lane length disagrees with the mask");
-        return Value::sum_tagged(Tags::constant(0, err.len()), vec![ok, Value::Unit(0)]);
+        return Value::sum_tagged(Tags::Const(0, err.len()), vec![ok, Value::Unit(0)]);
     }
     let mut tags = Vec::with_capacity(err.len());
     let mut off = Vec::with_capacity(err.len());
@@ -109,7 +109,7 @@ fn ranks(err: &[bool], keep: &[usize]) -> Vec<usize> {
 /// difference between free and 9 bytes a row each time.
 pub(crate) fn lift(v: Value) -> Value {
     let n = v.len();
-    Value::sum_tagged(Tags::constant(0, n), vec![v, Value::Unit(0)])
+    Value::sum_tagged(Tags::Const(0, n), vec![v, Value::Unit(0)])
 }
 
 /// `Fail<Fail<T>> -> Fail<T>`: a row is Ok iff Ok at both levels; the inner Ok lane passes through.
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Fail: lane lengths disagree with the assignment")]
     fn fail_parts_checks_lane_lengths() {
-        let bad = Value::sum_tagged(Tags::constant(0, 3), vec![Value::Unit(2), Value::Unit(0)]);
+        let bad = Value::sum_tagged(Tags::Const(0, 3), vec![Value::Unit(2), Value::Unit(0)]);
         let _ = fail_parts(bad, "test");
     }
 

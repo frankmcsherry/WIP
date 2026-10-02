@@ -9,9 +9,8 @@
 //! refinement as children, flattened once at the end. A level's work is proportional to the rows
 //! of the classes it refines — a full pass over both inputs while a leading field leaves most
 //! rows tied, and nothing once it does not — and never to the reports already made. Nothing is
-//! gathered, and the shape is walked once per level rather than once per comparison. [`survey`] is the older pairwise
-//! report: a leaf pair is walked directly, anything else is derived from the groups. Layout, top
-//! down: the reports, the entry points, the level walk, the leaf merges, the report tree.
+//! gathered, and the shape is walked once per level rather than once per comparison. Layout, top
+//! down: the reports, the entry point, the level walk, the leaf merges, the report tree.
 
 use crate::value::{Bounds, Prim, Value};
 
@@ -27,16 +26,7 @@ pub enum GroupRun {
     Both(usize, usize, usize, usize),
 }
 
-/// One report from [`survey`]: an exclusive range, or a single matched pair.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Run {
-    A(usize, usize),
-    B(usize, usize),
-    /// Row `a[ia]` and row `b[ib]` are structurally equal.
-    Both(usize, usize),
-}
-
-// ---- entry points ---------------------------------------------------------------------------
+// ---- entry point ----------------------------------------------------------------------------
 
 /// Survey `a` and `b`, both in structural order. Ensures: the `A` ranges and the `a` halves of
 /// the `Both` classes partition `0..a.len()` in order without gap or overlap, likewise `b`;
@@ -47,68 +37,6 @@ pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
     let mut tree = Tree { nodes: vec![Node::Class { alo: 0, ahi: a.len(), blo: 0, bhi: b.len(), la: 0, lb: 0, kids: None }] };
     level(a, b, Identity, Identity, &[0], &mut tree);
     tree.flatten()
-}
-
-/// [`survey_groups`] as pairwise reports: a class of `k` rows against `l` matches the first
-/// `min(k, l)` of each side pair by pair, and the excess joins the exclusive run that follows it,
-/// which is what a two-pointer walk reports. A leaf pair is walked directly.
-pub fn survey(a: &Value, b: &Value) -> Vec<Run> {
-    if let (Value::Prim(pa), Value::Prim(pb)) = (a, b) {
-        macro_rules! go {
-            ($($V:ident),*) => {
-                match (pa, pb) {
-                    $( (Prim::$V(va), Prim::$V(vb)) => return merge_pairs(|i| va[i], |j| vb[j], va.len(), vb.len()), )*
-                    _ => panic!("survey: leaf width mismatch"),
-                }
-            };
-        }
-        go!(U8, U16, U32, U64)
-    }
-    let mut lanes = Vec::new();
-    if leaves(a, b, &mut lanes) && (1..=4).contains(&lanes.len()) {
-        let (na, nb) = (a.len(), b.len());
-        if let Some(w) = wide(&lanes) {
-            return match w.len() {
-                1 => merge_pairs(|i| w[0].0[i], |j| w[0].1[j], na, nb),
-                2 => merge_pairs(|i| (w[0].0[i], w[1].0[i]), |j| (w[0].1[j], w[1].1[j]), na, nb),
-                3 => merge_pairs(|i| (w[0].0[i], w[1].0[i], w[2].0[i]), |j| (w[0].1[j], w[1].1[j], w[2].1[j]), na, nb),
-                _ => merge_pairs(|i| (w[0].0[i], w[1].0[i], w[2].0[i], w[3].0[i]), |j| (w[0].1[j], w[1].1[j], w[2].1[j], w[3].1[j]), na, nb),
-            };
-        }
-        let at = |x: usize, i: usize| lanes[x].0.usize_at(i);
-        let bt = |x: usize, j: usize| lanes[x].1.usize_at(j);
-        return match lanes.len() {
-            1 => merge_pairs(|i| at(0, i), |j| bt(0, j), na, nb),
-            2 => merge_pairs(|i| (at(0, i), at(1, i)), |j| (bt(0, j), bt(1, j)), na, nb),
-            3 => merge_pairs(|i| (at(0, i), at(1, i), at(2, i)), |j| (bt(0, j), bt(1, j), bt(2, j)), na, nb),
-            _ => merge_pairs(|i| (at(0, i), at(1, i), at(2, i), at(3, i)), |j| (bt(0, j), bt(1, j), bt(2, j), bt(3, j)), na, nb),
-        };
-    }
-    let mut out: Vec<Run> = Vec::new();
-    let mut push = |r: Run| match (out.last_mut(), r) {
-        (Some(Run::A(_, hi)), Run::A(lo, nhi)) if *hi == lo => *hi = nhi,
-        (Some(Run::B(_, hi)), Run::B(lo, nhi)) if *hi == lo => *hi = nhi,
-        _ => out.push(r),
-    };
-    for g in survey_groups(a, b) {
-        match g {
-            GroupRun::A(lo, hi) => push(Run::A(lo, hi)),
-            GroupRun::B(lo, hi) => push(Run::B(lo, hi)),
-            GroupRun::Both(alo, ahi, blo, bhi) => {
-                let k = (ahi - alo).min(bhi - blo);
-                for i in 0..k {
-                    push(Run::Both(alo + i, blo + i));
-                }
-                if alo + k < ahi {
-                    push(Run::A(alo + k, ahi));
-                }
-                if blo + k < bhi {
-                    push(Run::B(blo + k, bhi));
-                }
-            }
-        }
-    }
-    out
 }
 
 // ---- the level walk -------------------------------------------------------------------------
@@ -400,41 +328,6 @@ fn merge<T: Ord + Copy>(ka: impl Fn(usize) -> T, kb: impl Fn(usize) -> T, open: 
     }
 }
 
-/// The pairwise walk over two leaves, as [`survey`] reports it: a match is one pair, and the
-/// walk goes on from the next row of each side.
-fn merge_pairs<T: Ord + Copy>(ka: impl Fn(usize) -> T, kb: impl Fn(usize) -> T, na: usize, nb: usize) -> Vec<Run> {
-    let (mut i, mut j) = (0usize, 0usize);
-    let mut out = Vec::new();
-    while i < na && j < nb {
-        match ka(i).cmp(&kb(j)) {
-            std::cmp::Ordering::Less => {
-                let s = i;
-                i += 1;
-                gallop(&mut i, na, |k| ka(k) < kb(j));
-                out.push(Run::A(s, i));
-            }
-            std::cmp::Ordering::Equal => {
-                out.push(Run::Both(i, j));
-                i += 1;
-                j += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                let s = j;
-                j += 1;
-                gallop(&mut j, nb, |k| kb(k) < ka(i));
-                out.push(Run::B(s, j));
-            }
-        }
-    }
-    if i < na {
-        out.push(Run::A(i, na));
-    }
-    if j < nb {
-        out.push(Run::B(j, nb));
-    }
-    out
-}
-
 /// Advance `idx` while `pred` holds, by doubling steps then bisection: `O(log gap)` probes.
 fn gallop(idx: &mut usize, hi: usize, pred: impl Fn(usize) -> bool) {
     if *idx < hi && pred(*idx) {
@@ -723,53 +616,6 @@ mod tests {
                 let b = gather(&sorted, &(2..sorted.len()).collect::<Vec<_>>());
                 assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b), "seed={seed}");
             }
-        }
-    }
-
-    /// the pairwise oracle: the old two-pointer walk with `compare_at`.
-    fn naive_pairs(a: &Value, b: &Value) -> Vec<Run> {
-        let (na, nb) = (a.len(), b.len());
-        let (mut i, mut j) = (0, 0);
-        let mut out = Vec::new();
-        while i < na && j < nb {
-            match compare_at(a, i, b, j) {
-                Ordering::Less => {
-                    let s = i;
-                    while i < na && compare_at(a, i, b, j) == Ordering::Less {
-                        i += 1;
-                    }
-                    out.push(Run::A(s, i));
-                }
-                Ordering::Equal => {
-                    out.push(Run::Both(i, j));
-                    i += 1;
-                    j += 1;
-                }
-                Ordering::Greater => {
-                    let s = j;
-                    while j < nb && compare_at(b, j, a, i) == Ordering::Less {
-                        j += 1;
-                    }
-                    out.push(Run::B(s, j));
-                }
-            }
-        }
-        if i < na {
-            out.push(Run::A(i, na));
-        }
-        if j < nb {
-            out.push(Run::B(j, nb));
-        }
-        out
-    }
-
-    #[test]
-    fn pairs_agree_with_the_scalar_walk_on_random_shapes() {
-        for seed in 1..120u64 {
-            let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
-            let (na, nb) = (rng.below(30), rng.below(30));
-            let (a, b) = two_sorted(&mut rng, na, nb, 3);
-            assert_eq!(survey(&a, &b), naive_pairs(&a, &b), "\n{}\n{}", crate::value::show(&a), crate::value::show(&b));
         }
     }
 
