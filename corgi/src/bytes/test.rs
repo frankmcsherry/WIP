@@ -159,7 +159,7 @@ fn random_value(rng: &mut Rng, rows: usize, depth: usize) -> Value {
                 .collect();
             Value::sum_tagged(
                 Tags::Column(
-                    Prim::U8(std::sync::Arc::new(tags.iter().map(|&t| t as u8).collect())),
+                    Prim::U8(crate::pool::leaf(tags.iter().map(|&t| t as u8).collect())),
                     std::sync::Arc::new(offsets),
                 ),
                 variants,
@@ -344,7 +344,7 @@ fn structurally_impossible_columns_are_refused() {
     // and the payload word carries the single u8 discriminant in its low byte.
     let bad_tag = patched(
         &Value::sum_tagged(
-            Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+            Tags::Column(Prim::U8(crate::pool::leaf(vec![0])), std::sync::Arc::new(vec![0])),
             vec![Value::u64(vec![7])],
         ),
         4,
@@ -355,7 +355,7 @@ fn structurally_impossible_columns_are_refused() {
     // A sum whose carried offset points past the end of the lane it names.
     let bad_offset = patched(
         &Value::sum_tagged(
-            Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+            Tags::Column(Prim::U8(crate::pool::leaf(vec![0])), std::sync::Arc::new(vec![0])),
             vec![Value::u64(vec![7])],
         ),
         6, // [Sum][form][bits][len][tags][n_offsets][offsets[0]]
@@ -381,7 +381,7 @@ fn structurally_impossible_columns_are_refused() {
     // the arity fits it), which would otherwise let a tag column carry more than 256 lanes.
     let wide_tags = patched(
         &Value::sum_tagged(
-            Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+            Tags::Column(Prim::U8(crate::pool::leaf(vec![0])), std::sync::Arc::new(vec![0])),
             vec![Value::u64(vec![7])],
         ),
         2,
@@ -402,7 +402,7 @@ fn declared_rows_sees_through_nesting() {
 
     // A one-row sum whose lane names a trillion rows.
     let hidden_in_a_lane = Value::sum_tagged(
-        Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
+        Tags::Column(Prim::U8(crate::pool::leaf(vec![0])), std::sync::Arc::new(vec![0])),
         vec![Value::Unit(huge)],
     );
     assert_eq!(hidden_in_a_lane.len(), 1);

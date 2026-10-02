@@ -263,7 +263,7 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
                 per[t].push(tags.offset_at(i));
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
-            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
+            Value::Sum(Tags::column(Prim::U8(crate::pool::leaf(new_tags)), new_off), nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
         // a reference column: move the spans, never the arena. This one arm is the entire cost model
@@ -308,7 +308,7 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
             for (k, (lane, at)) in lanes.iter().zip(&per).enumerate() {
                 nv.push(if k == 0 { gather_or_zero(lane, at)? } else { gather(lane, at) });
             }
-            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
+            Value::Sum(Tags::column(Prim::U8(crate::pool::leaf(new_tags)), new_off), nv)
         }
         Value::Ref(payload, spans) => {
             Value::Ref(payload.clone(), Arc::new(idx.iter().map(|&i| spans.get(i).copied().unwrap_or((0, 0))).collect()))

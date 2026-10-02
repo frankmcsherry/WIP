@@ -4,7 +4,7 @@ use super::*;
 /// stored bytes ARE the result's bytes, so the result shares the buffer (an `Arc` bump).
 #[test]
 fn identity_cast_reuses_the_buffer() {
-    let xs = Arc::new(vec![10u32, 20, 30]);
+    let xs = leaf(vec![10u32, 20, 30]);
     let p = Prim::U32(xs.clone());
     let Prim::U32(out) = p.cast(32) else { panic!("cast(32) must stay a U32 leaf") };
     assert!(Arc::ptr_eq(&out, &xs), "same-width cast copied the column");
@@ -14,14 +14,14 @@ fn identity_cast_reuses_the_buffer() {
 /// (source, destination) pair the `prim!` grid generates.
 #[test]
 fn rewidth_keeps_the_low_bytes() {
-    let wide = Prim::U64(Arc::new(vec![0x0102_0304_0506_0708, 0xff, 0x1_0000]));
-    assert_eq!(wide.cast(8), Prim::U8(Arc::new(vec![0x08, 0xff, 0x00])));
-    assert_eq!(wide.cast(16), Prim::U16(Arc::new(vec![0x0708, 0x00ff, 0x0000])));
-    assert_eq!(wide.cast(32), Prim::U32(Arc::new(vec![0x0506_0708, 0xff, 0x1_0000])));
+    let wide = Prim::U64(leaf(vec![0x0102_0304_0506_0708, 0xff, 0x1_0000]));
+    assert_eq!(wide.cast(8), Prim::U8(leaf(vec![0x08, 0xff, 0x00])));
+    assert_eq!(wide.cast(16), Prim::U16(leaf(vec![0x0708, 0x00ff, 0x0000])));
+    assert_eq!(wide.cast(32), Prim::U32(leaf(vec![0x0506_0708, 0xff, 0x1_0000])));
 
-    let narrow = Prim::U8(Arc::new(vec![0, 1, 255]));
-    assert_eq!(narrow.cast(16), Prim::U16(Arc::new(vec![0, 1, 255])));
-    assert_eq!(narrow.cast(64), Prim::U64(Arc::new(vec![0, 1, 255])));
+    let narrow = Prim::U8(leaf(vec![0, 1, 255]));
+    assert_eq!(narrow.cast(16), Prim::U16(leaf(vec![0, 1, 255])));
+    assert_eq!(narrow.cast(64), Prim::U64(leaf(vec![0, 1, 255])));
 }
 
 /// A `Value` clone must be a refcount bump, not a column copy: `eval_graph` clones at every
@@ -66,7 +66,7 @@ fn one_tag_throughout_costs_no_columns() {
 fn const_and_column_assignments_agree() {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let konst = Tags::Const(1, 3);
-    let column = Tags::Column(Prim::U8(Arc::new(vec![1, 1, 1])), Arc::new(vec![0, 1, 2]));
+    let column = Tags::Column(Prim::U8(leaf(vec![1, 1, 1])), Arc::new(vec![0, 1, 2]));
     assert_eq!(konst, column);
     let h = |t: &Tags| {
         let mut s = DefaultHasher::new();
@@ -82,6 +82,6 @@ fn const_and_column_assignments_agree() {
 /// round trip. Pinned so a future "make cast lossless" change has to face the corpus.
 #[test]
 fn narrow_then_widen_truncates() {
-    let wide = Prim::U64(Arc::new(vec![0x1_0000, 0x1_0001]));
-    assert_eq!(wide.cast(16).cast(64), Prim::U64(Arc::new(vec![0, 1])));
+    let wide = Prim::U64(leaf(vec![0x1_0000, 0x1_0001]));
+    assert_eq!(wide.cast(16).cast(64), Prim::U64(leaf(vec![0, 1])));
 }

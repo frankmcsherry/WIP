@@ -29,6 +29,7 @@ pub(crate) mod graph;
 pub(crate) mod hash;
 pub(crate) mod ops;
 pub(crate) mod optimize;
+pub(crate) mod pool;
 pub(crate) mod shape;
 pub(crate) mod value;
 

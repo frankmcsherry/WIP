@@ -14,6 +14,7 @@ use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
 
+use crate::pool::{collect, leaf, take, Buf, Elem};
 use crate::value::{Prim, Value};
 use std::sync::Arc;
 
@@ -30,10 +31,10 @@ pub fn dec_i64(u: u64) -> i64 {
 /// `Op::Lit` of this.
 pub(crate) fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
     let raw = match width {
-        8 => Prim::U8(Arc::new(vec![n as u8])),
-        16 => Prim::U16(Arc::new(vec![n as u16])),
-        32 => Prim::U32(Arc::new(vec![n as u32])),
-        64 => Prim::U64(Arc::new(vec![n])),
+        8 => Prim::U8(leaf(vec![n as u8])),
+        16 => Prim::U16(leaf(vec![n as u16])),
+        32 => Prim::U32(leaf(vec![n as u32])),
+        64 => Prim::U64(leaf(vec![n])),
         _ => panic!("lit: unsupported width {width}"),
     };
     Value::Prim(if matches!(kind, Kind::I) { raw.xor_signbit() } else { raw })
@@ -128,7 +129,7 @@ macro_rules! swiz {
 /// Both lanes are read before the store, so EITHER side is a valid destination (Sub included:
 /// `f` is `x - y` regardless of where it lands). `get_mut` (not `make_mut`) tests uniqueness
 /// without cloning, so a shared LHS falls through to a unique RHS; only when both are shared do we allocate.
-fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+fn bin_into<T: Elem>(mut a: Arc<Buf<T>>, mut b: Arc<Buf<T>>, f: impl Fn(T, T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = f(*x, y); }
         a
@@ -136,19 +137,19 @@ fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) ->
         for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = f(x, *y); }
         b
     } else {
-        Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect())
+        leaf(collect(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y))))
     }
 }
 
 /// apply a binary lane op `f` against the constant `c`, in place when `a` is uniquely owned, else
 /// fresh. The immediate sibling of `bin_into`: `f(x, c)` is exactly what `bin_into` computes when
 /// every row of the right operand is `c`.
-fn imm_into<T: Copy>(mut a: Arc<Vec<T>>, c: T, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+fn imm_into<T: Elem>(mut a: Arc<Buf<T>>, c: T, f: impl Fn(T, T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for x in dst.iter_mut() { *x = f(*x, c); }
         a
     } else {
-        Arc::new(a.iter().map(|&x| f(x, c)).collect())
+        leaf(collect(a.iter().map(|&x| f(x, c))))
     }
 }
 
@@ -182,12 +183,12 @@ macro_rules! int_arms {
 }
 
 /// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh.
-fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
+fn neg_into<T: Elem>(mut a: Arc<Buf<T>>, f: impl Fn(T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for x in dst.iter_mut() { *x = f(*x); }
         a
     } else {
-        Arc::new(a.iter().map(|&x| f(x)).collect())
+        leaf(collect(a.iter().map(|&x| f(x))))
     }
 }
 
@@ -351,7 +352,7 @@ impl ArithOp {
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
                 let xs = vals.as_u64("reduce values")?;
-                let mut out = Vec::with_capacity(bounds.len());
+                let mut out = take(bounds.len());
                 let mut start = 0;
                 for end in bounds.ends() {
                     let s = &xs[start..end]; // empty row -> the monoid identity

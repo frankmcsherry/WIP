@@ -21,7 +21,6 @@ use crate::engine::{gather, index_plan, Owners};
 use crate::graph::OpLike;
 use crate::shape::shape_of_value;
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
-use std::sync::Arc;
 
 // --- the representation --------------------------------------------------------------------------
 
@@ -49,7 +48,7 @@ pub(crate) fn fail(err: &[bool], ok: Value) -> Value {
         }
     }
     debug_assert_eq!(ok.len(), n_ok, "fail: Ok lane length disagrees with the mask");
-    Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), vec![ok, Value::Unit(n_err)])
+    Value::sum_tagged(Tags::column(Prim::U8(crate::pool::leaf(tags)), off), vec![ok, Value::Unit(n_err)])
 }
 
 /// Does this value have the `Fail<T> = Sum{T | Unit}` shape?

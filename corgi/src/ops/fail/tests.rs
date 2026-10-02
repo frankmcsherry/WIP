@@ -51,9 +51,9 @@ fn squash_retains_a_noncanonical_all_ok_assignment() {
     for n in [0, 3] {
         // Bypass producer compaction: an all-Ok Column is valid too. Preserve
         // its representation and buffers, but require the same value as Lift.
-        let tags = Arc::new(vec![0; n]);
+        let tags = crate::pool::leaf(vec![0u8; n]);
         let offsets = Arc::new((0..n).collect::<Vec<_>>());
-        let values = Arc::new((0..n).map(|i| 10 + i as u64).collect::<Vec<_>>());
+        let values = crate::pool::leaf((0..n).map(|i| 10 + i as u64).collect::<Vec<_>>());
         let ok = Value::Prim(Prim::U64(values.clone()));
         let inner = Value::sum_tagged(
             Tags::Column(Prim::U8(tags.clone()), offsets.clone()),
@@ -89,7 +89,7 @@ fn fast_paths_keep_shape_errors_even_on_empty_columns() {
     }
 }
 
-fn one_row(idx: Vec<u64>, hay: &Arc<Vec<u64>>) -> Value {
+fn one_row(idx: Vec<u64>, hay: &Arc<crate::pool::Buf<u64>>) -> Value {
     Value::Prod(vec![
         Value::List(vec![idx.len()].into(), Box::new(Value::u64(idx))),
         Value::List(vec![hay.len()].into(), Box::new(Value::Prim(Prim::U64(hay.clone())))),
@@ -101,7 +101,7 @@ fn one_row(idx: Vec<u64>, hay: &Arc<Vec<u64>>) -> Value {
 /// column, and "did anything fail" is a field read rather than a mask to build and scan.
 #[test]
 fn a_fail_that_has_not_failed_carries_no_witness_columns() {
-    let hay = Arc::new(vec![10, 20, 30]);
+    let hay = crate::pool::leaf(vec![10u64, 20, 30]);
     let ok = try_gather::<crate::ops::NumOp>(one_row(vec![2, 0, 1], &hay)).unwrap();
     assert!(no_errors(&ok));
     let Value::Sum(tags, _) = &ok else { panic!("a Fail is a Sum") };
@@ -121,7 +121,7 @@ fn a_fail_that_has_not_failed_carries_no_witness_columns() {
 /// they mean, so the mask read back is the same either way.
 #[test]
 fn a_failure_forces_the_general_assignment() {
-    let hay = Arc::new(vec![10, 20, 30]);
+    let hay = crate::pool::leaf(vec![10u64, 20, 30]);
     let bad = try_gather::<crate::ops::NumOp>(one_row(vec![7], &hay)).unwrap();
     assert!(!no_errors(&bad));
     let (err, _) = into_fail(bad, "t").unwrap();
@@ -130,7 +130,7 @@ fn a_failure_forces_the_general_assignment() {
 
 #[test]
 fn one_row_identity_gather_reuses_the_haystack_leaf() {
-    let hay = Arc::new(vec![10, 20, 30]);
+    let hay = crate::pool::leaf(vec![10u64, 20, 30]);
     let (err, ok) = into_fail(try_gather::<crate::ops::NumOp>(one_row(vec![0, 1, 2], &hay)).unwrap(), "t").unwrap();
     assert_eq!(err, vec![false]);
     let (_, vals) = ok.into_list("identity gather result").unwrap();
@@ -140,7 +140,7 @@ fn one_row_identity_gather_reuses_the_haystack_leaf() {
 
 #[test]
 fn one_row_u64_gather_discards_a_partially_rewritten_failure() {
-    let hay = Arc::new(vec![10, 20, 30]);
+    let hay = crate::pool::leaf(vec![10u64, 20, 30]);
     let (err, ok) = into_fail(try_gather::<crate::ops::NumOp>(one_row(vec![1, 3, 0], &hay)).unwrap(), "t").unwrap();
     assert_eq!(err, vec![true]);
     assert_eq!(ok.len(), 0);
@@ -149,7 +149,7 @@ fn one_row_u64_gather_discards_a_partially_rewritten_failure() {
 
 #[test]
 fn one_row_nonidentity_u64_gather_returns_values_and_normalizes_bounds() {
-    let hay = Arc::new(vec![10, 20, 30]);
+    let hay = crate::pool::leaf(vec![10u64, 20, 30]);
     let input = Value::Prod(vec![
         Value::List(Bounds::offsets(vec![3]), Box::new(Value::u64(vec![2, 0, 1]))),
         Value::List(vec![3].into(), Box::new(Value::Prim(Prim::U64(hay.clone())))),

@@ -322,7 +322,7 @@ impl<L: OpLike> Op<L> {
                 // the tags are a byte per row, and stay one: the sum's own tag column is shared,
                 // not copied, so a program that projects the tags away pays nothing for them.
                 let narrow = match &tags {
-                    Tags::Const(t, rows) => Prim::U8(Arc::new(vec![*t as u8; *rows])),
+                    Tags::Const(t, rows) => Prim::U8(crate::pool::leaf(vec![*t as u8; *rows])),
                     Tags::Column(p @ Prim::U8(_), _) => p.clone(),
                     Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
                 };
@@ -370,7 +370,7 @@ impl<L: OpLike> Op<L> {
                     }
                     start = end;
                 }
-                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), lanes);
+                let sum = Value::sum_tagged(Tags::column(Prim::U8(crate::pool::leaf(tag8)), off), lanes);
                 Value::List(tb, Box::new(sum))
             }
 
@@ -507,7 +507,7 @@ impl<L: OpLike> Op<L> {
                     groups[t].push(i);
                 }
                 let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-                Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), variants)
+                Value::sum_tagged(Tags::column(Prim::U8(crate::pool::leaf(tag8)), off), variants)
             }
 
             Op::Unwrap => {
@@ -805,7 +805,7 @@ impl<L: OpLike> Op<L> {
                     }
                 }
                 let lanes = vec![gather(hvals, &abs), Value::Unit(missing)];
-                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
+                let sum = Value::sum_tagged(Tags::column(Prim::U8(crate::pool::leaf(tags)), off), lanes);
                 Value::List(ib, Box::new(sum))
             }
 

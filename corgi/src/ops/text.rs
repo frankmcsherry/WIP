@@ -8,7 +8,6 @@
 
 
 use crate::value::{Prim, Tags, Value};
-use std::sync::Arc;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum TextOp {
@@ -91,7 +90,7 @@ impl TextOp {
                         let tags = tags.unwrap_or_default();
                         let mut count = [0usize; 2];
                         let off = tags.iter().map(|&t| { let p = count[t as usize]; count[t as usize] += 1; p }).collect();
-                        Tags::column(Prim::U8(Arc::new(tags)), off)
+                        Tags::column(Prim::U8(crate::pool::leaf(tags)), off)
                     }
                 };
                 Value::sum_tagged(assignment, vec![Value::u64(oks), Value::Unit(errs)])
