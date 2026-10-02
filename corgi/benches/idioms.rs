@@ -3,15 +3,15 @@
 //! `partition_point`), on the same data, built outside the timer. The rows of `performance.md`
 //! that `gaps.rs` does not measure come from here.
 //!
-//! Each case reports ns per row for both sides (best of 7 samples) and their ratio. Run all cases
+//! Each case runs at two sizes, inside the caches and well beyond them, and reports ns per row for
+//! both sides (best of 7 samples) and their ratio. Results can differ between processes, so run each
+//! case in several and keep the best and the worst. Run all cases
 //! with `cargo bench --bench idioms`, or name some: `cargo bench --bench idioms -- sum_map find`.
 //! `dispatch` reports ns per run of a tiny program instead: the guard on small batches.
 
 use corgi::{Bounds, Program, Value};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-
-const ROWS: usize = 1_000_000;
 
 /// best of 7 samples of ns per row; each sample repeats `f` enough to cover about 4M rows.
 fn best(rows: usize, mut f: impl FnMut()) -> f64 {
@@ -102,46 +102,46 @@ fn lists(rows: usize, max: u64, rng: &mut Rng) -> (Vec<Vec<u64>>, Value) {
     (ls, Value::List(Bounds::offsets(ends), Box::new(Value::u64(flat))))
 }
 
-fn report(case: &str, param: &str, rust: f64, corgi: f64, what: &str) {
-    println!("{case:<14} {param:<7} corgi {corgi:8.2}  rust {rust:8.2} ns/row  {:6.2}x  {what}", corgi / rust);
+fn report(case: &str, rows: usize, param: &str, rust: f64, corgi: f64, what: &str) {
+    println!("{case:<14} {rows:>8} {param:<7} corgi {corgi:8.2}  rust {rust:8.2} ns/row  {:6.2}x  {what}", corgi / rust);
 }
 
 /// `Result<u64, u64>`: subtract one from Ok, add one to Err.
-fn sum_map(pct: u64, param: &str) {
+fn sum_map(rows: usize, pct: u64, param: &str) {
     let mut rng = Rng(0x5eed);
-    let (rs, input) = results(ROWS, pct, 1_000_000, &mut rng);
+    let (rs, input) = results(rows, pct, 1_000_000, &mut rng);
     let p = corgi("input map_variant 0 (x -> (x, 1u64) sub) map_variant 1 (e -> (e, 1u64) add)");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&rs).iter().map(|r| match r { Ok(x) => Ok(x - 1), Err(e) => Err(e + 1) }).collect::<Vec<_>>());
     });
-    report("sum_map", param, r, corgi_t(ROWS, &p, &input), "a match whose arms are one op");
+    report("sum_map", rows, param, r, corgi_t(rows, &p, &input), "a match whose arms are one op");
 }
 
 /// `Result<u64, u64>` with a few ops in each arm.
-fn sum_heavy(pct: u64, param: &str) {
+fn sum_heavy(rows: usize, pct: u64, param: &str) {
     let mut rng = Rng(0x5eed);
-    let (rs, input) = results(ROWS, pct, 1_000_000, &mut rng);
+    let (rs, input) = results(rows, pct, 1_000_000, &mut rng);
     let p = corgi("input map_variant 0 (x -> ((((x, 3u64) mul, 7u64) add) shr 1, 11u64) mul) map_variant 1 (e -> ((e shr 2, 5u64) mul, e) add)");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&rs).iter().map(|r| match r { Ok(x) => Ok(((x * 3 + 7) >> 1) * 11), Err(e) => Err((e >> 2) * 5 + e) }).collect::<Vec<_>>());
     });
-    report("sum_heavy", param, r, corgi_t(ROWS, &p, &input), "a match with a few ops per arm");
+    report("sum_heavy", rows, param, r, corgi_t(rows, &p, &input), "a match with a few ops per arm");
 }
 
 /// `Result<u64, u64>` to `u64`: the arms' results merged back into one column by tag.
-fn sum_merge() {
+fn sum_merge(rows: usize) {
     let mut rng = Rng(0x5eed);
-    let (rs, input) = results(ROWS, 50, 1_000_000, &mut rng);
+    let (rs, input) = results(rows, 50, 1_000_000, &mut rng);
     let p = corgi("input match (0 (x -> (x, 1u64) sub), 1 (e -> (e, 1u64) add))");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&rs).iter().map(|r| match r { Ok(x) => x - 1, Err(e) => e + 1 }).collect::<Vec<u64>>());
     });
-    report("sum_merge", "50%", r, corgi_t(ROWS, &p, &input), "a match whose arms merge into one column");
+    report("sum_merge", rows, "50%", r, corgi_t(rows, &p, &input), "a match whose arms merge into one column");
 }
 
 /// the area of a circle or a rectangle, in `f64` (corgi's floats are order-preserving encodings).
 #[allow(clippy::approx_constant)] // the same literal as the corgi program's
-fn shapes() {
+fn shapes(rows: usize) {
     #[derive(Clone, Copy)]
     enum Shape {
         Circle(f64),
@@ -152,7 +152,7 @@ fn shapes() {
         if b >> 63 == 1 { !b } else { b ^ (1 << 63) }
     }
     let mut rng = Rng(0x5eed);
-    let t = tags(ROWS, 50, &mut rng);
+    let t = tags(rows, 50, &mut rng);
     let f = |rng: &mut Rng| (rng.next() % 10_000) as f64 / 100.0 + 0.5;
     let shapes: Vec<Shape> = t.iter().map(|&t| if t == 0 { Shape::Circle(f(&mut rng)) } else { Shape::Rect(f(&mut rng), f(&mut rng)) }).collect();
     let (mut r, mut w, mut h) = (Vec::new(), Vec::new(), Vec::new());
@@ -167,141 +167,141 @@ fn shapes() {
     }
     let input = Value::sum(t, vec![Value::u64(r), Value::Prod(vec![Value::u64(w), Value::u64(h)])]);
     let p = corgi("input match (0 (r -> ((r, r) mul_f64, 3.14159f64) mul_f64), 1 ((w, h) -> (w, h) mul_f64))");
-    let rt = best(ROWS, || {
+    let rt = best(rows, || {
         black_box(black_box(&shapes).iter().map(|s| match *s { Shape::Circle(r) => r * r * 3.14159, Shape::Rect(w, h) => w * h }).collect::<Vec<f64>>());
     });
-    report("shapes", "50%", rt, corgi_t(ROWS, &p, &input), "a two-variant match in f64, merged into one column");
+    report("shapes", rows, "50%", rt, corgi_t(rows, &p, &input), "a two-variant match in f64, merged into one column");
 }
 
 /// the sum of the Err payloads: Rust reads every row, corgi reads the Err lane.
-fn sum_err_total(pct: u64, param: &str) {
+fn sum_err_total(rows: usize, pct: u64, param: &str) {
     let mut rng = Rng(0x5eed);
-    let (rs, inner) = results(ROWS, pct, 1000, &mut rng);
-    let input = one_row(ROWS, inner);
+    let (rs, inner) = results(rows, pct, 1000, &mut rng);
+    let input = one_row(rows, inner);
     let p = corgi("input unweave .2 fold_add");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&rs).iter().filter_map(|r| r.err()).sum::<u64>());
     });
-    report("sum_err_total", param, r, corgi_t(ROWS, &p, &input), "the sum of a Result column's Err payloads");
+    report("sum_err_total", rows, param, r, corgi_t(rows, &p, &input), "the sum of a Result column's Err payloads");
 }
 
 /// one field of a struct of eight `u64`, summed over all rows.
-fn field_sum() {
+fn field_sum(rows: usize) {
     #[derive(Clone, Copy)]
     struct Row {
         _a: u64, _b: u64, c: u64, _d: u64, _e: u64, _f: u64, _g: u64, _h: u64,
     }
     let mut rng = Rng(0x5eed);
-    let data: Vec<Row> = (0..ROWS)
+    let data: Vec<Row> = (0..rows)
         .map(|_| Row { _a: rng.next(), _b: rng.next(), c: rng.next() % 1000, _d: rng.next(), _e: rng.next(), _f: rng.next(), _g: rng.next(), _h: rng.next() })
         .collect();
     let cols: Vec<Value> = (0..8).map(|k| Value::u64(data.iter().map(|r| if k == 2 { r.c } else { r._a }).collect())).collect();
-    let input = one_row(ROWS, Value::Prod(cols));
+    let input = one_row(rows, Value::Prod(cols));
     let p = corgi("input map (r -> r.2) fold_add");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&data).iter().map(|r| r.c).sum::<u64>());
     });
-    report("field_sum", "", r, corgi_t(ROWS, &p, &input), "one field of an eight-field struct, summed");
+    report("field_sum", rows, "", r, corgi_t(rows, &p, &input), "one field of an eight-field struct, summed");
 }
 
 /// an enum with one small and one wide variant: add one to the small variant's payload. Rust's
 /// rows are as wide as the widest variant, and Rust updates them in place.
-fn sum_wide(pct: u64, param: &str) {
+fn sum_wide(rows: usize, pct: u64, param: &str) {
     #[derive(Clone, Copy)]
     enum Msg {
         Small(u64),
         Big([u64; 7]),
     }
     let mut rng = Rng(0x5eed);
-    let t = tags(ROWS, pct, &mut rng);
+    let t = tags(rows, pct, &mut rng);
     let msgs: Vec<Msg> = t.iter().map(|&t| if t == 0 { Msg::Small(rng.next() % 1000) } else { Msg::Big([rng.next(); 7]) }).collect();
     let small: Vec<u64> = msgs.iter().filter_map(|m| if let Msg::Small(x) = m { Some(*x) } else { None }).collect();
     let big: Vec<Value> = (0..7).map(|k| Value::u64(msgs.iter().filter_map(|m| if let Msg::Big(a) = m { Some(a[k]) } else { None }).collect())).collect();
     let input = Value::sum(t, vec![Value::u64(small), Value::Prod(big)]);
     let p = corgi("input map_variant 0 (x -> x add_u64 1)");
     let mut v = msgs.clone();
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         for m in black_box(&mut v).iter_mut() {
             if let Msg::Small(x) = m {
                 *x += 1
             }
         }
     });
-    report("sum_wide", param, r, corgi_t(ROWS, &p, &input), "an enum with one small and one 56-byte variant, the small one updated");
+    report("sum_wide", rows, param, r, corgi_t(rows, &p, &input), "an enum with one small and one 56-byte variant, the small one updated");
 }
 
 /// a per-row sum, and a per-row count of elements above a threshold, over `Vec<Vec<u64>>`.
-fn list_reduce(max: u64) {
+fn list_reduce(rows: usize, max: u64) {
     let mut rng = Rng(0x5eed);
-    let (ls, input) = lists(ROWS, max, &mut rng);
+    let (ls, input) = lists(rows, max, &mut rng);
     let param = format!("0..={max}");
     let p = corgi("input fold_add");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&ls).iter().map(|l| l.iter().sum::<u64>()).collect::<Vec<u64>>());
     });
-    report("list_sum", &param, r, corgi_t(ROWS, &p, &input), "each row's list summed");
+    report("list_sum", rows, &param, r, corgi_t(rows, &p, &input), "each row's list summed");
     let p = corgi("input map (x -> x gt 500) fold_add");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&ls).iter().map(|l| l.iter().filter(|&&x| x > 500).count() as u64).collect::<Vec<u64>>());
     });
-    report("list_count", &param, r, corgi_t(ROWS, &p, &input), "each row's elements above a threshold, counted");
+    report("list_count", rows, &param, r, corgi_t(rows, &p, &input), "each row's elements above a threshold, counted");
 }
 
 /// sort a column of lists (structural order: length, then elements). Rust sorts its own copy in
 /// place; the copy is made outside the timer.
-fn sort_lists(max: u64) {
+fn sort_lists(rows: usize, max: u64) {
     let mut rng = Rng(0x5eed);
-    let (ls, inner) = lists(ROWS, max, &mut rng);
-    let input = one_row(ROWS, inner);
+    let (ls, inner) = lists(rows, max, &mut rng);
+    let input = one_row(rows, inner);
     let p = corgi("input sort");
-    let r = best_setup(ROWS, || ls.clone(), |mut v| {
+    let r = best_setup(rows, || ls.clone(), |mut v| {
         v.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         v
     });
-    report("sort_lists", &format!("0..={max}"), r, corgi_t(ROWS, &p, &input), "a column of lists, sorted");
+    report("sort_lists", rows, &format!("0..={max}"), r, corgi_t(rows, &p, &input), "a column of lists, sorted");
 }
 
 /// sort a column of `Result<u64, u64>`. Rust sorts its own copy in place.
-fn sort_results() {
+fn sort_results(rows: usize) {
     let mut rng = Rng(0x5eed);
-    let (rs, inner) = results(ROWS, 50, u64::MAX >> 17, &mut rng);
-    let input = one_row(ROWS, inner);
+    let (rs, inner) = results(rows, 50, u64::MAX >> 17, &mut rng);
+    let input = one_row(rows, inner);
     let p = corgi("input sort");
-    let r = best_setup(ROWS, || rs.clone(), |mut v| {
+    let r = best_setup(rows, || rs.clone(), |mut v| {
         v.sort_unstable();
         v
     });
-    report("sort_results", "50%", r, corgi_t(ROWS, &p, &input), "a column of Results, sorted");
+    report("sort_results", rows, "50%", r, corgi_t(rows, &p, &input), "a column of Results, sorted");
 }
 
 /// count the distinct `(u64, u64)` pairs.
-fn distinct_pairs() {
+fn distinct_pairs(rows: usize) {
     let mut rng = Rng(0x5eed);
-    let pairs: Vec<(u64, u64)> = (0..ROWS).map(|_| (rng.next() % 1000, rng.next() % 1000)).collect();
-    let input = one_row(ROWS, Value::Prod(vec![Value::u64(pairs.iter().map(|p| p.0).collect()), Value::u64(pairs.iter().map(|p| p.1).collect())]));
+    let pairs: Vec<(u64, u64)> = (0..rows).map(|_| (rng.next() % 1000, rng.next() % 1000)).collect();
+    let input = one_row(rows, Value::Prod(vec![Value::u64(pairs.iter().map(|p| p.0).collect()), Value::u64(pairs.iter().map(|p| p.1).collect())]));
     let p = corgi("input dedup len");
-    let r = best(ROWS, || {
+    let r = best(rows, || {
         black_box(black_box(&pairs).iter().collect::<std::collections::HashSet<_>>().len());
     });
-    report("distinct_pairs", "", r, corgi_t(ROWS, &p, &input), "distinct pairs counted (Rust: HashSet)");
+    report("distinct_pairs", rows, "", r, corgi_t(rows, &p, &input), "distinct pairs counted (Rust: HashSet)");
 }
 
-/// the equal range of each needle in a sorted haystack of `ROWS` keys (each key four times).
-fn find(sorted: bool, param: &str) {
+/// the equal range of each of `rows / 16` needles in a sorted haystack of `rows` keys (each key four times).
+fn find(rows: usize, sorted: bool, param: &str) {
     let mut rng = Rng(0x5eed);
-    let hay: Vec<u64> = (0..ROWS as u64).map(|x| x >> 2).collect();
-    let mut needles: Vec<u64> = (0..ROWS / 16).map(|_| rng.next() % (ROWS as u64 / 4)).collect();
+    let hay: Vec<u64> = (0..rows as u64).map(|x| x >> 2).collect();
+    let mut needles: Vec<u64> = (0..rows / 16).map(|_| rng.next() % (rows as u64 / 4)).collect();
     if sorted {
         needles.sort_unstable();
     }
-    let input = Value::Prod(vec![one_row(needles.len(), Value::u64(needles.clone())), one_row(ROWS, Value::u64(hay.clone()))]);
+    let input = Value::Prod(vec![one_row(needles.len(), Value::u64(needles.clone())), one_row(rows, Value::u64(hay.clone()))]);
     let p = corgi("let (n, h) = input in (n, h) find");
     let n = needles.len();
     let r = best(n, || {
         let (ns, hs) = (black_box(&needles), black_box(&hay));
         black_box(ns.iter().map(|x| (hs.partition_point(|y| y < x), hs.partition_point(|y| y <= x))).collect::<Vec<_>>());
     });
-    report("find", param, r, corgi_t(n, &p, &input), "equal ranges of 62,500 needles in 1M sorted keys (Rust: partition_point), ns per needle");
+    report("find", rows, param, r, corgi_t(n, &p, &input), "equal ranges of rows/16 needles in rows sorted keys (Rust: partition_point), ns per needle");
 }
 
 /// ns per run of a chain of `k` in-place adds on a one-element column: the per-run and per-op
@@ -329,20 +329,29 @@ fn dispatch() {
     println!("{line}");
 }
 
+/// Two sizes per case, away from the cache boundary (the M4 has 16 MB of L2 per cluster and an
+/// 8 MB system cache): 64K rows, inside the caches; and a size whose data is 100 MB or more.
+const SMALL: usize = 1 << 16;
+const LARGE: usize = 1 << 23;
+const LARGE_LISTS: usize = 1 << 21;
+const LARGE_FIND: usize = 1 << 24;
+
 fn main() {
     let wanted: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let runs = |c: &str| wanted.is_empty() || wanted.iter().any(|w| w == c);
-    if runs("sum_map") { sum_map(50, "50%"); sum_map(5, "5%"); }
-    if runs("sum_heavy") { sum_heavy(50, "50%"); sum_heavy(5, "5%"); }
-    if runs("sum_merge") { sum_merge(); }
-    if runs("shapes") { shapes(); }
-    if runs("sum_err_total") { sum_err_total(50, "50%"); sum_err_total(5, "5%"); }
-    if runs("field_sum") { field_sum(); }
-    if runs("sum_wide") { sum_wide(50, "50%"); sum_wide(5, "5%"); }
-    if runs("list") { for m in [4, 16, 64] { list_reduce(m); } }
-    if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(m); } }
-    if runs("sort_results") { sort_results(); }
-    if runs("distinct_pairs") { distinct_pairs(); }
-    if runs("find") { find(true, "sorted"); find(false, "random"); }
+    for (rows, lists, hay) in [(SMALL, SMALL, SMALL), (LARGE, LARGE_LISTS, LARGE_FIND)] {
+        if runs("sum_map") { sum_map(rows, 50, "50%"); sum_map(rows, 5, "5%"); }
+        if runs("sum_heavy") { sum_heavy(rows, 50, "50%"); sum_heavy(rows, 5, "5%"); }
+        if runs("sum_merge") { sum_merge(rows); }
+        if runs("shapes") { shapes(rows); }
+        if runs("sum_err_total") { sum_err_total(rows, 50, "50%"); sum_err_total(rows, 5, "5%"); }
+        if runs("field_sum") { field_sum(rows); }
+        if runs("sum_wide") { sum_wide(rows, 50, "50%"); sum_wide(rows, 5, "5%"); }
+        if runs("list") { for m in [4, 16, 64] { list_reduce(lists, m); } }
+        if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(lists, m); } }
+        if runs("sort_results") { sort_results(rows); }
+        if runs("distinct_pairs") { distinct_pairs(rows); }
+        if runs("find") { find(hay, true, "sorted"); find(hay, false, "random"); }
+    }
     if runs("dispatch") { dispatch(); }
 }
