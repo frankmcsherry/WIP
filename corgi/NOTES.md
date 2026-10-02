@@ -2,18 +2,45 @@
 
 ## Goal
 
-corgi is a vectorized interpreter for algebraic data: products, sums and lists (and references
-into lists), defined at run time. A program is a term graph, and each op runs over whole columns,
-so interpretation costs per op rather than per row.
+Corgi is a vectorized interpreter for columns of algebraic data: products, sums, lists, with shapes defined at run time.
+A program is a graph of operations over whole columns, so interpretation costs per operation rather than per row.
 
-- **Goals:** small enough to understand; interpreted throughout, with no code generation; near
-  hand-written Rust on bulk columnar work; failure as data.
-- **Non-goals:** matching per-row scalar loops (measured, not targeted); a user-facing language
-  inside the crate (front ends lower to the ML notation from outside).
+Corgi is built in layers.
+The core is a small set of operations that mirror what one CPU core does well with SIMD:
+element-wise arithmetic and comparison, scans and reductions, selection by mask and by position, ordering and search, and the structure of products, sums and lists.
+Every core operation is total, and takes and returns its natural data: a sort returns its order, not only the sorted values.
+Layers above add opinions:
 
-The motivation is datatoad, where idiom detection and a few columnar kernels are written by hand
-in Rust. corgi should let those be written as programs instead. The data there is often large, and
-most of the work is finding and collecting data rather than arithmetic.
+- words written in Corgi over the core, which expand into the graph so the optimizer sees through them;
+- the representations the engine chooses (integer widths, list bounds, tags);
+- and languages that check what the core leaves unchecked (types, totality, unwrapping).
+
+**Goals:**
+
+- Small enough to understand and reason about.
+- Few largely orthogonal operations, each capable: new work is built from what exists, and the core grows only when recombining cannot reach the cost.
+- A new word must behave as what it replaces, not only equal it: the same answers at about the same cost.
+- Near (or better than) hand-written Rust on bulk columnar work.
+- Failure as data.
+- Interpreted, with no code generation.
+
+**Non-goals:**
+
+- matching per-row scalar loops;
+- a user-facing language inside this crate;
+- specialized kernels added to rescue an abstraction that should have been reshaped.
+- a stable interface while evolving.
+
+**Motivation:**
+Several consumers exist, which span a few use cases.
+
+- DDIR uses Corgi as an interpreted expression language, and applies it to collection of independent rows.
+- Datatoad hand-writes column-oriented logic, and would like to use a simpler and more direct language.
+- Other projects use DDIR as an interactive sandbox, and exercise the breadth of its coverage and find holes.
+- There is not currently a DuckDB-like batch processor, but that hypothetical tool also fits here.
+
+What corgi does well, what it could do better, and what it accepts doing badly is in
+[`performance.md`](performance.md).
 
 Judge additions against this section. Anything below that conflicts with it is stale; fix the
 text below, not this.
@@ -322,7 +349,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   composition matrix × per-op awareness) is the cautionary tale. What IS in the representation is
   the REFERENCE, as its own shape: `Ref<List<T>>` (`ref`/`clone`), because a List row is the only
   unbounded-size row and capturing it by copy is `elements × length` where a closure pays `elements`
-  (perf-gaps.md family K: 2088× → 3.7×). Only list rows are referenced: a first cut also had thin
+  (pointer chasing through a list every row copied: 2088× → 3.7×). Only list rows are referenced: a first cut also had thin
   `&T` row refs into any column, whose one use (a referenced tuple read for its scalar, K2) is Field
   pushdown's job; they come back with a consumer (the μ-type knot). The choice is explicit in the program — `(ctx ref, ys)
   cap_list` is one reference per element, `(ctx, ys) cap_list` copies — and the only copy of
@@ -336,7 +363,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   is held. The win there is HOISTING — an iteration that does not depend on the element (`c fold_add`)
   runs once per owner row before the capture, and the scalar is captured instead — i.e. the pass
   asks what the use needs and copies (or computes) only that. And the GROWING-STATE
-  fold (perf-gaps.md family L: a List accumulator is rebuilt per round, O(k²)/row, 4567× at k=4096): let
+  fold (a List accumulator is rebuilt per round, O(k²)/row, 4567× at k=4096): let
   a `FoldScan` state hold a `Ref` into its own emitted-so-far output — append-only and immutable, so
   the ref is stable and `get` through it is O(1) — which turns a self-referential recurrence / stack
   machine into O(k) per row. (The unconditional collect already has the linear `foldscan` spelling.)

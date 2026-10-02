@@ -111,7 +111,7 @@ pub enum ArithOp {
     Scan(Red),             // List<U64> -> List<U64>  per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
                            // general `FoldScan` re-evals the body per element (catastrophic on one long
-                           // row — see perf-gaps.md). `Reduce` is its drop-the-prefix sibling.
+                           // row — see performance.md). `Reduce` is its drop-the-prefix sibling.
 }
 
 // deswizzle the order-preserving signed encoding (XOR the top bit `m`), apply a native wrapping op,

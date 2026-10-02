@@ -20,7 +20,7 @@
 
 use corgi::{Bounds,
     arrange, eval_graph, lower_effects, parse_ml, ArithOp, Builder, Graph, NumOp,
-    Op, Value,
+    Op, Program, Value,
 };
 use std::env;
 use std::hint::black_box;
@@ -33,11 +33,17 @@ use std::time::{Duration, Instant};
 /// lowering threads their `Fail<T> = Sum{T | Unit}` past the ops downstream. The arg is cloned (Arc
 /// bump) outside the timer, matching a pipeline that hands an owned column to each op.
 fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
+    // run through `Program`, the path a user's program takes (constant operands as immediates, and
+    // on branches that have one, the program's buffer pool kept from run to run).
+    let p = Program::from_graph(g.clone());
+    if std::env::var_os("GAPS_CHECK").is_some() {
+        assert_eq!(corgi::show(&eval_graph(&lower_effects(g), arg.clone())), corgi::show(&p.run_partial(arg.clone())));
+    }
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
         let t = Instant::now();
-        let out = black_box(eval_graph(g, black_box(a)));
+        let out = black_box(p.run_partial(black_box(a)));
         // a partial program's output is `Sum{T | Unit}`; rows in the Unit lane are its errors. No
         // benchmark program yields an Option-like value of its own, so this reads only that lane.
         let failed = matches!(&out, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(n) if n > 0));
@@ -52,6 +58,7 @@ fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
 /// Raw kernel timing, used only by the H safety and I pointer-chase controls to isolate the cost of
 /// the effect check from the underlying gather. This is not the normal surface execution path.
 fn corgi_raw_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
+    let g = &lower_effects(g);
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
@@ -165,8 +172,8 @@ fn sorted_list(n: usize) -> Value {
 }
 
 fn compile(src: &str) -> Graph<NumOp> {
-    // the lowered graph is what a `Program` runs: fallible stages' downstream ops on the Ok lane.
-    lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}")))
+    // as written; `corgi_t` runs it through a `Program`, which lowers it.
+    parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"))
 }
 
 /// a fixed 5-letter lowercase word, base-26 of `v` — the word-count vocabulary generator (mod a vocab
