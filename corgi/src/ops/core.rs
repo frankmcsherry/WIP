@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans,
+    blend, clone_ref, compress, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans,
     resolve_indices, take_ref, unwrap_leaves,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
@@ -404,8 +404,25 @@ impl<L: OpLike> Op<L> {
                 let (mb, mv) = mask.into_list("Filter mask")?;
                 assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
                 let m = mv.as_u64("Filter mask")?;
-                let (idx, nb) = filter_mask(&bounds, m);
-                Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+                // leaves (and products of them) compress in one pass each; the new row ends are a
+                // count of each row's kept elements. Lists, sums and references build positions
+                // and gather them.
+                match compress(&vals, m) {
+                    Some(kept) => {
+                        let mut nb = Vec::with_capacity(bounds.len());
+                        let (mut acc, mut start) = (0usize, 0usize);
+                        for end in bounds.ends() {
+                            acc += m[start..end].iter().filter(|&&b| b != 0).count();
+                            nb.push(acc);
+                            start = end;
+                        }
+                        Value::List(nb.into(), Box::new(kept))
+                    }
+                    None => {
+                        let (idx, nb) = filter_mask(&bounds, m);
+                        Value::List(nb.into(), Box::new(gather(&vals, &idx)))
+                    }
+                }
             }
 
             // row-wise append: row r's output is a's row r elements followed by b's. A multi-source

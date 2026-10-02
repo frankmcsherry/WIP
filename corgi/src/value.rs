@@ -388,6 +388,25 @@ macro_rules! prim {
                 }
             }
 
+            /// the rows whose mask element is nonzero, in order, in one pass with no branch on the
+            /// mask: every row is written to the next free slot, and the slot is kept only if the
+            /// mask says so. The buffer has room for every row (plus the one slot written past the
+            /// last kept row); a sparse mask touches only its front, so the rest costs no memory.
+            pub(crate) fn compress(&self, mask: &[u64]) -> Prim {
+                match self {
+                    $( Prim::$V(v) => {
+                        let mut out = vec![<$t>::default(); v.len() + 1];
+                        let mut len = 0;
+                        for (&x, &b) in v.iter().zip(mask) {
+                            out[len] = x;
+                            len += (b != 0) as usize;
+                        }
+                        out.truncate(len);
+                        Prim::$V(Arc::new(out))
+                    } )+
+                }
+            }
+
             /// A U64 index column is also correctly typed storage for a U64 gather result. Rewrite
             /// that owned buffer in place; other haystack widths allocate their native vector. The
             /// raw caller deliberately materializes even an identity gather rather than adding an

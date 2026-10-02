@@ -195,6 +195,18 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     }
 }
 
+/// `filter`'s values in one pass per leaf: the rows whose mask element is nonzero, in order, for a
+/// leaf, a unit, or a product of those. `None` for a list, sum or reference, which keep the
+/// positions-then-gather path.
+pub(crate) fn compress(v: &Value, mask: &[u64]) -> Option<Value> {
+    match v {
+        Value::Prim(p) => Some(Value::Prim(p.compress(mask))),
+        Value::Prod(fields) => fields.iter().map(|f| compress(f, mask)).collect::<Option<_>>().map(Value::Prod),
+        Value::Unit(_) => Some(Value::Unit(mask.iter().filter(|&&b| b != 0).count())),
+        Value::List(..) | Value::Sum(..) | Value::Ref(..) => None,
+    }
+}
+
 /// `Unwrap` for lanes made of leaves (a leaf, or products of leaves): each row read from its lane
 /// with the sum's own `u8` discriminants, in place, rather than widened into a `usize` column first.
 /// `None` when a lane holds a list, sum, reference or unit, which take [`gather_lanes`].
