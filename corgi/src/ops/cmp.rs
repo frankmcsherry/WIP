@@ -1,5 +1,5 @@
-//! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `Gt` (a column
-//! vs a constant, the immediate-form sugar) — plus the list ops `SortList`/`DedupList`/`GroupKey`
+//! The comparison/order op bucket. The leaf compare `Rel` (two columns → mask; `RelImm` when one side
+//! is a constant) — plus the list ops `SortList`/`DedupList`/`GroupKey`
 //! (discrimination via `sort_blocks`/`run_starts`) and `Find` (a search per needle on leaves, `search`;
 //! a batched binary search via `compare_idx` otherwise). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
@@ -17,6 +17,7 @@ use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
 use search::find_leaf;
+use std::hint::select_unpredictable;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -235,18 +236,17 @@ fn batched_bound(
         mids.clear();
         mids.extend(active.iter().map(|&k| (lo[k] + hi[k]) / 2));
         let ord = compare_idx(hvals, nvals, &mids, &active);
+        // Branch-free: which way each window moves is as good as random, and a branch on it was
+        // the largest single cost of this loop. Every needle is written back, and the cursor
+        // advances past it only while its window is open.
         let mut w = 0usize;
         for t in 0..active.len() {
-            let k = active[t];
-            if go_right(ord[t]) {
-                lo[k] = mids[t] + 1;
-            } else {
-                hi[k] = mids[t];
-            }
-            if lo[k] < hi[k] {
-                active[w] = k;
-                w += 1;
-            }
+            let (k, mid) = (active[t], mids[t]);
+            let right = go_right(ord[t]);
+            let (l, h) = (select_unpredictable(right, mid + 1, lo[k]), select_unpredictable(right, hi[k], mid));
+            (lo[k], hi[k]) = (l, h);
+            active[w] = k;
+            w += (l < h) as usize;
         }
         active.truncate(w);
     }
