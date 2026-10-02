@@ -71,7 +71,7 @@ Verdicts:
 | one field of an eight-field struct, summed | Keep | 0.11–0.16×: corgi reads one column |
 | a match whose arms are one op | Keep | 0.44× a `Vec<Result>` map at 64K rows, 0.51× at 8M |
 | a match with a few ops per arm | Keep | 1.04× at 64K rows, 0.87–0.89× at 8M |
-| the sum of a `Result` column's `Err` payloads | Improve | 0.59–0.82× at 64K rows, but 2.3–2.6× at 8M, though corgi reads only the `Err` lane |
+| the sum of a `Result` column's `Err` payloads | Improve | 0.59–0.82× at 64K rows, but 2.3–2.6× at 8M: `unweave` always builds its tag list, widened to 8 bytes a row, even when `.2` projects it away; at 8M that is 64 MB written and never read |
 | a match whose arms merge into one column | Improve | 3.4× at 64K rows, 2.5× at 8M (2.0× with #50/#51) |
 | a two-variant match in `f64`, merged into one column | Improve | 4.7× at 64K rows, 3.2× at 8M (2.8× with #50/#51): floats go through the order-preserving encoding on every op |
 | build a sum, then unweave it | Improve | 3.3× a one-pass partition into two vectors |
