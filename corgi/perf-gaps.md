@@ -75,7 +75,7 @@ Ratios are corgi/Rust slowdown (higher = corgi slower); for chains, tax and fusi
 | **C3 group_by_sum** | aggregation | 22× | **49–63×** | **79–82×** | sort-based group where a 256-bucket accumulate is one O(n) pass | no — **missing narrow-key op** |
 | **C4 scan_prefix** (general) | aggregation | **1150×** | **252×** | **205×** | lockstep foldscan on ONE long row: #rounds = row length, body re-evaluated per round | monoid body → C4k; general → single-row interpreter |
 | C4k scan_add (kernel) | aggregation | 1.4× | 0.98× | 1.09× | the monoid prefix kernel — one in-place pass | **DONE** |
-| **C5 fold_sum_count** | aggregation | **6394×** | **4716×** | **2949×** | same lockstep degeneration, product-of-monoids accumulator | monoid kernel, or the interpreter |
+| C5 fold_sum_count | aggregation | 7.1× | 14× | 6.6× | recognized as a product of monoids: one reduction per field, no loop; what is left is un-fused passes (2026-09-10, same machine) | fusion |
 | D1 sort_u64 | order | 1.3× | 1.2× | 2.6× | the indexed sort: keys pulled once, radixed with the permutation alongside, emitted as the column; the carried permutation is the residue | values-only leaf mode |
 | D2 dedup | order | 1.7× | 1.5× | 2.8× | the same sort, run starts read off the sorted column | values-only leaf mode |
 | **E1 join_find_slices** | relational | — | 5.3× | 6.3× | `find` searches per probe instead of merging two sorted runs | merge-join path |
@@ -107,7 +107,7 @@ The cases stratify by fixability, unchanged from the previous audit:
 
 - **scalar-leaf monoid** (cumsum, running min/max/product/all/any) — **done.** `ArithOp::Scan(Red)` is a one-pass in-place kernel, and C4k now measures 0.98–1.4×: at or below the Rust cumsum loop.
 - **fixed-width non-monoid body** (affine recurrences, small state machines) — inherently sequential, so the lever is the per-step constant: a single-row interpreter stepping the body over register/stack scratch, no per-element heap. Not built.
-- **product-of-monoids accumulator** (`(sum, count)`) — a kernel that updates each field, reached by a richer named form or a `FoldScan[monoid body] → kernel` rewrite. This is C5, the worst row on the board.
+- **product-of-monoids accumulator** (`(sum, count)`) — **done.** `ops::numeric::monoid_fold` recognizes the body at eval time and runs one named reduction per field: C5 went from 306 to 0.9 ns/row at 1 M.
 - **`List`/`Sum` (variable-size) accumulator** — the genuine residual: the accumulator is heap and reshapes per step. No tight-loop fix; keep it correct, steer to structural ops, accept it. Rare.
 
 **But the same lockstep mechanism is a WIN, which the old audit never recorded.**
