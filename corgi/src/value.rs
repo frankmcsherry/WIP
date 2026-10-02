@@ -2,7 +2,7 @@
 //! is a single `T0 -> T1` on one element, lifted 1:1 across the column; all
 //! cardinality change lives *inside* a `List`.
 
-use crate::pool::{collect, leaf, take, Buf};
+use crate::pool::{collect, leaf, take, take_init, Buf};
 use crate::shape::{shape_of_value, Shape};
 use std::sync::Arc;
 
@@ -394,13 +394,13 @@ macro_rules! prim {
 
             /// the rows whose mask element is nonzero, in order, in one pass with no branch on the
             /// mask: every row is written to the next free slot, and the slot is kept only if the
-            /// mask says so. The buffer has room for every row (plus the one slot written past the
-            /// last kept row); a sparse mask touches only its front, so the rest costs no memory.
+            /// mask says so. Before row `i` is written at most `i` rows are kept, so `n` slots take
+            /// every write. They are a buffer an earlier op wrote (from the pool), so already
+            /// initialized: nothing is zeroed first, except any tail the buffer never had.
             pub(crate) fn compress(&self, mask: &[u64]) -> Prim {
                 match self {
                     $( Prim::$V(v) => {
-                        let mut out = take(v.len() + 1);
-                        out.resize(v.len() + 1, <$t>::default());
+                        let mut out = take_init(v.len());
                         let mut len = 0;
                         for (&x, &b) in v.iter().zip(mask) {
                             out[len] = x;

@@ -127,6 +127,33 @@ pub(crate) fn take<T: Elem>(n: usize) -> Vec<T> {
     }
 }
 
+/// a buffer of exactly `n` initialized elements, for a kernel that writes slots in place rather than
+/// appending (compress): the pool's buffer that already holds the most initialized elements, so
+/// that only a tail it never had is zeroed; with no pool, a zeroed allocation (what `vec![0; n]`
+/// gives). The elements' values are whatever the buffer last held.
+pub(crate) fn take_init<T: Elem>(n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let found = with_list::<T, _>(|list, takes| {
+        *takes += 1;
+        let max = 2 * n + 64;
+        let best = (0..list.len())
+            .filter(|&i| (n..=max).contains(&list[i].capacity()))
+            .max_by_key(|&i| (list[i].len().min(n), std::cmp::Reverse(list[i].capacity())))?;
+        Some(list.swap_remove(best))
+    })
+    .flatten();
+    match found {
+        Some(mut v) => {
+            v.truncate(n);
+            v.resize(n, T::default());
+            v
+        }
+        None => vec![T::default(); n],
+    }
+}
+
 /// a buffer holding exactly the elements `it` yields, written into a buffer from [`take`]. For an
 /// iterator over a slice this is the same loop `collect` would run.
 pub(crate) fn collect<T: Elem>(it: impl ExactSizeIterator<Item = T>) -> Vec<T> {
