@@ -441,11 +441,7 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
             if !matches!(list, Value::List(..)) {
                 return Err(format!("corgi::bytes: a ref names rows of a list, not of {}", crate::shape::shape_of_value(&list)));
             }
-            // every arena ends in its empty row, the one a zero reference names.
             let len = list.len();
-            if len == 0 || list.rows_of("ref arena").map(|(rows, _)| rows.span(len - 1)).is_ok_and(|(s, e)| s != e) {
-                return Err("corgi::bytes: a ref's list must end in an empty row".into());
-            }
             let mut rows = Vec::with_capacity(n);
             for w in words {
                 rows.push(match w {

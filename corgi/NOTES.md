@@ -69,9 +69,9 @@ src/
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
                Value::Ref(Arc<list>, Arc<rows>) = referenced LIST ROWS (shape Ref<List<T>>, Rust's &[T]):
-               row j is row rows[j] of the shared list (the arena). Every arena ends in one empty row, the
-               zero a lossy gather names; `ref` adds it by writing new row ends (the values are shared, not
-               copied). `ref` takes them (through products and sums; bounded rows stay by value), `clone` copies out (deep; the
+               row j is row rows[j] of the shared list (the arena). A lossy gather out of range names an
+               empty row of the arena: its last when that is empty, else a new arena with one more row end
+               (the values shared), a copy paid only where a panic once stood. `ref` takes them (through products and sums; bounded rows stay by value), `clone` copies out (deep; the
                only copy of referenced rows), `gather` moves row numbers only; `gather_lanes` too over one
                arena, and over distinct arenas copies the named rows once into a new arena (live rows only,
                never once per reference).

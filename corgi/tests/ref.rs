@@ -37,11 +37,11 @@ fn ref_clone_round_trips_and_shows_as_the_rows() {
 }
 
 
-/// a list of references (row 0 holds three, row 1 two) into one arena of three rows (and the empty
-/// row every arena ends in), some named more than once, and the lists those references name, copied out.
+/// a list of references (row 0 holds three, row 1 two) into one arena of three rows, some named
+/// more than once, and the lists those references name, copied out.
 fn sub_list_references() -> (Value, Value) {
     use std::sync::Arc;
-    let arena = Arc::new(Value::List(vec![1, 2, 4, 4].into(), Box::new(Value::u64(vec![3, 7, 3, 1]))));
+    let arena = Arc::new(Value::List(vec![1, 2, 4].into(), Box::new(Value::u64(vec![3, 7, 3, 1]))));
     let rows = Arc::new(vec![0, 1, 0, 2, 0]);
     let by_ref = Value::List(vec![3, 5].into(), Box::new(Value::Ref(arena, rows)));
     let by_val = Value::List(
@@ -81,8 +81,8 @@ fn order_reads_through_references() {
 fn merges_keep_references() {
     use corgi::arrange::gather_lanes;
     use std::sync::Arc;
-    // rows [1], [2, 3], [4], and the empty row
-    let arena = Arc::new(Value::List(vec![1, 3, 4, 4].into(), Box::new(Value::u64(vec![1, 2, 3, 4]))));
+    // rows [1], [2, 3], [4]
+    let arena = Arc::new(Value::List(vec![1, 3, 4].into(), Box::new(Value::u64(vec![1, 2, 3, 4]))));
     let a = Value::Ref(arena.clone(), Arc::new(vec![0, 1]));
     let b = Value::Ref(arena.clone(), Arc::new(vec![2]));
     let (tags, off) = ([1, 0, 0], [0, 1, 0]);
@@ -91,13 +91,13 @@ fn merges_keep_references() {
     assert!(Arc::ptr_eq(p, &arena), "one arena: row numbers only");
     assert_eq!(**rows, vec![2, 1, 0]);
 
-    // rows [9, 8], [7], [6, 5], and the empty row
-    let other = Arc::new(Value::List(vec![2, 3, 5, 5].into(), Box::new(Value::u64(vec![9, 8, 7, 6, 5]))));
+    // rows [9, 8], [7], [6, 5]
+    let other = Arc::new(Value::List(vec![2, 3, 5].into(), Box::new(Value::u64(vec![9, 8, 7, 6, 5]))));
     let c = Value::Ref(other, Arc::new(vec![0, 0, 1]));
     let merged = gather_lanes(&[Some(&a), Some(&c)], &[1, 0, 1, 0, 1], &[0, 0, 1, 1, 2]);
     let Value::Ref(p, _) = &merged else { panic!() };
     let Value::List(_, held) = &**p else { panic!("an arena is a list") };
-    assert_eq!((p.len(), held.len()), (5, 6), "a's two rows and c's two, each once, and the empty row; c's unnamed [6, 5] left behind");
+    assert_eq!((p.len(), held.len()), (4, 6), "a's two rows and c's two, each once; c's unnamed [6, 5] left behind");
     let expect = Value::List(vec![2, 3, 5, 7, 8].into(), Box::new(Value::u64(vec![9, 8, 1, 9, 8, 2, 3, 7])));
     assert_eq!(run("input clone", merged), expect);
 }
@@ -107,7 +107,7 @@ fn merges_keep_references() {
 #[test]
 fn fold_state_stays_a_reference() {
     use std::sync::Arc;
-    let arena = Arc::new(Value::List(vec![2, 3, 3].into(), Box::new(Value::u64(vec![5, 6, 7]))));
+    let arena = Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7]))));
     let seed = Value::Ref(arena.clone(), Arc::new(vec![0, 1]));
     let xs = Value::List(vec![3, 4].into(), Box::new(Value::u64(vec![0, 1, 0, 1])));
     let out = run(
@@ -120,7 +120,7 @@ fn fold_state_stays_a_reference() {
 }
 
 /// the codec carries a reference column as its row numbers and its arena once: same shape, same
-/// rows, including a reference to the arena's empty row (the zero).
+/// rows, including a reference to an empty row.
 #[test]
 fn bytes_round_trip_a_reference() {
     use std::sync::Arc;
@@ -131,12 +131,10 @@ fn bytes_round_trip_a_reference() {
     assert_eq!(buf.len(), corgi::bytes::length_in_bytes(&r));
     let (back, used) = corgi::bytes::read_from(&buf).unwrap();
     assert_eq!((back, used), (r, buf.len()));
-    // a row past its arena, an arena that is not a list, or one that does not end in an empty row,
-    // is refused, not trusted
+    // a row past its arena, or an arena that is not a list, is refused, not trusted
     for bad in [
         Value::Ref(arena, Arc::new(vec![3])),
         Value::Ref(Arc::new(Value::u64(vec![10])), Arc::new(vec![0])),
-        Value::Ref(Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![10, 11, 12])))), Arc::new(vec![0])),
     ] {
         let mut buf = Vec::new();
         corgi::bytes::write_to(&bad, &mut buf).unwrap();
@@ -233,7 +231,7 @@ fn wco_step_searches_through_references() {
     use std::sync::Arc;
     let anchors = 4;
     let adj_vals: Vec<u64> = (0..40).collect();
-    let adj = Value::List(vec![adj_vals.len(), adj_vals.len()].into(), Box::new(Value::u64(adj_vals)));
+    let adj = Value::List(vec![adj_vals.len()].into(), Box::new(Value::u64(adj_vals)));
     let by_ref = Value::Ref(Arc::new(adj), Arc::new(vec![0; anchors]));
     let ranges = Value::List(
         vec![1, 2, 3, 4].into(),
