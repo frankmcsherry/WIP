@@ -700,7 +700,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
-                Apply::Op(name, _) if words() && matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(order_word(b, id, name)),
+                Apply::Op(name, _) if matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(sort_word(b, id, name)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
@@ -756,18 +756,13 @@ fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
     b.add(Op::TryGather, vec![args])
 }
 
-/// spike: with `CORGI_WORDS` set, `sort`, `dedup` and `group` are words over `sort_by`.
-fn words() -> bool {
-    std::env::var_os("CORGI_WORDS").is_some()
-}
-
 /// `sort`, `dedup` and `group` as words over `sort_by` (stable by key, a payload carried along, and
 /// each element's run of equal keys), `adjacent`, `filter` and `cut`. `dedup` and `group` sort a
 /// list key by reference, so that only the keys they keep are copied out:
 /// - `xs sort` = `sort_by` with a unit payload;
 /// - `xs dedup` = the sorted elements that start a run;
 /// - `kvs group` = the keys that start a run, and the values cut where a run starts.
-fn order_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
+fn sort_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
     use crate::ops::CmpOp;
     let pair_up = |b: &mut Builder<NumOp>, l: usize, r: usize| {
         let pair = b.tuple(vec![l, r]);

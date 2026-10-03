@@ -715,18 +715,5 @@ fn in_tie(labels: &[u64], q: usize) -> bool {
     (q > 0 && labels[q - 1] == labels[q]) || (q + 1 < labels.len() && labels[q + 1] == labels[q])
 }
 
-/// Whether the shape holds a `List` anywhere; a `List`'s sorted form is a gather of every
-/// element, which a caller keeping only some rows would rather do itself.
-pub(crate) fn contains_list(v: &Value) -> bool {
-    match v {
-        Value::List(..) => true,
-        Value::Prod(cols) => cols.iter().any(contains_list),
-        Value::Sum(_, lanes) => lanes.iter().any(contains_list),
-        Value::Prim(_) | Value::Unit(_) => false,
-        // a referenced row IS a list row (its sorted form gathers the named row's elements).
-        Value::Ref(..) => true,
-    }
-}
-
 #[cfg(test)]
 mod tests;

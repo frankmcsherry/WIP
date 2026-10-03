@@ -88,11 +88,9 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
         "branch" => Op::Branch(n()? as usize).into(), // the demux; a tag of n-1 or more goes to the last lane
         "filter" => Op::Filter.into(), // [(mask, x)] -> [x]: keep the x whose mask is nonzero; total
-        "sort" => CmpOp::SortList.into(),
+        // `sort`, `dedup` and `group` are words over `sort_by`, built in ml.rs (`sort_word`).
         "sort_by" => CmpOp::SortBy.into(), // [(k, v)] -> [(k, v, run)]: stable by k, v carried along, each run of equal k numbered
         "sort_limit" => CmpOp::SortLimit(n()? as usize).into(), // `sort`, then the first k of each row
-        "dedup" => CmpOp::DedupList.into(),
-        "group" => CmpOp::GroupKey.into(),
         "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<U64>: 1 where a run of equal elements starts
         "cut" => Op::Cut.into(),              // [(mask, x)] -> [[x]]: a piece starts at each marked x
         "find" => CmpOp::Find.into(),

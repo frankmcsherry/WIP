@@ -32,7 +32,9 @@ Measured 2026-10-03 on an M4 mini, one partition (`hits_0`, 1M rows). Times are 
 The queries whose ORDER BY … LIMIT became `sort_limit` and moved (q12–q14, q18, q24–q27, q33, q34,
 q36, q38–q40) were measured again after that change; the rest are as first written. DuckDB holds the
 table in memory and runs on one thread; its per-query overhead is about 0.1 ms. The last column is
-from one `--profile` run.
+from one `--profile` run, taken while `sort`, `dedup` and `group` were the kernels `SortList`,
+`DedupList` and `GroupKey`. They are words over `sort_by` now: across the queries that use them,
+1.02× those times, the slowest q27 at 1.38× and q04, q05 and q10 at 1.08–1.09×.
 
 | query | corgi | DuckDB 1 thread | × | what dominates |
 |---|---|---|---|---|

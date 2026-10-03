@@ -15,9 +15,11 @@ the two is a rewrite the optimizer could aim at.
 
 ## The corpus
 
-All times are in ns per row, at 65,536 rows on an M4 mini, measured 2026-10-03 at this commit: the
-best of three processes per program, since one process can run 20% slower than the next. The last
-column is corgi's time divided by Rust's.
+All times are in ns per row, at 65,536 rows on an M4 mini, measured 2026-10-03: the best of three
+processes per program, since one process can run 20% slower than the next. The last column is
+corgi's time divided by Rust's. `sort`, `dedup` and `group` became words over `sort_by` after most
+of these rows were measured; the rows that moved by more than 5% with that change are measured
+again (group_aggregate, interval_merge_cut, mode, mode_cut, sort_pairs, top_pairs, word_topk).
 
 | program | computes | corgi | Rust | × |
 |---|---|---|---|---|
@@ -28,12 +30,12 @@ column is corgi's time divided by Rust's.
 | base64_encode_arith | the same without the alphabet table or appends | 370 | 27.0 | 13.7 |
 | days_from_civil | days since 1970 and weekday (Hinnant) | 5.7 | 2.1 | 2.7 |
 | gcd | Euclid, as a fold over a fixed round count | 316 | 32.6 | 9.7 |
-| group_aggregate | GROUP BY key: count, sum, max | 337 | 248 | 1.4 |
+| group_aggregate | GROUP BY key: count, sum, max | 333 | 253 | 1.3 |
 | histogram | 8-bucket counts, as an outer product | 482 | 27.0 | 17.9 |
 | histogram_sorted | the same by sorting the bucket ids | 265 | 27.1 | 9.8 |
 | horner | polynomial at x | 57.7 | 5.4 | 10.7 |
 | interval_merge | merge overlapping intervals | 349 | 128 | 2.7 |
-| interval_merge_cut | the same, merged intervals cut at their marks | 289 | 132 | 2.2 |
+| interval_merge_cut | the same, merged intervals cut at their marks | 264 | 136 | 1.9 |
 | ipv4_parse | dotted quad to `{U64 \| ()}` | 83.2 | 14.0 | 5.9 |
 | itoa | a u64's decimal digits | 355 | 22.4 | 15.8 |
 | jaccard_sets | \|A∩B\| / \|A∪B\| of two lists as sets | 569 | 548 | 1.0 |
@@ -45,8 +47,8 @@ column is corgi's time divided by Rust's.
 | linear_regression | least-squares slope and intercept | 238 | 8.9 | 26.8 |
 | luhn | Luhn check of a digit string | 105 | 6.9 | 15.2 |
 | median_percentile | median and 90th percentile | 242 | 76.6 | 3.2 |
-| mode | most frequent value | 501 | 115 | 4.4 |
-| mode_cut | the same as runs cut from the sorted values | 350 | 116 | 3.0 |
+| mode | most frequent value | 403 | 120 | 3.4 |
+| mode_cut | the same as runs cut from the sorted values | 385 | 121 | 3.2 |
 | moving_average | sums of every 4-wide window | 256 | 27.2 | 9.4 |
 | moving_average_prefix | the same from prefix sums | 144 | 27.4 | 5.3 |
 | normalize_whitespace | lowercase, collapse and trim spaces | 147 | 108 | 1.4 |
@@ -55,17 +57,17 @@ column is corgi's time divided by Rust's.
 | run_length_encode_scan | the same as the loop | 179 | 44.5 | 4.0 |
 | run_length_encode_cut | the same, runs marked by `adjacent` and `cut` | 50.7 | 44.3 | 1.1 |
 | sessionize | sessions split at gaps over 30 | 184 | 10.9 | 16.9 |
-| sort_pairs | (a, b) pairs sorted | 346 | 214 | 1.6 |
+| sort_pairs | (a, b) pairs sorted | 151 | 218 | 0.69 |
 | sort_pairs_steps | the same a column at a time, as Datatoad sorts | 435 | 211 | 2.1 |
 | soundex | American Soundex code | 381 | 48.6 | 7.8 |
 | substring_count | overlapping occurrences of a pattern | 1027 | 64.6 | 15.9 |
 | top_k | the three largest values | 179 | 88.5 | 2.0 |
-| top_pairs | the first ten (a, b) pairs, sort then take | 392 | 199 | 2.0 |
+| top_pairs | the first ten (a, b) pairs, sort then take | 192 | 202 | 0.95 |
 | top_pairs_limit | the same by `sort_limit` | 415 | 194 | 2.1 |
 | top_pairs_steps | the same a column at a time, pruned between the columns | 708 | 206 | 3.4 |
 | trigram_similarity | pg_trgm similarity of two strings | 1146 | 266 | 4.3 |
 | two_sum | does a pair sum to the target | 353 | 330 | 1.1 |
-| word_topk | the three most frequent words | 606 | 298 | 2.0 |
+| word_topk | the three most frequent words | 661 | 314 | 2.1 |
 
 The rows near 1× (jaccard_sets, two_sum, group_aggregate, normalize_whitespace) are measured
 against Rust that hashes or allocates. Rust written for the small key domain would be several times
@@ -105,9 +107,10 @@ which in a long list comes almost at once, while corgi finishes every row.
 ### Sorting as words over `sort_by`
 
 `sort_by` is the sort's own output: stable by key, a payload carried, each run of equal keys
-numbered (dev/indexed-sort.md). With `CORGI_WORDS` set, `sort`, `dedup` and `group` are words over
-it. Measured 2026-10-03, best of three processes, the kernels against the words, on today's lists
-(ns per row) and on one row of about a million pairs (`--scale 65536`, ms):
+numbered (dev/indexed-sort.md). `sort`, `dedup` and `group` are words over it; the kernels they
+replaced (`SortList`, `DedupList`, `GroupKey`) are gone. Measured 2026-10-03 just before they went,
+best of three processes, the kernels against the words, on today's lists (ns per row) and on one
+row of about a million pairs (`--scale 65536`, ms):
 
 | program | kernels | words | one row, kernels | one row, words | one row, Rust |
 |---|---|---|---|---|---|
@@ -138,8 +141,10 @@ word_topk 1.09 the slowest.
 
 Below, "time" is a program's per-op profile (own time, ns per row, from one `--profile` run at
 65,536 rows; one process, so up to 20% above the table's best of three), and a share is that op's
-fraction of the program's time. Items are grouped by what
-they need, and ranked within groups by how much time they would recover across the corpus.
+fraction of the program's time. Items are grouped by what they need, and ranked within groups by
+how much time they would recover across the corpus. The profiles were taken while `sort`, `dedup`
+and `group` were the kernels `SortList`, `DedupList` and `GroupKey`; they are words over `sort_by`
+now, at about the same cost (above).
 
 ### Exact rewrites, no analysis
 
@@ -273,7 +278,9 @@ prefix, with no gather or scatter.
     - A foldscan output field that copies the input element is projected back out (interval_merge).
     - query_param extracts every pair's value though only the first match is used.
 14. **Sort, then take k, is top-k.** top_k spends 162 of 183 in SortList to read three values;
-    word_topk sorts all words for the top three.
+    word_topk sorts all words for the top three. `sort_limit k` now says it directly, and pays
+    where the key does not fit one packed word (ClickBench q24–q26); on integer pairs the packed
+    sort is already faster than pruning (top_pairs).
 15. **Tuples of narrow leaves sort as one packed leaf.** trigram_similarity's `dedup` and `find` on
     `(U8, U8, U8)` grams take 801 (69%) as structured comparisons. Packed into one integer (order
     preserved by big-endian concatenation) they are a radix sort and a leaf search.

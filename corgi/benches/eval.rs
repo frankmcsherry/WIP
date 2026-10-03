@@ -4,7 +4,7 @@
 //! (run the bench binary under perf → pollard). Kept deliberately small and factored: it touches no
 //! `src`, and criterion is the upgrade path if statistical rigor is ever wanted.
 
-use corgi::{eval_graph, ArithOp, BinOp, Builder, CmpOp, Graph, Kind, NumOp, Value};
+use corgi::{eval_graph, ArithOp, BinOp, Builder, Graph, Kind, NumOp, Value};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -74,8 +74,8 @@ fn main() {
     let n = 1 << 20;
     // ReduceSum over one big list — into_list + into_u64.
     report("reduce_add", n, bench(&graph(ArithOp::Reduce(corgi::Red::Add)), &one_list(n), reps));
-    // SortList over one big list — the discrimination / byte-radix leaf sort.
-    report("sort_list", n, bench(&graph(CmpOp::SortList), &one_list(n), reps));
+    // `sort` over one big list — the word over `sort_by`, the discrimination / byte-radix leaf sort.
+    report("sort_list", n, bench(&corgi::parse_ml("input sort").unwrap(), &one_list(n), reps));
 
     // sum_list, after roto's HN benchmark: m lists of l u64 each. Two regimes for the SAME work —
     // one bulk ReduceSum (corgi's columnar regime) vs m separate evals (row-at-a-time, where roto's

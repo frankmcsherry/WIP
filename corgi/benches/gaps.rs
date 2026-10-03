@@ -784,7 +784,7 @@ fn family_arrange(n: usize, reps: u32) {
     }
 
     // R9/R10 the SEGMENTED structured sorts: the same Sum and List columns sorted within outer rows
-    // of ~4 elements (`segment_labels`), i.e. `SortList` over a list of sums / a list of lists. A
+    // of ~4 elements (`segment_labels`), i.e. `sort` over a list of sums / a list of lists. A
     // sort under fine labels is one tiny block per row, which is where a per-block recursion pays
     // its allocations n/4 times; the Rust side sorts each row's slice in place.
     {

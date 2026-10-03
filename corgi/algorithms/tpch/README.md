@@ -37,13 +37,13 @@ sorted, and `sort` is no cheaper on sorted input.
 
 ## Measured
 
-Measured 2026-10-03 on an M4 mini, at scale factor 0.2 (1.2M lineitem rows), at this commit. Times
-are the best run, in ms. DuckDB holds the tables in memory and runs on one thread.
+Measured 2026-10-03 on an M4 mini, at scale factor 0.2 (1.2M lineitem rows). Times are the best
+run, in ms. DuckDB holds the tables in memory and runs on one thread.
 
 | query | what | corgi | DuckDB 1 thread | × |
 |---|---|---|---|---|
-| q01 | group by two flags, 6 aggregates | 30.25 | 18.71 | 1.62 |
-| q01b | q01 with the flags as bytes, not strings | 25.13 | 18.60 | 1.35 |
+| q01 | group by two flags, 6 aggregates | 37.95 | 18.71 | 2.03 |
+| q01b | q01 with the flags as bytes, not strings | 29.08 | 18.60 | 1.56 |
 | q03 | 3-way: lineitems probe sorted orders, then group | 8.12 | 5.95 | 1.36 |
 | q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 12.92 | 5.95 | 2.17 |
 | q03c | q03b without the lineitem sort (stored in key order) | 5.82 | 6.14 | 0.95 |
@@ -53,6 +53,10 @@ are the best run, in ms. DuckDB holds the tables in memory and runs on one threa
 | q12 | 2-way, string predicates (`eq` on strings), conditional counts | 70.22 | 15.25 | 4.60 |
 | q14 | 2-way, `LIKE 'PROMO%'` | 5.20 | 2.98 | 1.74 |
 | q19 | 2-way, OR of three string-heavy predicates (`eq` on strings) | 110.04 | 23.81 | 4.62 |
+
+q01 and q01b were measured again after `group` became a word over `sort_by` (1.25× and 1.10× the
+kernel's time: four groups over 1.2M rows, where the sort is cheap and the word's separate passes
+for run starts, keys and pieces show); the other queries moved less than 5%.
 
 The joins run 1.1–1.4× DuckDB (q03, q05), and 0.95× when the large table is already in key order
 (q03c). Where string predicates dominate, they run 2.3–4.6× (q10, q12, q19).

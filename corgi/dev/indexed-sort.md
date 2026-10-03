@@ -72,10 +72,9 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
   block has split down to itself. While subsets refine, a label is the position its run starts
   at, unique per class over the whole problem, so a class one sub-call splits cannot collide
   with a class another sub-call left alone. One pass makes labels dense at the end.
-- **Consumers.** `SortList`, `DedupList` and `GroupKey` take their output from the sort. A shape
-  holding a `List` has a sorted form that is itself a gather of every element, so `dedup` and
-  `group` gather their kept rows from the source there (`cmp.rs::representatives`). `SortBy` and
-  `SortLimit` are below.
+- **Consumers.** `SortBy`, the sort's own output, and `SortLimit`, both below. `sort`, `dedup`
+  and `group` are words over `SortBy`; the kernels they replaced (`SortList`, `DedupList`,
+  `GroupKey`) are in this file's history.
 
 ## `sort_by`: the sort as a primitive
 
@@ -84,7 +83,7 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
 Each row's elements in stable order by `K` alone, `V` carried along, and each element's run of
 equal keys: the refined labels, numbered densely over the column (a run never spans two rows). A
 unit `V` carries nothing, and then the sort carries no index. It is the sort's own output, and
-with `CORGI_WORDS` set `sort`, `dedup` and `group` are words over it (`frontend/ml.rs`):
+`sort`, `dedup` and `group` are words over it (`frontend/ml.rs::sort_word`):
 
 - `xs sort` is `sort_by` with a unit payload.
 - `xs dedup` takes a reference to each element, sorts, keeps the elements whose run number differs
@@ -131,6 +130,27 @@ Positions move forward with the sort, as the payload, where Datatoad keeps them 
 the groups back. `algorithms/sort_pairs*.col` and `top_pairs*.col` measure the idioms: one
 `sort_by` over the whole key, a column at a time, positions out, and the first ten with pruning
 between the columns (see `algorithms/README.md`).
+
+### Why `sort_limit` is still a kernel
+
+As words, `sort_limit k` is the pruned column steps of `top_pairs_steps.col`: `sort_by` the first
+level carrying positions; keep, per row, the prefix up to the end of the k-th element's run (found
+by `find` on the sorted run numbers); read the next level at the kept positions and `sort_by` it
+within the kept runs; repeat. On integer pairs that matches the kernel on one long row (10.5
+against 11.1 ms) and is 1.7× slower on short rows, where nothing is pruned and the prefix is extra
+passes. Two things block writing it for any key:
+
+1. **The levels come from the key's type.** A product's fields in turn; a list's length, then its
+   elements position by position (bytes eight at a time). The words are built while lowering,
+   before shapes are known (shapes come from evaluating on zero rows), so a word cannot list the
+   levels. A lowering that runs after typing, such as the sugar language's, could.
+2. **A list key has as many levels as its longest tied prefix**, which is data. The word needs a
+   loop that runs until nothing is tied, and corgi's loops are lockstep folds, far slower than the
+   kernel's loop over levels.
+
+A type-directed lowering would remove the first. The second needs either a loop cheap enough to
+run a sort per round, or a primitive for "the next level of the rows still tied", which would be
+`sort_limit`'s own inner step.
 
 ## Measurements (2026-09-06, M4, ns per row)
 

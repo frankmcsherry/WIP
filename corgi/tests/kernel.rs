@@ -30,7 +30,7 @@ fn weave_unweaves_round_trip() {
 /// sort each, and require identical results. A silent wrong-order regression fails here.
 #[test]
 fn stride_sort_matches_offsets() {
-    use corgi::{Bounds, CmpOp};
+    use corgi::Bounds;
     let (n, k) = (500usize, 8usize);
     let bytes: Vec<u8> = (0..n * k).map(|i| i.wrapping_mul(37).wrapping_add(11) as u8).collect();
     // one outer row of `n` width-`k` records; only the inner bounds representation differs.
@@ -40,10 +40,7 @@ fn stride_sort_matches_offsets() {
     let strided = one_row(Bounds::Stride(k, n));
     let offsets = one_row(Bounds::offsets((1..=n).map(|r| r * k).collect()));
 
-    let mut b = Builder::<NumOp>::default();
-    let i = b.input();
-    let s = b.add(CmpOp::SortList, vec![i]);
-    let g = b.finish(s);
+    let g = corgi::parse_ml("input sort").unwrap();
 
     assert_eq!(
         eval_graph(&g, strided),
