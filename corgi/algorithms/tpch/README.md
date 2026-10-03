@@ -54,9 +54,15 @@ run, in ms. DuckDB holds the tables in memory and runs on one thread.
 | q14 | 2-way, `LIKE 'PROMO%'` | 5.20 | 2.98 | 1.74 |
 | q19 | 2-way, OR of three string-heavy predicates (`eq` on strings) | 110.04 | 23.81 | 4.62 |
 
-q01 and q01b were measured again after `group` became a word over `sort_by` (1.25× and 1.10× the
-kernel's time: four groups over 1.2M rows, where the sort is cheap and the word's separate passes
-for run starts, keys and pieces show); the other queries moved less than 5%.
+q01 and q01b were measured again after `group` became a word over `sort_by`: 1.25× and 1.10× the
+kernel's time; the other queries moved less than 5%. The word makes about seven more passes over
+the 1.18M rows that pass q01's filter, about 1 ms each: references to the two keys, those
+references in sorted order, run starts, the filter that keeps one key per group, and the cut. The
+sort itself is not cheap. The keys are strings, so it takes the list arm, and with four distinct
+keys every row stays tied through every level: 12 of the kernel's 31 ms (7.5 ms with the flags as
+bytes, q01b). Moving the four summed columns into group order is 3.5 ms more. Adding each row into
+its group's sums as it is scanned would do neither, and that is how DuckDB answers in 19 ms; corgi
+has no op for it (a scatter-add, a reduce by a small key).
 
 The joins run 1.1–1.4× DuckDB (q03, q05), and 0.95× when the large table is already in key order
 (q03c). Where string predicates dominate, they run 2.3–4.6× (q10, q12, q19).
