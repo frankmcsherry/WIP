@@ -28,10 +28,12 @@ column is corgi's time divided by Rust's.
 | days_from_civil | days since 1970 and weekday (Hinnant) | 5.7 | 2.1 | 2.7 |
 | gcd | Euclid, as a fold over a fixed round count | 316 | 32.6 | 9.7 |
 | group_aggregate | GROUP BY key: count, sum, max | 337 | 248 | 1.4 |
+| group_aggregate_cut | the same as runs cut from the sorted pairs | 500 | 250 | 2.0 |
 | histogram | 8-bucket counts, as an outer product | 482 | 27.0 | 17.9 |
 | histogram_sorted | the same by sorting the bucket ids | 265 | 27.1 | 9.8 |
 | horner | polynomial at x | 57.7 | 5.4 | 10.7 |
 | interval_merge | merge overlapping intervals | 349 | 128 | 2.7 |
+| interval_merge_cut | the same, merged intervals cut at their marks | 289 | 132 | 2.2 |
 | ipv4_parse | dotted quad to `{U64 \| ()}` | 83.2 | 14.0 | 5.9 |
 | itoa | a u64's decimal digits | 355 | 22.4 | 15.8 |
 | jaccard_sets | \|A∩B\| / \|A∪B\| of two lists as sets | 569 | 548 | 1.0 |
@@ -44,12 +46,14 @@ column is corgi's time divided by Rust's.
 | luhn | Luhn check of a digit string | 105 | 6.9 | 15.2 |
 | median_percentile | median and 90th percentile | 242 | 76.6 | 3.2 |
 | mode | most frequent value | 501 | 115 | 4.4 |
+| mode_cut | the same as runs cut from the sorted values | 350 | 116 | 3.0 |
 | moving_average | sums of every 4-wide window | 256 | 27.2 | 9.4 |
 | moving_average_prefix | the same from prefix sums | 144 | 27.4 | 5.3 |
 | normalize_whitespace | lowercase, collapse and trim spaces | 147 | 108 | 1.4 |
 | query_param | a key's value in `a=1&b=2` | 253 | 32.3 | 7.8 |
 | run_length_encode | runs as (byte, count), gaps and islands | 178 | 43.7 | 4.1 |
 | run_length_encode_scan | the same as the loop | 179 | 44.5 | 4.0 |
+| run_length_encode_cut | the same, runs marked by `adjacent` and `cut` | 50.7 | 44.3 | 1.1 |
 | sessionize | sessions split at gaps over 30 | 184 | 10.9 | 16.9 |
 | soundex | American Soundex code | 381 | 48.6 | 7.8 |
 | substring_count | overlapping occurrences of a pattern | 1027 | 64.6 | 15.9 |
@@ -57,6 +61,7 @@ column is corgi's time divided by Rust's.
 | trigram_similarity | pg_trgm similarity of two strings | 1146 | 266 | 4.3 |
 | two_sum | does a pair sum to the target | 353 | 330 | 1.1 |
 | word_topk | the three most frequent words | 606 | 298 | 2.0 |
+| word_topk_cut | the same, counting the runs of sorted words | 738 | 308 | 2.4 |
 
 The rows near 1× (jaccard_sets, two_sum, group_aggregate, normalize_whitespace) are measured
 against Rust that hashes or allocates. Rust written for the small key domain would be several times
@@ -216,7 +221,12 @@ prefix, with no gather or scatter.
     group` sorts a non-decreasing key. The groups are the stretches between marks: new bounds, no
     sort, no copy.
     - At stake: run_length_encode GroupKey 96 (53%), interval_merge 96 (26%).
-    - The op this needs, "split a list where a mask is set", is also missing as a word.
+    - `adjacent` (where a run of equal elements starts) and `cut` (split a row at marks, moving no
+      values) say this directly. Written with them: run_length_encode 183 → 51 ns/row (1.1× Rust),
+      mode 499 → 350, interval_merge 358 → 289.
+    - `group` itself stays fused. As a word (sort, `adjacent`, `cut`) it is slower: group_aggregate
+      352 → 500, word_topk 617 → 738. The sort already knows where its runs start; `adjacent`
+      compares again, which costs most on list keys like words.
 13. **Read only part of the output, compute only that part (projection pushdown into kernels).**
     - `find` read only as `hi - lo` or `hi > lo` is a count or a membership test. Against sorted
       needles it is one merge. Applies to jaccard_sets, two_sum, histogram_sorted, and
