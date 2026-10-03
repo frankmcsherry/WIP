@@ -1,0 +1,5 @@
+# The positions of each row's (a, b) pairs in sorted order, ties in input order (an argsort):
+# `sort_by` on the pairs, carrying each one's position.
+# Input a `List<(U64, U64)>` per row. Output a `List<U64>` of positions.
+(input, input len iota) zip sort_by map ((_, q, _) -> q)
+    try match (0 (r -> r), 1 (_ -> 0u64 iota))
