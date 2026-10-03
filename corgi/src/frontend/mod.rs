@@ -22,7 +22,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "shr" | "and" | "cast" | "chunk")
+    matches!(name, "shr" | "and" | "cast" | "chunk" | "sort_limit")
 }
 
 /// parse a `<kind><width>` suffix like `i32` / `u8` / `f64` into `(Kind, width)`, validating the
@@ -89,6 +89,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "branch" => Op::Branch(n()? as usize).into(), // the demux; a tag of n-1 or more goes to the last lane
         "filter" => Op::Filter.into(), // [(mask, x)] -> [x]: keep the x whose mask is nonzero; total
         "sort" => CmpOp::SortList.into(),
+        "sort_limit" => CmpOp::SortLimit(n()? as usize).into(), // `sort`, then the first k of each row
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<U64>: 1 where a run of equal elements starts

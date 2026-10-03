@@ -1,0 +1,16 @@
+# Q39: SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000
+# The variant with `sort_limit`: sorting only what can reach the limit.
+# sql: SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE ''::BLOB END AS Src,
+# sql:   URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0
+# sql:   GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst
+# sql:   ORDER BY PageViews DESC, TraficSourceID, SearchEngineID, AdvEngineID, octet_length(Src), Src, octet_length(Dst), Dst LIMIT 10 OFFSET 1000
+# columns: CounterID EventDate IsRefresh TraficSourceID SearchEngineID AdvEngineID Referer URL
+# output: [i,u,u,s,s,u]
+let (counter, date, refresh, source, engine, adv, referer, url) = input in
+let views = (counter, (date, (refresh, (source, (engine, (adv, (referer, url) zip) zip) zip) zip) zip) zip) zip
+    map ((c, (d, (r, (t, (e, (a, (f, u))))))) ->
+        ((((c, 62u64) eq, ((d, 15887u64) ge, (d, 15917u64) le) mul) mul, (r, 0u64) eq) mul,
+         ((t, e, a, (((e, 0u64) eq, (a, 0u64) eq) mul, f, "") select, u), 1u64))) filter in
+let ranked = views group map (((t, e, a, s, u), ones) -> ((18446744073709551615u64, ones len) sub, t, e, a, s, u)) sort_limit 1010 in
+((1000u64, (ranked len, 1010u64) min) range, ranked) gather
+    try match (0 (top -> top map ((d, t, e, a, s, u) -> (t, e, a, s, u, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, z, z, "", "", z))))
