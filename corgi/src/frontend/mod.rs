@@ -92,12 +92,12 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
-        // point access — `gather` (per row, positions into that row's list; the result keeps their
-        // structure) errs per ROW. `get`, `head` and `slices` are words over it, built in ml.rs:
-        // `get` = enlist; gather; delist, `head` = get 0, `slices` = map(range); gather. `gather_try`
-        // is the DISTINCT per-element gather (`List<Sum{Found | Missing}>`), each element's miss as data.
+        // point access — `gather` (per row, positions of any shape into that row's list, each integer
+        // leaf replaced by its element) errs per ROW. `get` is the same op on one position per row;
+        // `head` (= get 0) and `slices` (= map(range); gather) are built in ml.rs. `gather_try` is the
+        // DISTINCT per-element gather (`List<Sum{Found | Missing}>`), each element's miss as data.
         "gather" => Op::TryGather.into(),     // per row all-or-nothing over its positions
-        "delist" => Op::TryDelist.into(),     // each row's one element; a row of another length errs
+        "get" => Op::TryGather.into(),        // gather on one position per row: (i, list) -> list[i]
         "range" => Op::Range.into(),          // (lo, hi) -> [lo, hi), empty when lo >= hi
         "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Found | Missing}>
         "try" => Op::Try.into(), // handle a fallible stage here: its Fail<T> = Sum{T | Unit} is now data to match

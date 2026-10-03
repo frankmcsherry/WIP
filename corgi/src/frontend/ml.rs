@@ -699,7 +699,6 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
         E::Pipe(e, ap) => {
             let id = lower(e, env, b)?;
             match ap {
-                Apply::Op(name, _) if name == "get" => Ok(get_word(b, id)),
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
@@ -727,28 +726,16 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     Ok(b.add(Op::Unwrap, vec![ms]))
                 }
                 Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
-                // first element = index 0 of the row: build the (0, list) pair and `get` it. An empty
+                // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
                 // row errs (carried in the err-mask, observed by a downstream TRY), not a panic.
                 Apply::Head => {
                     let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
-                    Ok(get_word(b, pair))
+                    Ok(b.add(Op::TryGather, vec![pair]))
                 }
             }
         }
     }
-}
-
-/// `(i, list) get`: row r's element at position `i[r]`. The word `enlist; gather; delist`: the one
-/// position becomes a one-element list, `gather` fetches it (erring the row out of range), and
-/// `delist` leaves the list layer, free on the width-1 bounds `enlist` made.
-fn get_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
-    let idx = b.add(Op::Field(0), vec![pair]);
-    let list = b.add(Op::Field(1), vec![pair]);
-    let one = b.add(Op::Enlist, vec![idx]);
-    let args = b.tuple(vec![one, list]);
-    let got = b.add(Op::TryGather, vec![args]);
-    b.add(Op::TryDelist, vec![got])
 }
 
 /// `(ranges, list) slices`: each `(lo, hi)` range of row r becomes the sub-list `list[r][lo..hi)`.

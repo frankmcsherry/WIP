@@ -62,7 +62,7 @@ pub(crate) fn clone_ref(v: Value) -> Value {
 mod generators {
     //! Index generators — the `gather`-family currency. Each composite op is "make an index (and sometimes
     //! re-segmented bounds), then `gather`": mask→survivors (`Filter`), bounds→owner-ids (`CapList`),
-    //! point-resolve (`Gather`), nested positions (`Gather` over lists of positions). The index math lives here; the op bodies in
+    //! positions of any shape (`Gather`, via `index_plan`). The index math lives here; the op bodies in
     //! `ops::core` just generate, gather, and re-wrap. (`Unwrap` reads the Sum's carried offset via
     //! `gather_lanes` — no generator; `Branch` groups by tag inline.)
 
@@ -98,69 +98,104 @@ mod generators {
         idx
     }
 
-    /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
-    /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
-    /// of `index_leaves` below. An index outside its row's span is a (data-dependent) panic. `hay` may
-    /// be a list or a referenced list (`Rows`): rows are read through `span`.
-    pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: Rows) -> Vec<usize> {
-        let mut abs = Vec::with_capacity(idx.len());
-        for r in 0..outer.len() {
-            let (os, oe) = outer.span(r);
-            let (hs, he) = hay.span(r);
-            for &x in &idx[os..oe] {
-                let p = hs + x as usize;
-                assert!(p < he, "Gather: index {x} out of row {r}'s bounds");
-                abs.push(p);
-            }
-        }
-        abs
+    /// the top-level row of each element of a value inside an index structure: the identity at the
+    /// top (and through products), a column once lists or sums have rearranged the elements.
+    pub(crate) enum Owners {
+        Identity,
+        Rows(Vec<usize>),
     }
 
-    /// resolve a nested index structure: every leaf position, relative to its TOP-level row's
-    /// haystack (`hay`), becomes an absolute haystack position, in leaf order. An index list's
-    /// elements may themselves be lists of positions (`List<List<U64>>`, and deeper), as `slices`
-    /// builds with `range`. One walk down the levels' spans, no per-leaf owner column. Returns the
-    /// positions and, per top-level row, whether all its positions were in range (an out-of-range
-    /// position is still written, wrapped; the caller decides whether a row's `false` is a panic or
-    /// an error).
-    pub(crate) fn nested_positions(outer: &Bounds, inner: &Value, hay: Rows) -> Result<(Vec<usize>, Vec<bool>), String> {
-        fn walk(level: &Value, from: usize, to: usize, hs: usize, rowlen: u64, pos: &mut Vec<usize>) -> Result<bool, String> {
-            match level {
-                Value::List(bounds, vals) => {
-                    let mut ok = true;
-                    for e in from..to {
-                        let (s, t) = bounds.span(e);
-                        ok &= walk(vals, s, t, hs, rowlen, pos)?;
-                    }
-                    Ok(ok)
-                }
-                leaf => {
-                    let xs = leaf.as_u64("gather positions")?;
-                    let mut ok = true;
-                    for &x in &xs[from..to] {
-                        ok &= x < rowlen;
-                        pos.push(hs.wrapping_add(x as usize));
-                    }
-                    Ok(ok)
-                }
+    impl Owners {
+        fn get(&self, j: usize) -> usize {
+            match self {
+                Owners::Identity => j,
+                Owners::Rows(rows) => rows[j],
             }
         }
-        let mut pos = Vec::new();
-        let mut ok = Vec::with_capacity(outer.len());
-        for r in 0..outer.len() {
-            let (s, t) = outer.span(r);
-            let (hs, he) = hay.span(r);
-            ok.push(walk(inner, s, t, hs, (he - hs) as u64, &mut pos)?);
-        }
-        Ok((pos, ok))
     }
 
-    /// a nested index structure with its leaves replaced: every level's bounds kept, the leaf column
-    /// swapped for `leaves` (the gathered values). The result has the shape of the index structure.
-    pub(crate) fn with_leaves(inner: Value, leaves: Value) -> Value {
-        match inner {
-            Value::List(bounds, vals) => Value::List(bounds, Box::new(with_leaves(*vals, leaves))),
-            _ => leaves,
+    /// an index value with every integer leaf resolved to absolute haystack positions: the same
+    /// structure (bounds and tags kept), each leaf column replaced by the positions it names.
+    /// [`IndexPlan::fill`] gathers them.
+    pub(crate) enum IndexPlan {
+        Leaf(Vec<usize>),
+        Unit(usize),
+        Prod(Vec<IndexPlan>),
+        List(Bounds, Box<IndexPlan>),
+        Sum(Tags, Vec<IndexPlan>),
+    }
+
+    /// resolve an index value of any shape (`gather`'s positions): every integer leaf is a position
+    /// relative to its element's TOP-level row of the haystack (`hay`). Clears `ok[r]` when top-level
+    /// row `r` names a position outside its row; such a position is recorded but must not be read,
+    /// so the caller fills the plan only when every row it keeps is `ok`.
+    pub(crate) fn index_plan(index: &Value, owners: &Owners, hay: Rows, ok: &mut [bool]) -> Result<IndexPlan, String> {
+        fn resolve(hay: Rows, ok: &mut [bool], r: usize, x: u64, pos: &mut Vec<usize>) {
+            let (hs, he) = hay.span(r);
+            ok[r] &= x < (he - hs) as u64;
+            pos.push(hs.wrapping_add(x as usize));
+        }
+        Ok(match index {
+            Value::Prim(p) => {
+                let mut pos = Vec::with_capacity(p.len());
+                match p {
+                    Prim::U64(xs) => xs.iter().enumerate().for_each(|(j, &x)| resolve(hay, ok, owners.get(j), x, &mut pos)),
+                    _ => (0..p.len()).for_each(|j| resolve(hay, ok, owners.get(j), p.u64_at(j), &mut pos)),
+                }
+                IndexPlan::Leaf(pos)
+            }
+            Value::Unit(n) => IndexPlan::Unit(*n),
+            Value::Prod(fields) => {
+                IndexPlan::Prod(fields.iter().map(|f| index_plan(f, owners, hay, ok)).collect::<Result<_, _>>()?)
+            }
+            // a list of positions (the common case) resolves row by row with no owner column; a list
+            // of anything else hands its elements their rows.
+            Value::List(bounds, vals) => match &**vals {
+                Value::Prim(Prim::U64(xs)) => {
+                    let mut pos = Vec::with_capacity(xs.len());
+                    for i in 0..bounds.len() {
+                        let r = owners.get(i);
+                        let (s, e) = bounds.span(i);
+                        xs[s..e].iter().for_each(|&x| resolve(hay, ok, r, x, &mut pos));
+                    }
+                    IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(pos)))
+                }
+                inner => {
+                    let mut rows = Vec::with_capacity(inner.len());
+                    for i in 0..bounds.len() {
+                        let (s, e) = bounds.span(i);
+                        rows.extend(std::iter::repeat_n(owners.get(i), e - s));
+                    }
+                    IndexPlan::List(bounds.clone(), Box::new(index_plan(inner, &Owners::Rows(rows), hay, ok)?))
+                }
+            },
+            // a lane's elements are its rows in row order, so each lane takes its rows' owners.
+            Value::Sum(tags, lanes) => {
+                let mut rows: Vec<Vec<usize>> = vec![Vec::new(); lanes.len()];
+                for (i, t) in tags.tags_iter().enumerate() {
+                    rows[t].push(owners.get(i));
+                }
+                let lanes = lanes
+                    .iter()
+                    .zip(rows)
+                    .map(|(lane, rows)| index_plan(lane, &Owners::Rows(rows), hay, ok))
+                    .collect::<Result<_, _>>()?;
+                IndexPlan::Sum(tags.clone(), lanes)
+            }
+            Value::Ref(..) => return Err("gather: positions can't be a referenced list; clone first".into()),
+        })
+    }
+
+    impl IndexPlan {
+        /// the index value with each leaf replaced by the haystack elements its positions name.
+        pub(crate) fn fill(self, hvals: &Value) -> Value {
+            match self {
+                IndexPlan::Leaf(pos) => gather(hvals, &pos),
+                IndexPlan::Unit(n) => Value::Unit(n),
+                IndexPlan::Prod(fields) => Value::Prod(fields.into_iter().map(|f| f.fill(hvals)).collect()),
+                IndexPlan::List(bounds, inner) => Value::List(bounds, Box::new(inner.fill(hvals))),
+                IndexPlan::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(|l| l.fill(hvals)).collect()),
+            }
         }
     }
 
