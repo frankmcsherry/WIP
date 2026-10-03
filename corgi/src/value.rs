@@ -16,38 +16,63 @@ pub enum Value {
     Unit(usize),                  // a length-carrying unit column: `n` rows, no payload. The terminal
                                   // object as a COLUMN (a fieldless `Prod` has no length witness); the
                                   // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
-    Ref(Arc<Value>, Arc<Vec<(usize, usize)>>),
-                                  // a column of REFERENCED LIST ROWS (`&[T]`): row `j` is the span
-                                  // `spans[j]` of the shared payload (the arena). `ref` takes them
-                                  // (O(rows), nothing copied), `clone` copies them out; `gather` on a
-                                  // Ref moves only the spans. The explicit "by reference, not by value"
-                                  // — a closure's `&ctx`, a `&str` into a shared text. Only a list row
-                                  // is unbounded, so only a list row is ever referenced: `ref` passes
+    Ref(Arc<Value>, Arc<Vec<usize>>),
+                                  // a column of REFERENCED LIST ROWS (`&[T]`): row `j` is row
+                                  // `rows[j]` of the shared list (always a `List`, the arena). `ref`
+                                  // takes them (nothing copied), `clone` copies them out; `gather` on
+                                  // a Ref moves only the row numbers. A lossy gather out of range
+                                  // names an empty row of the arena (see [`with_empty_row`]). The explicit "by reference, not by value" — a
+                                  // closure's `&ctx`, a `&str` into a shared text. Only a list row is
+                                  // unbounded, so only a list row is ever referenced: `ref` passes
                                   // through products and sums and leaves bounded rows by value. (The
-                                  // spans sit behind an `Arc` like a leaf: a clone is a refcount bump.)
+                                  // row numbers sit behind an `Arc` like a leaf: a clone is a
+                                  // refcount bump.)
+}
+
+/// an arena with an empty row, and that row's number: the zero a reference names (the empty list,
+/// what a lossy gather gives a position out of range). The arena's last row, when it is empty;
+/// otherwise a new arena, the same values with one more row end. Only a lossy gather that misses
+/// asks, the case that once panicked, so the copy of the row ends is paid only there.
+pub(crate) fn with_empty_row(list: &Arc<Value>) -> (Arc<Value>, usize) {
+    let (bounds, vals) = referenced(list);
+    let n = bounds.len();
+    if n > 0 && bounds.span(n - 1).0 == bounds.total() {
+        return (list.clone(), n - 1);
+    }
+    let mut ends = bounds.to_vec();
+    ends.push(bounds.total());
+    (Arc::new(Value::List(ends.into(), Box::new(vals.clone()))), n)
+}
+
+/// a reference column's arena, as its row ends and values.
+pub(crate) fn referenced(list: &Value) -> (&Bounds, &Value) {
+    match list {
+        Value::List(bounds, vals) => (bounds, vals),
+        other => unreachable!("a Ref names rows of a List, not of {}", shape_of_value(other)),
+    }
 }
 
 /// the rows of a haystack as a reader sees them: `span(i)` over one payload, whether the rows came
-/// as a `List` (a partition of its payload) or as a `Ref` (spans of a shared payload). The
+/// as a `List` (a partition of its payload) or as a `Ref` (rows of a shared list, by number). The
 /// span-aware readers (`Gather`/`Find`/`Len`) take this via `rows_of`; every other
 /// op takes `into_list`, which only accepts a `List` — a Ref is the shape error "clone first".
 #[derive(Clone, Copy)]
 pub(crate) enum Rows<'a> {
     Part(&'a Bounds),
-    Spans(&'a [(usize, usize)]),
+    Named(&'a Bounds, &'a [usize]),
 }
 
 impl Rows<'_> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Rows::Part(b) => b.len(),
-            Rows::Spans(s) => s.len(),
+            Rows::Named(_, rows) => rows.len(),
         }
     }
     pub(crate) fn span(&self, i: usize) -> (usize, usize) {
         match self {
             Rows::Part(b) => b.span(i),
-            Rows::Spans(s) => s[i],
+            Rows::Named(b, rows) => b.span(rows[i]),
         }
     }
 }
@@ -773,7 +798,7 @@ impl Value {
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
             Shape::Ref(s) => match &**s {
-                Shape::List(t) => Value::Ref(Arc::new(Value::empty(t)), Arc::new(Vec::new())),
+                Shape::List(_) => Value::Ref(Arc::new(Value::empty(s)), Arc::new(Vec::new())),
                 other => panic!("Value::empty: Ref<{other}> — only list rows are referenced"),
             },
         }
@@ -787,7 +812,7 @@ impl Value {
             Value::Sum(t, _) => t.len(),
             Value::List(b, _) => b.len(),
             Value::Unit(n) => *n,
-            Value::Ref(_, spans) => spans.len(),
+            Value::Ref(_, rows) => rows.len(),
         }
     }
 
@@ -826,13 +851,16 @@ impl Value {
         }
     }
 
-    /// a haystack's rows over its payload: a `List` (partition) or a `Ref` (spans of the shared
-    /// payload), for the readers that address rows through `span(i)` and never need the payload to
-    /// be exactly the rows. Borrowed: every reader only indexes the payload.
+    /// a haystack's rows over its payload: a `List` (partition) or a `Ref` (rows of the shared
+    /// list, by number), for the readers that address rows through `span(i)` and never need the
+    /// payload to be exactly the rows. Borrowed: every reader only indexes the payload.
     pub(crate) fn rows_of(&self, who: &str) -> Result<(Rows<'_>, &Value), String> {
         match self {
             Value::List(bounds, vals) => Ok((Rows::Part(bounds), vals)),
-            Value::Ref(payload, spans) => Ok((Rows::Spans(spans), payload)),
+            Value::Ref(list, rows) => {
+                let (bounds, vals) = referenced(list);
+                Ok((Rows::Named(bounds, rows), vals))
+            }
             other => Err(format!("{who}: expected a list (or a referenced list), got {}", shape_of_value(other))),
         }
     }

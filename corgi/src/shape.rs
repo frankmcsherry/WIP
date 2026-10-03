@@ -36,7 +36,7 @@ pub fn shape_of_value(v: &Value) -> Shape {
         Value::Sum(_, variants) => Shape::Sum(variants.iter().map(shape_of_value).collect()),
         Value::List(_, vals) => Shape::List(Box::new(shape_of_value(vals))),
         Value::Unit(_) => Shape::Unit,
-        Value::Ref(payload, _) => Shape::Ref(Box::new(Shape::List(Box::new(shape_of_value(payload))))),
+        Value::Ref(list, _) => Shape::Ref(Box::new(shape_of_value(list))),
     }
 }
 

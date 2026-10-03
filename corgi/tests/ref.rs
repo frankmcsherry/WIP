@@ -1,6 +1,7 @@
 //! `Ref<List<T>>`: referenced list rows. `ref` takes them (nothing copied, through products and
 //! sums), `clone` copies the rows out, `gather` (hence the capture family and literals) and the merges
-//! move only spans, and the readers `get`/`gather`/`find`/`slices`/`len` accept a referenced list.
+//! move only row numbers, and the readers `get`/`gather`/`find`/`slices`/`len` accept a referenced
+//! list.
 //! These tests pin that a referenced haystack answers exactly as the list it references, that the two
 //! spellings of a capture — by value and by reference — agree, and that references stay references
 //! (over one arena) through the ops that move rows.
@@ -36,13 +37,13 @@ fn ref_clone_round_trips_and_shows_as_the_rows() {
 }
 
 
-/// a column of sub-list references (row 0 references three sub-ranges, row 1 two) over one arena,
-/// and the lists those references name, copied out.
+/// a list of references (row 0 holds three, row 1 two) into one arena of three rows, some named
+/// more than once, and the lists those references name, copied out.
 fn sub_list_references() -> (Value, Value) {
     use std::sync::Arc;
-    let arena = Arc::new(Value::u64(vec![7, 3, 3, 1]));
-    let spans = Arc::new(vec![(1, 2), (0, 1), (1, 2), (2, 4), (2, 3)]);
-    let by_ref = Value::List(vec![3, 5].into(), Box::new(Value::Ref(arena, spans)));
+    let arena = Arc::new(Value::List(vec![1, 2, 4].into(), Box::new(Value::u64(vec![3, 7, 3, 1]))));
+    let rows = Arc::new(vec![0, 1, 0, 2, 0]);
+    let by_ref = Value::List(vec![3, 5].into(), Box::new(Value::Ref(arena, rows)));
     let by_val = Value::List(
         vec![3, 5].into(),
         Box::new(Value::List(vec![1, 2, 3, 5, 6].into(), Box::new(Value::u64(vec![3, 7, 3, 3, 1, 3])))),
@@ -73,38 +74,41 @@ fn order_reads_through_references() {
     assert!(matches!(&**inner, Value::Ref(..)), "sorting references moves references");
 }
 
-/// merging reference columns over ONE arena moves spans only; over distinct arenas each arena
-/// contributes the union of its picked spans, once (never once per reference, never its dead
-/// elements), and either way the rows are the rows.
+/// merging reference columns over ONE arena moves row numbers only; over distinct arenas each
+/// arena contributes the rows the result names, once (never once per reference, never its rows
+/// that nothing names), and either way the rows are the rows.
 #[test]
 fn merges_keep_references() {
     use corgi::arrange::gather_lanes;
     use std::sync::Arc;
-    let arena = Arc::new(Value::u64(vec![1, 2, 3, 4]));
-    let a = Value::Ref(arena.clone(), Arc::new(vec![(0, 4), (1, 2)]));
-    let b = Value::Ref(arena.clone(), Arc::new(vec![(2, 4)]));
+    // rows [1], [2, 3], [4]
+    let arena = Arc::new(Value::List(vec![1, 3, 4].into(), Box::new(Value::u64(vec![1, 2, 3, 4]))));
+    let a = Value::Ref(arena.clone(), Arc::new(vec![0, 1]));
+    let b = Value::Ref(arena.clone(), Arc::new(vec![2]));
     let (tags, off) = ([1, 0, 0], [0, 1, 0]);
     let merged = gather_lanes(&[Some(&a), Some(&b)], &tags, &off);
-    let Value::Ref(p, spans) = &merged else { panic!("a merge of references is references") };
-    assert!(Arc::ptr_eq(p, &arena), "one arena: spans only");
-    assert_eq!(**spans, vec![(2, 4), (1, 2), (0, 4)]);
+    let Value::Ref(p, rows) = &merged else { panic!("a merge of references is references") };
+    assert!(Arc::ptr_eq(p, &arena), "one arena: row numbers only");
+    assert_eq!(**rows, vec![2, 1, 0]);
 
-    let other = Arc::new(Value::u64(vec![9, 8, 7, 6, 5]));
-    let c = Value::Ref(other, Arc::new(vec![(0, 2), (0, 2), (1, 2)]));
+    // rows [9, 8], [7], [6, 5]
+    let other = Arc::new(Value::List(vec![2, 3, 5].into(), Box::new(Value::u64(vec![9, 8, 7, 6, 5]))));
+    let c = Value::Ref(other, Arc::new(vec![0, 0, 1]));
     let merged = gather_lanes(&[Some(&a), Some(&c)], &[1, 0, 1, 0, 1], &[0, 0, 1, 1, 2]);
     let Value::Ref(p, _) = &merged else { panic!() };
-    assert_eq!(p.len(), 6, "a's [0, 4) and c's [0, 2), each once; c's unreferenced [2, 5) left behind");
-    let expect = Value::List(vec![2, 6, 8, 9, 10].into(), Box::new(Value::u64(vec![9, 8, 1, 2, 3, 4, 9, 8, 2, 8])));
+    let Value::List(_, held) = &**p else { panic!("an arena is a list") };
+    assert_eq!((p.len(), held.len()), (4, 6), "a's two rows and c's two, each once; c's unnamed [6, 5] left behind");
+    let expect = Value::List(vec![2, 3, 5, 7, 8].into(), Box::new(Value::u64(vec![9, 8, 1, 9, 8, 2, 3, 7])));
     assert_eq!(run("input clone", merged), expect);
 }
 
 /// a fold whose state is a reference keeps it a reference into the same arena, round after round:
-/// the state is overwritten span by span in place, never rebuilt from the rows it names.
+/// the state is overwritten row number by row number in place, never rebuilt from the rows it names.
 #[test]
 fn fold_state_stays_a_reference() {
     use std::sync::Arc;
-    let arena = Arc::new(Value::u64(vec![5, 6, 7]));
-    let seed = Value::Ref(arena.clone(), Arc::new(vec![(0, 3), (1, 2)]));
+    let arena = Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7]))));
+    let seed = Value::Ref(arena.clone(), Arc::new(vec![0, 1]));
     let xs = Value::List(vec![3, 4].into(), Box::new(Value::u64(vec![0, 1, 0, 1])));
     let out = run(
         "let (s, xs) = input in (s, xs) fold ((acc, x) -> (x, acc, acc) select)",
@@ -115,24 +119,27 @@ fn fold_state_stays_a_reference() {
     assert_eq!(out, seed);
 }
 
-/// the codec carries a reference column as its spans and its payload once: same shape, same rows.
+/// the codec carries a reference column as its row numbers and its arena once: same shape, same
+/// rows, including a reference to an empty row.
 #[test]
 fn bytes_round_trip_a_reference() {
     use std::sync::Arc;
-    let r = Value::Prod(vec![
-        Value::u64(vec![1, 2]),
-        Value::Ref(Arc::new(Value::u64(vec![10, 11, 12])), Arc::new(vec![(0, 3), (1, 2)])),
-    ]);
+    let arena = Arc::new(Value::List(vec![2, 3, 3].into(), Box::new(Value::u64(vec![10, 11, 12]))));
+    let r = Value::Prod(vec![Value::u64(vec![1, 2, 3]), Value::Ref(arena.clone(), Arc::new(vec![1, 0, 2]))]);
     let mut buf = Vec::new();
     corgi::bytes::write_to(&r, &mut buf).unwrap();
     assert_eq!(buf.len(), corgi::bytes::length_in_bytes(&r));
     let (back, used) = corgi::bytes::read_from(&buf).unwrap();
     assert_eq!((back, used), (r, buf.len()));
-    // a span past its payload is refused, not trusted
-    let bad = Value::Ref(Arc::new(Value::u64(vec![10])), Arc::new(vec![(0, 2)]));
-    let mut buf = Vec::new();
-    corgi::bytes::write_to(&bad, &mut buf).unwrap();
-    assert!(corgi::bytes::read_from(&buf).is_err());
+    // a row past its arena, or an arena that is not a list, is refused, not trusted
+    for bad in [
+        Value::Ref(arena, Arc::new(vec![3])),
+        Value::Ref(Arc::new(Value::u64(vec![10])), Arc::new(vec![0])),
+    ] {
+        let mut buf = Vec::new();
+        corgi::bytes::write_to(&bad, &mut buf).unwrap();
+        assert!(corgi::bytes::read_from(&buf).is_err());
+    }
 }
 
 /// every reader gives the same answer on `h ref` as on `h`.
@@ -224,7 +231,8 @@ fn wco_step_searches_through_references() {
     use std::sync::Arc;
     let anchors = 4;
     let adj_vals: Vec<u64> = (0..40).collect();
-    let by_ref = Value::Ref(Arc::new(Value::u64(adj_vals)), Arc::new(vec![(0, 40); anchors]));
+    let adj = Value::List(vec![adj_vals.len()].into(), Box::new(Value::u64(adj_vals)));
+    let by_ref = Value::Ref(Arc::new(adj), Arc::new(vec![0; anchors]));
     let ranges = Value::List(
         vec![1, 2, 3, 4].into(),
         Box::new(Value::Prod(vec![Value::u64(vec![0, 10, 20, 30]), Value::u64(vec![10, 20, 30, 40])])),
@@ -260,7 +268,8 @@ fn fold_state_across_arenas_holds_only_live_rows() {
         "let (s, xs) = input in (s ref, xs) fold ((acc, x) -> x iota ref)",
         Value::Prod(vec![seed, xs]),
     );
-    let Value::Ref(payload, _) = &out else { panic!("the fold's state is still a reference") };
-    assert!(payload.len() <= 6, "the state's arena holds {} elements for 2 rows of 3", payload.len());
+    let Value::Ref(arena, _) = &out else { panic!("the fold's state is still a reference") };
+    let Value::List(_, held) = &**arena else { panic!("an arena is a list") };
+    assert!(held.len() <= 6, "the state's arena holds {} elements for 2 rows of 3", held.len());
     assert_eq!(show(&run("input clone", out)), "List ends=[3, 6] <[0, 1, 2, 0, 1, 2]>");
 }
