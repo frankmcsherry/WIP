@@ -1,11 +1,13 @@
-//! The comparison/order op bucket. Two leaf compares — `Rel` (two columns → mask) and `Gt` (a column
-//! vs a constant, the immediate-form sugar) — plus the list ops `SortList`/`DedupList`/`GroupKey`
-//! (discrimination via `sort_blocks`/`run_starts`) and `Find` (batched binary search via `compare_idx`). All are
+//! The comparison/order op bucket. The leaf compare `Rel` (two columns → mask; `RelImm` when one side
+//! is a constant) — plus the list ops `SortList`/`DedupList`/`GroupKey`
+//! (discrimination via `sort_blocks`/`run_starts`) and `Find` (a search per needle on leaves, `search`;
+//! a batched binary search via `compare_idx` otherwise). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
 //! The structural-order engine these ops reduce to is the private [`order`] submodule.
 
 pub(crate) mod order;
+pub(crate) mod search;
 pub(crate) mod sort;
 pub(crate) mod survey;
 
@@ -14,6 +16,8 @@ use order::{compare_cols, compare_idx, run_starts, runs_per_row, segment_labels}
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
+use search::find_leaf;
+use std::hint::select_unpredictable;
 
 /// a relational predicate for the leaf compare-to-mask op [`CmpOp::Rel`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -132,8 +136,9 @@ impl CmpOp {
                 Value::List(no.into(), Box::new(Value::Prod(vec![keys, inner])))
             }
 
-            // for each needle element, equal_range it in the matching haystack row (batched binary
-            // search, see `batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
+            // for each needle element, equal_range it in the matching haystack row: leaves by a
+            // search per needle (`search`), anything else by the batched binary search
+            // (`batched_bound`). Output shaped like `needle`, each (lo,hi) relative to its row.
             CmpOp::Find => {
                 let (needle, haystack) = input.into_pair("Find")?;
                 let (nb, nvals) = needle.into_list("Find needle")?;
@@ -142,6 +147,11 @@ impl CmpOp {
                 let (hb, hvals) = haystack.rows_of("Find haystack")?;
                 same(&shape_of_value(&nvals), &shape_of_value(hvals)).map_err(|e| format!("Find: {e}"))?;
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
+                // Leaves: a search per needle (a walk for a dense row of needles in order; a
+                // branch-free binary search, sixteen needles at a time, otherwise). See `search`.
+                if let Some((lo_c, hi_c)) = find_leaf(&nb, &nvals, hb, hvals) {
+                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)]))));
+                }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
                 // row base the answer is relative to; the search moves `lo`, so the base is rewalked
@@ -226,18 +236,17 @@ fn batched_bound(
         mids.clear();
         mids.extend(active.iter().map(|&k| (lo[k] + hi[k]) / 2));
         let ord = compare_idx(hvals, nvals, &mids, &active);
+        // Branch-free: which way each window moves is as good as random, and a branch on it was
+        // the largest single cost of this loop. Every needle is written back, and the cursor
+        // advances past it only while its window is open.
         let mut w = 0usize;
         for t in 0..active.len() {
-            let k = active[t];
-            if go_right(ord[t]) {
-                lo[k] = mids[t] + 1;
-            } else {
-                hi[k] = mids[t];
-            }
-            if lo[k] < hi[k] {
-                active[w] = k;
-                w += 1;
-            }
+            let (k, mid) = (active[t], mids[t]);
+            let right = go_right(ord[t]);
+            let (l, h) = (select_unpredictable(right, mid + 1, lo[k]), select_unpredictable(right, hi[k], mid));
+            (lo[k], hi[k]) = (l, h);
+            active[w] = k;
+            w += (l < h) as usize;
         }
         active.truncate(w);
     }

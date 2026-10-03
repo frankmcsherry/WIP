@@ -328,8 +328,25 @@ fn merge<T: Ord + Copy>(ka: impl Fn(usize) -> T, kb: impl Fn(usize) -> T, open: 
     }
 }
 
+/// The walk itself, over one sorted `needles` slice into one sorted `hay` slice: `report(lo, hi)`
+/// is called once per needle, in order, with its equal range in `hay`. Each needle gallops from
+/// the previous needle's `lo`, so the cursor never goes backwards and a repeated needle costs one
+/// probe; a needle far from the last costs `O(log gap)`, where a search from scratch costs
+/// `O(log |hay|)` whatever the gap.
+pub(crate) fn walk_ranges<T: Ord + Copy>(needles: &[T], hay: &[T], mut report: impl FnMut(usize, usize)) {
+    let mut cursor = 0usize;
+    for &want in needles {
+        let mut lo = cursor;
+        gallop(&mut lo, hay.len(), |j| hay[j] < want);
+        let mut hi = lo;
+        gallop(&mut hi, hay.len(), |j| hay[j] <= want);
+        report(lo, hi);
+        cursor = lo;
+    }
+}
+
 /// Advance `idx` while `pred` holds, by doubling steps then bisection: `O(log gap)` probes.
-fn gallop(idx: &mut usize, hi: usize, pred: impl Fn(usize) -> bool) {
+pub(crate) fn gallop(idx: &mut usize, hi: usize, pred: impl Fn(usize) -> bool) {
     if *idx < hi && pred(*idx) {
         let mut step = 1;
         while *idx + step < hi && pred(*idx + step) {
