@@ -89,7 +89,7 @@ pub mod profile {
     /// (op, runs, own time), most time first.
     pub fn report() -> Vec<(String, u64, Duration)> {
         let mut v: Vec<_> = STATE.with(|s| s.borrow().ops.iter().map(|(k, &(n, t))| (k.clone(), n, t)).collect());
-        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.sort_by_key(|r| std::cmp::Reverse(r.2));
         v
     }
 
