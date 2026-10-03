@@ -127,13 +127,14 @@ mod generators {
 
     /// resolve an index value of any shape (`gather`'s positions): every integer leaf is a position
     /// relative to its element's TOP-level row of the haystack (`hay`). Clears `ok[r]` when top-level
-    /// row `r` names a position outside its row; such a position is recorded but must not be read,
-    /// so the caller fills the plan only when every row it keeps is `ok`.
+    /// row `r` names a position outside its row; such a position is recorded as `usize::MAX`, which
+    /// [`IndexPlan::fill_or_zero`] reads as zero and [`IndexPlan::fill`] must never see.
     pub(crate) fn index_plan(index: &Value, owners: &Owners, hay: Rows, ok: &mut [bool]) -> Result<IndexPlan, String> {
         fn resolve(hay: Rows, ok: &mut [bool], r: usize, x: u64, pos: &mut Vec<usize>) {
             let (hs, he) = hay.span(r);
-            ok[r] &= x < (he - hs) as u64;
-            pos.push(hs.wrapping_add(x as usize));
+            let inside = x < (he - hs) as u64;
+            ok[r] &= inside;
+            pos.push(if inside { hs + x as usize } else { usize::MAX });
         }
         Ok(match index {
             Value::Prim(p) => {
@@ -187,6 +188,18 @@ mod generators {
     }
 
     impl IndexPlan {
+        /// as [`IndexPlan::fill`], with a position outside its row reading the zero of the element's
+        /// shape (see [`gather_or_zero`]).
+        pub(crate) fn fill_or_zero(self, hvals: &Value) -> Result<Value, String> {
+            Ok(match self {
+                IndexPlan::Leaf(pos) => gather_or_zero(hvals, &pos)?,
+                IndexPlan::Unit(n) => Value::Unit(n),
+                IndexPlan::Prod(fields) => Value::Prod(fields.into_iter().map(|f| f.fill_or_zero(hvals)).collect::<Result<_, _>>()?),
+                IndexPlan::List(bounds, inner) => Value::List(bounds, Box::new(inner.fill_or_zero(hvals)?)),
+                IndexPlan::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(|l| l.fill_or_zero(hvals)).collect::<Result<_, _>>()?),
+            })
+        }
+
         /// the index value with each leaf replaced by the haystack elements its positions name.
         pub(crate) fn fill(self, hvals: &Value) -> Value {
             match self {
@@ -257,6 +270,50 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
         // of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Ref they are free.
         Value::Ref(payload, spans) => Value::Ref(payload.clone(), Arc::new(idx.iter().map(|&i| spans[i]).collect())),
     }
+}
+
+/// `gather` where a position past `v`'s rows reads the ZERO of the element's shape: zero bits for a
+/// leaf, the empty list, a unit, lane 0 (holding its own zero) for a sum. A sum of no lanes has no
+/// zero, so it is an error. Every in-range position reads as `gather` would.
+pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> {
+    Ok(match v {
+        Value::Prim(p) => Value::Prim(p.gather_or_zero(idx)),
+        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather_or_zero(c, idx)).collect::<Result<_, _>>()?),
+        Value::Unit(_) => Value::Unit(idx.len()),
+        Value::List(bounds, vals) => {
+            let (mut elem, mut nb) = (Vec::new(), Vec::with_capacity(idx.len()));
+            for &i in idx {
+                if i < bounds.len() {
+                    let (s, e) = row_span(bounds, i);
+                    elem.extend(s..e);
+                }
+                nb.push(elem.len());
+            }
+            Value::List(nb.into(), Box::new(gather(vals, &elem)))
+        }
+        Value::Sum(tags, lanes) => {
+            if lanes.is_empty() {
+                return Err("gather: a sum of no lanes has no zero to read out of range".into());
+            }
+            // a position past the rows goes to lane 0, which reads it as its own zero.
+            let mut per = vec![Vec::new(); lanes.len()];
+            let (mut new_tags, mut new_off) = (Vec::with_capacity(idx.len()), Vec::with_capacity(idx.len()));
+            for &i in idx {
+                let (t, at) = if i < tags.len() { (tags.tag_at(i), tags.offset_at(i)) } else { (0, usize::MAX) };
+                new_tags.push(t as u8);
+                new_off.push(per[t].len());
+                per[t].push(at);
+            }
+            let mut nv = Vec::with_capacity(lanes.len());
+            for (k, (lane, at)) in lanes.iter().zip(&per).enumerate() {
+                nv.push(if k == 0 { gather_or_zero(lane, at)? } else { gather(lane, at) });
+            }
+            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
+        }
+        Value::Ref(payload, spans) => {
+            Value::Ref(payload.clone(), Arc::new(idx.iter().map(|&i| spans.get(i).copied().unwrap_or((0, 0))).collect()))
+        }
+    })
 }
 
 /// `filter`'s values in one pass per leaf: the rows whose mask element is nonzero, in order, for a

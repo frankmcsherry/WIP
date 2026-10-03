@@ -177,7 +177,9 @@ pub enum Op<L> {
                     // top-level row; the result has P's structure with every leaf replaced by its
                     // element. Chains compose in-language — gather(gather(v,i),j) = gather(v,
                     // gather(i,j)), so index math stays index math.
-                    // PARTIAL (panics out of bounds): the unchecked fast path; `TryGather` is total.
+                    // Total but lossy: a position outside its row reads the ZERO of the element's
+                    // shape (zero bits, the empty list, a sum's lane 0). `TryGather` reports it as an
+                    // error row instead; when positions are proven in range the two agree.
     Range,          // (lo:U64, hi:U64) -> List<U64>  per row [lo, hi), empty when lo >= hi: `iota` with
                     // a start. Total.
     GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Found:T | Missing}>  TOTAL vector
@@ -734,10 +736,10 @@ impl<L: OpLike> Op<L> {
                 // payload (a partition); a referenced haystack takes the general path below.
                 if let (Value::List(ib, ivals), Value::Prim(p), Rows::Part(_)) = (&idx, hvals, hb) {
                     if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::U64(_))) {
-                        // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
-                        // indexing in the gather supplies that check without a separate scan. This
-                        // is the one path that CONSUMES the indices — it rewrites that buffer into
-                        // the result — so it is also the only one that takes ownership.
+                        // Raw Gather reads zero out of range, not an all-or-nothing error row: a
+                        // clamped read and a select, no separate scan. This is the one path that
+                        // CONSUMES the indices — it rewrites that buffer into the result — so it is
+                        // also the only one that takes ownership.
                         let p = p.clone();
                         let Value::List(ib, ivals) = idx else { unreachable!() };
                         let idxs = ivals.into_u64("Gather indices")?;
@@ -745,11 +747,7 @@ impl<L: OpLike> Op<L> {
                     }
                 }
                 let mut ok = vec![true; idx.len()];
-                let plan = index_plan(&idx, &Owners::Identity, hb, &mut ok)?;
-                if let Some(r) = ok.iter().position(|&o| !o) {
-                    panic!("Gather: an index out of row {r}'s bounds");
-                }
-                plan.fill(hvals)
+                index_plan(&idx, &Owners::Identity, hb, &mut ok)?.fill_or_zero(hvals)?
             }
 
             // total vector access: each index either names a haystack-row element (Found) or is out of

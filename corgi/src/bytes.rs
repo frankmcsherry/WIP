@@ -452,6 +452,9 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
 /// carried offset that lands inside it. Without these, `hash` and the comparators index out
 /// of bounds on a column the decoder handed them.
 fn check_sum(tags: &Tags, lanes: &[Value]) -> Result<(), String> {
+    if lanes.is_empty() {
+        return Err("corgi::bytes: a sum needs at least one lane".into());
+    }
     if lanes.len() > 256 {
         return Err(format!("corgi::bytes: {} sum lanes exceeds the u8 tag width", lanes.len()));
     }
