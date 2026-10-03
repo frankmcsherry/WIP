@@ -54,8 +54,8 @@ pub enum CmpOp {
     MinImm(u32, u64), // X -> X   lane-wise min with a constant (stored bits at width w), in place
     MaxImm(u32, u64), // X -> X   lane-wise max with a constant
     SortList,  // List<X> -> List<X>   structural order
-    Order,     // List<X> -> List<(U64, U64)>   the sort's own output, per row: the positions in
-               // stable sorted order, and a mark where each run of equal elements starts
+    SortBy,    // List<(K,V)> -> List<(K,V,U64)>   stable order by K alone, V carried along (a Unit
+               // V carries nothing), and each element's run of equal keys (numbered densely)
     SortLimit(usize), // List<X> -> List<X>   the first k of each row in structural order (`sort`,
                // then take k), sorting only what can reach the first k: see `sort_limit`
     DedupList, // List<X> -> List<X>   distinct, per row (sorted)
@@ -111,19 +111,21 @@ impl CmpOp {
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
             }
 
-            // the permutation and the runs the sort finds anyway: nothing is moved but positions.
-            CmpOp::Order => {
-                let (bounds, vals) = input.into_list("Order")?;
-                let (perm, refined) = sort_blocks(&row_labels(&bounds), &vals);
-                let (mut pos, mut mark) = (Vec::with_capacity(perm.len()), Vec::with_capacity(perm.len()));
-                for r in 0..bounds.len() {
-                    let (s, e) = bounds.span(r);
-                    for p in s..e {
-                        pos.push((perm[p] - s) as u64);
-                        mark.push((p == s || refined[p] != refined[p - 1]) as u64);
-                    }
-                }
-                Value::List(bounds, Box::new(Value::Prod(vec![Value::u64(pos), Value::u64(mark)])))
+            // the sort moves the keys; the payload follows the permutation, unless there is none.
+            CmpOp::SortBy => {
+                let (bounds, vals) = input.into_list("SortBy")?;
+                let (k, v) = vals.into_pair("SortBy elements")?;
+                let labels = row_labels(&bounds);
+                let (sk, sv, refined) = if let Value::Unit(n) = v {
+                    let (refined, sk) = sort_values_only(&labels, &k);
+                    (sk, Value::Unit(n), refined)
+                } else {
+                    let (perm, refined, sk) = sort_values(&labels, &k);
+                    (sk, gather(&v, &perm), refined)
+                };
+                // the runs the sort found, as it found them: each element's run, numbered densely
+                // over the whole column (a run never spans two rows)
+                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::u64(refined)])))
             }
 
             CmpOp::SortLimit(k) => {

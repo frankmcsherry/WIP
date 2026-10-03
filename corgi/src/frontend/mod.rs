@@ -89,7 +89,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "branch" => Op::Branch(n()? as usize).into(), // the demux; a tag of n-1 or more goes to the last lane
         "filter" => Op::Filter.into(), // [(mask, x)] -> [x]: keep the x whose mask is nonzero; total
         "sort" => CmpOp::SortList.into(),
-        "order" => CmpOp::Order.into(), // [x] -> [(position, run start)]: the sort's order, and its runs
+        "sort_by" => CmpOp::SortBy.into(), // [(k, v)] -> [(k, v, run)]: stable by k, v carried along, each run of equal k numbered
         "sort_limit" => CmpOp::SortLimit(n()? as usize).into(), // `sort`, then the first k of each row
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),

@@ -86,12 +86,27 @@ pub(crate) fn sort_indexed(
         // a sum's lanes and a list's elements are read through the index after their sorts.
         Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit.keeping_index(), scratch),
         Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit.keeping_index(), scratch),
-        // a reference sorts as what it names: order a scratch clone of the referenced rows, then
-        // move the ROW NUMBERS into that order, so the sorted column is still references. (A
-        // refs-aware sort would read through the arena instead; not needed yet.)
-        Value::Ref(..) => {
-            let owned = crate::engine::clone_ref(v.clone());
-            sort_indexed(&owned, labels, index, emit.keeping_index(), scratch);
+        // a reference sorts as what it names, read through its arena: the arena's rows are sorted
+        // in place of the references, and mapped back to positions; the sorted column is still
+        // references. (An arena row named twice falls back to a scratch clone.)
+        Value::Ref(list, rows) => {
+            // references to every arena row in order (as `ref` makes them) name the arena itself
+            if rows.len() == list.len() && rows.iter().enumerate().all(|(i, &r)| i == r) {
+                sort_indexed(list, labels, index, Emit::Index, scratch);
+                return emit.values().then(|| gather(v, index));
+            }
+            let mut at: Vec<usize> = index.iter().map(|&i| rows[i]).collect();
+            let mut back = vec![usize::MAX; list.len()];
+            let once = index.iter().zip(&at).all(|(&i, &r)| std::mem::replace(&mut back[r], i) == usize::MAX);
+            if once {
+                sort_indexed(list, labels, &mut at, Emit::Index, scratch);
+                for (slot, &r) in index.iter_mut().zip(&at) {
+                    *slot = back[r];
+                }
+            } else {
+                let owned = crate::engine::clone_ref(v.clone());
+                sort_indexed(&owned, labels, index, emit.keeping_index(), scratch);
+            }
             emit.values().then(|| gather(v, index))
         }
         Value::Unit(_) => {
