@@ -5,6 +5,5 @@
 # output: [i,i,i,i,u]
 # Written as the SQL is: grouped on all four expressions.
 let ranked = input map (i -> ((i, (i, 1i64) sub_i64, (i, 2i64) sub_i64, (i, 3i64) sub_i64), 1u64)) group
-    map (((a, b, c, d), ones) -> ((18446744073709551615u64, ones len) sub, a, b, c, d)) sort in
-((0u64, ((ranked len, 10u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((x, a, b, c, d) -> (a, b, c, d, (18446744073709551615u64, x) sub))), 1 (_ -> 0u64 iota map (z -> (z, z, z, z, z))))
+    map (((a, b, c, d), ones) -> ((18446744073709551615u64, ones len) sub, a, b, c, d)) sort_limit 10 in
+ranked map ((x, a, b, c, d) -> (a, b, c, d, (18446744073709551615u64, x) sub))

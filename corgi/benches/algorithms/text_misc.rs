@@ -69,6 +69,5 @@ pub fn run(cfg: &Cfg) {
     }
     let expected = Value::List(Bounds::offsets(ends), Box::new(Value::Prod(vec![bytes_col(&words), Value::u64(counts)])));
     let rust = || texts.iter().map(|t| word_topk(t)).collect::<Vec<_>>();
-    run_case(cfg, "word_topk", "0-12 words of 1-3 letters over 3 letters", include_str!("../../algorithms/word_topk.col"), input.clone(), expected.clone(), rust);
-    run_case(cfg, "word_topk_cut", "0-12 words of 1-3 letters over 3 letters", include_str!("../../algorithms/word_topk_cut.col"), input, expected, rust);
+    run_case(cfg, "word_topk", "0-12 words of 1-3 letters over 3 letters", include_str!("../../algorithms/word_topk.col"), input, expected, rust);
 }

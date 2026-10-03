@@ -1,9 +1,0 @@
-# Q24: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10
-# The variant with `sort_limit`: sorting only what can reach the limit.
-# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, octet_length(SearchPhrase), SearchPhrase LIMIT 10
-# columns: EventTime SearchPhrase
-# output: [s]
-let (time, phrase) = input in
-let sorted = (time, phrase) zip map ((t, s) -> ((s len, 0u64) gt, (t, s))) filter sort_limit 10 in
-sorted map ((_, s) -> s)
-    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> "")))

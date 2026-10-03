@@ -23,6 +23,6 @@ let matched = (at, lines) zip map (((lo, hi), (_, rev)) -> ((hi, lo) gt, (lo, re
 let joined = (matched map ((lo, _) -> lo), orders) gather in
 # Revenue per order; the ten largest (ties: earlier order date, then order key).
 let per = (joined, matched map ((_, rev) -> rev)) zip group
-    map (((k, dt, pr), revs) -> let r = revs fold_add in ((18446744073709551615u64, r) sub, dt, k, pr, r)) sort in
-((0u64, (per len, 10u64) min) range, per) gather
-    try match (0 (top -> top map ((_, dt, k, pr, r) -> (k, r, dt, pr))), 1 (_ -> 0u64 iota map (z -> (z, z, z, z))))
+    map (((k, dt, pr), revs) -> let r = revs fold_add in ((18446744073709551615u64, r) sub, dt, k, pr, r)) sort_limit 10 in
+per map ((_, dt, k, pr, r) -> (k, r, dt, pr))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, z, z))))

@@ -3,6 +3,5 @@
 # columns: SearchPhrase
 # output: [s]
 # corgi orders strings shorter first, then by bytes; the SQL sorts the same way.
-let sorted = input map (s -> ((s len, 0u64) gt, s)) filter sort in
-((0u64, ((sorted len, 10u64) min)) range, sorted) gather
-    try match (0 (top -> top map (s -> s)), 1 (_ -> 0u64 iota map (z -> "")))
+let sorted = input map (s -> ((s len, 0u64) gt, s)) filter sort_limit 10 in
+sorted map (s -> s)

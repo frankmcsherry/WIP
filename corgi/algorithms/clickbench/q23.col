@@ -18,6 +18,6 @@ let google = url map (u ->
         let tail = ((lo, (lo, 5u64) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0u8))) in
         (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
     (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1u64) add, n) lt, e) mul) fold_any) in
-let sorted = (google, (time, (watch, url) zip) zip) zip map ((g, (t, (w, u))) -> (g, (t, w, u))) filter sort in
-((0u64, ((sorted len, 10u64) min)) range, sorted) gather
-    try match (0 (top -> top map ((t, w, u) -> (t, w, u))), 1 (_ -> 0u64 iota map (z -> (z, z, ""))))
+let sorted = (google, (time, (watch, url) zip) zip) zip map ((g, (t, (w, u))) -> (g, (t, w, u))) filter sort_limit 10 in
+sorted map ((t, w, u) -> (t, w, u))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, ""))))

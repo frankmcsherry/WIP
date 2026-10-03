@@ -17,8 +17,8 @@ let at = (lines map ((k, _) -> k), orders map ((k, _) -> k)) find in
 let matched = (at, lines) zip map (((lo, hi), (_, r)) -> ((hi, lo) gt, (lo, r))) filter in
 let custs = (matched map ((lo, _) -> lo), orders) gather map ((_, c) -> c) in
 let per = (custs, matched map ((_, r) -> r)) zip group
-    map ((c, rs) -> let r = rs fold_add in ((18446744073709551615u64, r) sub, c, r)) sort in
-let top = ((0u64, (per len, 20u64) min) range, per) gather in
+    map ((c, rs) -> let r = rs fold_add in ((18446744073709551615u64, r) sub, c, r)) sort_limit 20 in
+let top = per in
 # The top customers' nation names: customer -> nation key -> name.
 let cs = (ckey, cnat) zip sort in
 let ns = (nkey, nname) zip sort in

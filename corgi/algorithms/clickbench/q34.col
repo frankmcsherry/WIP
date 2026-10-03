@@ -2,6 +2,5 @@
 # sql: SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC, octet_length(URL), URL LIMIT 10
 # columns: URL
 # output: [u,s,u]
-let ranked = input map (u -> ((1u64, u), 1u64)) group map (((one, u), ones) -> ((18446744073709551615u64, ones len) sub, one, u)) sort in
-((0u64, ((ranked len, 10u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((d, one, u) -> (one, u, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, "", z))))
+let ranked = input map (u -> ((1u64, u), 1u64)) group map (((one, u), ones) -> ((18446744073709551615u64, ones len) sub, one, u)) sort_limit 10 in
+ranked map ((d, one, u) -> (one, u, (18446744073709551615u64, d) sub))

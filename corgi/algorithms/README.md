@@ -28,7 +28,6 @@ column is corgi's time divided by Rust's.
 | days_from_civil | days since 1970 and weekday (Hinnant) | 5.7 | 2.1 | 2.7 |
 | gcd | Euclid, as a fold over a fixed round count | 316 | 32.6 | 9.7 |
 | group_aggregate | GROUP BY key: count, sum, max | 337 | 248 | 1.4 |
-| group_aggregate_cut | the same as runs cut from the sorted pairs | 500 | 250 | 2.0 |
 | histogram | 8-bucket counts, as an outer product | 482 | 27.0 | 17.9 |
 | histogram_sorted | the same by sorting the bucket ids | 265 | 27.1 | 9.8 |
 | horner | polynomial at x | 57.7 | 5.4 | 10.7 |
@@ -61,7 +60,6 @@ column is corgi's time divided by Rust's.
 | trigram_similarity | pg_trgm similarity of two strings | 1146 | 266 | 4.3 |
 | two_sum | does a pair sum to the target | 353 | 330 | 1.1 |
 | word_topk | the three most frequent words | 606 | 298 | 2.0 |
-| word_topk_cut | the same, counting the runs of sorted words | 738 | 308 | 2.4 |
 
 The rows near 1× (jaccard_sets, two_sum, group_aggregate, normalize_whitespace) are measured
 against Rust that hashes or allocates. Rust written for the small key domain would be several times

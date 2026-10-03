@@ -9,6 +9,6 @@ let views = (counter, (date, (refresh, (link, (download, url) zip) zip) zip) zip
     map ((c, (d, (r, (l, (w, u))))) ->
         ((((c, 62u64) eq, ((d, 15887u64) ge, (d, 15917u64) le) mul) mul,
           (((r, 0u64) eq, (l, 0u64) ne) mul, (w, 0u64) eq) mul) mul, (u, 1u64))) filter in
-let ranked = views group map ((u, ones) -> ((18446744073709551615u64, ones len) sub, u)) sort in
-((1000u64, ((ranked len, 1010u64) min)) range, ranked) gather
+let ranked = views group map ((u, ones) -> ((18446744073709551615u64, ones len) sub, u)) sort_limit 1010 in
+((1000u64, (ranked len, 1010u64) min) range, ranked) gather
     try match (0 (top -> top map ((d, u) -> (u, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> ("", z))))

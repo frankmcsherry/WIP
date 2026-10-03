@@ -3,6 +3,6 @@
 # columns: EventTime SearchPhrase
 # output: [s]
 let (time, phrase) = input in
-let sorted = (time, phrase) zip map ((t, s) -> ((s len, 0u64) gt, (t, s))) filter sort in
-((0u64, (sorted len, 10u64) min) range, sorted) gather
-    try match (0 (top -> top map ((_, s) -> s)), 1 (_ -> 0u64 iota map (z -> "")))
+let sorted = (time, phrase) zip map ((t, s) -> ((s len, 0u64) gt, (t, s))) filter sort_limit 10 in
+sorted map ((_, s) -> s)
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> "")))

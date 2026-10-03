@@ -8,6 +8,6 @@
 let (counter, url) = input in
 let ranked = (counter, url) zip map ((c, u) -> ((u len, 0u64) gt, (c, u len))) filter group
     map ((c, ls) -> let n = ls len in ((n, 1000u64) gt, (c, (ls fold_add to_f64, n to_f64) div_f64, n))) filter
-    map ((c, l, n) -> ((18446744073709551615u64, l) sub, c, l, n)) sort in
-((0u64, ((ranked len, 25u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((_, c, l, n) -> (c, l, n))), 1 (_ -> 0u64 iota map (z -> (z, 0f64, z))))
+    map ((c, l, n) -> ((18446744073709551615u64, l) sub, c, l, n)) sort_limit 25 in
+ranked map ((_, c, l, n) -> (c, l, n))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, 0f64, z))))

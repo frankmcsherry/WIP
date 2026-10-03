@@ -26,6 +26,6 @@ let keep = (phrase, (google, dotted) zip) zip map ((s, (g, d)) -> (((s len, 0u64
 let ranked = (keep, (phrase, (url, (title, user) zip) zip) zip) zip filter group
     map ((s, rows) ->
         ((18446744073709551615u64, rows len) sub, s, rows map ((u, _) -> u) sort head, rows map ((_, (t, _)) -> t) sort head,
-         rows len, rows map ((_, (_, x)) -> x) dedup len)) sort in
-((0u64, ((ranked len, 10u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((_, s, u, t, c, x) -> (s, u, t, c, x))), 1 (_ -> 0u64 iota map (z -> ("", "", "", z, z))))
+         rows len, rows map ((_, (_, x)) -> x) dedup len)) sort_limit 10 in
+ranked map ((_, s, u, t, c, x) -> (s, u, t, c, x))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", "", "", z, z))))

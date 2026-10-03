@@ -1,9 +1,0 @@
-# group_aggregate with the groups cut out of the sorted pairs: sort, mark where each key's run
-# starts, take the marked keys, and cut the values at the marks.
-let s = input sort in
-let keys = s map ((k, _) -> k) in
-let starts = keys adjacent in
-let ks = (starts, keys) zip filter in
-let groups = (starts, s map ((_, v) -> v)) zip cut in
-(ks, groups) zip map ((k, vs) -> (k, vs len, vs fold_add, vs fold_max))
-    try match (0 (g -> g), 1 (_ -> 0u64 iota map (z -> (z, z, z, z))))
