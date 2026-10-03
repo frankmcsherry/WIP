@@ -44,7 +44,7 @@ impl Pred {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
     RelImm(Pred, u32, u64), // X -> U64 mask   `x pred c`, `c` a constant's stored bits at width w

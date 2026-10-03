@@ -96,7 +96,7 @@ pub(crate) fn init_active(bounds: &Bounds) -> Vec<(usize, usize, usize)> {
 /// two further tiers: the structural isos (re-slicings the columnar layout stores for free) and
 /// the fused forms / producers (each reducible to the kernel where the isos allow — the `law`
 /// corpus programs witness it — but kept for the execution strategy the expansion would lose).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Op<L> {
     // ---- the kernel matrix ------------------------------------------------------------------
     // PROD — intro is the graph-structural `Tuple`. Products are transparent (fixed arity, no

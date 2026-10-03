@@ -7,6 +7,10 @@ edition = "2021"
 # optional: `Shape` (de)serializes, so a host can carry corgi types inside its own serialized IR.
 serde = { version = "1", features = ["derive"], optional = true }
 
+[features]
+# time per op kind over a run (`corgi::explain::profile`); off, it costs nothing.
+profile = []
+
 [[bench]]
 name = "eval"
 harness = false   # plain `fn main()` timing — no framework, no dependency

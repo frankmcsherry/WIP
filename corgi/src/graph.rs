@@ -17,20 +17,20 @@ pub trait OpLike: Sized {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NodeKind<O> {
     Input,  // arity 0: the graph's parameter (stratum root)
     Tuple,  // arity N: the sole fan-in
     Op(O),  // a unary op
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Node<O> {
     pub(crate) kind: NodeKind<O>,
     pub(crate) inputs: Vec<usize>, // indices of earlier nodes — the edges
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Graph<O> {
     pub(crate) nodes: Vec<Node<O>>,
     pub(crate) output: usize,
