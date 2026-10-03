@@ -1,0 +1,7 @@
+# run_length_encode with the runs cut out directly: `adjacent` marks where each run starts, the
+# marked bytes are the runs' bytes, and `cut` makes each run a piece whose length is its count.
+let s = input in
+let starts = s adjacent in
+let bytes = (starts, s) zip filter in
+let lens = (starts, s) zip cut map (r -> r len) in
+(bytes, lens) zip try match (0 (runs -> runs), 1 (_ -> 0u64 iota map (z -> (z cast 8, z))))

@@ -42,5 +42,6 @@ pub fn run(cfg: &Cfg) {
     let rust = || inputs.iter().map(|s| reference(s)).collect::<Vec<_>>();
     let what = "strings of 0-24 bytes in runs of 1-4";
     run_case(cfg, "run_length_encode", what, include_str!("../../algorithms/run_length_encode.col"), bytes_col(&inputs), expected.clone(), rust);
-    run_case(cfg, "run_length_encode_scan", what, include_str!("../../algorithms/run_length_encode_scan.col"), bytes_col(&inputs), expected, rust);
+    run_case(cfg, "run_length_encode_scan", what, include_str!("../../algorithms/run_length_encode_scan.col"), bytes_col(&inputs), expected.clone(), rust);
+    run_case(cfg, "run_length_encode_cut", what, include_str!("../../algorithms/run_length_encode_cut.col"), bytes_col(&inputs), expected, rust);
 }

@@ -12,7 +12,7 @@ pub(crate) mod sort;
 pub(crate) mod survey;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_starts, runs_per_row, segment_labels};
+use order::{compare_adjacent, compare_cols, compare_idx, run_starts, runs_per_row, segment_labels};
 use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
@@ -56,6 +56,8 @@ pub enum CmpOp {
     SortList,  // List<X> -> List<X>   structural order
     DedupList, // List<X> -> List<X>   distinct, per row (sorted)
     GroupKey,  // List<(K,V)> -> List<(K, List<V>)>   group by key, per row (sorted)
+    Adjacent,  // List<X> -> List<U64>   1 where an element differs from the one before it in its
+               // row, and at each row's first element: where runs of equal elements start
     Find,      // (needle:List<X>, haystack:List<X>) -> List<(lo,hi)>  equal_range / needle elem
 }
 
@@ -103,6 +105,23 @@ impl CmpOp {
                     return Err(format!("min/max with a U{w} constant expects U{w}, got U{}", p.bits()));
                 }
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
+            }
+
+            // one structural compare of each element with the next, over the whole column; a row's
+            // first element starts a run whatever it follows.
+            CmpOp::Adjacent => {
+                let (bounds, vals) = input.into_list("Adjacent")?;
+                let mut mask = vec![1u64; vals.len()];
+                for (k, s) in compare_adjacent(&vals).into_iter().enumerate() {
+                    mask[k + 1] = (s != 0) as u64;
+                }
+                for r in 0..bounds.len() {
+                    let (s, e) = bounds.span(r);
+                    if s < e {
+                        mask[s] = 1;
+                    }
+                }
+                Value::List(bounds, Box::new(Value::u64(mask)))
             }
 
             // the sort produces the sorted column itself; nothing is gathered afterwards.

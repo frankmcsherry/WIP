@@ -23,5 +23,6 @@ pub fn run(cfg: &Cfg) {
     let input = tuple_lists(&rows);
     let expected = tuple_lists(&rows.iter().map(|r| reference(r)).collect::<Vec<_>>());
     let rust = || rows.iter().map(|r| reference(r)).collect::<Vec<_>>();
-    run_case(cfg, "group_aggregate", "0-32 (key below 8, value below 1000) pairs", include_str!("../../algorithms/group_aggregate.col"), input, expected, rust);
+    run_case(cfg, "group_aggregate", "0-32 (key below 8, value below 1000) pairs", include_str!("../../algorithms/group_aggregate.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "group_aggregate_cut", "0-32 (key below 8, value below 1000) pairs", include_str!("../../algorithms/group_aggregate_cut.col"), input, expected, rust);
 }
