@@ -196,21 +196,61 @@ impl CmpOp {
 
 }
 
-/// The labels for a per-row sort: each element its row, or none at all when there is one row.
-/// the columns whose lexicographic order is the structural order of `v`'s rows, most significant
-/// first: a product's fields' in turn, a list's length and then the list (lists order shorter
-/// first), anything else itself.
-fn order_levels(v: &Value, out: &mut Vec<Value>) {
+/// one level of the structural order of a column's rows: a column sorted whole, or a list's elements,
+/// position by position (each position its own level, made only for the rows still in play).
+enum Level {
+    Col(Value),
+    Elems(Value),
+}
+
+/// the levels whose lexicographic order is the structural order of `v`'s rows, most significant
+/// first: a product's fields' in turn, a list's length and then its elements by position (lists
+/// order shorter first), anything else itself.
+fn order_levels(v: &Value, out: &mut Vec<Level>) {
     match v {
         Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
         Value::List(inner, _) => {
-            out.push(Value::u64((0..inner.len()).map(|i| {
+            out.push(Level::Col(Value::u64((0..inner.len()).map(|i| {
                 let (s, e) = inner.span(i);
                 (e - s) as u64
-            }).collect()));
-            out.push(v.clone());
+            }).collect())));
+            out.push(Level::Elems(v.clone()));
         }
-        other => out.push(other.clone()),
+        other => out.push(Level::Col(other.clone())),
+    }
+}
+
+/// the rows still in play, in order so far: `idx` (rows of the column), `labels` (equal where the
+/// levels so far tie), `ends` (each row's end in `idx`).
+struct InPlay {
+    idx: Vec<usize>,
+    labels: Vec<u64>,
+    ends: Vec<usize>,
+}
+
+impl InPlay {
+    /// sort the rows in play by `col` (one value per row in play) within their ties, then keep each
+    /// row's first `k` and the whole run of ties at the `k`-th.
+    fn level(&mut self, col: &Value, k: usize) {
+        let (perm, refined) = sort_blocks(&self.labels, col);
+        let sorted: Vec<usize> = perm.iter().map(|&p| self.idx[p]).collect();
+        let (mut keep, mut lab, mut ends) = (Vec::new(), Vec::new(), Vec::with_capacity(self.ends.len()));
+        let mut s = 0;
+        for &e in &self.ends {
+            let mut stop = e.min(s + k);
+            while stop > s && stop < e && refined[stop] == refined[stop - 1] {
+                stop += 1; // the run of ties at the k-th position comes whole
+            }
+            keep.extend_from_slice(&sorted[s..stop]);
+            lab.extend_from_slice(&refined[s..stop]);
+            ends.push(keep.len());
+            s = e;
+        }
+        (self.idx, self.labels, self.ends) = (keep, lab, ends);
+    }
+    /// no ties left: later levels cannot change the order.
+    fn settled(&self) -> bool {
+        self.labels.windows(2).all(|w| w[0] != w[1])
     }
 }
 
@@ -218,40 +258,80 @@ fn order_levels(v: &Value, out: &mut Vec<Value>) {
 /// levels (see `order_levels`) are sorted one at a time, each within the ties the levels before it
 /// left. After each level a row keeps its first `k` positions and the whole run of ties at the
 /// `k`-th: nothing past that run can reach the first `k`, so the later levels sort only what is kept.
+/// A list's elements are levels position by position, an MSD radix sort that stops where the rows in
+/// play stop tying.
 fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
     let mut levels = Vec::new();
     order_levels(vals, &mut levels);
-    let mut idx: Vec<usize> = (0..vals.len()).collect();
-    let mut labels = row_labels(bounds);
-    let mut ends: Vec<usize> = bounds.ends().collect();
+    let mut play = InPlay { idx: (0..vals.len()).collect(), labels: row_labels(bounds), ends: bounds.ends().collect() };
     for (l, level) in levels.iter().enumerate() {
-        let col = if l == 0 { level.clone() } else { gather(level, &idx) };
-        let (perm, refined) = sort_blocks(&labels, &col);
-        let sorted: Vec<usize> = perm.iter().map(|&p| idx[p]).collect();
-        let (mut keep, mut lab, mut new_ends) = (Vec::new(), Vec::new(), Vec::with_capacity(ends.len()));
-        let mut s = 0;
-        for &e in &ends {
-            let mut stop = e.min(s + k);
-            while stop > s && stop < e && refined[stop] == refined[stop - 1] {
-                stop += 1; // the run of ties at the k-th position comes whole
-            }
-            keep.extend_from_slice(&sorted[s..stop]);
-            lab.extend_from_slice(&refined[s..stop]);
-            new_ends.push(keep.len());
-            s = e;
+        if l > 0 && play.settled() {
+            break;
         }
-        (idx, labels, ends) = (keep, lab, new_ends);
+        match level {
+            Level::Col(c) if l == 0 => play.level(c, k),
+            Level::Col(c) => play.level(&gather(c, &play.idx), k),
+            Level::Elems(list) => {
+                let Value::List(inner, elems) = list else { unreachable!("a list level is a List") };
+                // bytes go eight at a time, packed big-endian into one u64 level; rows in play tie on
+                // their length, so a short row's zero padding is compared only with its own length's.
+                // Eight bytes every tied run agrees on (a shared prefix) change nothing: no sort.
+                if let Ok(bytes) = elems.as_u8("bytes") {
+                    for j in (0..).step_by(8) {
+                        if play.settled() {
+                            break;
+                        }
+                        let mut any = false;
+                        let col: Vec<u64> = play.idx.iter().map(|&r| {
+                            let (s, e) = inner.span(r);
+                            let mut word = 0u64;
+                            for b in 0..8 {
+                                let at = s + j + b;
+                                word = (word << 8) | if at < e { any = true; bytes[at] as u64 } else { 0 };
+                            }
+                            word
+                        }).collect();
+                        if !any {
+                            break;
+                        }
+                        let splits = (1..col.len()).any(|p| play.labels[p] == play.labels[p - 1] && col[p] != col[p - 1]);
+                        if splits {
+                            play.level(&Value::u64(col), k);
+                        }
+                    }
+                    continue;
+                }
+                for j in 0.. {
+                    if play.settled() {
+                        break;
+                    }
+                    // element j of each row in play; a row without one reads zero, and sorts only
+                    // among rows of its own length, so the zero is never compared.
+                    let mut any = false;
+                    let at: Vec<usize> = play.idx.iter().map(|&r| {
+                        let (s, e) = inner.span(r);
+                        if s + j < e { any = true; s + j } else { usize::MAX }
+                    }).collect();
+                    if !any {
+                        break;
+                    }
+                    let col = crate::engine::gather_or_zero(elems, &at).expect("a list's elements have a zero");
+                    play.level(&col, k);
+                }
+            }
+        }
     }
     // every level sorted: each row's first k positions are its answer
-    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(ends.len()), 0);
-    for &e in &ends {
-        take.extend_from_slice(&idx[s..e.min(s + k)]);
+    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(play.ends.len()), 0);
+    for &e in &play.ends {
+        take.extend_from_slice(&play.idx[s..e.min(s + k)]);
         out_ends.push(take.len());
         s = e;
     }
     Value::List(out_ends.into(), Box::new(gather(vals, &take)))
 }
 
+/// The labels for a per-row sort: each element its row, or none at all when there is one row.
 fn row_labels(bounds: &Bounds) -> Vec<u64> {
     if bounds.len() == 1 { Vec::new() } else { segment_labels(bounds) }
 }
