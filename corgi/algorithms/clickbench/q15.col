@@ -1,0 +1,7 @@
+# Q15: SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10
+# sql: SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID ORDER BY c DESC, UserID LIMIT 10
+# columns: UserID
+# output: [i,u]
+let ranked = input map (u -> (u, 1u64)) group map ((u, ones) -> ((18446744073709551615u64, ones len) sub, u)) sort in
+((0u64, (ranked len, 10u64) min) range, ranked) gather
+    try match (0 (top -> top map ((d, u) -> (u, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, z))))

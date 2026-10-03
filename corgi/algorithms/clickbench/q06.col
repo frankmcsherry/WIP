@@ -1,0 +1,5 @@
+# Q6: SELECT MIN(EventDate), MAX(EventDate) FROM hits
+# sql: SELECT MIN(EventDate), MAX(EventDate) FROM hits
+# columns: EventDate
+# output: u,u
+(input fold_min, input fold_max)

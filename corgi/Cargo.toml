@@ -27,3 +27,8 @@ harness = false   # idiomatic corgi against idiomatic Rust; the rows of performa
 name = "algorithms"
 path = "benches/algorithms/main.rs"
 harness = false   # algorithms written as a user would, checked and timed against plain Rust
+
+[[bench]]
+name = "clickbench"
+path = "benches/clickbench/main.rs"
+harness = false   # ClickBench queries in corgi, checked against DuckDB's answers (see prepare.py)

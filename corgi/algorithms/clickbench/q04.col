@@ -1,0 +1,5 @@
+# Q4: SELECT COUNT(DISTINCT UserID) FROM hits
+# sql: SELECT COUNT(DISTINCT UserID) FROM hits
+# columns: UserID
+# output: u
+input dedup len
