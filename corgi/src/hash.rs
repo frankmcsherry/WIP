@@ -117,12 +117,10 @@ pub fn hash(v: &Value) -> Vec<u64> {
         Value::Unit(n) => vec![UNIT; *n],
 
         // a referenced row hashes as the list row it names (a reference has the identity of what it
-        // names), and a reference to no row as the empty list. The whole arena is hashed, even where
-        // the references name little of it.
+        // names). The whole arena is hashed, even where the references name little of it.
         Value::Ref(list, rows) => {
             let rh = hash(list);
-            let empty = hash_span(&[], (0, 0));
-            rows.iter().map(|&r| if r == crate::value::NO_ROW { empty } else { rh[r] }).collect()
+            rows.iter().map(|&r| rh[r]).collect()
         }
     }
 }

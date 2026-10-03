@@ -41,7 +41,7 @@
 //! whatever rows of it are named (to ship only the named rows, `clone` first). Two `Ref` columns
 //! of one value that share an arena each carry a copy of it, and decode to separate arenas.
 
-use crate::value::{Bounds, Prim, Tags, Value, NO_ROW};
+use crate::value::{Bounds, Prim, Tags, Value};
 
 /// Round a byte count up to a whole number of 64-bit words.
 #[inline]
@@ -96,7 +96,7 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
             word(writer, 5)?;
             word(writer, rows.len() as u64)?;
             for &r in rows.iter() {
-                word(writer, if r == NO_ROW { u64::MAX } else { r as u64 })?;
+                word(writer, r as u64)?;
             }
             write_to(list, writer)
         }
@@ -441,11 +441,14 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
             if !matches!(list, Value::List(..)) {
                 return Err(format!("corgi::bytes: a ref names rows of a list, not of {}", crate::shape::shape_of_value(&list)));
             }
+            // every arena ends in its empty row, the one a zero reference names.
             let len = list.len();
+            if len == 0 || list.rows_of("ref arena").map(|(rows, _)| rows.span(len - 1)).is_ok_and(|(s, e)| s != e) {
+                return Err("corgi::bytes: a ref's list must end in an empty row".into());
+            }
             let mut rows = Vec::with_capacity(n);
             for w in words {
                 rows.push(match w {
-                    u64::MAX => NO_ROW,
                     w if w < len as u64 => w as usize,
                     w => return Err(format!("corgi::bytes: ref row {w} outside a list of {len} rows")),
                 });

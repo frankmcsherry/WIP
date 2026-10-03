@@ -4,7 +4,7 @@
 
 use crate::shape::shape_of_value;
 use std::sync::Arc;
-use crate::value::{Bounds, Prim, Rows, Tags, Value, NO_ROW};
+use crate::value::{arena, zero_row, Bounds, Prim, Rows, Tags, Value};
 
 pub(crate) use generators::*;
 
@@ -39,7 +39,7 @@ pub(crate) fn take_ref(v: Value) -> Value {
     match v {
         list @ Value::List(..) => {
             let rows = (0..list.len()).collect();
-            Value::Ref(Arc::new(list), Arc::new(rows))
+            Value::Ref(Arc::new(arena(list)), Arc::new(rows))
         }
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(take_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(take_ref).collect()),
@@ -52,8 +52,8 @@ pub(crate) fn take_ref(v: Value) -> Value {
 /// `clone` undoes `ref`; a value without references comes back as it is.
 pub(crate) fn clone_ref(v: Value) -> Value {
     match v {
-        // the named rows, copied (a reference to no row copies as the empty list).
-        Value::Ref(list, rows) => clone_ref(gather_or_zero(&list, &rows).expect("a list has a zero")),
+        // the named rows, copied (the zero reference names the arena's empty row).
+        Value::Ref(list, rows) => clone_ref(gather(&list, &rows)),
         Value::List(bounds, vals) => Value::List(bounds, Box::new(clone_ref(*vals))),
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(clone_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(clone_ref).collect()),
@@ -310,8 +310,10 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
             }
             Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
+        // out of range: the arena's empty row, which every arena keeps for this.
         Value::Ref(list, rows) => {
-            Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows.get(i).copied().unwrap_or(NO_ROW)).collect()))
+            let zero = zero_row(list);
+            Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows.get(i).copied().unwrap_or(zero)).collect()))
         }
     })
 }
@@ -461,8 +463,8 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
         // arenas, each arena contributes only what the result still references: the rows it names,
         // copied once into one new arena, and the numbers rebased. So the result holds live rows only
         // (a fold rebuilding its state every round does not accumulate dead arenas), and a row
-        // referenced many times is still copied once. (A source naming no rows — often a fresh
-        // `Value::empty` — and a reference to no row don't count.)
+        // referenced many times is still copied once, and the new arena ends in its own empty row.
+        // (A source naming no rows — often a fresh `Value::empty` — doesn't count.)
         Value::Ref(..) => {
             let parts: Vec<(&Arc<Value>, &[usize])> = filled
                 .iter()
@@ -491,10 +493,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             // arena's rows in turn, so a row's new number is its arena's base plus its rank.
             let mut used: Vec<Vec<usize>> = vec![Vec::new(); arenas.len()];
             for i in 0..tags.len() {
-                let r = picked(i);
-                if r != NO_ROW {
-                    used[arena_of[tags[i]]].push(r);
-                }
+                used[arena_of[tags[i]]].push(picked(i));
             }
             let (mut atags, mut aoff, mut base) = (Vec::new(), Vec::new(), Vec::with_capacity(arenas.len()));
             for (a, rows) in used.iter_mut().enumerate() {
@@ -505,14 +504,12 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 aoff.extend(rows.iter().copied());
             }
             let srcs: Vec<Option<&Value>> = arenas.iter().map(|a| Some(&***a)).collect();
-            let list = Arc::new(gather_lanes(&srcs, &atags, &aoff));
+            // the new arena ends in its own empty row, as every arena does.
+            let list = Arc::new(arena(gather_lanes(&srcs, &atags, &aoff)));
             let rows = (0..tags.len())
-                .map(|i| match picked(i) {
-                    NO_ROW => NO_ROW,
-                    r => {
-                        let a = arena_of[tags[i]];
-                        base[a] + used[a].binary_search(&r).expect("a picked row is used")
-                    }
+                .map(|i| {
+                    let a = arena_of[tags[i]];
+                    base[a] + used[a].binary_search(&picked(i)).expect("a picked row is used")
                 })
                 .collect();
             Value::Ref(list, Arc::new(rows))

@@ -18,9 +18,10 @@ pub enum Value {
                                   // `None` of `Option = Sum{Unit | T}`, and JSON `null`.
     Ref(Arc<Value>, Arc<Vec<usize>>),
                                   // a column of REFERENCED LIST ROWS (`&[T]`): row `j` is row
-                                  // `rows[j]` of the shared list (always a `List`, the arena), or
-                                  // [`NO_ROW`], the empty list. `ref` takes them (O(rows), nothing
-                                  // copied), `clone` copies them out; `gather` on a Ref moves only the
+                                  // `rows[j]` of the shared list (always a `List`, the arena). The
+                                  // arena's last row is always an empty row, the ZERO a lossy gather
+                                  // names (see [`arena`]). `ref` takes them (nothing copied but row
+                                  // ends), `clone` copies them out; `gather` on a Ref moves only the
                                   // row numbers. The explicit "by reference, not by value" — a
                                   // closure's `&ctx`, a `&str` into a shared text. Only a list row is
                                   // unbounded, so only a list row is ever referenced: `ref` passes
@@ -29,9 +30,29 @@ pub enum Value {
                                   // refcount bump.)
 }
 
-/// the row number a reference holds when it names no row: it reads as the empty list (the zero a
-/// lossy gather gives a position out of range).
-pub(crate) const NO_ROW: usize = usize::MAX;
+/// a list as a reference's arena: the same values, and row ends with one more, empty row at the end.
+/// That row is the zero a reference can name (the empty list, what a lossy gather gives a position
+/// out of range), so every reference names a stored row and the arena always has one. The values
+/// are shared, never copied; only the row ends are new (pushed in place when not shared).
+pub(crate) fn arena(list: Value) -> Value {
+    match list {
+        Value::List(bounds, vals) => {
+            let total = bounds.total();
+            let mut ends = match bounds {
+                Bounds::Offsets(v) => Arc::try_unwrap(v).unwrap_or_else(|v| (*v).clone()),
+                stride @ Bounds::Stride(..) => stride.ends().collect(),
+            };
+            ends.push(total);
+            Value::List(ends.into(), vals)
+        }
+        other => unreachable!("an arena is a List, not {}", shape_of_value(&other)),
+    }
+}
+
+/// the row an arena keeps for the zero reference: its last, which is empty.
+pub(crate) fn zero_row(list: &Value) -> usize {
+    list.len() - 1
+}
 
 /// a reference column's arena, as its row ends and values.
 pub(crate) fn referenced(list: &Value) -> (&Bounds, &Value) {
@@ -61,10 +82,7 @@ impl Rows<'_> {
     pub(crate) fn span(&self, i: usize) -> (usize, usize) {
         match self {
             Rows::Part(b) => b.span(i),
-            Rows::Named(b, rows) => match rows[i] {
-                NO_ROW => (0, 0),
-                r => b.span(r),
-            },
+            Rows::Named(b, rows) => b.span(rows[i]),
         }
     }
 }
@@ -790,7 +808,7 @@ impl Value {
             Shape::List(s) => Value::List(Bounds::offsets(Vec::new()), Box::new(Value::empty(s))),
             Shape::Unit => Value::Unit(0),
             Shape::Ref(s) => match &**s {
-                Shape::List(_) => Value::Ref(Arc::new(Value::empty(s)), Arc::new(Vec::new())),
+                Shape::List(_) => Value::Ref(Arc::new(arena(Value::empty(s))), Arc::new(Vec::new())),
                 other => panic!("Value::empty: Ref<{other}> — only list rows are referenced"),
             },
         }
