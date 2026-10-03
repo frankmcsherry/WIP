@@ -21,6 +21,7 @@ column is corgi's time divided by Rust's.
 
 | program | computes | corgi | Rust | × |
 |---|---|---|---|---|
+| argsort_pairs | positions of (a, b) pairs in sorted order, by `sort_by` | 191 | 233 | 0.82 |
 | balanced_brackets | `()[]{}` balanced, by a fold with a stack | 1109 | 58.5 | 19.0 |
 | balanced_brackets_levels | the same from scans and a sort, no stack | 397 | 57.9 | 6.9 |
 | base64_encode | base64 with `=` padding | 618 | 26.7 | 23.1 |
@@ -54,9 +55,14 @@ column is corgi's time divided by Rust's.
 | run_length_encode_scan | the same as the loop | 179 | 44.5 | 4.0 |
 | run_length_encode_cut | the same, runs marked by `adjacent` and `cut` | 50.7 | 44.3 | 1.1 |
 | sessionize | sessions split at gaps over 30 | 184 | 10.9 | 16.9 |
+| sort_pairs | (a, b) pairs sorted | 346 | 214 | 1.6 |
+| sort_pairs_steps | the same a column at a time, as Datatoad sorts | 435 | 211 | 2.1 |
 | soundex | American Soundex code | 381 | 48.6 | 7.8 |
 | substring_count | overlapping occurrences of a pattern | 1027 | 64.6 | 15.9 |
 | top_k | the three largest values | 179 | 88.5 | 2.0 |
+| top_pairs | the first ten (a, b) pairs, sort then take | 392 | 199 | 2.0 |
+| top_pairs_limit | the same by `sort_limit` | 415 | 194 | 2.1 |
+| top_pairs_steps | the same a column at a time, pruned between the columns | 708 | 206 | 3.4 |
 | trigram_similarity | pg_trgm similarity of two strings | 1146 | 266 | 4.3 |
 | two_sum | does a pair sum to the target | 353 | 330 | 1.1 |
 | word_topk | the three most frequent words | 606 | 298 | 2.0 |
@@ -95,6 +101,38 @@ off. Loops fall behind. The lockstep fold is parallel only across rows, so a few
 a few elements per round: kadane is 30× here, while the same algorithm as prefix scans
 (kadane_prefix) holds at 11×. two_sum's 217× is early exit: Rust stops at the first pair it finds,
 which in a long list comes almost at once, while corgi finishes every row.
+
+### Sorting as words over `sort_by`
+
+`sort_by` is the sort's own output: stable by key, a payload carried, each run of equal keys
+numbered (dev/indexed-sort.md). With `CORGI_WORDS` set, `sort`, `dedup` and `group` are words over
+it. Measured 2026-10-03, best of three processes, the kernels against the words, on today's lists
+(ns per row) and on one row of about a million pairs (`--scale 65536`, ms):
+
+| program | kernels | words | one row, kernels | one row, words | one row, Rust |
+|---|---|---|---|---|---|
+| sort_pairs | 346 | 151 | 20.6 | 9.6 | 26.2 |
+| sort_pairs_steps | 435 | 449 | 27.7 | 27.9 | 25.7 |
+| argsort_pairs | 191 | 194 | 11.4 | 11.6 | 57.0 |
+| top_pairs | 392 | 192 | 21.1 | 9.4 | 2.3 |
+| top_pairs_limit | 415 | 408 | 11.3 | 11.1 | 2.3 |
+| top_pairs_steps | 708 | 703 | 10.7 | 10.5 | 2.3 |
+
+- One `sort_by` over the whole key is the fast form. As the `sort` word it packs a and b into one
+  word at the bits their values use, and sorts 2.2× faster than the `SortList` kernel, which packs
+  by declared width and so never packs two `u64` columns.
+- Positions cost what values cost: `argsort_pairs` carries `iota` as the payload, packed below the
+  key.
+- A column at a time, as Datatoad sorts, costs 1.3× the kernel and 3× the word: each step packs
+  and unpacks its columns, which one call over both does not.
+- For the first ten, sorting everything and taking ten is now the fastest on integer pairs, which
+  fit one word. `sort_limit`, and the same pruning written as words between the columns (equal to
+  the kernel on one long row, slower on short rows where nothing is pruned), pay where the key
+  does not fit a word: ClickBench q24–q26 sort strings, 18–26× DuckDB before and 4× after.
+
+Across the other corpus programs that use `sort`, `dedup` or `group`, the words take 1.00× the
+kernels' time: mode 0.79 and group_aggregate 0.94, where a key and its value pack into one word;
+word_topk 1.09 the slowest.
 
 ## What the optimizer could do
 
@@ -222,9 +260,10 @@ prefix, with no gather or scatter.
     - `adjacent` (where a run of equal elements starts) and `cut` (split a row at marks, moving no
       values) say this directly. Written with them: run_length_encode 183 → 51 ns/row (1.1× Rust),
       mode 499 → 350, interval_merge 358 → 289.
-    - `group` itself stays fused. As a word (sort, `adjacent`, `cut`) it is slower: group_aggregate
-      352 → 500, word_topk 617 → 738. The sort already knows where its runs start; `adjacent`
-      compares again, which costs most on list keys like words.
+    - `group` as a word over `sort_by` costs what the kernel does or less (above). Spelled by hand
+      as a structural sort, `adjacent` and `cut`, it was slower (group_aggregate 352 → 500): that
+      sorts whole pairs, not keys, and compares the keys again where the sort already numbered
+      its runs.
 13. **Read only part of the output, compute only that part (projection pushdown into kernels).**
     - `find` read only as `hi - lo` or `hi > lo` is a count or a membership test. Against sorted
       needles it is one merge. Applies to jaccard_sets, two_sum, histogram_sorted, and

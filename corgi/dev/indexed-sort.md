@@ -74,7 +74,63 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
   with a class another sub-call left alone. One pass makes labels dense at the end.
 - **Consumers.** `SortList`, `DedupList` and `GroupKey` take their output from the sort. A shape
   holding a `List` has a sorted form that is itself a gather of every element, so `dedup` and
-  `group` gather their kept rows from the source there (`cmp.rs::representatives`).
+  `group` gather their kept rows from the source there (`cmp.rs::representatives`). `SortBy` and
+  `SortLimit` are below.
+
+## `sort_by`: the sort as a primitive
+
+    sort_by : List<(K, V)> -> List<(K, V, U64)>
+
+Each row's elements in stable order by `K` alone, `V` carried along, and each element's run of
+equal keys: the refined labels, numbered densely over the column (a run never spans two rows). A
+unit `V` carries nothing, and then the sort carries no index. It is the sort's own output, and
+with `CORGI_WORDS` set `sort`, `dedup` and `group` are words over it (`frontend/ml.rs`):
+
+- `xs sort` is `sort_by` with a unit payload.
+- `xs dedup` takes a reference to each element, sorts, keeps the elements whose run number differs
+  from the one before (`adjacent`, `filter`), and clones those.
+- `kvs group` does the same for the keys, and cuts the values where a run starts (`cut`).
+
+On a leaf, `ref` and `clone` do nothing, so integer keys move as values. A list key moves as a
+reference, which is a position, and only the kept keys are copied out. Sorting a column of
+references sorts the arena's rows in place of a scratch clone of them.
+
+Two things decided the shape, measured as words against the kernels:
+
+- What moves. For leaf keys the sort moves the keys themselves; positions are extra (an index
+  through every pass, then a gather), and words over positions lost 10-40%. For list keys the
+  sort moves positions; moving the bytes is the cost, and words that moved every key lost 20-50%.
+  A reference is the switch between the two.
+- Where the runs come from. The sort has them. Comparing neighbours again costs nothing much on
+  integers, but on strings it was 40% of the sort's own time (ClickBench q05). Building marks
+  inside the sort for every caller cost 5-13% on small integer rows that never read them. Run
+  numbers cost nothing to hand out, and marks from them are an integer compare.
+
+**Packed.** When the key is a leaf or a product of leaves and the payload a leaf, and their values
+fit one `u64` together at the bits they use (each column's width is the highest bit set in it),
+each element becomes one word, the payload lowest; the words sort on the bits above the payload,
+which rides uncompared, so no index is carried and nothing is gathered. A leading key field
+already in order within each row splits the rows into blocks sorted one at a time. This is the
+adaptive packing set aside above, in a narrower form: one word or nothing, decided per call. It
+is taken up here because what `sort_by` packs has no narrow declared width to pack by: positions
+(`iota`) and run numbers are `U64` by type, and the payload is not part of the key at all.
+
+**Against Datatoad's** `sort(groups, indexs, last)`, which reads a column at `indexs`, sorts
+`(group, value, i)`, makes one item per distinct `(group, value)` and one list per group, and
+writes each position's new item number back to `groups[i]`:
+
+| Datatoad | `sort_by` |
+|---|---|
+| groups in | a leading key field (the runs of a step before), or the list's rows |
+| indexs in | the column read at the positions first (`gather`), or by reference |
+| values out | field 0, the sorted keys; one per distinct key is `adjacent` + `filter` after |
+| groups out | field 2, the run numbers, in sorted order rather than written back |
+| `last` | a unit payload |
+
+Positions move forward with the sort, as the payload, where Datatoad keeps them fixed and writes
+the groups back. `algorithms/sort_pairs*.col` and `top_pairs*.col` measure the idioms: one
+`sort_by` over the whole key, a column at a time, positions out, and the first ten with pruning
+between the columns (see `algorithms/README.md`).
 
 ## Measurements (2026-09-06, M4, ns per row)
 
