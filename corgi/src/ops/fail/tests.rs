@@ -164,12 +164,12 @@ fn one_row_nonidentity_u64_gather_returns_values_and_normalizes_bounds() {
 }
 
 #[test]
-#[should_panic(expected = "Gather: index 3 out of row 0's bounds")]
-fn raw_one_row_primitive_gather_still_panics_on_an_invalid_index() {
+fn raw_one_row_primitive_gather_reads_zero_out_of_range() {
     use crate::ops::{NumOp, Op};
     use crate::graph::OpLike;
-    let _ = NumOp::Core(Op::Gather).eval(Value::Prod(vec![
+    let got = NumOp::Core(Op::Gather).eval(Value::Prod(vec![
         Value::List(vec![2].into(), Box::new(Value::u64(vec![0, 3]))),
         Value::List(vec![2].into(), Box::new(Value::u64(vec![10, 20]))),
     ]));
+    assert_eq!(got.unwrap(), Value::List(vec![2].into(), Box::new(Value::u64(vec![10, 0]))));
 }

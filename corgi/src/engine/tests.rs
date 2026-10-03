@@ -114,3 +114,20 @@ fn gather_lanes_matches_concat_gather() {
     // empty
     check(&[], vec![u(&[]), u(&[])]);
 }
+
+/// out of range, `gather_or_zero` reads the zero of the element's shape: zero bits, the empty list,
+/// a unit, lane 0 holding its own zero; in range it reads as `gather`. A sum of no lanes has no zero.
+#[test]
+fn gather_or_zero_reads_the_shapes_zero() {
+    let leaf = Value::u64(vec![7, 8]);
+    assert_eq!(gather_or_zero(&leaf, &[1, 5]).unwrap(), Value::u64(vec![8, 0]));
+    let pair = Value::Prod(vec![Value::u64(vec![1, 2]), Value::u8(vec![3, 4])]);
+    assert_eq!(gather_or_zero(&pair, &[9, 0]).unwrap(), Value::Prod(vec![Value::u64(vec![0, 1]), Value::u8(vec![0, 3])]));
+    let lists = Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7])));
+    assert_eq!(gather_or_zero(&lists, &[1, 4, 0]).unwrap(), Value::List(vec![1, 1, 3].into(), Box::new(Value::u64(vec![7, 5, 6]))));
+    let sum = Value::sum(vec![1, 0], vec![Value::u64(vec![40]), Value::u64(vec![30])]);
+    let got = gather_or_zero(&sum, &[0, 2, 1]).unwrap();
+    assert_eq!(got, Value::sum(vec![1, 0, 0], vec![Value::u64(vec![0, 40]), Value::u64(vec![30])]));
+    let none = Value::Sum(crate::value::Tags::Const(0, 0), Vec::new());
+    assert!(gather_or_zero(&none, &[0]).is_err());
+}
