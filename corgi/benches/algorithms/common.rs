@@ -14,8 +14,21 @@ pub struct Cfg {
     /// run the program through `corgi::optimize` (peephole, iso cancellation, map fusion, cse, dce)
     /// before `Program` takes it.
     pub optimize: bool,
+    /// lists `scale` times longer and rows `scale` times fewer, for the cases over lists of numbers.
+    pub scale: usize,
     /// the case names asked for (a case runs when one is part of its name); empty, all of them.
     pub names: Vec<String>,
+}
+
+impl Cfg {
+    /// how many rows a list case generates.
+    pub fn list_rows(&self) -> usize {
+        (self.rows / self.scale).max(1)
+    }
+    /// a list length below `n` scaled: `0..n * scale`.
+    pub fn list_len(&self, rng: &mut Rng, n: u64) -> usize {
+        rng.below(n * self.scale as u64) as usize
+    }
 }
 
 /// a small xorshift generator, so inputs are the same on every run.

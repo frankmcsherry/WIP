@@ -4,7 +4,7 @@ Programs written the way a user would first write them: the direct translation o
 algorithm, not arranged for speed. Each is checked against a plain-Rust reference and timed
 against it by `benches/algorithms`:
 
-    cargo bench --bench algorithms [-- NAME ...] [--check] [--explain] [--optimize] [--rows N]
+    cargo bench --bench algorithms [-- NAME ...] [--check] [--explain] [--optimize] [--rows N] [--scale K]
     cargo bench --bench algorithms --features profile -- NAME --check --profile
 
 `--check` compares outputs on small inputs; `--explain` prints the graph `Program` runs;
@@ -64,6 +64,34 @@ faster, so those ratios flatter corgi.
 
 The optimizer passes that exist (`--optimize`: peephole, iso cancellation, map fusion, CSE) change
 almost nothing: gcd is 11% faster, and every other program is within the run-to-run spread (±4%).
+
+### Longer rows
+
+`--scale K` makes the lists of numbers K times longer in K times fewer rows, so a run handles the
+same number of values. Ratios to Rust, best of three processes:
+
+| program | today's lists | 32× longer | 1024× longer |
+|---|---|---|---|
+| group_aggregate | 1.36 | 0.84 | 0.90 |
+| histogram | 18 | 44 | 45 |
+| histogram_sorted | 9.76 | 9.46 | 8.83 |
+| jaccard_sets | 1.04 | 0.85 | 0.77 |
+| kadane | 7.82 | 6.24 | 30 |
+| kadane_prefix | 11 | 9.67 | 11 |
+| linear_regression | 27 | 19 | 66 |
+| median_percentile | 3.17 | 1.45 | 1.01 |
+| mode | 4.36 | 2.30 | 3.06 |
+| moving_average | 9.43 | 43 | 57 |
+| moving_average_prefix | 5.27 | 19 | 27 |
+| sessionize | 17 | 20 | 20 |
+| top_k | 2.02 | 1.36 | 0.95 |
+| two_sum | 1.07 | 8.58 | 217 |
+
+At long rows, sort, group and set programs match or beat Rust: radix sort and the dense search pay
+off. Loops fall behind. The lockstep fold is parallel only across rows, so a few long rows give it
+a few elements per round: kadane is 30× here, while the same algorithm as prefix scans
+(kadane_prefix) holds at 11×. two_sum's 217× is early exit: Rust stops at the first pair it finds,
+which in a long list comes almost at once, while corgi finishes every row.
 
 ## What the optimizer could do
 

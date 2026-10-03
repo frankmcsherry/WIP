@@ -17,7 +17,7 @@ fn mode(xs: &[u64]) -> u64 {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(16);
-    let rows: Vec<Vec<u64>> = (0..cfg.rows).map(|_| { let n = rng.below(33) as usize; (0..n).map(|_| rng.below(16)).collect() }).collect();
+    let rows: Vec<Vec<u64>> = (0..cfg.list_rows()).map(|_| { let n = cfg.list_len(&mut rng, 33); (0..n).map(|_| rng.below(16)).collect() }).collect();
     let input = u64_lists(&rows);
     let expected = Value::u64(rows.iter().map(|r| mode(r)).collect());
     let rust = || rows.iter().map(|r| mode(r)).collect::<Vec<_>>();

@@ -5,7 +5,8 @@
 //!   cargo bench --bench algorithms --features profile -- NAME --profile
 //!
 //! `--check` compares on small inputs without timing; `--explain` prints each program's lowered
-//! graph; `--profile` prints time per op; `--optimize` runs `corgi::optimize` on each program first.
+//! graph; `--profile` prints time per op; `--optimize` runs `corgi::optimize` on each program first;
+//! `--scale K` makes the lists of numbers K times longer in K times fewer rows.
 
 mod common;
 mod common_data;
@@ -78,13 +79,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let check = flag("--check");
-    let rows = args
-        .iter()
-        .position(|a| a == "--rows")
-        .map(|i| args[i + 1].parse().expect("--rows N"))
-        .unwrap_or(if check { 2_000 } else { 1 << 16 });
+    let arg = |f: &str| args.iter().position(|a| a == f).map(|i| args[i + 1].parse::<usize>().expect("a number"));
+    let rows = arg("--rows").unwrap_or(if check { 2_000 } else { 1 << 16 });
     let names: Vec<String> = args.iter().filter(|a| !a.starts_with("--") && a.parse::<usize>().is_err()).cloned().collect();
-    let cfg = Cfg { rows, check, explain: flag("--explain"), profile: flag("--profile"), optimize: flag("--optimize"), names: names.clone() };
+    let cfg = Cfg { rows, check, explain: flag("--explain"), profile: flag("--profile"), optimize: flag("--optimize"), scale: arg("--scale").unwrap_or(1), names: names.clone() };
     // a family runs when a name is part of its key or its key part of a name (`kadane_prefix`);
     // `run_case` then runs only the cases a name matches.
     for (family, run) in CASES {

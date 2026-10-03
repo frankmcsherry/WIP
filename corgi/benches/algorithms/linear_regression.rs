@@ -22,9 +22,9 @@ fn fit(pts: &[(f64, f64)]) -> (f64, f64) {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(13);
-    let rows: Vec<Vec<(f64, f64)>> = (0..cfg.rows)
+    let rows: Vec<Vec<(f64, f64)>> = (0..cfg.list_rows())
         .map(|_| {
-            let n = rng.below(33) as usize;
+            let n = cfg.list_len(&mut rng, 33);
             // x often repeats, so some rows have no spread; y is noisy around a line.
             (0..n).map(|_| { let x = rng.below(8) as f64; (x, 3.0 * x + rng.below(20) as f64) }).collect()
         })

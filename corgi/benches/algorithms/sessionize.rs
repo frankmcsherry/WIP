@@ -18,9 +18,9 @@ fn reference(ts: &[u64]) -> (u64, u64) {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(12);
-    let rows: Vec<Vec<u64>> = (0..cfg.rows)
+    let rows: Vec<Vec<u64>> = (0..cfg.list_rows())
         .map(|_| {
-            let n = rng.below(33) as usize;
+            let n = cfg.list_len(&mut rng, 33);
             let mut t = rng.below(100);
             (0..n).map(|_| { t += rng.below(50); t }).collect()
         })

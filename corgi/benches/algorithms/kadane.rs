@@ -15,7 +15,7 @@ fn kadane(xs: &[i64]) -> i64 {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(14);
-    let rows: Vec<Vec<i64>> = (0..cfg.rows).map(|_| { let n = rng.below(33) as usize; (0..n).map(|_| rng.below(201) as i64 - 100).collect() }).collect();
+    let rows: Vec<Vec<i64>> = (0..cfg.list_rows()).map(|_| { let n = cfg.list_len(&mut rng, 33); (0..n).map(|_| rng.below(201) as i64 - 100).collect() }).collect();
     let input = u64_lists(&rows.iter().map(|r| r.iter().map(|&x| enc_i64(x)).collect::<Vec<_>>()).collect::<Vec<_>>());
     let expected = Value::u64(rows.iter().map(|r| enc_i64(kadane(r))).collect());
     let rust = || rows.iter().map(|r| kadane(r)).collect::<Vec<_>>();

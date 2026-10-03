@@ -15,7 +15,7 @@ fn median_p90(xs: &[u64]) -> (u64, u64) {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(11);
-    let rows: Vec<Vec<u64>> = (0..cfg.rows).map(|_| { let n = rng.below(33) as usize; (0..n).map(|_| rng.below(1000)).collect() }).collect();
+    let rows: Vec<Vec<u64>> = (0..cfg.list_rows()).map(|_| { let n = cfg.list_len(&mut rng, 33); (0..n).map(|_| rng.below(1000)).collect() }).collect();
     let input = u64_lists(&rows);
     let out: Vec<(u64, u64)> = rows.iter().map(|r| median_p90(r)).collect();
     let expected = Value::Prod(vec![Value::u64(out.iter().map(|o| o.0).collect()), Value::u64(out.iter().map(|o| o.1).collect())]);

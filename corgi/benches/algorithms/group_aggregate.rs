@@ -17,8 +17,8 @@ fn reference(kvs: &[[u64; 2]]) -> Vec<[u64; 4]> {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(18);
-    let rows: Vec<Vec<[u64; 2]>> = (0..cfg.rows)
-        .map(|_| (0..rng.below(33)).map(|_| [rng.below(8), rng.below(1000)]).collect())
+    let rows: Vec<Vec<[u64; 2]>> = (0..cfg.list_rows())
+        .map(|_| (0..cfg.list_len(&mut rng, 33)).map(|_| [rng.below(8), rng.below(1000)]).collect())
         .collect();
     let input = tuple_lists(&rows);
     let expected = tuple_lists(&rows.iter().map(|r| reference(r)).collect::<Vec<_>>());

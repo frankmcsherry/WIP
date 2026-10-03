@@ -8,7 +8,7 @@ fn window_sums(xs: &[u64]) -> Vec<u64> {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(12);
-    let rows: Vec<Vec<u64>> = (0..cfg.rows).map(|_| { let n = rng.below(33) as usize; (0..n).map(|_| rng.below(1000)).collect() }).collect();
+    let rows: Vec<Vec<u64>> = (0..cfg.list_rows()).map(|_| { let n = cfg.list_len(&mut rng, 33); (0..n).map(|_| rng.below(1000)).collect() }).collect();
     let input = u64_lists(&rows);
     let expected = u64_lists(&rows.iter().map(|r| window_sums(r)).collect::<Vec<_>>());
     let rust = || rows.iter().map(|r| window_sums(r)).collect::<Vec<_>>();

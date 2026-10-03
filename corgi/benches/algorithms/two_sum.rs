@@ -17,8 +17,8 @@ fn reference(xs: &[u64], t: u64) -> u64 {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(16);
-    let rows: Vec<(Vec<u64>, u64)> = (0..cfg.rows)
-        .map(|_| ((0..rng.below(33)).map(|_| rng.below(500)).collect(), rng.below(1000)))
+    let rows: Vec<(Vec<u64>, u64)> = (0..cfg.list_rows())
+        .map(|_| ((0..cfg.list_len(&mut rng, 33)).map(|_| rng.below(500)).collect(), rng.below(1000)))
         .collect();
     let input = Value::Prod(vec![
         u64_lists(&rows.iter().map(|r| &r.0[..]).collect::<Vec<_>>()),
