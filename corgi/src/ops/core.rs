@@ -36,9 +36,9 @@ pub(crate) fn scatter(mut acc: Value, active: &[usize], new: Value) -> Value {
 }
 
 /// every row occupies a constant byte slot — true for a leaf and a product of fixed-width fields,
-/// false once a `List` or `Sum` (variable-size rows) appears. A `Ref` row is a constant-size span,
-/// so it counts when `acc` and `new` reference ONE arena (a span of another arena can't be written
-/// into `acc`'s). Checked WHOLE before any mutation, so the in-place pass below can't half-write a
+/// false once a `List` or `Sum` (variable-size rows) appears. A `Ref` row is a row number, so it
+/// counts when `acc` and `new` reference ONE arena (a row of another arena can't be named in
+/// `acc`'s). Checked WHOLE before any mutation, so the in-place pass below can't half-write a
 /// value that turns out to be variable-width deeper down.
 fn fixed_width(acc: &Value, new: &Value) -> bool {
     match (acc, new) {
@@ -50,7 +50,7 @@ fn fixed_width(acc: &Value, new: &Value) -> bool {
 }
 
 /// in-place scatter for a fixed-width `acc` (precondition: `fixed_width(acc, new)`), recursing
-/// products to the leaves (and spans) where the actual write happens.
+/// products to the leaves (and row numbers) where the actual write happens.
 fn scatter_fixed(acc: &mut Value, active: &[usize], new: &Value) {
     match (acc, new) {
         (Value::Prim(d), Value::Prim(s)) => d.scatter_into(active, s),
@@ -136,7 +136,7 @@ pub enum Op<L> {
                     // (né Broadcast); the list-side closure capture. Copies X per element unless X
                     // is referenced — then it is one reference per element (a closure's `&ctx`).
     // REF — referenced list rows. The explicit by-reference/by-value pair: everything that moves
-    // rows (`gather`, hence the capture family, `Lit`, and the merges) moves only spans on a Ref, and
+    // rows (`gather`, hence the capture family, `Lit`, and the merges) moves only row numbers on a Ref, and
     // nothing copies referenced rows except `Clone`. The readers `Gather`/`Find`/`Len`
     // accept a referenced list haystack; every other op on a Ref is the shape error "clone first".
     Ref,            // T -> T'           every top-level List<X> in T becomes Ref<List<X>> (through

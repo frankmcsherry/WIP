@@ -197,7 +197,7 @@ mod compare {
             // list = length-first: unequal-length pairs decided by length. Equal-length pairs expand
             // to their element index pairs, recurse ONCE (no per-position loop — `sort` needs that
             // refinement, `cmp` doesn't), then read each pair's first difference off its segment.
-            // A referenced list compares as the rows it names, read through its spans.
+            // A referenced list compares as the rows it names, read through its arena.
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
