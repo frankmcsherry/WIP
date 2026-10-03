@@ -1,0 +1,13 @@
+# Run-length encoding, as the loop a programmer writes first: walk the bytes keeping the current
+# run (byte, length); a byte that differs from the run's emits the finished run. The last run is
+# emitted after the walk. Input `List<U8>`. Output `List<(U8, U64)>`.
+let s = input in
+let walk = ((0u8, 0u64), s) foldscan (((b, k), c) ->
+    let differs = ((c, b) ne, (k, 0u64) gt) mul in
+    # the state after this byte, and the run it finished (if `differs`).
+    ((((c, b) ne, c, b) select, ((c, b) eq, (k, 1u64) add, 1u64) select), (differs, (b, k)))) in
+let ((b, k), emitted) = walk in
+let finished = emitted filter in
+# The run still open at the end, if the string was not empty.
+let last = (((k, 0u64) gt, (b, k)) enlist) filter in
+(finished, last) append

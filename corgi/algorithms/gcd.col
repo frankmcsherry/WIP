@@ -1,0 +1,8 @@
+# Greatest common divisor of two `U64` by Euclid's algorithm. Input `(a, b)`. Output a `U64`
+# (gcd(0, 0) = 0). There is no loop that runs until done, so the steps are a fold over a fixed
+# count: Euclid needs at most 93 steps for 64-bit values (Lamé), and a finished pair stays put.
+let (a, b) = input in
+let (g, _) = ((a, b), 93u64 iota) fold (((a, b), _) ->
+    let done = (b, 0u64) eq in
+    ((done, a, b) select, (done, 0u64, (a, b) rem) select)) in
+g

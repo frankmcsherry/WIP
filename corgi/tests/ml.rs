@@ -268,7 +268,7 @@ fn jaro_winkler_examples_match_the_reference() {
     };
     let input = Value::Prod(vec![column(pairs.iter().map(|p| &p.0).collect()), column(pairs.iter().map(|p| &p.1).collect())]);
     let decode = |u: u64| f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u });
-    for src in [include_str!("../examples/jaro_winkler/direct.col"), include_str!("../examples/jaro_winkler/by_byte.col")] {
+    for src in [include_str!("../algorithms/jaro_winkler_direct.col"), include_str!("../algorithms/jaro_winkler_by_byte.col")] {
         let p = Program::compile_ml(src).expect("parse error");
         let out = p.run(input.clone()).into_u64("similarity").unwrap();
         for ((a, b), u) in pairs.iter().zip(out) {

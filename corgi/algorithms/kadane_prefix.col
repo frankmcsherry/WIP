@@ -1,0 +1,13 @@
+# `kadane` by prefix sums, with no fold: the best run ending at i is P[i] minus the smallest of
+# P[0] .. P[i - 1], where P[0] = 0 and P[i] = x[0] + .. + x[i - 1]. The rewrite of the max-plus
+# recurrence cur = max(x, cur + x) into scans: a prefix sum, a running minimum, a difference and a
+# maximum. Input and output as `kadane`.
+let xs = input in
+# `signed` turns the order-preserving encoding into two's-complement bits, which wrapping add sums
+# correctly, and back.
+let p = xs map (x -> x signed) scan_add map (s -> s signed) in
+# The smallest prefix before each position: P[0] = 0, then the running minimum, cut to n entries.
+let before = ((xs len) iota, (0i64 enlist, p) append scan_min) gather in
+let best = (p, before) zip map ((hi, lo) -> (hi, lo) sub_i64) fold_max
+    try match (0 (b -> b), 1 (_ -> 0i64)) in
+((xs len, 0u64) eq, 0i64, best) select

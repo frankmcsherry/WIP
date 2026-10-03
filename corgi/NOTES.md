@@ -131,7 +131,9 @@ tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · te
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
            an equivalence via `(A, B) eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
-examples/ (tour.rs, jaro_winkler/)   benches/ (eval, gaps, idioms)   dev/ (design notes)
+algorithms/  *.col — algorithms written plainly; benches/algorithms checks and times them against
+           Rust, and algorithms/README.md lists the rewrites they call for.
+examples/ (tour.rs)   benches/ (eval, gaps, idioms, algorithms)   dev/ (design notes)
 ```
 
 ## Structural completeness — the functor commutation table

@@ -1,0 +1,3 @@
+# GROUP BY key: count, sum and max of the values under each key. Input a `List<(key, value)>` per
+# row. Output, per distinct key in increasing order, `(key, count, sum, max)`.
+input group map ((k, vs) -> (k, vs len, vs fold_add, vs fold_max))

@@ -1,0 +1,13 @@
+# The Luhn check (credit-card numbers): from the rightmost digit leftwards, double every second
+# digit, subtracting 9 when that exceeds 9, and sum; the number is valid when the sum is a multiple
+# of ten. Input `List<U8>` of ASCII digits. Output `U64`: 1 if valid, 0 if not (an empty string is
+# not valid).
+let ds = input map (c -> ((c, 48u8) sub_u8) cast 64) in
+let n = ds len in
+let sum = (n, ((ds len) iota, ds) zip) cap_list map ((n, (i, d)) ->
+    # the digit's position counted from the right; odd positions are doubled.
+    let second = ((((n, i) sub, 1u64) sub) and 1, 1u64) eq in
+    let twice = (d, 2u64) mul in
+    let twice = ((twice, 9u64) gt, (twice, 9u64) sub, twice) select in
+    (second, twice, d) select) fold_add in
+(((sum, 10u64) rem, 0u64) eq, (n, 0u64) gt) mul try match (0 (v -> v), 1 (_ -> 0u64))

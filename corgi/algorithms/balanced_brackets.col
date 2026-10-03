@@ -1,0 +1,22 @@
+# Are the brackets of a byte string balanced? Three kinds, () [] {}, nest; other bytes are ignored.
+# Input a `List<U8>` per row. Output 1 if balanced, else 0.
+#
+# The textbook stack machine: walk the bytes keeping a stack of open brackets. An opener is
+# pushed; a closer must match the opener on top, which it pops; anything else leaves the stack
+# alone. Balanced when no closer failed and the stack ends empty.
+let (ok, stack) = ((1u64, ""), input) fold (((ok, stack), c) ->
+    let open = (((c, 40u8) eq, (c, 91u8) eq) max, (c, 123u8) eq) max in
+    let close = (((c, 41u8) eq, (c, 93u8) eq) max, (c, 125u8) eq) max in
+    # the opener a closer needs: ( for ), [ for ], { for }
+    let want = ((c, 41u8) eq, 40u8, ((c, 93u8) eq, 91u8, 123u8) select) select in
+    let n = stack len in
+    let top = (((n, 1u64) max, 1u64) sub, stack) get try match (0 (t -> t), 1 (_ -> 0u8)) in
+    let matched = ((n, 0u64) gt, (top, want) eq) mul in
+    # 0: push, 1: pop, 2: leave the stack as it is
+    let action = (open, 0u64, (close, 1u64, 2u64) select) select in
+    let stack2 = ((c, stack), action) branch 3 match (
+        0 ((c, s) -> (s, c enlist) append),
+        1 ((_, s) -> ((0u64, ((s len, 1u64) max, 1u64) sub) range, s) gather try match (0 (t -> t), 1 (_ -> ""))),
+        2 ((_, s) -> s)) in
+    ((ok, (close, matched, 1u64) select) mul, stack2)) in
+(ok, (stack len, 0u64) eq) mul

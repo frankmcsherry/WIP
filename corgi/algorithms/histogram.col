@@ -1,0 +1,6 @@
+# Counts of values in 0..1000 over 8 equal-width buckets (125 wide). Input a `List<U64>` per row.
+# Output a `List<U64>` of 8 counts per row.
+#
+# Bucket each value, then for each of the 8 buckets count the values that fell in it.
+let buckets = input map (v -> (v, 125u64) div_u64) in
+(buckets, 8u64 iota) cap_list map ((bs, k) -> (k, bs) cap_list map ((k, b) -> (b, k) eq) fold_add)

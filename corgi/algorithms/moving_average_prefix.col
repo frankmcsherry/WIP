@@ -1,0 +1,10 @@
+# `moving_average` by prefix sums: one pass for the running total, then each window is the
+# difference of two prefix sums four apart. The rewrite of a sliding-window sum (an invertible
+# monoid) that turns 4 reads per window into 2. Input a `List<U64>`; output as `moving_average`.
+let xs = input in
+let starts = (((xs len, 3u64) max, 3u64) sub) iota in
+# pre[i] = xs[0] + .. + xs[i - 1], so pre has n + 1 entries.
+let pre = (0u64 enlist, xs scan_add) append in
+let hi = (starts map (i -> (i, 4u64) add), pre) gather in
+let lo = (starts, pre) gather in
+(hi, lo) zip map ((h, l) -> (h, l) sub) try match (0 (sums -> sums), 1 (_ -> 0u64 iota))
