@@ -275,9 +275,11 @@ separate syntactic query — total iff every fallible column meets a `try` befor
 refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
 
 The raw kernels (`Op::Gather`, `Chunk`, `Zip`) stay in the enum for a host holding a bounds proof
-(DDIR); they are not on the surface. `Chunk` and `Zip` panic on bad input; the raw `Gather` is total
-but lossy: a position outside its row reads the zero of the element's shape (zero bits, the empty
-list, a sum's lane 0), so a sum must have at least one lane. `Branch` is total (a tag of n-1 or
+(DDIR); they are not on the surface. They are total but lossy, so nothing in corgi panics on data:
+the raw `Gather` reads the zero of the element's shape for a position outside its row (zero bits, the
+empty list, a sum's lane 0, so a sum must have at least one lane); the raw `Zip` keeps each row's
+shortest column; the raw `Chunk` drops a row's remainder. Their `Try` forms, the surface ops, report
+those rows as errors instead. `Branch` is total (a tag of n-1 or
 more goes to the last lane) and is the surface `branch`. `gather_try` is distinct: the per-ELEMENT
 `List<Sum{Found | Missing}>`, a value the program handles itself, not a per-row effect. Every "maybe"
 result has this one shape: Ok first, the failures only counted (`Fail<T>`, `gather_try`, `parse_u64`).
