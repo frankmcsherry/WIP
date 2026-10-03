@@ -201,6 +201,10 @@ The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Th
     - When the body only reads from the captured list (`get`, `gather`, `len`), capture a
       reference instead. `ref` already does this when written by hand, so this is the automatic
       closure-capture pass. Or decorrelate: move the body's reads to one gather at the outer level.
+    - Measured by hand: substring_count_ref captures the text with `ref` and runs 1006 → 398
+      ns/row; soundex_ref captures its table with `ref` and runs 363 → 252. What remains of the
+      capture is a 16-byte span per element (substring_count_ref's CapList is still 104 ns/row),
+      and a literal is still filled once per row before it can be referenced.
 
 The machinery itself is a runtime matter rather than a rewrite. Every round gathers the active
 rows' state and scatters it back. Running rows in order of length would make the active rows a

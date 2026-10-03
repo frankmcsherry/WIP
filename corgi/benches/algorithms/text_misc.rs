@@ -38,7 +38,8 @@ pub fn run(cfg: &Cfg) {
     ]);
     let expected = Value::u64(pairs.iter().map(|(t, p)| substring_count(t, p)).collect());
     let rust = || pairs.iter().map(|(t, p)| substring_count(t, p)).collect::<Vec<u64>>();
-    run_case(cfg, "substring_count", "text 0-40 bytes, pattern 0-3, 3 letters", include_str!("../../algorithms/substring_count.col"), input, expected, rust);
+    run_case(cfg, "substring_count", "text 0-40 bytes, pattern 0-3, 3 letters", include_str!("../../algorithms/substring_count.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "substring_count_ref", "text 0-40 bytes, pattern 0-3, 3 letters", include_str!("../../algorithms/substring_count_ref.col"), input, expected, rust);
 
     // itoa: u64s of every magnitude.
     let xs: Vec<u64> = (0..cfg.rows).map(|_| rng.next() >> rng.below(64)).collect();

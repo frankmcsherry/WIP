@@ -38,5 +38,6 @@ pub fn run(cfg: &Cfg) {
     let input = bytes_col(&words);
     let expected = bytes_col(&words.iter().map(|w| reference(w)).collect::<Vec<_>>());
     let rust = || words.iter().map(|w| reference(w)).collect::<Vec<_>>();
-    run_case(cfg, "soundex", "words of 0-12 letters", include_str!("../../algorithms/soundex.col"), input, expected, rust);
+    run_case(cfg, "soundex", "words of 0-12 letters", include_str!("../../algorithms/soundex.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "soundex_ref", "words of 0-12 letters", include_str!("../../algorithms/soundex_ref.col"), input, expected, rust);
 }
