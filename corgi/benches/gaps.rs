@@ -322,7 +322,7 @@ fn family_b(n: usize, reps: u32) {
     let t = 0x8000_0000u64; // ~half pass the threshold (32-bit-masked inputs)
 
     // B1 filter — keep values > T. corgi: mask pass + `filter_mask` scalar gather. rust: predicated push.
-    let g = compile("let xs = input in (xs, xs map (e -> (e, 2147483648u64) gt)) filter");
+    let g = compile("input map (e -> ((e, 2147483648u64) gt, e)) filter");
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);

@@ -166,8 +166,9 @@ pub enum Op<L> {
     Cast(u32),      // leaf -> leaf  re-width to N bits (low bytes / zero-pad), kind-blind
     Hash,           // X -> U64   stable content hash of each row: structural, kind-blind, one pass
                     // (the boundary id function — see [`crate::hash`]). TOTAL over any shape.
-    Filter,         // (List<X>, List<U64-mask>) -> List<X>  keep mask-nonzero elements in one
-                    // pass (the kernel expansion is zip; map(branch); unweave; field — see the law)
+    Filter,         // List<(U64-mask, X)> -> List<X>  keep the elements whose mask is nonzero, in one
+                    // pass. Total by construction: a list of pairs can't disagree in length. (The
+                    // kernel expansion is map(branch); unweave; field — see the law.)
     // point access — fetch a haystack element by index. The atom is the SCALAR get (one O(1)
     // lookup per row; `TryGet` below is its total form), `Gather` is its vectorization (the index
     // arrives as a list), and `head` is sugar for `get 0` (an empty row errs, so a TOTAL head needs
@@ -208,7 +209,6 @@ pub enum Op<L> {
     TryGet,         // (idx:U64, haystack:List<T>) -> Fail<T>
     TryGather,      // (idx:List<U64>, haystack:List<T>) -> Fail<List<T>>   per row all-or-nothing
     TrySlices,      // (List<(lo,hi)>, List<T>) -> Fail<List<List<T>>>      every range in bounds
-    TryFilter,      // (List<X>, List<U64>) -> Fail<List<X>>                data/mask lengths agree
     TryChunk(usize),// List<X> -> Fail<List<List<X>>>                       row length divides by k
     TryZip,         // (List<X>, List<Y>) -> Fail<List<(X,Y)>>              inner lengths agree
     Lift,           // X -> Fail<X>                                         every row Ok
@@ -399,11 +399,9 @@ impl<L: OpLike> Op<L> {
             Op::Hash => Value::u64(crate::hash::hash(&input)),
 
             Op::Filter => {
-                let (data, mask) = input.into_pair("Filter")?;
-                let (bounds, vals) = data.into_list("Filter data")?;
-                let (mb, mv) = mask.into_list("Filter mask")?;
-                assert_eq!(bounds, mb, "Filter: data/mask bounds differ");
-                let m = mv.as_u64("Filter mask")?;
+                let (bounds, pairs) = input.into_list("Filter")?;
+                let (mask, vals) = pairs.into_pair("Filter element")?;
+                let m = mask.as_u64("Filter mask")?;
                 // leaves (and products of them) compress in one pass each; the new row ends are a
                 // count of each row's kept elements. Lists, sums and references build positions
                 // and gather them.
@@ -900,7 +898,7 @@ impl<L: OpLike> Op<L> {
             Op::Try => input,
 
             // the failure family was dispatched to `ops::fail::eval` above.
-            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_)
+            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryChunk(_)
             | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::eval handles the failure family"),
 
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the

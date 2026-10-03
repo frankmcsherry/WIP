@@ -23,7 +23,7 @@ let per = (d, ab) cap_list map ((d, ((c, al), bl)) ->
         let hit = (q, u) lt in
         ((q, hit), ((q, (q, hit) add), hit)))) .1 in
     let mb = (sc map ((r, _) -> r), bl) slices try match (0 (ok -> ok flatten .1), 1 (_ -> 0u64 iota)) in
-    let ma = (al, sc map ((_, h) -> h)) filter try match (0 (ok -> ok), 1 (_ -> 0u64 iota)) in
+    let ma = (sc map ((_, h) -> h), al) zip filter try match (0 (ok -> ok), 1 (_ -> 0u64 iota)) in
     ((c, ma) cap_list map ((c, a) -> (a, c)), (c, mb) cap_list map ((c, b) -> (b, c)), sc map ((_, h) -> h) fold_add)) in
 let m = per map ((_, _, n) -> n) fold_add in
 # Transpositions: the matched bytes of each string in position order, compared rank by rank.
