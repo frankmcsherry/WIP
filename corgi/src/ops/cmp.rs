@@ -54,6 +54,8 @@ pub enum CmpOp {
     MinImm(u32, u64), // X -> X   lane-wise min with a constant (stored bits at width w), in place
     MaxImm(u32, u64), // X -> X   lane-wise max with a constant
     SortList,  // List<X> -> List<X>   structural order
+    SortLimit(usize), // List<X> -> List<X>   the first k of each row in structural order (`sort`,
+               // then take k), sorting only what can reach the first k: see `sort_limit`
     DedupList, // List<X> -> List<X>   distinct, per row (sorted)
     GroupKey,  // List<(K,V)> -> List<(K, List<V>)>   group by key, per row (sorted)
     Find,      // (needle:List<X>, haystack:List<X>) -> List<(lo,hi)>  equal_range / needle elem
@@ -103,6 +105,11 @@ impl CmpOp {
                     return Err(format!("min/max with a U{w} constant expects U{w}, got U{}", p.bits()));
                 }
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
+            }
+
+            CmpOp::SortLimit(k) => {
+                let (bounds, vals) = input.into_list("SortLimit")?;
+                sort_limit(&bounds, &vals, *k)
             }
 
             // the sort produces the sorted column itself; nothing is gathered afterwards.
@@ -190,6 +197,61 @@ impl CmpOp {
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
+/// the columns whose lexicographic order is the structural order of `v`'s rows, most significant
+/// first: a product's fields' in turn, a list's length and then the list (lists order shorter
+/// first), anything else itself.
+fn order_levels(v: &Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
+        Value::List(inner, _) => {
+            out.push(Value::u64((0..inner.len()).map(|i| {
+                let (s, e) = inner.span(i);
+                (e - s) as u64
+            }).collect()));
+            out.push(v.clone());
+        }
+        other => out.push(other.clone()),
+    }
+}
+
+/// `sort` then the first `k` of each row, sorting only what can still reach the first `k`. The order's
+/// levels (see `order_levels`) are sorted one at a time, each within the ties the levels before it
+/// left. After each level a row keeps its first `k` positions and the whole run of ties at the
+/// `k`-th: nothing past that run can reach the first `k`, so the later levels sort only what is kept.
+fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
+    let mut levels = Vec::new();
+    order_levels(vals, &mut levels);
+    let mut idx: Vec<usize> = (0..vals.len()).collect();
+    let mut labels = row_labels(bounds);
+    let mut ends: Vec<usize> = bounds.ends().collect();
+    for (l, level) in levels.iter().enumerate() {
+        let col = if l == 0 { level.clone() } else { gather(level, &idx) };
+        let (perm, refined) = sort_blocks(&labels, &col);
+        let sorted: Vec<usize> = perm.iter().map(|&p| idx[p]).collect();
+        let (mut keep, mut lab, mut new_ends) = (Vec::new(), Vec::new(), Vec::with_capacity(ends.len()));
+        let mut s = 0;
+        for &e in &ends {
+            let mut stop = e.min(s + k);
+            while stop > s && stop < e && refined[stop] == refined[stop - 1] {
+                stop += 1; // the run of ties at the k-th position comes whole
+            }
+            keep.extend_from_slice(&sorted[s..stop]);
+            lab.extend_from_slice(&refined[s..stop]);
+            new_ends.push(keep.len());
+            s = e;
+        }
+        (idx, labels, ends) = (keep, lab, new_ends);
+    }
+    // every level sorted: each row's first k positions are its answer
+    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(ends.len()), 0);
+    for &e in &ends {
+        take.extend_from_slice(&idx[s..e.min(s + k)]);
+        out_ends.push(take.len());
+        s = e;
+    }
+    Value::List(out_ends.into(), Box::new(gather(vals, &take)))
+}
+
 fn row_labels(bounds: &Bounds) -> Vec<u64> {
     if bounds.len() == 1 { Vec::new() } else { segment_labels(bounds) }
 }

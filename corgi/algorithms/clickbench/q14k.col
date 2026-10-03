@@ -1,0 +1,11 @@
+# Q14: SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10
+# The variant with `sort_limit`: sorting only what can reach the limit.
+# sql: SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase
+# sql:   ORDER BY c DESC, SearchEngineID, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# columns: SearchEngineID SearchPhrase
+# output: [u,s,u]
+let (engine, phrase) = input in
+let ranked = (engine, phrase) zip map ((e, s) -> ((s len, 0u64) gt, ((e, s), 1u64))) filter group
+    map (((e, s), ones) -> ((18446744073709551615u64, ones len) sub, e, s)) sort_limit 10 in
+ranked map ((d, e, s) -> (e, s, (18446744073709551615u64, d) sub))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, "", z))))
