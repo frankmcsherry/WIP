@@ -27,5 +27,6 @@ pub fn run(cfg: &Cfg) {
     let input = tuple_lists(&rows);
     let expected = tuple_lists(&rows.iter().map(|r| reference(r)).collect::<Vec<_>>());
     let rust = || rows.iter().map(|r| reference(r)).collect::<Vec<_>>();
-    run_case(cfg, "interval_merge", "0-16 intervals of length 1-20 in 0..220", include_str!("../../algorithms/interval_merge.col"), input, expected, rust);
+    run_case(cfg, "interval_merge", "0-16 intervals of length 1-20 in 0..220", include_str!("../../algorithms/interval_merge.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "interval_merge_cut", "0-16 intervals of length 1-20 in 0..220", include_str!("../../algorithms/interval_merge_cut.col"), input, expected, rust);
 }

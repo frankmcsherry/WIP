@@ -1,0 +1,10 @@
+# word_topk counting words by sorting them and cutting the runs of equal words, instead of grouping.
+# Input `List<U8>`, words separated by single spaces. Output `List<(List<U8>, U64)>`.
+let words = input split " " map (w -> (((w len, 0u64) gt), w)) filter in
+let sorted = words sort in
+let starts = sorted adjacent in
+let counts = ((starts, sorted) zip filter, (starts, sorted) zip cut map (r -> r len)) zip in
+# most frequent first: sort on (MAX - count, word).
+let ranked = counts map ((w, c) -> ((18446744073709551615u64, c) sub, w, c)) sort in
+let k = ((ranked len, 3u64) min) in
+((0u64, k) range, ranked) gather try match (0 (top -> top map ((_, w, c) -> (w, c))), 1 (_ -> 0u64 iota map (z -> ("", z))))
