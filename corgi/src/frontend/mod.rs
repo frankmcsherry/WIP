@@ -110,8 +110,10 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
         "hash" => Op::Hash.into(), // X -> U64  stable structural content hash (the boundary id fn)
-        // relational compares: two equal-width leaf columns -> 0/1 mask. A constant on either side
-        // becomes an immediate (`optimize::immediates`), so `(x, 2u64) gt` builds no column of 2s.
+        // relational compares: two columns of one shape -> 0/1 mask, in structural order (leaves by
+        // lane; lists, products and sums as `sort` orders them, so `(s, "MAIL") eq` compares
+        // strings). A leaf constant on either side becomes an immediate (`optimize::immediates`),
+        // so `(x, 2u64) gt` builds no column of 2s; a list constant is still filled per row.
         "eq" => CmpOp::Rel(Pred::Eq).into(),
         "ne" => CmpOp::Rel(Pred::Ne).into(),
         "lt" => CmpOp::Rel(Pred::Lt).into(),

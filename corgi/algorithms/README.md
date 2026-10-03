@@ -247,8 +247,9 @@ item in NOTES.md, an execution strategy rather than a graph rewrite.
   - A default costs four ops: `get try match (0 (v -> v), 1 (_ -> d))`. `get_or d` would be one.
   - A typed empty list for a fallback arm is spelled `0u64 iota map (z -> …)`.
 - **Missing list words:** lag or shift, exclusive scan, take, drop, slice, split-where-mask,
-  pairwise, descending sort or top-k, tuple to list, and equality of lists (query_param compares
-  `hash`es).
+  pairwise, descending sort or top-k, and tuple to list.
+- **`eq` on lists was thought missing.** The comments described `eq` as comparing leaves, though it
+  compares any shape structurally. query_param first compared `hash`es for that reason.
 - **Arithmetic:**
   - No unsuffixed `div` (though `rem` exists), `shl`, `or`, shift by a variable amount, or float and
     signed reductions and scans.

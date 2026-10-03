@@ -6,5 +6,4 @@ let (q, key) = input in
 let pairs = q split "&" map (p ->
     let parts = p split "=" in
     ((0u64, parts) get, (1u64, parts) get try match (0 (v -> v), 1 (_ -> "")))) in
-# Strings don't compare with `eq` (it takes numbers), so compare their hashes.
-(key hash, pairs) cap_list map ((h, (k, v)) -> ((k hash, h) eq, v)) filter head try
+(key, pairs) cap_list map ((key, (k, v)) -> ((k, key) eq, v)) filter head try

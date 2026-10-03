@@ -12,7 +12,7 @@ let orders = ((okey, ocust) zip, odate) zip
     map (((k, c), dt) -> (((dt, 8674u64) ge, (dt, 8766u64) lt) mul, (k, c))) filter sort in
 # Returned line items, each looked up in those orders: revenue per customer.
 let lines = ((lkey, lrf) zip, (price, disc) zip) zip
-    map (((k, f), (p, d)) -> ((f hash, "R" hash) eq, (k, (p, (100u64, d) sub) mul))) filter in
+    map (((k, f), (p, d)) -> ((f, "R") eq, (k, (p, (100u64, d) sub) mul))) filter in
 let at = (lines map ((k, _) -> k), orders map ((k, _) -> k)) find in
 let matched = (at, lines) zip map (((lo, hi), (_, r)) -> ((hi, lo) gt, (lo, r))) filter in
 let custs = (matched map ((lo, _) -> lo), orders) gather map ((_, c) -> c) in

@@ -10,7 +10,7 @@
 # output: [s,u]
 let (rkey, rname, nkey, nname, nreg, skey, snat, ckey, cnat, okey, ocust, odate, lkey, lsupp, price, disc) = input in
 # The ASIA region, and its nations (key, name) sorted by key.
-let asia = (rkey, rname) zip map ((k, s) -> ((s hash, "ASIA" hash) eq, k)) filter sort in
+let asia = (rkey, rname) zip map ((k, s) -> ((s, "ASIA") eq, k)) filter sort in
 let nations = ((nkey, nreg) zip, nname) zip map (((k, r), name) -> (r, (k, name))) in
 let nfound = (nations map ((r, _) -> r), asia) find in
 let anations = (nfound, nations) zip map (((lo, hi), (_, n)) -> ((hi, lo) gt, n)) filter sort in

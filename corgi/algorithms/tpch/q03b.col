@@ -7,7 +7,7 @@
 # columns: c_custkey c_mktsegment o_orderkey o_custkey o_orderdate o_shippriority l_orderkey l_shipdate l_extendedprice l_discount
 # output: [u,u,u,u]
 let (ckey, seg, okey, ocust, odate, oprio, lkey, lship, price, disc) = input in
-let building = (ckey, seg) zip map ((k, s) -> ((s hash, "BUILDING" hash) eq, k)) filter sort in
+let building = (ckey, seg) zip map ((k, s) -> ((s, "BUILDING") eq, k)) filter sort in
 let early = ((okey, ocust) zip, (odate, oprio) zip) zip
     map (((k, c), (dt, pr)) -> ((dt, 9204u64) lt, (c, (k, dt, pr)))) filter in
 let found = (early map ((c, _) -> c), building) find in

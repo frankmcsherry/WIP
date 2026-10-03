@@ -42,29 +42,33 @@ are the best run, in ms. DuckDB holds the tables in memory and runs on one threa
 
 | query | what | corgi | DuckDB 1 thread | × |
 |---|---|---|---|---|
-| q01 | group by two flags, 6 aggregates | 30.48 | 18.71 | 1.63 |
-| q01b | q01 with the flags as bytes, not strings | 25.63 | 18.60 | 1.38 |
-| q03 | 3-way: lineitems probe sorted orders, then group | 8.69 | 5.95 | 1.46 |
-| q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 13.57 | 5.95 | 2.28 |
-| q03c | q03b without the lineitem sort (stored in key order) | 6.29 | 6.14 | 1.02 |
-| q05 | 6-way join chain, group by nation | 7.13 | 6.42 | 1.11 |
-| q06 | filter and sum, no join | 5.04 | 1.85 | 2.72 |
-| q10 | 4-way, top 20 customers | 14.57 | 9.03 | 1.61 |
-| q12 | 2-way, string predicates, conditional counts | 82.19 | 15.25 | 5.39 |
-| q12b | q12 with literal hashes folded to constants, CSE | 22.39 | 15.50 | 1.44 |
-| q14 | 2-way, `LIKE 'PROMO%'` | 5.40 | 2.98 | 1.81 |
-| q19 | 2-way, OR of three string-heavy predicates | 143.62 | 23.81 | 6.03 |
-| q19b | q19 with literal hashes folded to constants | 39.63 | 23.32 | 1.70 |
+| q01 | group by two flags, 6 aggregates | 30.25 | 18.71 | 1.62 |
+| q01b | q01 with the flags as bytes, not strings | 25.13 | 18.60 | 1.35 |
+| q03 | 3-way: lineitems probe sorted orders, then group | 8.12 | 5.95 | 1.36 |
+| q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 12.92 | 5.95 | 2.17 |
+| q03c | q03b without the lineitem sort (stored in key order) | 5.82 | 6.14 | 0.95 |
+| q05 | 6-way join chain, group by nation | 6.81 | 6.42 | 1.06 |
+| q06 | filter and sum, no join | 4.95 | 1.85 | 2.68 |
+| q10 | 4-way, top 20 customers | 20.48 | 9.03 | 2.27 |
+| q12 | 2-way, string predicates (`eq` on strings), conditional counts | 70.22 | 15.25 | 4.60 |
+| q14 | 2-way, `LIKE 'PROMO%'` | 5.20 | 2.98 | 1.74 |
+| q19 | 2-way, OR of three string-heavy predicates (`eq` on strings) | 110.04 | 23.81 | 4.62 |
 
-The natural versions are 1.1–1.6× DuckDB for the joins, except where string predicates dominate:
-q12 at 5.4× and q19 at 6.0×.
+The joins run 1.1–1.4× DuckDB (q03, q05), and 0.95× when the large table is already in key order
+(q03c). Where string predicates dominate, they run 2.3–4.6× (q10, q12, q19).
 
 ## What the joins argue for
 
-1. **String equality.** `eq` compares leaves only, so `s = 'BUILDING'` is spelled
-   `(s hash, "BUILDING" hash) eq`, which is 80–95% of q12 and q19. Folding the literal's hash to a
-   constant, plus CSE, gives q12b and q19b: 3.6× faster. What remains is hashing the column itself.
-   An equality kernel against a constant, or dictionary codes, would remove that too.
+1. **String equality against a constant.** `eq` compares lists structurally, so
+   `(s, "BUILDING") eq` works. It costs about 20 ns per string, for two reasons:
+   - the literal is filled once per row (`lit`, 25 of q12's 70 ms);
+   - the list comparator builds index pairs for every element (`Rel(Eq)`, 41 ms).
+
+   Comparing against the constant in place (an immediate, as leaf constants already are) would
+   make it one pass over the bytes. These programs first compared `hash`es, on the belief that
+   `eq` took only leaves (its comments said so). For q12 and q19 that was 1.2–1.3× slower still.
+   For q10's one-byte flag it was faster (14.6 against 20.5 ms): there the per-row literal fill is
+   most of the cost.
 2. **Known sortedness.** Tables arrive in key order, and every query sorts its build side again.
    Skipping the sort (q03c) makes the range join the fastest form.
 3. **A lookup for unique keys.** Every join here is on a primary key, so `hi − lo` is 0 or 1.

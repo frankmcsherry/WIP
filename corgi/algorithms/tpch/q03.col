@@ -9,7 +9,7 @@
 # output: [u,u,u,u]
 let (ckey, seg, okey, ocust, odate, oprio, lkey, lship, price, disc) = input in
 # The BUILDING customers, as a sorted list of keys.
-let building = (ckey, seg) zip map ((k, s) -> ((s hash, "BUILDING" hash) eq, k)) filter sort in
+let building = (ckey, seg) zip map ((k, s) -> ((s, "BUILDING") eq, k)) filter sort in
 # Orders before 1995-03-15 whose customer is one of them: look each customer key up in that list.
 let early = ((okey, ocust) zip, (odate, oprio) zip) zip
     map (((k, c), (dt, pr)) -> ((dt, 9204u64) lt, (c, (k, dt, pr)))) filter in

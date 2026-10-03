@@ -13,21 +13,18 @@
 let (pkey, brand, cont, size, lpart, qty, mode, instr, price, disc) = input in
 # Each part's group: 1, 2 or 3 when its brand, container and size fit one, else 0; sorted by key.
 let parts = ((pkey, brand) zip, (cont, size) zip) zip map (((k, b), (c, s)) ->
-    let bh = b hash in
-    let ch = c hash in
-    let g1 = (((bh, "Brand#12" hash) eq, (((ch, "SM CASE" hash) eq, (ch, "SM BOX" hash) eq) max,
-        ((ch, "SM PACK" hash) eq, (ch, "SM PKG" hash) eq) max) max) mul, ((s, 1u64) ge, (s, 5u64) le) mul) mul in
-    let g2 = (((bh, "Brand#23" hash) eq, (((ch, "MED BAG" hash) eq, (ch, "MED BOX" hash) eq) max,
-        ((ch, "MED PKG" hash) eq, (ch, "MED PACK" hash) eq) max) max) mul, ((s, 1u64) ge, (s, 10u64) le) mul) mul in
-    let g3 = (((bh, "Brand#34" hash) eq, (((ch, "LG CASE" hash) eq, (ch, "LG BOX" hash) eq) max,
-        ((ch, "LG PACK" hash) eq, (ch, "LG PKG" hash) eq) max) max) mul, ((s, 1u64) ge, (s, 15u64) le) mul) mul in
+    let g1 = (((b, "Brand#12") eq, (((c, "SM CASE") eq, (c, "SM BOX") eq) max,
+        ((c, "SM PACK") eq, (c, "SM PKG") eq) max) max) mul, ((s, 1u64) ge, (s, 5u64) le) mul) mul in
+    let g2 = (((b, "Brand#23") eq, (((c, "MED BAG") eq, (c, "MED BOX") eq) max,
+        ((c, "MED PKG") eq, (c, "MED PACK") eq) max) max) mul, ((s, 1u64) ge, (s, 10u64) le) mul) mul in
+    let g3 = (((b, "Brand#34") eq, (((c, "LG CASE") eq, (c, "LG BOX") eq) max,
+        ((c, "LG PACK") eq, (c, "LG PKG") eq) max) max) mul, ((s, 1u64) ge, (s, 15u64) le) mul) mul in
     (k, ((g1, (2u64, g2) mul) add, (3u64, g3) mul) add)) sort in
 # Line items shipped by air and delivered in person: (part key, quantity, revenue).
 let lines = (((lpart, qty) zip, (mode, instr) zip) zip, (price, disc) zip) zip
     map ((((k, q), (m, i)), (p, d)) ->
-        let mh = m hash in
-        let air = ((mh, "AIR" hash) eq, (mh, "AIR REG" hash) eq) max in
-        ((air, (i hash, "DELIVER IN PERSON" hash) eq) mul, (k, q, (p, (100u64, d) sub) mul)))
+        let air = ((m, "AIR") eq, (m, "AIR REG") eq) max in
+        ((air, (i, "DELIVER IN PERSON") eq) mul, (k, q, (p, (100u64, d) sub) mul)))
     filter in
 # Each line item's part group, by looking its part up; the quantity must fit the group.
 let at = (lines map ((k, _, _) -> k), parts map ((k, _) -> k)) find in

@@ -11,11 +11,11 @@
 let (okey, oprio, lkey, lmode, lcommit, lreceipt, lship) = input in
 # Each order, and whether its priority is high, sorted by order key.
 let orders = (okey, oprio) zip
-    map ((k, p) -> (k, ((p hash, "1-URGENT" hash) eq, (p hash, "2-HIGH" hash) eq) max)) sort in
+    map ((k, p) -> (k, ((p, "1-URGENT") eq, (p, "2-HIGH") eq) max)) sort in
 # Line items shipped by MAIL or SHIP, received in 1994 after their commit date, shipped before it.
 let lines = ((lkey, lmode) zip, ((lcommit, lreceipt) zip, lship) zip) zip
     map (((k, m), ((c, r), s)) ->
-        let mode = ((m hash, "MAIL" hash) eq, (m hash, "SHIP" hash) eq) max in
+        let mode = ((m, "MAIL") eq, (m, "SHIP") eq) max in
         let keep = (((mode, (c, r) lt) mul, (s, c) lt) mul, ((r, 8766u64) ge, (r, 9131u64) lt) mul) mul in
         (keep, (k, m)))
     filter in
