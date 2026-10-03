@@ -110,7 +110,7 @@ src/
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
-               per-row producers (get/gather/branch/zip/slices/filter/chunk), `Lift`/`Squash`, and the
+               per-row producers (get/gather/zip/slices/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
                functor). The evals live here; `Op::eval` dispatches to them first.
     text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
@@ -256,7 +256,7 @@ reasons. Adding a structural op means either filling a hole (and writing its law
 
 ## Totality — partiality as data, threaded by a rewrite
 
-The surface's fallible verbs (`get`/`head`, `gather`, `branch`, `zip`, `slices`, `filter`, `chunk`)
+The surface's fallible verbs (`get`/`head`, `gather`, `zip`, `slices`, `chunk`)
 are TOTAL per-row producers: a row that would trip the partial kernel's assert lands in the Err lane
 of `Fail<T> = Sum{ Ok: T | Err: Unit }` (`ops/fail.rs`). Everything downstream is written against `T`;
 `effect::lower_effects` makes that well-typed by inserting ordinary ops — a pure op fed a `Fail<T>`

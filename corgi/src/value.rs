@@ -168,7 +168,7 @@ impl PartialEq for Bounds {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             // one buffer is one partition: the common case where two columns descend from the
-            // same list, which is exactly what `Zip` and `Filter` assert about their operands.
+            // same list, which is exactly what `Zip` asserts about its operands.
             (Bounds::Offsets(a), Bounds::Offsets(b)) => Arc::ptr_eq(a, b) || a == b,
             (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => k0 == k1 && n0 == n1,
             _ => self.len() == other.len() && self.ends().eq(other.ends()),

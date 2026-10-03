@@ -5,8 +5,8 @@
 //! Every op here is a plain `T0 -> T1` that `eval` runs and `judge` types like any other; there is no
 //! second evaluator and no second typer. Three kinds of op:
 //!
-//!   * the `Try*` producers — the total per-row forms of the partial kernels (`get`/`gather`/`branch`/
-//!     `zip`/`slices`/`filter`/`chunk`): a row that would have tripped the kernel's assert lands in Err.
+//!   * the `Try*` producers — the total per-row forms of the partial kernels (`get`/`gather`/`zip`/
+//!     `slices`/`chunk`): a row that would have tripped the kernel's assert lands in Err.
 //!   * `Lift` (`X -> Fail<X>`, all Ok) and `Squash` (`Fail<Fail<T>> -> Fail<T>`, the monad join).
 //!   * the `Hoist*` distributive laws — Fail commuted out through each structural functor:
 //!     `HoistProd` `(Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>` (a row errs if ANY field errs),
@@ -378,25 +378,6 @@ pub(crate) fn try_slices<L: OpLike>(input: Value) -> Result<Value, String> {
     per_row_try(&err, &super::core::Op::<L>::Slices, input)
 }
 
-/// `(data:List<X>, mask:List<U64>) -> Fail<List<X>>`: per row, data and mask must agree in length.
-pub(crate) fn try_filter<L: OpLike>(input: Value) -> Result<Value, String> {
-    let mut err = Vec::new();
-    {
-        let (data, mask) = pair_of(&input, "TryFilter")?;
-        let (db, _) = list_of(data, "TryFilter data")?;
-        let (mb, _) = list_of(mask, "TryFilter mask")?;
-        assert_eq!(db.len(), mb.len(), "TryFilter: row count");
-        let (mut ds, mut ms) = (0usize, 0usize);
-        for r in 0..db.len() {
-            let (de, me) = (db.end(r), mb.end(r));
-            err.push(de - ds != me - ms);
-            ds = de;
-            ms = me;
-        }
-    }
-    per_row_try(&err, &super::core::Op::<L>::Filter, input)
-}
-
 /// `List<X> -> Fail<List<List<X>>>`: per row, the length must divide by `k`.
 pub(crate) fn try_chunk<L: OpLike>(k: usize, input: Value) -> Result<Value, String> {
     if k == 0 {
@@ -444,7 +425,7 @@ pub(crate) fn is_family<L: OpLike>(op: &super::core::Op<L>) -> bool {
     matches!(
         op,
         Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) | Op::TryGet | Op::TryGather
-            | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryZip
+            | Op::TrySlices | Op::TryChunk(_) | Op::TryZip
     )
 }
 
@@ -460,7 +441,6 @@ pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<V
         Op::TryGet => try_get::<L>(input),
         Op::TryGather => try_gather::<L>(input),
         Op::TrySlices => try_slices::<L>(input),
-        Op::TryFilter => try_filter::<L>(input),
         Op::TryChunk(k) => try_chunk::<L>(*k, input),
         Op::TryZip => try_zip::<L>(input),
         _ => unreachable!("not a failure-family op"),

@@ -1,8 +1,8 @@
 //! The effect layer as a REWRITE: partiality is threaded through a program by inserting ordinary ops,
 //! not by a second evaluator.
 //!
-//! A program is written against pure values. Some of its ops (`get`, `gather`, `branch`, `zip`,
-//! `slices`, `filter`, `chunk`) are total per-row producers whose output is `Fail<T> = Sum{T | Unit}`
+//! A program is written against pure values. Some of its ops (`get`, `gather`, `zip`, `slices`,
+//! `chunk`) are total per-row producers whose output is `Fail<T> = Sum{T | Unit}`
 //! (see [`crate::ops::fail`]). Everything downstream of one still expects `T`. [`lower_effects`] makes the
 //! program well-typed and total by construction:
 //!
@@ -30,7 +30,6 @@ fn is_fail_op(op: &NumOp) -> bool {
                 | Op::TryGather
                 | Op::TryZip
                 | Op::TrySlices
-                | Op::TryFilter
                 | Op::TryChunk(_)
         )
     )

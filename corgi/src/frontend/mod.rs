@@ -72,7 +72,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // One name per fallible method — each is its TOTAL per-row `Try*` form (a row that would trip
         // the kernel's assert lands in Err); `effect::lower_effects` threads the Err lane past the
         // ops downstream, and `try` marks where the program takes it up as data. The partial kernels
-        // (`Op::Filter`, `Op::Gather`, ..) stay host-only, for a caller holding a bounds proof.
+        // (`Op::Gather`, `Op::Zip`, ..) stay host-only, for a caller holding a bounds proof.
         "zip" => Op::TryZip.into(),      // per row: inner lengths agree, else Err
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
@@ -87,7 +87,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "clone" => Op::Clone.into(),      // Ref<T> -> T: clone the referenced rows out
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
         "branch" => Op::Branch(n()? as usize).into(), // the demux; a tag of n-1 or more goes to the last lane
-        "filter" => Op::TryFilter.into(), // per row: data/mask lengths agree, else Err
+        "filter" => Op::Filter.into(), // [(mask, x)] -> [x]: keep the x whose mask is nonzero; total
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
