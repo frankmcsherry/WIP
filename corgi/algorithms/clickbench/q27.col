@@ -1,0 +1,13 @@
+# Q27: SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25
+# sql: SELECT CounterID, AVG(octet_length(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID
+# sql:   HAVING COUNT(*) > 1000 ORDER BY l DESC, CounterID LIMIT 25
+# columns: CounterID URL
+# output: [u,f,u]
+# HAVING scaled to 1/100 (one partition of the hundred). A float's stored bits keep its order, so
+# MAX minus them sorts largest first.
+let (counter, url) = input in
+let ranked = (counter, url) zip map ((c, u) -> ((u len, 0u64) gt, (c, u len))) filter group
+    map ((c, ls) -> let n = ls len in ((n, 1000u64) gt, (c, (ls fold_add to_f64, n to_f64) div_f64, n))) filter
+    map ((c, l, n) -> ((18446744073709551615u64, l) sub, c, l, n)) sort in
+((0u64, ((ranked len, 25u64) min)) range, ranked) gather
+    try match (0 (top -> top map ((_, c, l, n) -> (c, l, n))), 1 (_ -> 0u64 iota map (z -> (z, 0f64, z))))

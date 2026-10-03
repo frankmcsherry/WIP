@@ -11,7 +11,11 @@ Writes to OUT_DIR:
   `NAME.ends` (u64 row ends) and `NAME.bytes` for strings. Columns that can be negative are stored in
   corgi's signed encoding (the sign bit flipped), so corgi's order is the signed order.
 - `expected/QUERY.txt`: DuckDB's answer to each query in `algorithms/clickbench/`, in the canonical
-  form the bench prints corgi's in (one row per line, tab-separated, strings in hex).
+  form the bench prints corgi's in (one row per line, tab-separated, strings in hex, `f` floats to
+  four decimals, `g` floats to twelve significant digits).
+
+The string columns are BLOBs in the parquet; a query's SQL reads them as text with `decode(..)` where
+it needs text functions (LIKE, regexp), and gets bytes back either way.
 - `duckdb.tsv`: DuckDB's best time per query, on one thread and on all of them, the table in memory.
 """
 import os, re, sys, time
@@ -49,8 +53,10 @@ def field(kind, v):
         return str(int(v))
     if kind == 'f':
         return f'{float(v):.4f}'
+    if kind == 'g':
+        return f'{float(v):.11e}'
     if kind == 's':
-        return bytes(v).hex()
+        return (v.encode() if isinstance(v, str) else bytes(v)).hex()
     raise ValueError(kind)
 
 

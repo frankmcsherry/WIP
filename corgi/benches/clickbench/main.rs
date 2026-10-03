@@ -5,8 +5,9 @@
 //!
 //! Each query is `algorithms/clickbench/NAME.col`, whose header names the SQL it answers (`# sql:`), the
 //! columns it reads (`# columns:`, the program's input in that order) and its output's kinds
-//! (`# output:`: `u` unsigned, `i` signed, `f` float, `s` string; `[..]` for a list of rows). The whole
-//! table is one row: each column is a one-row `List`.
+//! (`# output:`: `u` unsigned, `i` signed, `f` float to four decimals, `g` float to twelve significant
+//! digits, `s` string; `[..]` for a list of rows). The whole table is one row: each column is a
+//! one-row `List`. `--profile` (with `--features profile`) prints each query's time per op.
 
 use corgi::{dec_i64, Bounds, Program, Value};
 use std::collections::HashMap;
@@ -75,6 +76,13 @@ fn field(kind: &str, col: &Value, j: usize) -> String {
         "u" => x.to_string(),
         "i" => dec_i64(x).to_string(),
         "f" => format!("{:.4}", dec_f64(x)),
+        // as Python's `{:.11e}`: a signed, at least two-digit exponent
+        "g" => {
+            let s = format!("{:.11e}", dec_f64(x));
+            let (m, e) = s.split_once('e').unwrap();
+            let e: i32 = e.parse().unwrap();
+            format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+        }
         other => panic!("unknown output kind {other}"),
     }
 }
@@ -117,6 +125,7 @@ fn best(mut f: impl FnMut()) -> Duration {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
     let check = args.iter().any(|a| a == "--check");
+    let profile = args.iter().any(|a| a == "--profile");
     let names: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let Some(dir) = std::env::var_os("CORGI_CLICKBENCH").map(PathBuf::from) else {
         println!("clickbench: set CORGI_CLICKBENCH to a directory made by benches/clickbench/prepare.py");
@@ -149,6 +158,21 @@ fn main() {
                 println!("       corgi  {a}\n       duckdb {b}");
             }
             continue;
+        }
+        #[cfg(feature = "profile")]
+        if profile {
+            corgi::explain::profile::reset();
+            black_box(p.run(input.clone()));
+            let report = corgi::explain::profile::report();
+            let total: Duration = report.iter().map(|r| r.2).sum();
+            println!("== {}: time per op, {:.2} ms in all", q.name, total.as_secs_f64() * 1e3);
+            for (op, n, t) in report.iter().take(12) {
+                println!("  {:>6.1}%  {:>9.3} ms  {:>7} runs  {op}", 100.0 * t.as_secs_f64() / total.as_secs_f64(), t.as_secs_f64() * 1e3, n);
+            }
+        }
+        #[cfg(not(feature = "profile"))]
+        if profile {
+            println!("== {}: --profile needs --features profile", q.name);
         }
         if check {
             println!("{:<6} ok", q.name);

@@ -1,0 +1,5 @@
+# Q19: SELECT UserID FROM hits WHERE UserID = 435090932899640449
+# sql: SELECT UserID FROM hits WHERE UserID = 435090932899640449
+# columns: UserID
+# output: [i]
+input map (u -> ((u, 435090932899640449i64) eq, u)) filter
