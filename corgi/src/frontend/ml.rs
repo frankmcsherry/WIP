@@ -700,6 +700,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
+                Apply::Op(name, _) if words() && matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(order_word(b, id, name)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
@@ -753,6 +754,58 @@ fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
     let positions = b.add(Op::MapList(Box::new(range)), vec![ranges]);
     let args = b.tuple(vec![positions, list]);
     b.add(Op::TryGather, vec![args])
+}
+
+/// spike: with `CORGI_WORDS` set, `sort`, `dedup` and `group` are words over `order`.
+fn words() -> bool {
+    std::env::var_os("CORGI_WORDS").is_some()
+}
+
+/// `sort`, `dedup` and `group` as words over `order` (the sort's positions and run starts), `gather`,
+/// `filter` and `cut`:
+/// - `xs sort` = the elements at the order's positions;
+/// - `xs dedup` = those at a run start;
+/// - `kvs group` = the keys' order; the keys at run starts, and the values (gathered in the keys'
+///   order, stable) cut at run starts.
+fn order_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
+    use crate::ops::CmpOp;
+    let at = |b: &mut Builder<NumOp>, pos: usize, col: usize| {
+        let pair = b.tuple(vec![pos, col]);
+        b.add(Op::Gather, vec![pair])
+    };
+    let pair_up = |b: &mut Builder<NumOp>, mark: usize, col: usize| {
+        let pair = b.tuple(vec![mark, col]);
+        b.add(Op::Zip, vec![pair])
+    };
+    let order_of = |b: &mut Builder<NumOp>, col: usize| {
+        let o = b.add(CmpOp::Order, vec![col]);
+        let t = b.add(Op::Transpose, vec![o]);
+        (b.add(Op::Field(0), vec![t]), b.add(Op::Field(1), vec![t]))
+    };
+    match name {
+        "sort" => {
+            let (pos, _) = order_of(b, xs);
+            at(b, pos, xs)
+        }
+        "dedup" => {
+            let (pos, mark) = order_of(b, xs);
+            let sorted = at(b, pos, xs);
+            let marked = pair_up(b, mark, sorted);
+            b.add(Op::Filter, vec![marked])
+        }
+        _ => {
+            let kv = b.add(Op::Transpose, vec![xs]);
+            let (k, v) = (b.add(Op::Field(0), vec![kv]), b.add(Op::Field(1), vec![kv]));
+            let (pos, mark) = order_of(b, k);
+            let (sk, sv) = (at(b, pos, k), at(b, pos, v));
+            let mk = pair_up(b, mark, sk);
+            let keys = b.add(Op::Filter, vec![mk]);
+            let mv = pair_up(b, mark, sv);
+            let pieces = b.add(Op::Cut, vec![mv]);
+            let out = b.tuple(vec![keys, pieces]);
+            b.add(Op::Zip, vec![out])
+        }
+    }
 }
 
 /// parse an ML-flavoured expression into a `Graph` (with `input` bound to the root).
