@@ -91,6 +91,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
+        "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<U64>: 1 where a run of equal elements starts
+        "cut" => Op::Cut.into(),              // [(mask, x)] -> [[x]]: a piece starts at each marked x
         "find" => CmpOp::Find.into(),
         // point access — `gather` (per row, positions of any shape into that row's list, each integer
         // leaf replaced by its element) errs per ROW. `get` is the same op on one position per row;

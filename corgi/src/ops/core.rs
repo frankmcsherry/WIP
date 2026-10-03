@@ -200,6 +200,9 @@ pub enum Op<L> {
                     // the list monoid, [] its unit). Same-shape elements, as in Zip.
     Len,            // List<X> -> U64                  each row's element count, read straight off the
                     // bounds (O(1) — the count the structure already holds, not a fold over the row).
+    Cut,            // List<(U64-mask, X)> -> List<List<X>>  cut each row into pieces: a piece starts
+                    // at each marked element and at the row's first. Only bounds are written; the
+                    // values don't move. With `adjacent`'s marks, the pieces are runs of equal elements.
     Chunk(usize),   // List<X> -> List<List<X>>        partition each row into fixed `k`-wide sub-rows
                     // (the uniform inverse of Flatten): a pure re-partition — values don't move, the
                     // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
@@ -474,6 +477,12 @@ impl<L: OpLike> Op<L> {
 
             // re-partition each row into k-wide sub-rows. Pure: the values never move — only the bounds
             // change, the new inner being a `Stride(k)` (the surface producer of wide strides).
+            Op::Cut => {
+                let (bounds, pairs) = input.into_list("Cut")?;
+                let (mask, vals) = pairs.into_pair("Cut element")?;
+                cut(&bounds, mask.as_u64("Cut mask")?, vals)
+            }
+
             Op::Chunk(k) => {
                 if *k == 0 {
                     return Err("Chunk width must be positive".into());
@@ -942,6 +951,26 @@ fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
 
 /// `Chunk(k)`: each row split into `k`-wide sub-rows; a row that doesn't divide by `k` drops its
 /// remainder, and then the kept elements are no longer contiguous, so they are gathered (cold).
+/// `Cut`: each row's pieces end where the next marked element starts one, and at the row's end.
+fn cut(bounds: &Bounds, mask: &[u64], vals: Value) -> Value {
+    let mut outer = Vec::with_capacity(bounds.len());
+    let mut inner = Vec::new();
+    let mut start = 0usize;
+    for end in bounds.ends() {
+        for (k, &m) in mask.iter().enumerate().take(end).skip(start + 1) {
+            if m != 0 {
+                inner.push(k);
+            }
+        }
+        if end > start {
+            inner.push(end);
+        }
+        outer.push(inner.len());
+        start = end;
+    }
+    Value::List(outer.into(), Box::new(Value::List(inner.into(), Box::new(vals))))
+}
+
 fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
     let mut outer = Vec::with_capacity(bounds.len());
     let (mut total, mut prev, mut ragged) = (0usize, 0usize, false);
