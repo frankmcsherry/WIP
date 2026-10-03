@@ -53,7 +53,7 @@ fn corgi(src: &str) -> Program {
 /// ns per row for one run of `p` on `input` (cloned outside the timer, an `Arc` bump).
 fn corgi_t(rows: usize, p: &Program, input: &Value) -> f64 {
     best(rows, || {
-        black_box(p.run_partial(black_box(input.clone())));
+        black_box(p.run(black_box(input.clone())));
     })
 }
 
@@ -320,7 +320,7 @@ fn dispatch() {
         for _ in 0..7 {
             let t = Instant::now();
             for _ in 0..100_000 {
-                black_box(p.run_partial(black_box(input.clone())));
+                black_box(p.run(black_box(input.clone())));
             }
             b = b.min(t.elapsed().as_nanos() as f64 / 100_000.0);
         }

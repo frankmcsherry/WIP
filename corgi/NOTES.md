@@ -80,8 +80,8 @@ src/
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
                passes are latent, not dead.
   effect.rs    the effect layer as a REWRITE: `lower_effects` threads `Fail<T>` columns past the ops
-               downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`; `is_total`
-               is the syntactic query. No second evaluator: the lowered graph is pure vocabulary.
+               downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`. No
+               second evaluator: the lowered graph is pure vocabulary.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture
@@ -94,7 +94,7 @@ src/
                empty row errs — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
                elim; FoldScan (T,List<A>)->(T,List<R>) (mapAccumL — the scan kernel; `scan` is sugar =
                FoldScan with body (a,x)->(b,b), field 1). Gather (positions per row, nested or flat;
-               the result keeps their structure) is the one fetch kernel, with a total per-row form and
+               the result keeps their structure) is the one fetch kernel, with a checked per-row form and
                `gather_try` (per element, Sum{Found|Missing}); `slices` = map(range); gather. Plus Unit
                (X -> Unit) and the typed numeric grid + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
@@ -112,8 +112,8 @@ src/
     host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
-    fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
-               per-row producers (gather/zip/chunk), `Lift`/`Squash`, and the
+    fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` checked
+               producers (gather/zip/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
                functor). The evals live here; `Op::eval` dispatches to them first.
     text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
@@ -121,8 +121,8 @@ src/
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
-    program.rs `Program`: parse, lower effects, type and run in one path (compile_ml / run /
-               run_partial / is_total).
+    program.rs `Program`: parse, lower effects, type and run in one path (compile_ml / shape /
+               run).
 tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text · effect · kernel · ref ·
         fail_allocations   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
@@ -257,10 +257,10 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
   all ragged input, take the general per-round gather and scatter.
 
-## Totality — partiality as data, threaded by a rewrite
+## Failure as data, threaded by a rewrite
 
 The surface's fallible verbs (`get`/`head`, `gather`, `zip`, `slices`, `chunk`)
-are TOTAL per-row producers: a row that would trip the partial kernel's assert lands in the Err lane
+are checked: a row the raw kernel would answer lossily (below) lands in the Err lane
 of `Fail<T> = Sum{ Ok: T | Err: Unit }` (`ops/fail.rs`). Everything downstream is written against `T`;
 `effect::lower_effects` makes that well-typed by inserting ordinary ops — a pure op fed a `Fail<T>`
 becomes `MapSum([(0, op)])` on the packed Ok lane, a second fallible op adds a `Squash`, a `Tuple`
@@ -268,14 +268,14 @@ with a fallible field `Lift`s the pure ones and `HoistProd`s, and a body-bearing
 `HoistList`s / `HoistSum`s the per-element errors out to the row (all-or-nothing). `try` is the
 identity on values: it marks where the program takes the `Sum{T | Unit}` up as data to `match` on.
 
-So there is ONE evaluator and ONE typer. `Program::run_partial` = `eval_graph(lower_effects(g))`; the
+So there is ONE evaluator and ONE typer. `Program::run` = `eval_graph(lower_effects(g))`; the
 corpus test types every lowered program with `shape_of`, which is what proves the discipline: an op
-applied to a fallible column where lowering forgot to lift would be a shape error. `is_total` is the
-separate syntactic query — total iff every fallible column meets a `try` before the output; `run`
-refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
+applied to a fallible column where lowering forgot to lift would be a shape error. A failure no
+`try` takes up reaches the output, which is then `Fail<T>`: `run` returns it as the value, and
+`Program::shape` shows it in the output's type.
 
-The raw kernels (`Op::Gather`, `Chunk`, `Zip`) stay in the enum for a host holding a bounds proof
-(DDIR); they are not on the surface. They are total but lossy, so nothing in corgi panics on data:
+The raw kernels (`Op::Gather`, `Chunk`, `Zip`) stay in the enum for hosts (DDIR uses them); they are
+not on the surface. They are lossy, and nothing in corgi panics on data:
 the raw `Gather` reads the zero of the element's shape for a position outside its row (zero bits, the
 empty list, a sum's lane 0, so a sum must have at least one lane); the raw `Zip` keeps each row's
 shortest column; the raw `Chunk` drops a row's remainder. Their `Try` forms, the surface ops, report

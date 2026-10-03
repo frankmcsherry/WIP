@@ -1,12 +1,12 @@
-//! The failure family: partiality as ORDINARY DATA in the pure vocabulary.
+//! The failure family: failure as ORDINARY DATA in the pure vocabulary.
 //!
 //! A fallible column is `Fail<T> = Sum{ Ok: T | Err: Unit }` — lane 0 the Ok payload (packed in row
 //! order), lane 1 a length-carrying unit (no error payload; the failing-node breadcrumb is deferred).
 //! Every op here is a plain `T0 -> T1` that `eval` runs and `judge` types like any other; there is no
 //! second evaluator and no second typer. Three kinds of op:
 //!
-//!   * the `Try*` producers — the total per-row forms of the partial kernels (`gather`/`zip`/`chunk`):
-//!     a row that would have tripped the kernel's assert lands in Err.
+//!   * the `Try*` producers — the checked forms of the lossy kernels (`gather`/`zip`/`chunk`): a row
+//!     the kernel would read zeros for, truncate or cut short lands in Err.
 //!   * `Lift` (`X -> Fail<X>`, all Ok) and `Squash` (`Fail<Fail<T>> -> Fail<T>`, the monad join).
 //!   * the `Hoist*` distributive laws — Fail commuted out through each structural functor:
 //!     `HoistProd` `(Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>` (a row errs if ANY field errs),
@@ -15,7 +15,7 @@
 //!
 //! The surface never writes `Lift`/`Squash`/`Hoist*`: [`crate::effect::lower_effects`] inserts them, so a
 //! program written against pure values runs on the Ok lane of whatever fails upstream. The layout is
-//! what `try` reveals — `try` is the identity on values and a marker to the totality query.
+//! what `try` reveals — `try` is the identity on values and a marker to the lowering.
 
 use crate::engine::{gather, index_plan, Owners};
 use crate::graph::OpLike;
@@ -235,21 +235,21 @@ pub(crate) fn hoist_sum(fallible: &[usize], input: Value) -> Result<Value, Strin
     Ok(fail(&err, Value::sum(ok_tags, new_lanes)))
 }
 
-// --- the total per-row producers -----------------------------------------------------------------
+// --- the checked producers -----------------------------------------------------------------------
 //
 // ONE shape, factored once (`per_row_try`): a mask pass — descriptor and leaf reads, no data
-// movement — then the BASE partial kernel does the real work. When no row failed (the state a
-// fallible pipeline spends most of its time in) the base op runs on the WHOLE input: the mask has
-// pre-proven its asserts, and its fast paths all apply — TryZip's Ok lane is Zip's zero-copy
+// movement — then the BASE kernel does the real work. When no row failed (the state a fallible
+// pipeline spends most of its time in) the base op runs on the WHOLE input: the mask has proven
+// it loses nothing, and its fast paths all apply — TryZip's Ok lane is Zip's zero-copy
 // rewrap, TryChunk's is Chunk's descriptor-only re-partition, neither of which the old fused
 // loops here could reach. Only when a row HAS failed are the Ok rows gathered out first; the rare
-// case pays the extra pass. The Try tier therefore re-implements no kernel: each partial op is
+// case pays the extra pass. The Try tier therefore re-implements no kernel: each base op is
 // the single implementation of its access pattern, serving both tiers — improving one improves
 // both, and a fast path added to a base op (a `Gather` stride path, say) reaches `TryGather` for
 // free. (The one exception, test-pinned: `try_gather`'s one-row leaf path keeps the identity
 // check that reuses the haystack buffer, which the base one-row path does not attempt.)
 
-/// The `Try*` shape: mask, then the base partial kernel — whole input when clean, Ok subset
+/// The `Try*` shape: mask, then the base kernel — whole input when clean, Ok subset
 /// otherwise. A fallible op that does not fit this shape is a design smell.
 fn per_row_try<L: OpLike>(
     err: &[bool],

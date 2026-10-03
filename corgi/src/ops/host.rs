@@ -20,8 +20,8 @@ use crate::value::Value;
 ///   elimination drops unused calls.
 /// - **Row-local.** Output row `i` depends only on input row `i`. Batches are split and joined
 ///   differently with worker count and inside `MapList`, so no row may see another.
-/// - **`Err` is fatal.** It is not an in-language failure: `eval_graph` panics on it, and
-///   `is_total` counts a host call as total. Return `Err` only for a broken contract.
+/// - **`Err` is fatal.** It is not an in-language failure: `eval_graph` panics on it. A kernel that
+///   can fail on data returns a sum. Return `Err` only for a broken contract.
 /// - **Shapes must carry their row count.** `Value::len` of a `Prod` is its first field's, so a
 ///   shape whose chain of first fields ends in an empty `Prod` has no rows. The adapter rejects
 ///   such an input or output shape as a type error; a kernel with no arguments declares `Unit`.

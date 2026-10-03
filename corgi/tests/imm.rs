@@ -17,7 +17,7 @@ impl Rng {
 
 /// through `Program`, which rewrites pairs with a literal into immediates.
 fn run(src: &str, input: Value) -> Value {
-    Program::compile_ml(src).unwrap_or_else(|e| panic!("{src}: {e}")).run(input).unwrap_or_else(|e| panic!("{src}: {e}"))
+    Program::compile_ml(src).unwrap_or_else(|e| panic!("{src}: {e}")).run(input)
 }
 
 /// the program as parsed: pairs with a literal stay pairs.

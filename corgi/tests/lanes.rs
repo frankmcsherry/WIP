@@ -13,7 +13,7 @@ impl Rng {
 }
 
 fn run(src: &str, input: Value) -> Value {
-    Program::compile_ml(src).unwrap().run(input).unwrap()
+    Program::compile_ml(src).unwrap().run(input)
 }
 
 /// a sum of `lanes` lanes over `rows` rows; lane `l` holds (row index, row index * 10 + l), as a

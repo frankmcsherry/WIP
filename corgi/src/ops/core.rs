@@ -207,10 +207,11 @@ pub enum Op<L> {
                     // doesn't divide by `k` drops its remainder (and only then are values copied).
                     // `TryChunk`, the surface `chunk`, reports such a row as an error instead.
 
-    // ---- the failure family (see `ops::fail`) — partiality as data: `Fail<T> = Sum{Ok:T | Err:Unit}`.
-    // The `Try*` ops are the TOTAL per-row forms of the partial kernels above (a row that would trip
-    // the kernel's assert lands in Err); `Lift`/`Squash`/`Hoist*` are the plumbing `effect::lower_effects`
-    // inserts so pure programs run on the Ok lane. All ordinary ops, with one eval each.
+    // ---- the failure family (see `ops::fail`) — failure as data: `Fail<T> = Sum{Ok:T | Err:Unit}`.
+    // The `Try*` ops are the checked forms of the lossy kernels above (a row the kernel would read
+    // zeros for, truncate or cut short lands in Err); `Lift`/`Squash`/`Hoist*` are the plumbing
+    // `effect::lower_effects` inserts so pure programs run on the Ok lane. All ordinary ops, with one
+    // eval each.
     TryGather,      // (idx:P, haystack:List<T>) -> Fail<P[T]>              per row all-or-nothing
     TryChunk(usize),// List<X> -> Fail<List<List<X>>>                       row length divides by k
     TryZip,         // (List<X>, List<Y>) -> Fail<List<(X,Y)>>              inner lengths agree
@@ -219,14 +220,14 @@ pub enum Op<L> {
     HoistProd,      // (Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>           errs if ANY field errs
     HoistList,      // List<Fail<T>> -> Fail<List<T>>                       errs if ANY element errs
     HoistSum(Vec<usize>), // Sum{.. Fail<A> ..} -> Fail<Sum{.. A ..}>       the listed lanes are Fail
-    Try,            // the TRY marker: identity on values. `is_total` reads it as "handled here" — the
-                    // point past which a fallible column is ordinary data the program matches on.
+    Try,            // the TRY marker: identity on values. The lowering reads it as "handled here" —
+                    // the point past which a fallible column is ordinary data the program matches on.
 }
 
 impl<L: OpLike> Op<L> {
     /// run the op on a column. `Err` is a SHAPE error — the operand is not what the op consumes —
-    /// which is what makes this the typer when run on zero rows (see `graph::shape_of`). Row-count
-    /// and data-dependent violations remain asserts: those are the partial kernels' contract.
+    /// which is what makes this the typer when run on zero rows (see `graph::shape_of`). No op fails
+    /// on data: a value of the right shape always has a result.
     pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
         // the failure family lives in `ops::fail`; everything else is below.
         if super::fail::is_family(self) {
@@ -877,7 +878,7 @@ impl<L: OpLike> Op<L> {
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
             Op::Unit => Value::Unit(input.len()),
 
-            // TRY is the identity on values; `effect::is_total` reads it as the handling point.
+            // TRY is the identity on values; the effect lowering reads it as the handling point.
             Op::Try => input,
 
             // the failure family was dispatched to `ops::fail::eval` above.
