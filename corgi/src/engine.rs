@@ -62,7 +62,7 @@ pub(crate) fn clone_ref(v: Value) -> Value {
 mod generators {
     //! Index generators — the `gather`-family currency. Each composite op is "make an index (and sometimes
     //! re-segmented bounds), then `gather`": mask→survivors (`Filter`), bounds→owner-ids (`CapList`),
-    //! point-resolve (`Gather`), range-expand (`Slices`). The index math lives here; the op bodies in
+    //! point-resolve (`Gather`), nested positions (`Gather` over lists of positions). The index math lives here; the op bodies in
     //! `ops::core` just generate, gather, and re-wrap. (`Unwrap` reads the Sum's carried offset via
     //! `gather_lanes` — no generator; `Branch` groups by tag inline.)
 
@@ -100,7 +100,7 @@ mod generators {
 
     /// the point family: each index RELATIVE to its haystack row (rows spanned by `hay`) becomes the
     /// absolute haystack position it names. Pairs with `gather` to realise `Gather` — the point sibling
-    /// of `range_spans` below. An index outside its row's span is a (data-dependent) panic. `hay` may
+    /// of `index_leaves` below. An index outside its row's span is a (data-dependent) panic. `hay` may
     /// be a list or a referenced list (`Rows`): rows are read through `span`.
     pub(crate) fn resolve_indices(outer: &Bounds, idx: &[u64], hay: Rows) -> Vec<usize> {
         let mut abs = Vec::with_capacity(idx.len());
@@ -116,27 +116,56 @@ mod generators {
         abs
     }
 
-    /// the range family: `(lo,hi)` pairs grouped by `outer` into rows, each pair RELATIVE to its haystack row
-    /// (rows spanned by `hay`). Emits each pair as an ABSOLUTE span of the haystack payload. `Slices` on
-    /// a list copies those spans out into a partition (the materialising inverse of `Flatten`); on a
-    /// REFERENCED list it hands them back as references. A range outside its row is a (data-dependent)
-    /// panic; `TrySlices` is the total form.
-    pub(crate) fn range_spans(outer: &Bounds, lo: &[u64], hi: &[u64], hay: Rows) -> Vec<(usize, usize)> {
-        let mut spans = Vec::with_capacity(lo.len());
-        for r in 0..outer.len() {
-            let (os, oe) = outer.span(r);
-            let (hs, he) = hay.span(r);
-            for k in os..oe {
-                let (a, b) = (lo[k] as usize, hi[k] as usize);
-                assert!(a <= b && b <= he - hs, "Slices: range ({a}, {b}) outside row {r} of {} elements", he - hs);
-                spans.push((hs + a, hs + b));
+    /// resolve a nested index structure: every leaf position, relative to its TOP-level row's
+    /// haystack (`hay`), becomes an absolute haystack position, in leaf order. An index list's
+    /// elements may themselves be lists of positions (`List<List<U64>>`, and deeper), as `slices`
+    /// builds with `range`. One walk down the levels' spans, no per-leaf owner column. Returns the
+    /// positions and, per top-level row, whether all its positions were in range (an out-of-range
+    /// position is still written, wrapped; the caller decides whether a row's `false` is a panic or
+    /// an error).
+    pub(crate) fn nested_positions(outer: &Bounds, inner: &Value, hay: Rows) -> Result<(Vec<usize>, Vec<bool>), String> {
+        fn walk(level: &Value, from: usize, to: usize, hs: usize, rowlen: u64, pos: &mut Vec<usize>) -> Result<bool, String> {
+            match level {
+                Value::List(bounds, vals) => {
+                    let mut ok = true;
+                    for e in from..to {
+                        let (s, t) = bounds.span(e);
+                        ok &= walk(vals, s, t, hs, rowlen, pos)?;
+                    }
+                    Ok(ok)
+                }
+                leaf => {
+                    let xs = leaf.as_u64("gather positions")?;
+                    let mut ok = true;
+                    for &x in &xs[from..to] {
+                        ok &= x < rowlen;
+                        pos.push(hs.wrapping_add(x as usize));
+                    }
+                    Ok(ok)
+                }
             }
         }
-        spans
+        let mut pos = Vec::new();
+        let mut ok = Vec::with_capacity(outer.len());
+        for r in 0..outer.len() {
+            let (s, t) = outer.span(r);
+            let (hs, he) = hay.span(r);
+            ok.push(walk(inner, s, t, hs, (he - hs) as u64, &mut pos)?);
+        }
+        Ok((pos, ok))
+    }
+
+    /// a nested index structure with its leaves replaced: every level's bounds kept, the leaf column
+    /// swapped for `leaves` (the gathered values). The result has the shape of the index structure.
+    pub(crate) fn with_leaves(inner: Value, leaves: Value) -> Value {
+        match inner {
+            Value::List(bounds, vals) => Value::List(bounds, Box::new(with_leaves(*vals, leaves))),
+            _ => leaves,
+        }
     }
 
     /// spans over a payload as a by-value list: the partition of their lengths over a gather of
-    /// exactly the spanned elements. What `Slices` on a list (and `clone` of a Ref) builds.
+    /// exactly the spanned elements. What `clone` of a Ref builds.
     pub(crate) fn materialize_spans(spans: &[(usize, usize)], payload: &Value) -> Value {
         let mut elem = Vec::with_capacity(spans.iter().map(|(s, e)| e - s).sum());
         let mut nb = Vec::with_capacity(spans.len());
