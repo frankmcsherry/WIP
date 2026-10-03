@@ -51,3 +51,25 @@ fn stride_sort_matches_offsets() {
         "stride sort fast path diverged from the structural sort"
     );
 }
+
+/// the raw `Zip` and `Chunk` are total but lossy: rows whose columns disagree in length keep the
+/// shortest, and a row that doesn't divide by `k` drops its remainder. (`zip` and `chunk` on the
+/// surface report those rows as errors instead.)
+#[test]
+fn raw_zip_and_chunk_are_total() {
+    let one = |op| {
+        let mut b = Builder::<NumOp>::default();
+        let i = b.input();
+        let o = b.add(op, vec![i]);
+        b.finish(o)
+    };
+    let a = Value::List(vec![2, 5].into(), Box::new(Value::u64(vec![1, 2, 3, 4, 5])));
+    let b = Value::List(vec![1, 4].into(), Box::new(Value::u64(vec![10, 20, 30, 40])));
+    let zipped = eval_graph(&one(Zip), Value::Prod(vec![a, b]));
+    let expect = Value::List(vec![1, 4].into(), Box::new(Value::Prod(vec![Value::u64(vec![1, 3, 4, 5]), Value::u64(vec![10, 20, 30, 40])])));
+    assert_eq!(zipped, expect);
+    let rows = Value::List(vec![5, 9].into(), Box::new(Value::u64((0..9).collect())));
+    let chunked = eval_graph(&one(Chunk(2)), rows);
+    let expect = Value::List(vec![2, 4].into(), Box::new(Value::List(corgi::Bounds::Stride(2, 4), Box::new(Value::u64(vec![0, 1, 2, 3, 5, 6, 7, 8])))));
+    assert_eq!(chunked, expect);
+}

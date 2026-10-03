@@ -148,9 +148,10 @@ pub enum Op<L> {
     // bounds work at most, no per-element compute. Pairs: List⊗Prod (Transpose/Zip), List⊗Sum
     // (Unweave/Weave); List⊗List's inverse of Flatten is the word `slices` (map(range); gather).
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
-    Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse; bounds must
-                    // agree (asserted). A pure rewrap — no data moves. PARTIAL: panics on differing
-                    // bounds; surface-usable once the size pass proves the bounds agree (else TryZip).
+    Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse. With agreeing
+                    // bounds a pure rewrap — no data moves. Total but lossy: a row whose columns
+                    // differ in length keeps the shortest (only then is data copied). `TryZip`, the
+                    // surface `zip`, reports such a row as an error instead.
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values (its
                     // inverse is the word `slices`: map(range); gather)
     Unweave,        // List<Sum{A|B|..}> -> (tags:List<U8>, List<A>, List<B>, ..)  destructure a
@@ -202,7 +203,9 @@ pub enum Op<L> {
     Chunk(usize),   // List<X> -> List<List<X>>        partition each row into fixed `k`-wide sub-rows
                     // (the uniform inverse of Flatten): a pure re-partition — values don't move, the
                     // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
-                    // chunked record stream feeds the stride fast paths. Each row must divide by `k`.
+                    // chunked record stream feeds the stride fast paths. Total but lossy: a row that
+                    // doesn't divide by `k` drops its remainder (and only then are values copied).
+                    // `TryChunk`, the surface `chunk`, reports such a row as an error instead.
 
     // ---- the failure family (see `ops::fail`) — partiality as data: `Fail<T> = Sum{Ok:T | Err:Unit}`.
     // The `Try*` ops are the TOTAL per-row forms of the partial kernels above (a row that would trip
@@ -259,15 +262,27 @@ impl<L: OpLike> Op<L> {
                 let cols = input.into_prod("Zip")?;
                 let mut bounds: Option<Bounds> = None;
                 let mut inner = Vec::with_capacity(cols.len());
+                let mut differ = Vec::new(); // each column's bounds, kept only once two disagree
                 for c in cols {
                     let (b, v) = c.into_list("Zip column")?;
                     match &bounds {
                         None => bounds = Some(b),
-                        Some(prev) => assert_eq!(prev, &b, "Zip: column bounds differ"),
+                        Some(prev) if differ.is_empty() && *prev == b => {}
+                        Some(prev) => {
+                            if differ.is_empty() {
+                                differ.resize(inner.len(), prev.clone());
+                            }
+                            differ.push(b);
+                        }
                     }
                     inner.push(v);
                 }
                 let bounds = bounds.ok_or("Zip expects a nonempty product of lists")?;
+                // every column on the first one's bounds: a pure rewrap. Otherwise each row keeps
+                // the shortest column's length (cold: only when two columns disagree).
+                if !differ.is_empty() {
+                    return Ok(zip_shortest(differ, inner));
+                }
                 Value::List(bounds, Box::new(Value::Prod(inner)))
             }
 
@@ -463,16 +478,7 @@ impl<L: OpLike> Op<L> {
                     return Err("Chunk width must be positive".into());
                 }
                 let (bounds, vals) = input.into_list("Chunk")?;
-                let mut outer = Vec::with_capacity(bounds.len());
-                let (mut total, mut prev) = (0usize, 0usize);
-                for end in bounds.ends() {
-                    let len = end - prev;
-                    assert!(len % k == 0, "Chunk: row length {len} not divisible by {k}");
-                    total += len / k;
-                    outer.push(total);
-                    prev = end;
-                }
-                Value::List(outer.into(), Box::new(Value::List(Bounds::Stride(*k, total), Box::new(vals))))
+                chunk(bounds, vals, *k)
             }
 
             // N-way partition: the discriminant `tags` routes each row of `data` to its variant. The
@@ -905,3 +911,59 @@ impl<L: OpLike> Op<L> {
         }
     }
 }
+
+/// `Zip` on columns whose rows disagree in length: each row keeps the shortest column's length, the
+/// rest of each longer row dropped.
+#[cold]
+#[inline(never)]
+fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
+    let rows = bounds[0].len();
+    let mut keep = Vec::with_capacity(rows);
+    for r in 0..rows {
+        keep.push(bounds.iter().map(|b| { let (s, e) = b.span(r); e - s }).min().unwrap_or(0));
+    }
+    let mut ends = Vec::with_capacity(rows);
+    let mut acc = 0;
+    for &n in &keep {
+        acc += n;
+        ends.push(acc);
+    }
+    let inner = bounds
+        .iter()
+        .zip(&cols)
+        .map(|(b, v)| {
+            let idx: Vec<usize> = (0..rows).flat_map(|r| { let s = b.span(r).0; s..s + keep[r] }).collect();
+            gather(v, &idx)
+        })
+        .collect();
+    Value::List(ends.into(), Box::new(Value::Prod(inner)))
+}
+
+/// `Chunk(k)`: each row split into `k`-wide sub-rows; a row that doesn't divide by `k` drops its
+/// remainder, and then the kept elements are no longer contiguous, so they are gathered (cold).
+fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
+    let mut outer = Vec::with_capacity(bounds.len());
+    let (mut total, mut prev, mut ragged) = (0usize, 0usize, false);
+    for end in bounds.ends() {
+        let len = end - prev;
+        if len % k != 0 {
+            ragged = true;
+        }
+        total += len / k;
+        outer.push(total);
+        prev = end;
+    }
+    let vals = if ragged { chunk_kept(&bounds, &vals, k) } else { vals };
+    Value::List(outer.into(), Box::new(Value::List(Bounds::Stride(k, total), Box::new(vals))))
+}
+
+/// `Chunk(k)`'s values when some row doesn't divide by `k`: each row's first `len / k * k` elements.
+#[cold]
+#[inline(never)]
+fn chunk_kept(bounds: &Bounds, vals: &Value, k: usize) -> Value {
+    let idx: Vec<usize> = (0..bounds.len())
+        .flat_map(|r| { let (s, e) = bounds.span(r); s..s + (e - s) / k * k })
+        .collect();
+    gather(vals, &idx)
+}
+
