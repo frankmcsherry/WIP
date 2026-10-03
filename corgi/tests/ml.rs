@@ -7,11 +7,11 @@ fn u64(xs: &[u64]) -> Value {
     Value::u64(xs.to_vec())
 }
 
-/// run through the effect layer and render: a total program shows its pure value; a partial program
-/// (an un-`TRY`'d `FailOp`) shows its result TRY'd to a `Sum{T | Unit}`.
+/// run through the effect layer and render: a failure no `try` takes up shows in the output as the
+/// `Sum{T | Unit}` a trailing `try` would reveal.
 fn run_ml(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
-    show(&p.run_partial(arg.clone()))
+    show(&p.run(arg.clone()))
 }
 
 fn sample() -> Value {
@@ -270,8 +270,7 @@ fn jaro_winkler_examples_match_the_reference() {
     let decode = |u: u64| f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u });
     for src in [include_str!("../examples/jaro_winkler/direct.col"), include_str!("../examples/jaro_winkler/by_byte.col")] {
         let p = Program::compile_ml(src).expect("parse error");
-        assert!(p.is_total());
-        let out = p.run(input.clone()).unwrap().into_u64("similarity").unwrap();
+        let out = p.run(input.clone()).into_u64("similarity").unwrap();
         for ((a, b), u) in pairs.iter().zip(out) {
             assert_eq!(decode(u).to_bits(), jaro_winkler_reference(a, b).to_bits(), "{a:?} {b:?}");
         }

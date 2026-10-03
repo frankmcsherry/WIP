@@ -69,10 +69,10 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     Ok(match name {
         "cast" => Op::Cast(n()? as u32).into(),
         "transpose" => Op::Transpose.into(),
-        // One name per fallible method — each is its TOTAL per-row `Try*` form (a row that would trip
-        // the kernel's assert lands in Err); `effect::lower_effects` threads the Err lane past the
-        // ops downstream, and `try` marks where the program takes it up as data. The partial kernels
-        // (`Op::Gather`, `Op::Zip`, ..) stay host-only, for a caller holding a bounds proof.
+        // One name per fallible method — each is its checked `Try*` form (a row the lossy kernel
+        // would read zeros for, truncate or cut short lands in Err); `effect::lower_effects` threads
+        // the Err lane past the ops downstream, and `try` marks where the program takes it up as
+        // data. The lossy kernels (`Op::Gather`, `Op::Zip`, ..) stay host-only.
         "zip" => Op::TryZip.into(),      // per row: inner lengths agree, else Err
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other

@@ -39,9 +39,6 @@ fn maplist_hoists_a_fallible_body() {
 
 #[test]
 fn try_erases_and_discharges() {
-    let g = parse_ml("input iota head try").unwrap();
-    assert!(is_total(&g));
-    assert!(!is_total(&parse_ml("input iota head").unwrap()));
     assert_eq!(run("input iota head try", 0), "Sum tags=[1] [[], ()x1]");
     // matching on the revealed sum is ordinary pure code again.
     let src = "input iota head try match (0 (x -> (x, 100u64) add), 1 (u -> 7u64))";

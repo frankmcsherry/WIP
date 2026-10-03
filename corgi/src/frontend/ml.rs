@@ -563,7 +563,7 @@ impl P {
                 let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
                 Ok(Apply::Inject(tag, self.enum_shape(&e)?))
             }
-            // head: first element, sugar for `get 0` — total (an empty row errs, carried in the err-mask).
+            // head: first element, sugar for `get 0` — checked (an empty row errs, carried in the err-mask).
             "head" => Ok(Apply::Head),
             // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
             // it names a byte, not a count.

@@ -7,7 +7,7 @@
 //! `Program` is not ML-specific: `compile_ml` is one constructor; `from_graph` wraps any `Graph`.
 
 use super::parse_ml;
-use crate::effect::{is_total, lower_effects};
+use crate::effect::lower_effects;
 use crate::graph::{eval_graph, shape_of, Graph};
 use crate::ops::NumOp;
 use crate::optimize::{dce, immediates};
@@ -15,7 +15,6 @@ use crate::shape::Shape;
 use crate::value::Value;
 
 pub struct Program {
-    graph: Graph<NumOp>,
     /// the graph with its effects lowered into the pure vocabulary — what actually runs and types.
     lowered: Graph<NumOp>,
 }
@@ -31,8 +30,7 @@ impl Program {
     /// What runs is the graph with constant operands made immediates and unreachable nodes dropped
     /// (both exact), then effect-lowered.
     pub fn from_graph(graph: Graph<NumOp>) -> Program {
-        let lowered = lower_effects(&dce(&immediates(&graph)));
-        Program { graph, lowered }
+        Program { lowered: lower_effects(&dce(&immediates(&graph))) }
     }
 
     /// the output shape for a given input shape — the typer, over the lowered program: a fallible
@@ -41,25 +39,10 @@ impl Program {
         shape_of(&self.lowered, input)
     }
 
-    /// run a TOTAL program to its value. A partial program (an un-`try`'d fallible stage) is an `Err`
-    /// here: its output is a `Fail` column, which [`Program::run_partial`] returns as a `Sum{T | Unit}`.
-    pub fn run(&self, input: Value) -> Result<Value, String> {
-        if !self.is_total() {
-            return Err("partial program (an un-try'd fallible stage); use run_partial or add a try".into());
-        }
-        Ok(self.run_partial(input))
-    }
-
-    /// run any program: a total program yields its value; a partial one yields its output wrapped as
-    /// `Fail<T> = Sum{ T | Unit }` (Ok rows at lane 0, errored rows counted at lane 1) — the same value
-    /// a trailing `try` would reveal. Totality is the separate, syntactic [`Program::is_total`].
-    pub fn run_partial(&self, input: Value) -> Value {
+    /// run the program to its value. A failure no `try` takes up reaches the output, which is then
+    /// `Fail<T> = Sum{ T | Unit }` (Ok rows at lane 0, errored rows counted at lane 1): the same value
+    /// a trailing `try` would reveal, and the shape [`Program::shape`] gives.
+    pub fn run(&self, input: Value) -> Value {
         eval_graph(&self.lowered, input)
-    }
-
-    /// is this program total — does every fallible stage get taken up by a `try` before the output?
-    /// Syntactic, read off the op tags.
-    pub fn is_total(&self) -> bool {
-        is_total(&self.graph)
     }
 }

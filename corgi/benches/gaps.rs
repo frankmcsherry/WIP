@@ -37,14 +37,14 @@ fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
     // on branches that have one, the program's buffer pool kept from run to run).
     let p = Program::from_graph(g.clone());
     if std::env::var_os("GAPS_CHECK").is_some() {
-        assert_eq!(corgi::show(&eval_graph(&lower_effects(g), arg.clone())), corgi::show(&p.run_partial(arg.clone())));
+        assert_eq!(corgi::show(&eval_graph(&lower_effects(g), arg.clone())), corgi::show(&p.run(arg.clone())));
     }
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
         let t = Instant::now();
-        let out = black_box(p.run_partial(black_box(a)));
-        // a partial program's output is `Sum{T | Unit}`; rows in the Unit lane are its errors. No
+        let out = black_box(p.run(black_box(a)));
+        // an un-`try`'d failure makes the output `Sum{T | Unit}`; rows in the Unit lane are its errors. No
         // benchmark program yields an Option-like value of its own, so this reads only that lane.
         let failed = matches!(&out, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(n) if n > 0));
         black_box(out); // include output destruction in the timer, as rust_t's closures do

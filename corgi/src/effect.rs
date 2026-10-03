@@ -1,10 +1,10 @@
-//! The effect layer as a REWRITE: partiality is threaded through a program by inserting ordinary ops,
+//! The effect layer as a REWRITE: failure is threaded through a program by inserting ordinary ops,
 //! not by a second evaluator.
 //!
 //! A program is written against pure values. Some of its ops (`gather`, `zip`, `chunk`, and the
-//! forms over `gather`: `get`, `head`, `slices`) are total per-row producers whose output is `Fail<T> = Sum{T | Unit}`
-//! (see [`crate::ops::fail`]). Everything downstream of one still expects `T`. [`lower_effects`] makes the
-//! program well-typed and total by construction:
+//! forms over `gather`: `get`, `head`, `slices`) are checked: they report a row that doesn't fit as
+//! an error, and their output is `Fail<T> = Sum{T | Unit}` (see [`crate::ops::fail`]). Everything
+//! downstream of one still expects `T`. [`lower_effects`] makes the program well-typed:
 //!
 //!   * a pure op fed a `Fail<T>` becomes `MapSum([(0, op)])` — it runs on the packed Ok lane, the Err
 //!     rows pass through untouched;
@@ -15,8 +15,8 @@
 //!   * `try` is erased — its input already IS the `Sum{T | Unit}` the program goes on to match.
 //!
 //! The lowered graph is in the pure vocabulary, so `eval_graph` runs it, `shape_of` types it, and the
-//! optimizer sees through it. Totality is the separate syntactic query [`is_total`]: a program is total
-//! iff every fallible column is discharged by a `try` before the output.
+//! optimizer sees through it. A failure no `try` takes up reaches the output, which is then a
+//! `Fail<T>`; the typer shows it there.
 
 use crate::graph::{Builder, Graph, NodeKind};
 use crate::ops::{NumOp, Op};
@@ -60,12 +60,6 @@ fn regimes(g: &Graph<NumOp>, input_fail: bool) -> Vec<bool> {
 /// whether the graph's output column is fallible, given its input's regime.
 pub(crate) fn graph_is_fail(g: &Graph<NumOp>, input_fail: bool) -> bool {
     regimes(g, input_fail)[g.output]
-}
-
-/// a program is TOTAL iff, on a pure input, its output column is pure — every fallible column it
-/// builds is taken up by a `try` before the output. Syntactic, read straight off the op tags.
-pub fn is_total(g: &Graph<NumOp>) -> bool {
-    !graph_is_fail(g, false)
 }
 
 /// a one-parameter graph from a builder closure: `Input`, then whatever `body` adds on it.
