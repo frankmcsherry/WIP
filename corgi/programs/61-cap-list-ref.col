@@ -1,5 +1,5 @@
-# capture of a LIST-shaped context BY REFERENCE: `ref` turns each row of `xs` into a reference (one span
-# of the one shared payload), so `cap_list` pairs every element with a reference to its owner's list and
+# capture of a LIST-shaped context BY REFERENCE: `ref` turns each row of `xs` into a reference (its row
+# number in the one shared list), so `cap_list` pairs every element with a reference to its owner's list and
 # copies nothing; the body's `get` reads through the reference. Without the `ref`, `cap_list` copies the
 # list into every element (same answer, `elements x length` cost) — the choice is in the program.
 # n = 6

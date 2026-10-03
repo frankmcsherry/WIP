@@ -117,10 +117,10 @@ pub fn hash(v: &Value) -> Vec<u64> {
         Value::Unit(n) => vec![UNIT; *n],
 
         // a referenced row hashes as the list row it names (a reference has the identity of what it
-        // names). The whole payload is hashed, even where the spans name little of it.
-        Value::Ref(payload, spans) => {
-            let ch = hash(payload);
-            spans.iter().map(|&span| hash_span(&ch, span)).collect()
+        // names). The whole arena is hashed, even where the references name little of it.
+        Value::Ref(list, rows) => {
+            let rh = hash(list);
+            rows.iter().map(|&r| rh[r]).collect()
         }
     }
 }

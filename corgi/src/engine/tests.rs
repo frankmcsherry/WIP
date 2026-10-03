@@ -130,4 +130,16 @@ fn gather_or_zero_reads_the_shapes_zero() {
     assert_eq!(got, Value::sum(vec![1, 0, 0], vec![Value::u64(vec![0, 40]), Value::u64(vec![30])]));
     let none = Value::Sum(crate::value::Tags::Const(0, 0), Vec::new());
     assert!(gather_or_zero(&none, &[0]).is_err());
+    // a reference's zero is an empty row of its arena: in range, the arena is the one shared; out of
+    // range, a new arena with one more, empty row (or the last row, when that is empty already)
+    let arena = std::sync::Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7]))));
+    let refs = Value::Ref(arena.clone(), std::sync::Arc::new(vec![1, 0]));
+    let Value::Ref(same, _) = gather_or_zero(&refs, &[1, 0]).unwrap() else { panic!() };
+    assert!(std::sync::Arc::ptr_eq(&same, &arena));
+    let missed = gather_or_zero(&refs, &[0, 9]).unwrap();
+    let Value::Ref(grown, rows) = &missed else { panic!() };
+    assert_eq!((grown.len(), rows.to_vec()), (3, vec![1, 2]));
+    assert_eq!(clone_ref(missed.clone()), Value::List(vec![1, 1].into(), Box::new(Value::u64(vec![7]))));
+    let Value::Ref(again, rows) = gather_or_zero(&missed, &[5]).unwrap() else { panic!() };
+    assert!(std::sync::Arc::ptr_eq(&again, grown) && rows.to_vec() == vec![2], "an empty last row is reused");
 }
