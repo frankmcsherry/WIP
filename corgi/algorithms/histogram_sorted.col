@@ -1,0 +1,4 @@
+# histogram, counting by sorting instead of comparing every value with every bucket: sort the
+# bucket numbers and each bucket's count is the length of its equal range.
+let buckets = input map (v -> (v, 125u64) div_u64) sort in
+(8u64 iota, buckets) find map ((lo, hi) -> (hi, lo) sub)

@@ -41,6 +41,9 @@ impl PartialEq for HostOp {
     fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 impl Eq for HostOp {}
+impl std::fmt::Debug for HostOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Host({})", self.0.name()) }
+}
 impl std::hash::Hash for HostOp {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) { self.0.name().hash(h) }
 }

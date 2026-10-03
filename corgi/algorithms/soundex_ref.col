@@ -1,0 +1,17 @@
+# soundex with the digit table captured by reference: the table literal is built once per word
+# (not once per letter), and each letter reads it through a reference.
+let w = input map (c -> (((c, 65u8) ge, (c, 90u8) le) mul, (c, 32u8) add_u8, c) select) in
+# The digit of each letter, from a table indexed by letter ('0' for vowels, h, w and y).
+let codes = ("01230120022455012623010202" ref, w) cap_list map ((t, c) -> (((c, 97u8) sub_u8) cast 64, t) get) in
+# Left to right, remembering the last digit written: a letter writes its digit when it is not '0'
+# and differs from the last one. A vowel resets the last digit; `h` and `w` leave it alone.
+let steps = (0u8, (w, codes) zip) foldscan ((last, (c, d)) ->
+    let keep = ((d, 48u8) ne, (d, last) ne) mul in
+    let hw = ((c, 104u8) eq, (c, 119u8) eq) max in
+    ((hw, last, d) select, (keep, d))) in
+# The first letter is written as itself, so its digit is dropped (but it still counts as last).
+let kept = ((w len) iota, steps.1) zip map ((i, (keep, d)) -> (((i, 0u64) gt, keep) mul, d)) filter in
+let first = (0u64, w) get in
+let upper = (((first, 97u8) ge, (first, 32u8) sub_u8, first) select) enlist in
+let padded = ((upper, kept) append, "000") append in
+((0u64, 4u64) range, padded) gather try match (0 (code -> code), 1 (_ -> "0000"))

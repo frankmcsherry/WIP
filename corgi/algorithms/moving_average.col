@@ -1,0 +1,7 @@
+# The sum of every window of four consecutive values, as `xs.windows(4).map(sum)`. Input a
+# `List<U64>`. Output a `List<U64>` of max(n - 3, 0) window sums.
+let xs = input in
+# Windows start at 0 .. n - 3; a row shorter than four has none.
+let starts = (((xs len, 3u64) max, 3u64) sub) iota in
+let windows = (starts map (i -> (i, (i, 4u64) add)), xs) slices in
+windows map (w -> w fold_add) try match (0 (sums -> sums), 1 (_ -> 0u64 iota))

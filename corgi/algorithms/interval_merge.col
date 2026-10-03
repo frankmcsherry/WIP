@@ -1,0 +1,15 @@
+# Merge overlapping or touching half-open intervals. Input a `List<(lo, hi)>` per row, in any
+# order. Output the merged intervals, sorted, as a `List<(lo, hi)>`.
+#
+# Sort by start, then sweep: an interval starts a new merged interval when it begins past the
+# furthest end of everything before it. Number the merged intervals by counting those starts,
+# group by that number, and take each group's least start and greatest end.
+let sorted = input sort in
+let marks = ((0u64, 0u64), sorted) foldscan (((seen, reach), (lo, hi)) ->
+    let start = ((seen, 0u64) eq, (lo, reach) gt) max in
+    ((1u64, (reach, hi) max), (start, (lo, hi)))) .1 in
+let ids = marks map ((start, _) -> start) scan_add in
+# ids and marks come from the same list, so the zip cannot fail; the fallback is never taken.
+let tagged = (ids, marks map ((_, iv) -> iv)) zip try
+    match (0 (z -> z), 1 (_ -> 0u64 iota map (z -> (z, (z, z))))) in
+tagged group map ((_, ivs) -> (ivs map ((lo, _) -> lo) fold_min, ivs map ((_, hi) -> hi) fold_max))

@@ -43,7 +43,7 @@ pub(crate) fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
 /// fold (the fast paths a general `fold` over the same monoid would be ~20x slower than). `Min`/`Max`
 /// are kind-blind (the order-preserving bytes make them correct for signed/float too); `Sum`/`Prod`
 /// are unsigned; `All`/`Any` are the 0/1-mask AND/OR.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Red {
     Add, // `fold_add` (sum) / `scan_add` (prefix sum)
     Mul, // `fold_mul` (product) / `scan_mul`
@@ -53,7 +53,7 @@ pub enum Red {
     Any,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -66,7 +66,7 @@ pub enum BinOp {
     // order-preserving leaf needs no deswizzle), so they live in `cmp` as `CmpOp::Min`/`Max`.
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     U, // unsigned: the bytes ARE the value
     I, // signed: the bytes are an order-preserving swizzle of the value
@@ -93,7 +93,7 @@ fn dec_f64(u: u64) -> f64 {
     f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u })
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ArithOp {
     Bin(BinOp, Kind, u32), // binary leaf arithmetic at a bit-width
     BinImm(BinOp, Kind, u32, u64), // the same with a constant right operand: `x op c`, where `c` is the
@@ -407,7 +407,7 @@ impl ArithOp {
 
 /// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),
 /// `arith`, and `text` buckets — the layer the `ml` surface and the optimizer are typed at.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NumOp {
     Core(Op<NumOp>),
     Cmp(CmpOp),
@@ -419,18 +419,36 @@ pub enum NumOp {
 
 impl OpLike for NumOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
+        #[cfg(feature = "profile")]
+        return crate::explain::profile::time(|| profile_key(self), || self.dispatch(input));
+        #[cfg(not(feature = "profile"))]
+        self.dispatch(input)
+    }
+    fn children(&self) -> Vec<&Graph<NumOp>> {
+        match self {
+            NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
+            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) => Vec::new(),
+        }
+    }
+}
+
+/// the name an op is profiled under: `explain`'s, with constants dropped so they aggregate.
+#[cfg(feature = "profile")]
+fn profile_key(op: &NumOp) -> String {
+    match op {
+        NumOp::Core(Op::Lit(_)) => "lit".into(),
+        _ => crate::explain::op_name(op),
+    }
+}
+
+impl NumOp {
+    fn dispatch(&self, input: Value) -> Result<Value, String> {
         match self {
             NumOp::Core(c) => c.eval(input),
             NumOp::Cmp(c) => c.eval(input),
             NumOp::Arith(a) => a.eval(input),
             NumOp::Text(t) => t.eval(input),
             NumOp::Host(h) => h.eval(input),
-        }
-    }
-    fn children(&self) -> Vec<&Graph<NumOp>> {
-        match self {
-            NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
-            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) => Vec::new(),
         }
     }
 }

@@ -1,0 +1,14 @@
+# Does any pair of distinct positions of a list sum to the row's target? Input `(xs, t)`, a
+# `List<U64>` and a `U64`. Output 1 if some xs[i] + xs[j] = t with i != j, else 0.
+#
+# Sort, then look each element's partner t - x up in the sorted list. An element that is its own
+# partner needs a second copy of itself.
+let (xs, t) = input in
+let s = xs sort in
+let wanted = (t, s) cap_list map ((t, x) -> (x, (t, x) sub)) in
+let found = (wanted map ((_, p) -> p), s) find in
+(t, (wanted, found) zip) cap_list map ((t, ((x, p), (lo, hi))) ->
+    let copies = (hi, lo) sub in
+    let enough = ((p, x) eq, (copies, 2u64) ge, (copies, 1u64) ge) select in
+    ((x, t) le, enough) mul) fold_max
+    try match (0 (r -> r), 1 (_ -> 0u64))

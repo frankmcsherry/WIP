@@ -1,0 +1,9 @@
+# The most frequent value of each row (the smallest of those tied). Input a `List<U64>`. Output a
+# `U64`; an empty row gives 0.
+let xs = input in
+# Count each value: group by it, and sum a 1 per occurrence.
+let counts = xs map (x -> (x, 1u64)) group map ((v, ones) -> (v, ones fold_add)) in
+let top = counts map ((_, c) -> c) fold_max in
+# Groups come out in value order, so the first group with the top count is the smallest value.
+let winners = (top, counts) cap_list map ((top, (v, c)) -> ((c, top) eq, v)) filter in
+winners head try match (0 (v -> v), 1 (_ -> 0u64))

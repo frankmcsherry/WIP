@@ -7,6 +7,10 @@ edition = "2021"
 # optional: `Shape` (de)serializes, so a host can carry corgi types inside its own serialized IR.
 serde = { version = "1", features = ["derive"], optional = true }
 
+[features]
+# time per op kind over a run (`corgi::explain::profile`); off, it costs nothing.
+profile = []
+
 [[bench]]
 name = "eval"
 harness = false   # plain `fn main()` timing — no framework, no dependency
@@ -18,3 +22,8 @@ harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see
 [[bench]]
 name = "idioms"
 harness = false   # idiomatic corgi against idiomatic Rust; the rows of performance.md gaps.rs does not measure
+
+[[bench]]
+name = "algorithms"
+path = "benches/algorithms/main.rs"
+harness = false   # algorithms written as a user would, checked and timed against plain Rust

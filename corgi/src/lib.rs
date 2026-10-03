@@ -24,6 +24,7 @@
 pub mod bytes;
 pub(crate) mod effect;
 pub(crate) mod engine;
+pub mod explain;
 pub(crate) mod frontend;
 pub(crate) mod graph;
 pub(crate) mod hash;

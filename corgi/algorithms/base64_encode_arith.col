@@ -1,0 +1,20 @@
+# Base64, as base64_encode.col, rewritten to avoid its two costs: the 64-byte alphabet (a literal
+# inside `map`, so a copy of it per group) becomes arithmetic on the six-bit value, and the four
+# characters of a group are made by one `map` over [0, 4) instead of three `append`s.
+let n = input len in
+let pad = ((3u64, (n, 3u64) rem) sub, 3u64) rem in
+let zeros = pad iota map (_ -> 0u8) in
+let text = (input, zeros) append chunk 3 map (g ->
+    let a = (0u64, g) get cast 64 in
+    let b = (1u64, g) get cast 64 in
+    let c = (2u64, g) get cast 64 in
+    let v = (((a, 65536u64) mul, (b, 256u64) mul) add, c) add in
+    (v, 4u64 iota) cap_list map ((v, j) ->
+        # the j-th six bits of the group (shifts take constants, so pick among four), then the
+        # character for that six-bit value.
+        let s = ((j, 0u64) eq, v shr 18, ((j, 1u64) eq, v shr 12, ((j, 2u64) eq, v shr 6, v) select) select) select and 63 in
+        let ch = ((s, 26u64) lt, (s, 65u64) add, ((s, 52u64) lt, (s, 71u64) add, ((s, 62u64) lt, (s, 4u64) sub, ((s, 62u64) eq, 43u64, 47u64) select) select) select) select in
+        ch cast 8)) flatten .1 in
+let cut = (text len, pad) sub in
+(cut, (text len iota, text) zip) cap_list map ((cut, (k, ch)) -> ((k, cut) ge, 61u8, ch) select)
+    try match (0 (t -> t), 1 (_ -> ""))

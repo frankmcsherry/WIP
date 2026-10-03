@@ -1,0 +1,14 @@
+# Least-squares line through each row's points: slope and intercept. Input a `List<(x, y)>` of
+# `f64`. Output `(slope, intercept)`, two `f64`. No points gives (0, 0); a vertical spread of zero
+# (one point, or every x equal) gives slope 0 and the mean y.
+let pts = input in
+let n = pts len to_f64 in
+# One pass for the four sums.
+let (sx, sy, sxx, sxy) = ((0f64, 0f64, 0f64, 0f64), pts) fold (((sx, sy, sxx, sxy), (x, y)) ->
+    ((sx, x) add_f64, (sy, y) add_f64, (sxx, (x, x) mul_f64) add_f64, (sxy, (x, y) mul_f64) add_f64)) in
+let num = ((n, sxy) mul_f64, (sx, sy) mul_f64) sub_f64 in
+let den = ((n, sxx) mul_f64, (sx, sx) mul_f64) sub_f64 in
+let slope = ((den, 0f64) eq, 0f64, (num, den) div_f64) select in
+let intercept = ((sy, (slope, sx) mul_f64) sub_f64, n) div_f64 in
+let empty = (pts len, 0u64) eq in
+((empty, 0f64, slope) select, (empty, 0f64, intercept) select)

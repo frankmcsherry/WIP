@@ -10,7 +10,7 @@
 use crate::value::{Prim, Tags, Value};
 use std::sync::Arc;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TextOp {
     Split(u8), // List<U8> -> List<List<U8>>   split each row's bytes at the delimiter; adjacent
                // delimiters and bare ends yield empty pieces, the delimiter byte is dropped.
