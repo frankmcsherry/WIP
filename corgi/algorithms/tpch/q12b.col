@@ -1,0 +1,27 @@
+# q12 as an optimizer would leave it: the hash of each string literal folded to its constant, and
+# each column's hash computed once. (Measures what constant folding and CSE recover; same answer.)
+# sql: SELECT l_shipmode,
+# sql:   sum(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END),
+# sql:   sum(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END)
+# sql:   FROM orders, lineitem WHERE o_orderkey = l_orderkey AND l_shipmode IN ('MAIL', 'SHIP')
+# sql:   AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate AND l_receiptdate >= 8766
+# sql:   AND l_receiptdate < 9131 GROUP BY l_shipmode ORDER BY l_shipmode
+# columns: o_orderkey o_orderpriority l_orderkey l_shipmode l_commitdate l_receiptdate l_shipdate
+# output: [s,u,u]
+let (okey, oprio, lkey, lmode, lcommit, lreceipt, lship) = input in
+# Each order, and whether its priority is high, sorted by order key.
+let orders = (okey, oprio) zip
+    map ((k, p) -> let ph = p hash in (k, ((ph, 4903938789976615998u64) eq, (ph, 1371222460531124796u64) eq) max)) sort in
+# Line items shipped by MAIL or SHIP, received in 1994 after their commit date, shipped before it.
+let lines = ((lkey, lmode) zip, ((lcommit, lreceipt) zip, lship) zip) zip
+    map (((k, m), ((c, r), s)) ->
+        let mh = m hash in
+        let mode = ((mh, 11465100474798915512u64) eq, (mh, 16170363257408538205u64) eq) max in
+        let keep = (((mode, (c, r) lt) mul, (s, c) lt) mul, ((r, 8766u64) ge, (r, 9131u64) lt) mul) mul in
+        (keep, (k, m)))
+    filter in
+# Each line item's order priority, by looking its order up.
+let at = (lines map ((k, _) -> k), orders map ((k, _) -> k)) find in
+let high = (at map ((lo, _) -> lo), orders) gather map ((_, h) -> h) in
+(lines map ((_, m) -> m), high) zip group map ((m, hs) -> let h = hs fold_add in (m, h, (hs len, h) sub))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", z, z))))
