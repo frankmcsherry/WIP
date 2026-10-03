@@ -1,7 +1,6 @@
-# branch: the TOTAL Branch. tag t < n routes to payload lane t+1; an out-of-range tag lands in
-# lane 0 (Oob) carrying the bad tag — no panic, the index/ParseU64 discipline. Here tags are the
-# element values [0..5); `branch 3` keeps 0,1,2 (lanes 1,2,3) and routes 3,4 to Oob. The clean
-# `branch` would be reachable only once a range pass proves tags < n; until then this is how you split.
+# branch: total by definition. A tag below n routes to lane tag; a tag of n-1 or more goes to the last
+# lane, so nothing panics and nothing is lost. Here tags are the element values [0..5); `branch 3`
+# keeps 0 and 1 in lanes 0 and 1, and routes 2, 3 and 4 to lane 2.
 # n = 5
-# = Sum tags=[1] [List ends=[] <Sum tags=[] [[], [], []]>, ()x1]
+# = List ends=[5] <Sum tags=[0, 1, 2, 2, 2] [[0], [1], [2, 3, 4]]>
 input iota map (x -> (x, x) branch 3)

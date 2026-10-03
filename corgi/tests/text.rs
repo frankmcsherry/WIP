@@ -36,12 +36,12 @@ fn split_keeps_empty_pieces() {
 
 #[test]
 fn parse_u64_is_total() {
-    // malformed rows (empty, non-digit) land in the Err lane with their original bytes; u64::MAX
-    // is well-formed. Nothing panics.
+    // malformed rows (empty, non-digit) land in the Err lane, which counts them; u64::MAX is
+    // well-formed. Nothing panics.
     let arg = strings(&["42", "", "9x", "18446744073709551615"]);
     assert_eq!(
         run("input parse_u64", &arg),
-        "Sum tags=[1, 0, 0, 1] [List ends=[0, 2] <[57, 120]>, [42, 18446744073709551615]]"
+        "Sum tags=[0, 1, 1, 0] [[42, 18446744073709551615], ()x2]"
     );
 }
 
@@ -50,7 +50,7 @@ fn parse_u64_overflow_is_err_not_wrap() {
     // u64::MAX + 1: the checked accumulate rejects it — an Err row, not a wrapped value.
     let arg = strings(&["18446744073709551616"]);
     let out = run("input parse_u64", &arg);
-    assert!(out.starts_with("Sum tags=[0]"), "expected an Err row, got {out}");
+    assert!(out.starts_with("Sum tags=[1]"), "expected an Err row, got {out}");
 }
 
 #[test]

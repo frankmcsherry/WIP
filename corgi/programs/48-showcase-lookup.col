@@ -1,10 +1,10 @@
 # SHOWCASE — a total table lookup with a default, via `gather_try` + `match`. The table is [0,1,4,9,16,25]
-# (squares); the queries [0..n+2) run two past the end. `gather_try` is total — hits return Found(value),
-# the two out-of-range queries return Oob(bad index) — and the `match` supplies a default of 0 for the
-# misses. No bounds panic, no sentinel value smuggled in a leaf: the miss is a Sum lane the program
+# (squares); the queries [0..n+2) run two past the end. `gather_try` is total — hits land in lane 0
+# (Found, the value), the two out-of-range queries in lane 1 (Missing) — and the `match` supplies a
+# default of 0 for the misses. No bounds panic, no sentinel value smuggled in a leaf: the miss is a Sum lane the program
 # must handle, so a forgotten case is a type error, not a crash. This is the agent-safe style.
 # n = 6
 # = List ends=[8] <[0, 1, 4, 9, 16, 25, 0, 0]>
 let table = input iota map (x -> (x, x) mul) in
 let queries = (input, 2u64) add iota in
-(queries, table) gather_try map (e -> e match (0 (oob -> 0u64), 1 (v -> v)))
+(queries, table) gather_try map (e -> e match (0 (v -> v), 1 (miss -> 0u64)))

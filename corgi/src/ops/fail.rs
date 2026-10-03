@@ -414,21 +414,6 @@ pub(crate) fn try_chunk<L: OpLike>(k: usize, input: Value) -> Result<Value, Stri
     per_row_try(&err, &super::core::Op::<L>::Chunk(k), input)
 }
 
-/// `(X, tags:U64) -> Fail<Sum{X × n}>`: the demux; a tag `>= n` errs its row.
-pub(crate) fn try_branch<L: OpLike>(n: usize, input: Value) -> Result<Value, String> {
-    if n > 256 {
-        return Err(format!("TryBranch: arity {n} exceeds the u8 tag width"));
-    }
-    let mut err = Vec::new();
-    {
-        let (data, tags_v) = pair_of(&input, "TryBranch")?;
-        let tags = tags_v.as_u64("TryBranch tags")?;
-        assert_eq!(data.len(), tags.len(), "TryBranch: payload/discriminant length");
-        err.extend(tags.iter().map(|&t| t as usize >= n));
-    }
-    per_row_try(&err, &super::core::Op::<L>::Branch(n), input)
-}
-
 /// `(List<X>, List<Y>) -> Fail<List<(X, Y)>>`: per row, the two inner lists must agree in length.
 pub(crate) fn try_zip<L: OpLike>(input: Value) -> Result<Value, String> {
     let mut err = Vec::new();
@@ -437,6 +422,11 @@ pub(crate) fn try_zip<L: OpLike>(input: Value) -> Result<Value, String> {
         let (bx, _) = list_of(lx, "TryZip lhs")?;
         let (by, _) = list_of(ly, "TryZip rhs")?;
         assert_eq!(bx.len(), by.len(), "TryZip: row count");
+        // two lists from one source share their bounds (`(xs, xs map f)`), which compares in O(1)
+        // and settles every row at once.
+        if bx == by {
+            return super::core::Op::<L>::Zip.eval(input).map(lift);
+        }
         let (mut sx, mut sy) = (0usize, 0usize);
         for r in 0..bx.len() {
             let (ex, ey) = (bx.end(r), by.end(r));
@@ -454,7 +444,7 @@ pub(crate) fn is_family<L: OpLike>(op: &super::core::Op<L>) -> bool {
     matches!(
         op,
         Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) | Op::TryGet | Op::TryGather
-            | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_) | Op::TryZip
+            | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryZip
     )
 }
 
@@ -472,7 +462,6 @@ pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<V
         Op::TrySlices => try_slices::<L>(input),
         Op::TryFilter => try_filter::<L>(input),
         Op::TryChunk(k) => try_chunk::<L>(*k, input),
-        Op::TryBranch(n) => try_branch::<L>(*n, input),
         Op::TryZip => try_zip::<L>(input),
         _ => unreachable!("not a failure-family op"),
     }

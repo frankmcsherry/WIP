@@ -86,19 +86,19 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "ref" => Op::Ref.into(),          // T -> Ref<T>: take references (a capture then costs one ref per element)
         "clone" => Op::Clone.into(),      // Ref<T> -> T: clone the referenced rows out
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
-        "branch" => Op::TryBranch(n()? as usize).into(), // the demux; a tag >= n errs its row
+        "branch" => Op::Branch(n()? as usize).into(), // the demux; a tag of n-1 or more goes to the last lane
         "filter" => Op::TryFilter.into(), // per row: data/mask lengths agree, else Err
         "sort" => CmpOp::SortList.into(),
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
         // point access — `get` (scalar, one index per row) and `gather` (vector, a list of indices) err
-        // per ROW; `gather_try` is the DISTINCT per-element gather (`List<Sum{Oob | Found}>`), reifying
+        // per ROW; `gather_try` is the DISTINCT per-element gather (`List<Sum{Found | Missing}>`), reifying
         // each element's miss as data — kept as its own verb. `head` is sugar for `get 0` (see ml.rs).
         "slices" => Op::TrySlices.into(),     // per row: every range in bounds, else Err
         "get" => Op::TryGet.into(),           // (idx, haystack) -> the element, or Err out of range
         "gather" => Op::TryGather.into(),     // per row all-or-nothing over its indices
-        "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Oob | Found}>
+        "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Found | Missing}>
         "try" => Op::Try.into(), // handle a fallible stage here: its Fail<T> = Sum{T | Unit} is now data to match
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),

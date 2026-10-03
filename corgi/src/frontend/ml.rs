@@ -563,7 +563,7 @@ impl P {
                 let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
                 Ok(Apply::Inject(tag, self.enum_shape(&e)?))
             }
-            // head: first element, sugar for `get 0` — total (an empty row -> Oob, carried in the err-mask).
+            // head: first element, sugar for `get 0` — total (an empty row errs, carried in the err-mask).
             "head" => Ok(Apply::Head),
             // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
             // it names a byte, not a count.
@@ -727,7 +727,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
                 // first element = index 0 of the row: build the (0, list) pair and scalar-`get` it.
                 Apply::Head => {
-                    // `head` lowers to `get` (GetTry) — the get FailOp; an empty row is an Oob carried
+                    // `head` lowers to `get` (GetTry) — the get FailOp; an empty row is an error carried
                     // in the err-mask, observed by a downstream TRY, not a panic.
                     let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);

@@ -89,10 +89,10 @@ src/
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
                    LIST   Enlist         Get      MapList   CapList  (witness: bounds column)
                LIST elim: Get (U64,List<X>)->X is the point eliminator (`head` = sugar `Get 0`, so an
-               empty row is Oob 0 — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
+               empty row errs — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
                elim; FoldScan (T,List<A>)->(T,List<R>) (mapAccumL — the scan kernel; `scan` is sugar =
                FoldScan with body (a,x)->(b,b), field 1). Get/Gather come in _uns (assert) and _try
-               (total -> Sum{Oob|Found}) tiers; Gather is Get vectorized (a list of indices). Plus Unit
+               (total -> Sum{Found|Missing}) tiers; Gather is Get vectorized (a list of indices). Plus Unit
                (X -> Unit) and the typed numeric grid + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
                List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave) — and the fused forms/producers
@@ -271,9 +271,11 @@ applied to a fallible column where lowering forgot to lift would be a shape erro
 separate syntactic query — total iff every fallible column meets a `try` before the output; `run`
 refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
 
-The partial kernels (`Op::Get`, `Gather`, `Filter`, `Slices`, `Chunk`, `Zip`, `Branch`) stay in the enum for
-a host holding a bounds proof (DDIR); they are not on the surface. `gather_try` is distinct: the
-per-ELEMENT `List<Sum{Oob | Found}>`, a value the program handles itself, not a per-row effect.
+The partial kernels (`Op::Get`, `Gather`, `Filter`, `Slices`, `Chunk`, `Zip`) stay in the enum for
+a host holding a bounds proof (DDIR); they are not on the surface. `Branch` is total (a tag of n-1 or
+more goes to the last lane) and is the surface `branch`. `gather_try` is distinct: the per-ELEMENT
+`List<Sum{Found | Missing}>`, a value the program handles itself, not a per-row effect. Every "maybe"
+result has this one shape: Ok first, the failures only counted (`Fail<T>`, `gather_try`, `parse_u64`).
 
 **Audit rule, kept from the old gates:** an analysis threaded through a fixpoint (`Fold`/`FoldScan`'s
 accumulator back-edge) must treat the fed-back value as unknown; the lowering does this by making the
@@ -298,8 +300,8 @@ Then the point-access factoring. `Index`/`Head` were retired in favour of one in
 at two strata: the atom is the **scalar `Get (U64,List<X>)->X`** (one O(1) lookup per row, the genuine
 list eliminator), `Gather` is its **vectorization** (the index arrives as a list), and `head` is **sugar
 `Get 0`** — so `Op::Head` left the engine and a *total* head needs no non-emptiness proof (an empty row
-is `Oob 0`). Each of get/gather carries a `_uns` tier (assert in-bounds) and a `_try` tier (total ->
-`Sum{Oob|Found}`); the plain checked tier (a proven bound) is reserved. Why this direction and not
+is an error row). Each of get/gather carries a `_uns` tier (assert in-bounds) and a `_try` tier (total ->
+`Sum{Found|Missing}`); the plain checked tier (a proven bound) is reserved. Why this direction and not
 `Get = enlist;gather;head`: `gather` is list-*preserving* so it can't eliminate, and the only
 irreducible piece is the bare-`X` outro — making `Get` the atom keeps one index kernel and yields the
 total head for free, where the HEAD-atom route would have needed new non-emptiness analysis. (`Fold`/
