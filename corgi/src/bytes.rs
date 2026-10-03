@@ -15,7 +15,7 @@
 //!     needs to agree on a schema in advance, and [`read_from`] reconstructs the same `Value` the
 //!     encoder held — same leaf widths, same `Bounds` encoding.
 //!
-//! The one thing the codec does NOT do is share buffers: a `Prim` is an `Arc<Vec<uN>>`, which owns
+//! The one thing the codec does NOT do is share buffers: a `Prim` is an `Arc` around a `Vec<uN>`, which owns
 //! its allocation, so a decode must copy the payload into a fresh `Vec`. That copy is one memcpy
 //! per leaf column and is the honest floor for this representation; borrowing bytes would take a
 //! different leaf type, not a different codec.
@@ -554,7 +554,6 @@ fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
 }
 
 fn read_prim(r: &mut Reader) -> Result<Prim, String> {
-    use std::sync::Arc;
     let bits = r.word()?;
     // Bound the element count by the width BEFORE multiplying: a wire-supplied length near
     // `u64::MAX` would otherwise wrap `len * width` — to something small in release (a corrupt
@@ -569,10 +568,10 @@ fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     };
     let bytes = r.payload(payload)?;
     Ok(match bits {
-        8 => Prim::U8(Arc::new(bytes.to_vec())),
-        16 => Prim::U16(Arc::new(read_le(bytes, u16::from_le_bytes))),
-        32 => Prim::U32(Arc::new(read_le(bytes, u32::from_le_bytes))),
-        _ => Prim::U64(Arc::new(read_le(bytes, u64::from_le_bytes))),
+        8 => Prim::U8(crate::pool::leaf(bytes.to_vec())),
+        16 => Prim::U16(crate::pool::leaf(read_le(bytes, u16::from_le_bytes))),
+        32 => Prim::U32(crate::pool::leaf(read_le(bytes, u32::from_le_bytes))),
+        _ => Prim::U64(crate::pool::leaf(read_le(bytes, u64::from_le_bytes))),
     })
 }
 

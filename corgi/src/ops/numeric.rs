@@ -14,6 +14,8 @@ use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
 
+use crate::pool::{collect, leaf, take, Buf, Elem};
+use crate::shape::shape_of_value;
 use crate::value::{Prim, Value};
 use std::sync::Arc;
 
@@ -30,10 +32,10 @@ pub fn dec_i64(u: u64) -> i64 {
 /// `Op::Lit` of this.
 pub(crate) fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
     let raw = match width {
-        8 => Prim::U8(Arc::new(vec![n as u8])),
-        16 => Prim::U16(Arc::new(vec![n as u16])),
-        32 => Prim::U32(Arc::new(vec![n as u32])),
-        64 => Prim::U64(Arc::new(vec![n])),
+        8 => Prim::U8(leaf(vec![n as u8])),
+        16 => Prim::U16(leaf(vec![n as u16])),
+        32 => Prim::U32(leaf(vec![n as u32])),
+        64 => Prim::U64(leaf(vec![n])),
         _ => panic!("lit: unsupported width {width}"),
     };
     Value::Prim(if matches!(kind, Kind::I) { raw.xor_signbit() } else { raw })
@@ -128,7 +130,7 @@ macro_rules! swiz {
 /// Both lanes are read before the store, so EITHER side is a valid destination (Sub included:
 /// `f` is `x - y` regardless of where it lands). `get_mut` (not `make_mut`) tests uniqueness
 /// without cloning, so a shared LHS falls through to a unique RHS; only when both are shared do we allocate.
-fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+fn bin_into<T: Elem>(mut a: Arc<Buf<T>>, mut b: Arc<Buf<T>>, f: impl Fn(T, T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = f(*x, y); }
         a
@@ -136,19 +138,19 @@ fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) ->
         for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = f(x, *y); }
         b
     } else {
-        Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect())
+        leaf(collect(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y))))
     }
 }
 
 /// apply a binary lane op `f` against the constant `c`, in place when `a` is uniquely owned, else
 /// fresh. The immediate sibling of `bin_into`: `f(x, c)` is exactly what `bin_into` computes when
 /// every row of the right operand is `c`.
-fn imm_into<T: Copy>(mut a: Arc<Vec<T>>, c: T, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+fn imm_into<T: Elem>(mut a: Arc<Buf<T>>, c: T, f: impl Fn(T, T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for x in dst.iter_mut() { *x = f(*x, c); }
         a
     } else {
-        Arc::new(a.iter().map(|&x| f(x, c)).collect())
+        leaf(collect(a.iter().map(|&x| f(x, c))))
     }
 }
 
@@ -181,13 +183,25 @@ macro_rules! int_arms {
     };
 }
 
+/// a `u64` leaf rewritten element by element: in place, keeping the leaf's `Arc`, when it is uniquely
+/// owned; else a copy (from the pool) rewritten. `who` names the op in the shape error.
+fn u64_in_place(input: Value, who: &str, f: impl Fn(&mut u64)) -> Result<Value, String> {
+    match input {
+        Value::Prim(Prim::U64(mut xs)) => {
+            Arc::make_mut(&mut xs).iter_mut().for_each(f);
+            Ok(Value::Prim(Prim::U64(xs)))
+        }
+        other => Err(format!("{who}: expected U64, got {}", shape_of_value(&other))),
+    }
+}
+
 /// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh.
-fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
+fn neg_into<T: Elem>(mut a: Arc<Buf<T>>, f: impl Fn(T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for x in dst.iter_mut() { *x = f(*x); }
         a
     } else {
-        Arc::new(a.iter().map(|&x| f(x)).collect())
+        leaf(collect(a.iter().map(|&x| f(x))))
     }
 }
 
@@ -336,22 +350,15 @@ impl ArithOp {
                 (64, Prim::U64(v)) => Prim::U64(neg_into(v, |x| enc_f64(x as f64))),
                 (w, p) => return Err(format!("to_float expects a U{w} leaf (w in 32/64), got U{}", p.bits())),
             }),
-            // in place when uniquely owned. Both vectorize (vector shift / vector AND) — the SIMD forms of
+            // in place when uniquely owned (the leaf's own `Arc` and buffer go on to the output),
+            // else into a copy. Both vectorize (vector shift / vector AND) — the SIMD forms of
             // divide / modulo by a power of two, which general integer div/mod lack on NEON.
-            ArithOp::Shr(k) => {
-                let mut xs = input.into_u64("Shr")?;
-                xs.iter_mut().for_each(|x| *x >>= *k);
-                Value::u64(xs)
-            }
-            ArithOp::And(m) => {
-                let mut xs = input.into_u64("And")?;
-                xs.iter_mut().for_each(|x| *x &= *m);
-                Value::u64(xs)
-            }
+            ArithOp::Shr(k) => u64_in_place(input, "Shr", |x| *x >>= *k)?,
+            ArithOp::And(m) => u64_in_place(input, "And", |x| *x &= *m)?,
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
                 let xs = vals.as_u64("reduce values")?;
-                let mut out = Vec::with_capacity(bounds.len());
+                let mut out = take(bounds.len());
                 let mut start = 0;
                 for end in bounds.ends() {
                     let s = &xs[start..end]; // empty row -> the monoid identity
@@ -371,8 +378,15 @@ impl ArithOp {
                 Value::u64(out)
             }
             ArithOp::Scan(r) => {
-                let (bounds, vals) = input.into_list("scan")?;
-                let mut xs = vals.into_u64("scan values")?; // owned -> inclusive prefix written in place
+                // the inclusive prefix is written in place, into the list's own box and leaf when
+                // they are uniquely owned (else into a copy of the leaf).
+                let Value::List(bounds, mut vals) = input else {
+                    return Err(format!("scan: expected a list, got {}", shape_of_value(&input)));
+                };
+                let Value::Prim(Prim::U64(leaf_buf)) = &mut *vals else {
+                    return Err(format!("scan values: expected U64, got {}", shape_of_value(&vals)));
+                };
+                let xs = Arc::make_mut(leaf_buf);
                 // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
                 // sequential within a row, so this is a single memory pass, not a vectorizable one.
                 macro_rules! prefix {
@@ -398,7 +412,7 @@ impl ArithOp {
                     Red::All => prefix!(1u64, a, x => a & (x != 0) as u64), // running "all nonzero so far"
                     Red::Any => prefix!(0u64, a, x => a | (x != 0) as u64), // running "any nonzero so far"
                 }
-                Value::List(bounds, Box::new(Value::u64(xs)))
+                Value::List(bounds, vals)
             }
         })
     }

@@ -6,6 +6,7 @@
 
 use crate::shape::{shape_of_value, Shape};
 use crate::value::Value;
+use std::cell::RefCell;
 
 /// an op vocabulary: a value-level `eval` — whose `Err` is the SHAPE error, so that `eval` run on a
 /// zero-row column is the typer — and any body sub-graphs it carries (so structural passes like
@@ -34,6 +35,30 @@ pub(crate) struct Node<O> {
 pub struct Graph<O> {
     pub(crate) nodes: Vec<Node<O>>,
     pub(crate) output: usize,
+    /// how many times each node's value is read: once per edge into it, and once more for the
+    /// output. It depends only on `nodes` and `output`, so it is computed once, when the graph is
+    /// built ([`Graph::new`]), rather than on every evaluation. (So a graph's nodes are not edited
+    /// in place after it is built; every pass builds a new graph.)
+    uses: Box<[usize]>,
+}
+
+impl<O> Graph<O> {
+    /// a graph from its nodes and its output node, with each node's read count worked out once.
+    pub(crate) fn new(nodes: Vec<Node<O>>, output: usize) -> Self {
+        let mut uses = vec![0usize; nodes.len()];
+        for node in &nodes {
+            for &i in &node.inputs {
+                // an edge that is not backward is `check`'s error to report, not this one's.
+                if let Some(u) = uses.get_mut(i) {
+                    *u += 1;
+                }
+            }
+        }
+        if let Some(u) = uses.get_mut(output) {
+            *u += 1; // the returned value is a use too, so a consumer can't move it out first
+        }
+        Graph { nodes, output, uses: uses.into() }
+    }
 }
 
 impl<O: OpLike> Graph<O> {
@@ -68,37 +93,55 @@ impl<O: OpLike> Graph<O> {
 /// reader holds the sole `Arc` to each leaf — `into_*` can move the buffer out (refcount 1) and an
 /// op can `Arc::make_mut` in place. Taking `arg` by value extends that to the FIRST op: `Input`
 /// moves the argument in rather than cloning it, so a caller that hands off sole ownership pays no
-/// input copy. Backward edges (see [`Graph::check`]) make the per-node consumer count a single pass.
+/// input copy. Backward edges (see [`Graph::check`]) make the per-node consumer count a single pass,
+/// made once when the graph is built.
 pub fn eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Value {
     try_eval_graph(g, arg).unwrap_or_else(|e| panic!("eval_graph: {e}"))
 }
 
 /// [`eval_graph`] with the shape error surfaced: the form the typer and body-bearing ops use.
 pub(crate) fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Value, String> {
-    let mut uses = vec![0usize; g.nodes.len()];
-    for node in &g.nodes { for &i in &node.inputs { uses[i] += 1; } }
-    uses[g.output] += 1; // the returned value is a use too, so a consumer can't move it out first
+    // the working state comes from this thread's stack of spare slot vectors, and goes back to it
+    // empty, so an evaluation allocates nothing for its own bookkeeping once the stack has warmed.
+    let mut slots = SLOTS.try_with(|s| s.borrow_mut().pop()).ok().flatten().unwrap_or_default();
+    let out = eval_slots(g, arg, &mut slots);
+    slots.clear(); // drops whatever an early error left behind
+    let _ = SLOTS.try_with(|s| s.borrow_mut().push(slots));
+    out
+}
 
+/// one node's working state during an evaluation: the reads of its value still to come, and the
+/// value itself once computed (until its last read moves it out).
+struct Slot {
+    uses: usize,
+    val: Option<Value>,
+}
+
+thread_local! {
+    /// spare slot vectors, kept empty between evaluations. A stack rather than one vector, because a
+    /// body's evaluation runs inside its parent's; one vector per level of nesting is ever in use.
+    static SLOTS: RefCell<Vec<Vec<Slot>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn eval_slots<O: OpLike>(g: &Graph<O>, arg: Value, slots: &mut Vec<Slot>) -> Result<Value, String> {
     // take node `i`'s value: move it out on its last use, else clone (a cheap `Arc` bump).
-    let take = |vals: &mut Vec<Option<Value>>, uses: &mut [usize], i: usize| -> Value {
-        uses[i] -= 1;
-        if uses[i] == 0 { vals[i].take().unwrap() }
-        else { vals[i].as_ref().unwrap().clone() }
-    };
+    fn take(slots: &mut [Slot], i: usize) -> Value {
+        let s = &mut slots[i];
+        s.uses -= 1;
+        if s.uses == 0 { s.val.take().unwrap() } else { s.val.as_ref().unwrap().clone() }
+    }
 
     let mut arg = Some(arg); // moved into the (single) `Input` node; `take` errors on a second one
-    let mut vals: Vec<Option<Value>> = Vec::with_capacity(g.nodes.len());
-    for node in &g.nodes {
+    slots.reserve(g.nodes.len());
+    for (node, &uses) in g.nodes.iter().zip(&g.uses[..]) {
         let v = match &node.kind {
             NodeKind::Input => arg.take().expect("graph has more than one Input node"),
-            NodeKind::Tuple => {
-                Value::Prod(node.inputs.iter().map(|&i| take(&mut vals, &mut uses, i)).collect())
-            }
-            NodeKind::Op(o) => o.eval(take(&mut vals, &mut uses, node.inputs[0]))?,
+            NodeKind::Tuple => Value::Prod(node.inputs.iter().map(|&i| take(slots, i)).collect()),
+            NodeKind::Op(o) => o.eval(take(slots, node.inputs[0]))?,
         };
-        vals.push(Some(v));
+        slots.push(Slot { uses, val: Some(v) });
     }
-    Ok(vals[g.output].take().unwrap())
+    Ok(slots[g.output].val.take().unwrap())
 }
 
 /// shape-check the graph given the input's shape: `eval` on a ZERO-ROW column of that shape. Every
@@ -138,6 +181,6 @@ impl<O: OpLike> Builder<O> {
         self.push(NodeKind::Op(op.into()), inputs)
     }
     pub fn finish(self, output: usize) -> Graph<O> {
-        Graph { nodes: self.nodes, output }
+        Graph::new(self.nodes, output)
     }
 }
