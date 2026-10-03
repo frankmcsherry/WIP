@@ -29,7 +29,7 @@ pub enum Value {
 
 /// the rows of a haystack as a reader sees them: `span(i)` over one payload, whether the rows came
 /// as a `List` (a partition of its payload) or as a `Ref` (spans of a shared payload). The
-/// span-aware readers (`Get`/`Gather`/`Find`/`Slices`/`Len`) take this via `rows_of`; every other
+/// span-aware readers (`Gather`/`Find`/`Len`) take this via `rows_of`; every other
 /// op takes `into_list`, which only accepts a `List` — a Ref is the shape error "clone first".
 #[derive(Clone, Copy)]
 pub(crate) enum Rows<'a> {

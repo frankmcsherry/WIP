@@ -3,8 +3,8 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, filter_mask, gather, gather_lanes, materialize_spans, owner_ids, range_spans,
-    resolve_indices, take_ref, unwrap_leaves,
+    blend, clone_ref, compress, fill, filter_mask, gather, gather_lanes, index_plan, owner_ids, take_ref,
+    unwrap_leaves, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
@@ -137,7 +137,7 @@ pub enum Op<L> {
                     // is referenced — then it is one reference per element (a closure's `&ctx`).
     // REF — referenced list rows. The explicit by-reference/by-value pair: everything that moves
     // rows (`gather`, hence the capture family, `Lit`, and the merges) moves only spans on a Ref, and
-    // nothing copies referenced rows except `Clone`. The readers `Get`/`Gather`/`Find`/`Slices`/`Len`
+    // nothing copies referenced rows except `Clone`. The readers `Gather`/`Find`/`Len`
     // accept a referenced list haystack; every other op on a Ref is the shape error "clone first".
     Ref,            // T -> T'           every top-level List<X> in T becomes Ref<List<X>> (through
                     //                   products and sums; O(rows), nothing copied)
@@ -145,15 +145,14 @@ pub enum Op<L> {
                     //                   referenced rows; `clone` undoes `ref`)
 
     // ---- structural isos: de-/re-structure between nestings the layout already stores; linear
-    // bounds work at most, no per-element compute. Three pairs: List⊗Prod (Transpose/Zip),
-    // List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave).
+    // bounds work at most, no per-element compute. Pairs: List⊗Prod (Transpose/Zip), List⊗Sum
+    // (Unweave/Weave); List⊗List's inverse of Flatten is the word `slices` (map(range); gather).
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
     Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse; bounds must
                     // agree (asserted). A pure rewrap — no data moves. PARTIAL: panics on differing
                     // bounds; surface-usable once the size pass proves the bounds agree (else TryZip).
-    Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values
-    Slices,         // (List<(lo,hi)>, haystack:List<T>) -> List<List<T>>  materialize each range —
-                    // Flatten's inverse and the range form of Gather.
+    Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values (its
+                    // inverse is the word `slices`: map(range); gather)
     Unweave,        // List<Sum{A|B|..}> -> (tags:List<U8>, List<A>, List<B>, ..)  destructure a
                     // sum column: the tag list plus each lane re-sliced per outer row. Lanes are
                     // already stored packed in row order, so only bounds are computed.
@@ -169,17 +168,18 @@ pub enum Op<L> {
     Filter,         // List<(U64-mask, X)> -> List<X>  keep the elements whose mask is nonzero, in one
                     // pass. Total by construction: a list of pairs can't disagree in length. (The
                     // kernel expansion is map(branch); unweave; field — see the law.)
-    // point access — fetch a haystack element by index. The atom is the SCALAR get (one O(1)
-    // lookup per row; `TryGet` below is its total form), `Gather` is its vectorization (the index
-    // arrives as a list), and `head` is sugar for `get 0` (an empty row errs, so a TOTAL head needs
-    // no non-emptiness proof).
-    Get,            // (idx:U64, haystack:List<T>) -> T  the scalar point access, PARTIAL (panics out of
-                    // bounds): the host-side kernel for an index the host has already checked or whose
-                    // failure it defines as a fault. `TryGet` is the total form.
-    Gather,         // (idx:List<U64>, haystack:List<T>) -> List<T>  the vector form: a list of indices.
-                    // The engine primitive surfaced; chains compose in-language —
-                    // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
-                    // PARTIAL (panics out of bounds): the unchecked fast path. `Get` is the 1-index case.
+    // point access — fetch haystack elements by position. `Gather` is the one fetch kernel: per row,
+    // positions of any shape into that row's haystack, each integer leaf replaced by the element it
+    // names. `get` is `Gather` on one position per row, `head` is `get 0`, and `slices` is the word
+    // `map(range); gather` (see `frontend::ml`).
+    Gather,         // (idx:P, haystack:List<T>) -> P[T]  P any shape whose leaves are integers (one
+                    // position, a list of them, nested lists, products, sums), each a position in its
+                    // top-level row; the result has P's structure with every leaf replaced by its
+                    // element. Chains compose in-language — gather(gather(v,i),j) = gather(v,
+                    // gather(i,j)), so index math stays index math.
+                    // PARTIAL (panics out of bounds): the unchecked fast path; `TryGather` is total.
+    Range,          // (lo:U64, hi:U64) -> List<U64>  per row [lo, hi), empty when lo >= hi: `iota` with
+                    // a start. Total.
     GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Found:T | Missing}>  TOTAL vector
                     // access: each index found or missing, the failure shape `Fail<T>` has (Ok first,
                     // the misses only counted). A bounds-proof pass demotes `GatherTry` to `Gather` +
@@ -206,9 +206,7 @@ pub enum Op<L> {
     // The `Try*` ops are the TOTAL per-row forms of the partial kernels above (a row that would trip
     // the kernel's assert lands in Err); `Lift`/`Squash`/`Hoist*` are the plumbing `effect::lower_effects`
     // inserts so pure programs run on the Ok lane. All ordinary ops, with one eval each.
-    TryGet,         // (idx:U64, haystack:List<T>) -> Fail<T>
-    TryGather,      // (idx:List<U64>, haystack:List<T>) -> Fail<List<T>>   per row all-or-nothing
-    TrySlices,      // (List<(lo,hi)>, List<T>) -> Fail<List<List<T>>>      every range in bounds
+    TryGather,      // (idx:P, haystack:List<T>) -> Fail<P[T]>              per row all-or-nothing
     TryChunk(usize),// List<X> -> Fail<List<List<X>>>                       row length divides by k
     TryZip,         // (List<X>, List<Y>) -> Fail<List<(X,Y)>>              inner lengths agree
     Lift,           // X -> Fail<X>                                         every row Ok
@@ -728,63 +726,30 @@ impl<L: OpLike> Op<L> {
                 Value::Sum(tags, variants)
             }
 
-            // materialize: replace each (lo,hi) range with the haystack-row slice it
-            // names. List<(lo,hi)> -> List<List<T>>; reuses `gather`. A list-introducer.
-            // on a list haystack the ranges are copied out (List<List<T>>); on a REFERENCED haystack
-            // they are handed back as references (List<Ref<List<T>>>), O(ranges) — the per-anchor
-            // sub-list of a join/WCO plan without materializing it.
-            Op::Slices => {
-                let (lohi, haystack) = input.into_pair("Slices")?;
-                let (lb, lvals) = lohi.into_list("Slices ranges")?;
-                let (hrows, hvals) = haystack.rows_of("Slices haystack")?;
-                let (lo, hi) = lvals.into_pair("Slices lo_hi")?;
-                let (lo_c, hi_c) = (lo.as_u64("Slices lo")?, hi.as_u64("Slices hi")?);
-                assert_eq!(lb.len(), hrows.len(), "Slices: row count");
-                let spans = range_spans(&lb, lo_c, hi_c, hrows);
-                let inner = match &haystack {
-                    Value::Ref(payload, _) => Value::Ref(payload.clone(), Arc::new(spans)), // same arena
-                    _ => materialize_spans(&spans, hvals),
-                };
-                Value::List(lb, Box::new(inner))
-            }
-
-            // vector point gather: each row-relative index becomes the haystack element it names.
-            // Output bounds are the index list's bounds (the indices decide the cardinality).
-            Op::Get => {
-                let (idx, haystack) = input.into_pair("Get")?;
-                let idxs = idx.as_u64("Get index")?;
-                let (hb, hvals) = haystack.rows_of("Get haystack")?;
-                assert_eq!(idxs.len(), hb.len(), "Get: index/haystack row count");
-                let mut abs = Vec::with_capacity(idxs.len());
-                for (r, &x) in idxs.iter().enumerate() {
-                    let (hs, he) = hb.span(r);
-                    let x = x as usize;
-                    assert!(x < he - hs, "Get: index {x} out of range for a row of {} elements", he - hs);
-                    abs.push(hs + x);
-                }
-                gather(hvals, &abs)
-            }
-
             Op::Gather => {
                 let (idx, haystack) = input.into_pair("Gather")?;
-                let (ib, ivals) = idx.into_list("Gather indices")?;
                 let (hb, hvals) = haystack.rows_of("Gather haystack")?;
-                assert_eq!(ib.len(), hb.len(), "Gather: indices/haystack row count");
+                assert_eq!(idx.len(), hb.len(), "Gather: indices/haystack row count");
                 // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
-                // payload (a partition); a referenced haystack takes the row-relative path below.
-                if ib.len() == 1 && hb.len() == 1 && matches!(hb, Rows::Part(_)) {
-                    if let Value::Prim(p) = hvals {
+                // payload (a partition); a referenced haystack takes the general path below.
+                if let (Value::List(ib, ivals), Value::Prim(p), Rows::Part(_)) = (&idx, hvals, hb) {
+                    if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::U64(_))) {
                         // Raw Gather promises a panic, not an all-or-nothing error row. Ordinary
                         // indexing in the gather supplies that check without a separate scan. This
                         // is the one path that CONSUMES the indices — it rewrites that buffer into
                         // the result — so it is also the only one that takes ownership.
+                        let p = p.clone();
+                        let Value::List(ib, ivals) = idx else { unreachable!() };
                         let idxs = ivals.into_u64("Gather indices")?;
                         return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs)))));
                     }
                 }
-                let idxs = ivals.as_u64("Gather indices")?;
-                let abs = resolve_indices(&ib, idxs, hb);
-                Value::List(ib, Box::new(gather(hvals, &abs)))
+                let mut ok = vec![true; idx.len()];
+                let plan = index_plan(&idx, &Owners::Identity, hb, &mut ok)?;
+                if let Some(r) = ok.iter().position(|&o| !o) {
+                    panic!("Gather: an index out of row {r}'s bounds");
+                }
+                plan.fill(hvals)
             }
 
             // total vector access: each index either names a haystack-row element (Found) or is out of
@@ -842,8 +807,8 @@ impl<L: OpLike> Op<L> {
 
             // DESTRUCTURE one list layer: return the per-inner-list ranges (relative to
             // each top row's flattened span) AND the one-level-flattened values. Both
-            // outputs are lists at the SAME top stratum, so they bundle as a Prod, and
-            // `Slices` is the exact inverse — hence MapList(MapList(b)) == Flatten; b; Slices.
+            // outputs are lists at the SAME top stratum, so they bundle as a Prod, and the
+            // word `slices` is the exact inverse — hence MapList(MapList(b)) == Flatten; b; slices.
             Op::Flatten => {
                 let (ob, inner) = input.into_list("Flatten")?;
                 let (ib, vals) = inner.into_list("Flatten inner")?;
@@ -891,6 +856,20 @@ impl<L: OpLike> Op<L> {
                 Value::List(bounds.into(), Box::new(Value::u64(vals)))
             }
 
+            // per row [lo, hi): iota with a start, empty when lo >= hi.
+            Op::Range => {
+                let (lo, hi) = input.into_pair("Range")?;
+                let (lo, hi) = (lo.as_u64("Range lo")?, hi.as_u64("Range hi")?);
+                assert_eq!(lo.len(), hi.len(), "Range: lo/hi row count");
+                let mut bounds = Vec::with_capacity(lo.len());
+                let mut vals = Vec::new();
+                for (&a, &z) in lo.iter().zip(hi) {
+                    vals.extend(a..z.max(a));
+                    bounds.push(vals.len());
+                }
+                Value::List(bounds.into(), Box::new(Value::u64(vals)))
+            }
+
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
             Op::Unit => Value::Unit(input.len()),
 
@@ -898,7 +877,7 @@ impl<L: OpLike> Op<L> {
             Op::Try => input,
 
             // the failure family was dispatched to `ops::fail::eval` above.
-            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryChunk(_)
+            Op::TryGather | Op::TryChunk(_)
             | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::eval handles the failure family"),
 
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the

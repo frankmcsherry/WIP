@@ -76,7 +76,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "zip" => Op::TryZip.into(),      // per row: inner lengths agree, else Err
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
-        // iso-inverses (Zip pairs any two columns; Slices materializes any ranges, incl. Find's),
+        // iso-inverses (Zip pairs any two columns; `slices` materializes any ranges, incl. Find's),
         // Weave's input — a tag stream whose per-row counts match a set of lane lengths — arises ONLY
         // from Unweave; a free-standing Weave is either provably the Unweave-inverse or a bug, and its
         // precondition is a histogram relation no static analysis cheaply proves. So `Op::Weave` stays
@@ -92,12 +92,13 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "dedup" => CmpOp::DedupList.into(),
         "group" => CmpOp::GroupKey.into(),
         "find" => CmpOp::Find.into(),
-        // point access — `get` (scalar, one index per row) and `gather` (vector, a list of indices) err
-        // per ROW; `gather_try` is the DISTINCT per-element gather (`List<Sum{Found | Missing}>`), reifying
-        // each element's miss as data — kept as its own verb. `head` is sugar for `get 0` (see ml.rs).
-        "slices" => Op::TrySlices.into(),     // per row: every range in bounds, else Err
-        "get" => Op::TryGet.into(),           // (idx, haystack) -> the element, or Err out of range
-        "gather" => Op::TryGather.into(),     // per row all-or-nothing over its indices
+        // point access — `gather` (per row, positions of any shape into that row's list, each integer
+        // leaf replaced by its element) errs per ROW. `get` is the same op on one position per row;
+        // `head` (= get 0) and `slices` (= map(range); gather) are built in ml.rs. `gather_try` is the
+        // DISTINCT per-element gather (`List<Sum{Found | Missing}>`), each element's miss as data.
+        "gather" => Op::TryGather.into(),     // per row all-or-nothing over its positions
+        "get" => Op::TryGather.into(),        // gather on one position per row: (i, list) -> list[i]
+        "range" => Op::Range.into(),          // (lo, hi) -> [lo, hi), empty when lo >= hi
         "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Found | Missing}>
         "try" => Op::Try.into(), // handle a fallible stage here: its Fail<T> = Sum{T | Unit} is now data to match
         "flatten" => Op::Flatten.into(),

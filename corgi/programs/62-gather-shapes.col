@@ -1,0 +1,11 @@
+# gather replaces every integer leaf of its positions by the element there, whatever their shape: a
+# pair of positions gives a pair of elements, a list of them a list, a sum a sum (tags untouched), and
+# one position — `get` — one element. Each position is relative to its row's list.
+# n = 4
+# = Sum tags=[0] [([20], ([0], [30]), List ends=[4] <[0, 10, 20, 30]>, Sum tags=[1] [[], [30]]), ()x0]
+let xs = input iota map (x -> (x, 10u64) mul) in
+let one = (2u64, xs) get in
+let pair = ((0u64, 3u64), xs) gather in
+let list = (input iota, xs) gather in
+let sum = (((3u64, 1u64) branch 2), xs) gather in
+(one, pair, list, sum)

@@ -5,8 +5,8 @@
 //! Every op here is a plain `T0 -> T1` that `eval` runs and `judge` types like any other; there is no
 //! second evaluator and no second typer. Three kinds of op:
 //!
-//!   * the `Try*` producers — the total per-row forms of the partial kernels (`get`/`gather`/`zip`/
-//!     `slices`/`chunk`): a row that would have tripped the kernel's assert lands in Err.
+//!   * the `Try*` producers — the total per-row forms of the partial kernels (`gather`/`zip`/`chunk`):
+//!     a row that would have tripped the kernel's assert lands in Err.
 //!   * `Lift` (`X -> Fail<X>`, all Ok) and `Squash` (`Fail<Fail<T>> -> Fail<T>`, the monad join).
 //!   * the `Hoist*` distributive laws — Fail commuted out through each structural functor:
 //!     `HoistProd` `(Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>` (a row errs if ANY field errs),
@@ -17,7 +17,7 @@
 //! program written against pure values runs on the Ok lane of whatever fails upstream. The layout is
 //! what `try` reveals — `try` is the identity on values and a marker to the totality query.
 
-use crate::engine::gather;
+use crate::engine::{gather, index_plan, Owners};
 use crate::graph::OpLike;
 use crate::shape::shape_of_value;
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
@@ -280,32 +280,18 @@ fn list_of<'a>(v: &'a Value, who: &str) -> Result<(&'a Bounds, &'a Value), Strin
     }
 }
 
-/// `(idx:U64, haystack:List<T>) -> Fail<T>`: row r's element `idx[r]`, Err if out of that row's range.
-pub(crate) fn try_get<L: OpLike>(input: Value) -> Result<Value, String> {
-    let mut err = Vec::new();
-    {
-        let (idx, haystack) = pair_of(&input, "TryGet")?;
-        let idxs = idx.as_u64("TryGet index")?;
-        let (hb, _) = haystack.rows_of("TryGet haystack")?;
-        assert_eq!(idxs.len(), hb.len(), "TryGet: index/haystack row count");
-        for (r, &x) in idxs.iter().enumerate() {
-            let (hs, he) = hb.span(r);
-            err.push(x as usize >= he - hs);
-        }
-    }
-    per_row_try(&err, &super::core::Op::<L>::Get, input)
-}
-
-/// `(idx:List<U64>, haystack:List<T>) -> Fail<List<T>>`: per row, all-or-nothing over its indices.
+/// `(idx:P, haystack:List<T>) -> Fail<P[T]>`: per row, all-or-nothing over its positions (`P` any
+/// shape whose leaves are integer positions, as for `Gather`).
 pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
     let one_row_leaf = {
         let (idx, haystack) = pair_of(&input, "TryGather")?;
-        let (ib, _) = list_of(idx, "TryGather indices")?;
         let (hb, hvals) = haystack.rows_of("TryGather haystack")?;
-        assert_eq!(ib.len(), hb.len(), "TryGather: indices/haystack row count");
+        assert_eq!(idx.len(), hb.len(), "TryGather: indices/haystack row count");
         // the leaf fast path indexes the payload directly, so row 0 must BE the payload (a
         // partition); a referenced haystack takes the row-relative path.
-        ib.len() == 1 && matches!(hvals, Value::Prim(_)) && matches!(hb, Rows::Part(_))
+        matches!(idx, Value::List(ib, ivals) if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::U64(_))))
+            && matches!(hvals, Value::Prim(_))
+            && matches!(hb, Rows::Part(_))
     };
     if one_row_leaf {
         // One row over a leaf: validate and gather in the index buffer itself (an identity
@@ -322,60 +308,21 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
             None => fail(&[true], Value::List(Bounds::offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
         });
     }
-    // one pass checks each row and resolves its indices to haystack positions, so a clean input is
-    // gathered from those positions without reading the indices again; a failing row takes the
-    // general path, which re-reads them.
-    let mut err = Vec::new();
-    let mut pos = Vec::new();
-    {
+    // one pass checks each row and resolves its positions, so a clean input is gathered from them
+    // without reading the indices again; a failing row takes the general path, which re-reads them.
+    let (plan, ok) = {
         let (idx, haystack) = pair_of(&input, "TryGather")?;
-        let (ib, ivals) = list_of(idx, "TryGather indices")?;
         let (hb, _) = haystack.rows_of("TryGather haystack")?;
-        let idxs = ivals.as_u64("TryGather indices")?;
-        pos.reserve(idxs.len());
-        for r in 0..ib.len() {
-            let (is, ie) = ib.span(r);
-            let (hs, he) = hb.span(r);
-            let rowlen = (he - hs) as u64;
-            let mut ok = true;
-            for &x in &idxs[is..ie] {
-                ok &= x < rowlen;
-                pos.push(hs.wrapping_add(x as usize));
-            }
-            err.push(!ok);
-        }
-    }
-    if !err.contains(&true) {
-        let (idx, haystack) = input.into_pair("TryGather")?;
-        let (ib, _) = idx.into_list("TryGather indices")?;
+        let mut ok = vec![true; idx.len()];
+        (index_plan(idx, &Owners::Identity, hb, &mut ok)?, ok)
+    };
+    if !ok.contains(&false) {
+        let (_, haystack) = input.into_pair("TryGather")?;
         let (_, hvals) = haystack.rows_of("TryGather haystack")?;
-        return Ok(lift(Value::List(ib, Box::new(gather(hvals, &pos)))));
+        return Ok(lift(plan.fill(hvals)));
     }
+    let err: Vec<bool> = ok.into_iter().map(|o| !o).collect();
     per_row_try(&err, &super::core::Op::<L>::Gather, input)
-}
-
-/// `(ranges:List<(lo,hi)>, haystack:List<T>) -> Fail<List<List<T>>>`: per row, every range must
-/// satisfy `lo <= hi <= rowlen`.
-pub(crate) fn try_slices<L: OpLike>(input: Value) -> Result<Value, String> {
-    let mut err = Vec::new();
-    {
-        let (lohi, haystack) = pair_of(&input, "TrySlices")?;
-        let (lb, lvals) = list_of(lohi, "TrySlices ranges")?;
-        let (hb, _) = haystack.rows_of("TrySlices haystack")?;
-        assert_eq!(lb.len(), hb.len(), "TrySlices: row count");
-        let (lo, hi) = pair_of(lvals, "TrySlices lo_hi")?;
-        let (lo_c, hi_c) = (lo.as_u64("TrySlices lo")?, hi.as_u64("TrySlices hi")?);
-        for r in 0..lb.len() {
-            let (ls, le) = lb.span(r);
-            let (hs, he) = hb.span(r);
-            let rowlen = he - hs;
-            err.push(!(ls..le).all(|k| {
-                let (l, h) = (lo_c[k] as usize, hi_c[k] as usize);
-                l <= h && h <= rowlen
-            }));
-        }
-    }
-    per_row_try(&err, &super::core::Op::<L>::Slices, input)
 }
 
 /// `List<X> -> Fail<List<List<X>>>`: per row, the length must divide by `k`.
@@ -424,8 +371,8 @@ pub(crate) fn is_family<L: OpLike>(op: &super::core::Op<L>) -> bool {
     use super::core::Op;
     matches!(
         op,
-        Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) | Op::TryGet | Op::TryGather
-            | Op::TrySlices | Op::TryChunk(_) | Op::TryZip
+        Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) | Op::TryGather
+            | Op::TryChunk(_) | Op::TryZip
     )
 }
 
@@ -438,9 +385,7 @@ pub(crate) fn eval<L: OpLike>(op: &super::core::Op<L>, input: Value) -> Result<V
         Op::HoistProd => hoist_prod(input),
         Op::HoistList => hoist_list(input),
         Op::HoistSum(fallible) => hoist_sum(fallible, input),
-        Op::TryGet => try_get::<L>(input),
         Op::TryGather => try_gather::<L>(input),
-        Op::TrySlices => try_slices::<L>(input),
         Op::TryChunk(k) => try_chunk::<L>(*k, input),
         Op::TryZip => try_zip::<L>(input),
         _ => unreachable!("not a failure-family op"),

@@ -61,7 +61,7 @@ src/
                (u8/u16/u32/u64) via the `prim!` macro. Sum = (Tags, variants), where Tags is the
                lane assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
   engine.rs    row-movement primitives: gather, concat, fill + index generators
-               (filter_mask / owner_ids / resolve_indices / expand_ranges).
+               (filter_mask / owner_ids / index_plan / expand_ranges).
   lib.rs       re-exports, plus `arrange`: the sort/survey/gather surface DDIR's backend calls.
   bytes.rs     the byte codec: a column to and from a self-describing, 8-byte-aligned byte string,
                for shipping columns between processes.
@@ -87,16 +87,19 @@ src/
                           intro          elim     map       capture
                    PROD   tuple (graph)  Field    —         —        (transparent; no witness column)
                    SUM    Branch/Inject  Unwrap   MapSum    CapSum   (witness: tag column)
-                   LIST   Enlist         Get      MapList   CapList  (witness: bounds column)
-               LIST elim: Get (U64,List<X>)->X is the point eliminator (`head` = sugar `Get 0`, so an
+                   LIST   Enlist         Gather   MapList   CapList  (witness: bounds column)
+               LIST elim: Gather (P, List<X>) -> P[X] replaces every integer leaf of P (any shape:
+               one position, a list, nested lists, products, sums) by the row's element there;
+               `get` is Gather on one position per row (`head` = get 0, so an
                empty row errs — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
                elim; FoldScan (T,List<A>)->(T,List<R>) (mapAccumL — the scan kernel; `scan` is sugar =
-               FoldScan with body (a,x)->(b,b), field 1). Get/Gather come in _uns (assert) and _try
-               (total -> Sum{Found|Missing}) tiers; Gather is Get vectorized (a list of indices). Plus Unit
+               FoldScan with body (a,x)->(b,b), field 1). Gather (positions per row, nested or flat;
+               the result keeps their structure) is the one fetch kernel, with a total per-row form and
+               `gather_try` (per element, Sum{Found|Missing}); `slices` = map(range); gather. Plus Unit
                (X -> Unit) and the typed numeric grid + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
-               List⊗List (Flatten/Slices), List⊗Sum (Unweave/Weave) — and the fused forms/producers
-               (Lit/Cast/Filter/Gather/Iota), each reducible to kernel+isos (the `law` corpus
+               List⊗List (Flatten / the word `slices`), List⊗Sum (Unweave/Weave) — and the fused forms/producers
+               (Lit/Cast/Filter/Gather/Iota/Range), each reducible to kernel+isos (the `law` corpus
                programs witness it), kept for the execution strategy the expansion loses. The
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
@@ -110,7 +113,7 @@ src/
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
                (op × kind × width) grid + ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` total
-               per-row producers (get/gather/zip/slices/chunk), `Lift`/`Squash`, and the
+               per-row producers (gather/zip/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
                functor). The evals live here; `Op::eval` dispatches to them first.
     text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
@@ -141,7 +144,7 @@ reason. The combinators are the **distributive laws** (functor-through-functor) 
 |-------|---|---------------|-----|-----|
 | `List<(X,Y)>` | ↔ | `(List<X>, List<Y>)` | Transpose / Zip | programs/32 |
 | `List<Sum{A\|B}>` | ↔ | `(tags, List<A>, List<B>)` | Unweave / Weave | programs/33 |
-| `List<List<X>>` | ↔ | `(ranges, flat)` | Flatten / Slices | programs/17, 31 |
+| `List<List<X>>` | ↔ | `(ranges, flat)` | Flatten / `slices` (a word) | programs/17, 31 |
 
 Note `List<Sum{A|B}>` is **not** `Sum{List<A>|List<B>}` — a list mixes variants, so the SoA form is the
 *shredded* `(tag-list, per-variant payload columns)` (Dremel/Parquet record shredding). That is exactly
@@ -271,7 +274,7 @@ applied to a fallible column where lowering forgot to lift would be a shape erro
 separate syntactic query — total iff every fallible column meets a `try` before the output; `run`
 refuses a partial program, `run_partial` returns its `Fail<T>` as the value.
 
-The partial kernels (`Op::Get`, `Gather`, `Filter`, `Slices`, `Chunk`, `Zip`) stay in the enum for
+The partial kernels (`Op::Gather`, `Chunk`, `Zip`) stay in the enum for
 a host holding a bounds proof (DDIR); they are not on the surface. `Branch` is total (a tag of n-1 or
 more goes to the last lane) and is the surface `branch`. `gather_try` is distinct: the per-ELEMENT
 `List<Sum{Found | Missing}>`, a value the program handles itself, not a per-row effect. Every "maybe"
@@ -306,6 +309,14 @@ is an error row). Each of get/gather carries a `_uns` tier (assert in-bounds) an
 irreducible piece is the bare-`X` outro — making `Get` the atom keeps one index kernel and yields the
 total head for free, where the HEAD-atom route would have needed new non-emptiness analysis. (`Fold`/
 `FoldScan` remain the accumulating eliminators; `head_try`→Option is expressible as a fold if wanted.)
+
+Reversed 2026-10-02 (the totality design note): `gather` is the one fetch kernel, and it takes
+positions of ANY shape — every integer leaf is replaced by the element it names, so the result has
+the positions' shape. That dissolves the bare-`X` outro the paragraph above names: a scalar position
+gives a scalar element, so `get` is `gather` on one position per row (no enlist, no delist), `head` is
+`get 0`, and `slices` is the word `map(range); gather` (`Range` is iota with a start). Fewer kernels
+was the reason: `Get`, `Slices` and their `Try` forms leave the core, and sub-list references (a
+`slices` view of a referenced list) go with `Slices`.
 
 ## Live work — the DDIR consumer
 
@@ -343,8 +354,8 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   ; mul ; gt`) a tile at a time through the existing kernels into reused buffers, and measure vs the
   per-op passes — that forces the ownership decision on a small surface before committing the
   convention. (Composing existing kernels, not generating code: see Goal.)
-- **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; `Slices`
-  is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
+- **Index-as-value — op DONE, rewrite pass open.** `Op::Gather` (row-relative point gather; the word
+  `slices` is the range form) makes indexes plain values; programs/26 (pointer jumping) and /27 (the law
   `gather(gather(v,i),j) = gather(v, gather(i,j))`) exercise it. Open: the optimizer rewrite applying
   that law, so gather chains become index math + one final gather. The lazy form (multiplicity View:
   0 = filter, ≥1 = repeat, range = slice) stays OUT of `List` — collie's `Selector` (4 variants × a

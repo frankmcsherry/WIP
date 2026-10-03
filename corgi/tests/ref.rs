@@ -35,39 +35,41 @@ fn ref_clone_round_trips_and_shows_as_the_rows() {
     assert_eq!(run("input clone", p.clone()), p);
 }
 
-/// `clone` is deep: the references `slices` hands out on a referenced haystack come back as the
-/// lists `slices` copies out of a plain one.
+
+/// a column of sub-list references (row 0 references three sub-ranges, row 1 two) over one arena,
+/// and the lists those references name, copied out.
+fn sub_list_references() -> (Value, Value) {
+    use std::sync::Arc;
+    let arena = Arc::new(Value::u64(vec![7, 3, 3, 1]));
+    let spans = Arc::new(vec![(1, 2), (0, 1), (1, 2), (2, 4), (2, 3)]);
+    let by_ref = Value::List(vec![3, 5].into(), Box::new(Value::Ref(arena, spans)));
+    let by_val = Value::List(
+        vec![3, 5].into(),
+        Box::new(Value::List(vec![1, 2, 3, 5, 6].into(), Box::new(Value::u64(vec![3, 7, 3, 3, 1, 3])))),
+    );
+    (by_ref, by_val)
+}
+
+/// `clone` is deep: nested references come back as the lists they name.
 #[test]
 fn clone_removes_nested_references() {
-    let ranges = Value::List(
-        vec![2, 2, 3].into(),
-        Box::new(Value::Prod(vec![Value::u64(vec![0, 1, 0]), Value::u64(vec![2, 2, 1])])),
-    );
-    let arg = Value::Prod(vec![ranges, haystack()]);
-    let copied = run("let (r, h) = input in (r, h) slices", arg.clone());
-    let cloned = run("let (r, h) = input in (r, h ref) slices clone", arg);
-    assert_eq!(copied, cloned);
+    let (by_ref, by_val) = sub_list_references();
+    assert_eq!(run("input clone", by_ref), by_val);
 }
 
 /// compare, sort, dedup and group read a referenced row as the list it names, and a sorted column of
 /// references is still references.
 #[test]
 fn order_reads_through_references() {
-    let ranges = Value::List(
-        vec![3, 5].into(),
-        Box::new(Value::Prod(vec![Value::u64(vec![1, 0, 1, 0, 0]), Value::u64(vec![2, 1, 2, 2, 1])])),
-    );
-    let h = Value::List(vec![2, 4].into(), Box::new(Value::u64(vec![7, 3, 3, 1])));
-    let arg = Value::Prod(vec![ranges, h]);
+    let (by_ref, by_val) = sub_list_references();
     for op in ["sort", "dedup", "map (s -> (s, s)) group", "map (s -> (s, s) lt)"] {
-        let by_ref = run(&format!("let (r, h) = input in (r, h ref) slices {op}"), arg.clone());
-        let by_val = run(&format!("let (r, h) = input in (r, h) slices {op}"), arg.clone());
-        assert_eq!(corgi::hash(&by_ref), corgi::hash(&by_val), "{op}");
-        assert_eq!(run("input clone", by_ref), by_val, "{op}");
+        let r = run(&format!("input {op}"), by_ref.clone());
+        let v = run(&format!("input {op}"), by_val.clone());
+        assert_eq!(corgi::hash(&r), corgi::hash(&v), "{op}");
+        assert_eq!(run("input clone", r), v, "{op}");
     }
-    let sorted = run("let (r, h) = input in (r, h ref) slices sort", arg);
-    let Value::Sum(_, lanes) = &sorted else { panic!() };
-    let Value::List(_, inner) = &lanes[0] else { panic!() };
+    let sorted = run("input sort", by_ref);
+    let Value::List(_, inner) = &sorted else { panic!() };
     assert!(matches!(&**inner, Value::Ref(..)), "sorting references moves references");
 }
 
@@ -157,35 +159,10 @@ fn readers_agree_through_a_box() {
         };
         let a = run(by_value, arg.clone());
         let b = run(by_ref, arg);
-        // `slices` on a ref returns references (its own test below); the rest are by value.
-        if name == "slices" {
-            assert_eq!(show(&a), show(&b).replace("Ref <", "").replacen(">>>", ">>", 1), "{name}");
-        } else {
-            assert_eq!(a, b, "{name}: referenced haystack disagrees with the list");
-        }
+        assert_eq!(a, b, "{name}: referenced haystack disagrees with the list");
     }
 }
 
-/// `slices` on a referenced haystack hands out references; on a list it copies. Same rows either way.
-#[test]
-fn slices_on_a_box_is_by_reference() {
-    let h = haystack();
-    let ranges = Value::List(
-        vec![2, 2, 3].into(),
-        Box::new(Value::Prod(vec![Value::u64(vec![0, 1, 0]), Value::u64(vec![2, 2, 1])])),
-    );
-    let copied = run("let (r, h) = input in (r, h) slices", Value::Prod(vec![ranges.clone(), h.clone()]));
-    let referenced = run("let (r, h) = input in (r, h ref) slices", Value::Prod(vec![ranges, h]));
-    let expect = "Sum tags=[0, 0, 0] [List ends=[2, 2, 3] <List ends=[2, 3, 4] <[10, 11, 11, 30]>>, ()x0]";
-    assert_eq!(show(&copied), expect);
-    assert_eq!(show(&referenced), expect.replace("<List ends=[2, 3, 4]", "<Ref <List ends=[2, 3, 4]").replace(">>, ()x0]", ">>>, ()x0]"));
-    let Value::Sum(_, lanes) = &referenced else { panic!() };
-    let Value::List(_, inner) = &lanes[0] else { panic!() };
-    assert!(matches!(&**inner, Value::Ref(..)), "the inner rows are references");
-}
-
-/// the capture: a referenced list context is one reference per element and the body's `get` reads
-/// through it — the same answer as the by-value capture and as the capture-free `gather`.
 #[test]
 fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
     let by_ref = run(

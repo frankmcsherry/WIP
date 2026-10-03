@@ -699,6 +699,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
         E::Pipe(e, ap) => {
             let id = lower(e, env, b)?;
             match ap {
+                Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
@@ -725,17 +726,33 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     Ok(b.add(Op::Unwrap, vec![ms]))
                 }
                 Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
-                // first element = index 0 of the row: build the (0, list) pair and scalar-`get` it.
+                // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
+                // row errs (carried in the err-mask, observed by a downstream TRY), not a panic.
                 Apply::Head => {
-                    // `head` lowers to `get` (GetTry) — the get FailOp; an empty row is an error carried
-                    // in the err-mask, observed by a downstream TRY, not a panic.
                     let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
-                    Ok(b.add(Op::TryGet, vec![pair]))
+                    Ok(b.add(Op::TryGather, vec![pair]))
                 }
             }
         }
     }
+}
+
+/// `(ranges, list) slices`: each `(lo, hi)` range of row r becomes the sub-list `list[r][lo..hi)`.
+/// The word `map(range); gather`: the ranges become nested position lists, and `gather` keeps their
+/// structure. A range with `lo >= hi` is empty; one reaching past the row errs the row.
+fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
+    let ranges = b.add(Op::Field(0), vec![pair]);
+    let list = b.add(Op::Field(1), vec![pair]);
+    let range = {
+        let mut rb = Builder::default();
+        let r = rb.input();
+        let out = rb.add(Op::Range, vec![r]);
+        rb.finish(out)
+    };
+    let positions = b.add(Op::MapList(Box::new(range)), vec![ranges]);
+    let args = b.tuple(vec![positions, list]);
+    b.add(Op::TryGather, vec![args])
 }
 
 /// parse an ML-flavoured expression into a `Graph` (with `input` bound to the root).
