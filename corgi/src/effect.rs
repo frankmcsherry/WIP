@@ -28,7 +28,6 @@ fn is_fail_op(op: &NumOp) -> bool {
         NumOp::Core(
             Op::TryGet
                 | Op::TryGather
-                | Op::TryBranch(_)
                 | Op::TryZip
                 | Op::TrySlices
                 | Op::TryFilter

@@ -112,12 +112,8 @@ fn branch_by_enum_and_named_match_arms() {
     let src = "enum Size = Lo | Hi in \
                let (subj, vals) = input.1 transpose in \
                vals map (v -> (v, (v, 300u64) gt) branch Size match (Lo (l -> l), Hi (h -> (h, 1u64) add)))";
-    // `branch` is a FailOp now (demux Sum{Lo|Hi} with Oob in the err-mask), so the result is a Fail
-    // column shown TRY'd; the match arms still align (the demux re-tags Lo=0, Hi=1) — Hi (>300) gets +1.
-    assert_eq!(
-        run_ml(src, &sample()),
-        "Sum tags=[0, 0, 0] [List ends=[2, 3, 6] <[100, 200, 300, 401, 501, 601]>, ()x0]"
-    );
+    // `branch` is total (the demux Sum{Lo|Hi}), and the match arms align: Hi (>300) gets +1.
+    assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[100, 200, 300, 401, 501, 601]>");
 }
 
 #[test]

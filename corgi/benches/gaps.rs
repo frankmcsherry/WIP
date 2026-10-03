@@ -691,7 +691,7 @@ fn family_g(m: usize, reps: u32) {
     // one pass over the bytes, atoi at each comma, accumulate (no pre-parsed shortcut).
     let (csv, csv_bytes) = csv_text(m);
     let g = compile(
-        "input split \",\" map (w -> w parse_u64 map_variant 0 (e -> 0u64) unwrap) fold_add",
+        "input split \",\" map (w -> w parse_u64 map_variant 1 (e -> 0u64) unwrap) fold_add",
     );
     let c = corgi_t(&g, &csv, reps);
     let r = rust_t(reps, || {

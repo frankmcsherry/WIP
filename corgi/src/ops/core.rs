@@ -105,8 +105,8 @@ pub enum Op<L> {
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, U64-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
-                    //        PARTIAL: panics on tag >= n. The clean kernel; surface-usable once a
-                    //        range pass proves tags < n (else write TryBranch).
+                    //        Total: a tag of n-1 or more goes to the last lane, so on a mask any
+                    //        nonzero tag is "true", as `filter` reads masks.
     Inject(usize, Vec<Shape>), // intro: X -> Sum{..} — the constant-tag Branch: the input fills lane
                     //        `tag` of the declared sum shape (whose lane `tag` must be X); the other
                     //        lanes are empty columns of their declared shapes.
@@ -179,9 +179,10 @@ pub enum Op<L> {
                     // The engine primitive surfaced; chains compose in-language —
                     // gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays index math.
                     // PARTIAL (panics out of bounds): the unchecked fast path. `Get` is the 1-index case.
-    GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Oob:U64 | Found:T}>  TOTAL vector
-                    // access — `GetTry` lifted over a list of indices. A bounds-proof pass demotes
-                    // `GatherTry` to `Gather` + `inject Found` when the Oob lane is provably empty.
+    GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Found:T | Missing}>  TOTAL vector
+                    // access: each index found or missing, the failure shape `Fail<T>` has (Ok first,
+                    // the misses only counted). A bounds-proof pass demotes `GatherTry` to `Gather` +
+                    // `inject 0` when the Missing lane is provably empty.
     Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
     Unit,           // X -> Unit  forget the payload, keep the length — how a column becomes the `None`
                     // lane of `Option = Sum{Unit | T}` (e.g. `branch 2 map_variant 1 (x -> x unit)`).
@@ -209,7 +210,6 @@ pub enum Op<L> {
     TrySlices,      // (List<(lo,hi)>, List<T>) -> Fail<List<List<T>>>      every range in bounds
     TryFilter,      // (List<X>, List<U64>) -> Fail<List<X>>                data/mask lengths agree
     TryChunk(usize),// List<X> -> Fail<List<List<X>>>                       row length divides by k
-    TryBranch(usize), // (X, U64-tags) -> Fail<Sum{X × n}>                  tag < n
     TryZip,         // (List<X>, List<Y>) -> Fail<List<(X,Y)>>              inner lengths agree
     Lift,           // X -> Fail<X>                                         every row Ok
     Squash,         // Fail<Fail<T>> -> Fail<T>                             the monad join
@@ -487,14 +487,17 @@ impl<L: OpLike> Op<L> {
                 if *n > 256 {
                     return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
                 }
+                if *n == 0 {
+                    return Err("Branch: a sum of no lanes has nowhere to put a row".into());
+                }
                 // one pass builds the tag column, each lane's row list, AND the within-variant offset
                 // (a row's offset is its lane's size when it arrives) — no decode/recompute afterwards.
                 let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n];
                 let mut tag8 = Vec::with_capacity(tags.len());
                 let mut off = Vec::with_capacity(tags.len());
+                let last = n.saturating_sub(1) as u64;
                 for (i, &t) in tags.iter().enumerate() {
-                    let t = t as usize;
-                    assert!(t < *n, "Branch: tag {t} out of range (n={n})");
+                    let t = t.min(last) as usize;
                     tag8.push(t as u8);
                     off.push(groups[t].len());
                     groups[t].push(i);
@@ -787,9 +790,9 @@ impl<L: OpLike> Op<L> {
             }
 
             // total vector access: each index either names a haystack-row element (Found) or is out of
-            // that row's bounds (Oob, carrying the bad index). The per-element test is branchless (a
+            // that row's bounds (Missing, only counted). The per-element test is branchless (a
             // comparison to a u64); only the routing into the two lanes is data-dependent. Output is a
-            // list (the index list's bounds) of Sum{Oob:U64 | Found:T}.
+            // list (the index list's bounds) of Sum{Found:T | Missing}.
             Op::GatherTry => {
                 let (idx, haystack) = input.into_pair("GatherTry")?;
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
@@ -810,31 +813,31 @@ impl<L: OpLike> Op<L> {
                     }
                 }
                 if ok && !pos.is_empty() {
-                    let found = Value::sum_tagged(Tags::Const(1, pos.len()), vec![Value::u64(Vec::new()), gather(hvals, &pos)]);
+                    let found = Value::sum_tagged(Tags::Const(0, pos.len()), vec![gather(hvals, &pos), Value::Unit(0)]);
                     return Ok(Value::List(ib, Box::new(found)));
                 }
                 // one pass routes each index AND records its within-lane offset — the size its
                 // lane had when it arrived — so the assignment needs no second pass to derive.
                 let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
-                let mut abs = Vec::new(); // absolute haystack positions of the Found elements (lane 1)
-                let mut oob = Vec::new(); // the out-of-bounds index values (lane 0)
+                let mut abs = Vec::new(); // absolute haystack positions of the found elements (lane 0)
+                let mut missing = 0usize; // how many indices are out of their row (lane 1)
                 for r in 0..ib.len() {
                     let (is, ie) = ib.span(r);
                     let (hs, he) = hb.span(r);
                     let rowlen = he - hs;
                     for &x in &idxs[is..ie] {
                         if (x as usize) < rowlen {
-                            tags.push(1u8);
+                            tags.push(0u8);
                             off.push(abs.len());
                             abs.push(hs + x as usize);
                         } else {
-                            tags.push(0u8);
-                            off.push(oob.len());
-                            oob.push(x);
+                            tags.push(1u8);
+                            off.push(missing);
+                            missing += 1;
                         }
                     }
                 }
-                let lanes = vec![Value::u64(oob), gather(hvals, &abs)];
+                let lanes = vec![gather(hvals, &abs), Value::Unit(missing)];
                 let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
                 Value::List(ib, Box::new(sum))
             }
@@ -897,7 +900,7 @@ impl<L: OpLike> Op<L> {
             Op::Try => input,
 
             // the failure family was dispatched to `ops::fail::eval` above.
-            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_) | Op::TryBranch(_)
+            Op::TryGet | Op::TryGather | Op::TrySlices | Op::TryFilter | Op::TryChunk(_)
             | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::eval handles the failure family"),
 
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the
