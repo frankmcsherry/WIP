@@ -46,7 +46,8 @@ impl Pred {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
-    Rel(Pred), // (X, X) -> U64 mask   lane-wise compare of two equal-width leaf columns (kind-blind)
+    Rel(Pred), // (X, X) -> U64 mask   compare row by row in structural order: leaves lane-wise
+               // (kind-blind), lists/products/sums as `sort` orders them
     RelImm(Pred, u32, u64), // X -> U64 mask   `x pred c`, `c` a constant's stored bits at width w
     Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
     Max,       // (X, X) -> X   lane-wise maximum

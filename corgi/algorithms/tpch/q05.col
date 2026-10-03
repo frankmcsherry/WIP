@@ -1,0 +1,43 @@
+# TPC-H Q5, in integers: 1994 revenue per ASIA nation from orders whose customer and supplier are in
+# the same nation. Six tables, joined by a chain of lookups: each step sorts one side by key, finds the
+# other side's keys in it, keeps the matches and gathers what it needs.
+# sql: SELECT n_name, sum(l_extendedprice * (100 - l_discount)) AS revenue
+# sql:   FROM customer, orders, lineitem, supplier, nation, region WHERE c_custkey = o_custkey
+# sql:   AND l_orderkey = o_orderkey AND l_suppkey = s_suppkey AND c_nationkey = s_nationkey
+# sql:   AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey AND r_name = 'ASIA'
+# sql:   AND o_orderdate >= 8766 AND o_orderdate < 9131 GROUP BY n_name ORDER BY revenue DESC, n_name
+# columns: r_regionkey r_name n_nationkey n_name n_regionkey s_suppkey s_nationkey c_custkey c_nationkey o_orderkey o_custkey o_orderdate l_orderkey l_suppkey l_extendedprice l_discount
+# output: [s,u]
+let (rkey, rname, nkey, nname, nreg, skey, snat, ckey, cnat, okey, ocust, odate, lkey, lsupp, price, disc) = input in
+# The ASIA region, and its nations (key, name) sorted by key.
+let asia = (rkey, rname) zip map ((k, s) -> ((s, "ASIA") eq, k)) filter sort in
+let nations = ((nkey, nreg) zip, nname) zip map (((k, r), name) -> (r, (k, name))) in
+let nfound = (nations map ((r, _) -> r), asia) find in
+let anations = (nfound, nations) zip map (((lo, hi), (_, n)) -> ((hi, lo) gt, n)) filter sort in
+let akeys = anations map ((k, _) -> k) in
+# Customers in those nations: (customer key, nation key), sorted by customer key.
+let cfound = (cnat, akeys) find in
+let custs = (cfound, (ckey, cnat) zip) zip map (((lo, hi), c) -> ((hi, lo) gt, c)) filter sort in
+# Orders from 1994 by those customers, each with its customer's nation, sorted by order key.
+let eorders = ((okey, ocust) zip, odate) zip
+    map (((k, c), dt) -> (((dt, 8766u64) ge, (dt, 9131u64) lt) mul, (c, k))) filter in
+let ofound = (eorders map ((c, _) -> c), custs map ((k, _) -> k)) find in
+let omatch = (ofound, eorders) zip map (((lo, hi), (_, k)) -> ((hi, lo) gt, (lo, k))) filter in
+let onat = (omatch map ((lo, _) -> lo), custs) gather map ((_, n) -> n) in
+let orders = (omatch map ((_, k) -> k), onat) zip sort in
+# Suppliers (key, nation) sorted by key.
+let supps = (skey, snat) zip sort in
+# Line items of those orders: the order's nation and the supplier's nation must agree.
+let lines = ((lkey, lsupp) zip, (price, disc) zip) zip map (((k, s), (p, d)) -> (k, s, (p, (100u64, d) sub) mul)) in
+let at = (lines map ((k, _, _) -> k), orders map ((k, _) -> k)) find in
+let lmatch = (at, lines) zip map (((lo, hi), (_, s, r)) -> ((hi, lo) gt, (lo, s, r))) filter in
+let lnat = (lmatch map ((lo, _, _) -> lo), orders) gather map ((_, n) -> n) in
+let sat = (lmatch map ((_, s, _) -> s), supps map ((k, _) -> k)) find in
+let snats = (sat map ((lo, _) -> lo), supps) gather map ((_, n) -> n) in
+let same = ((lnat, snats) zip, lmatch map ((_, _, r) -> r)) zip map (((a, b), r) -> ((a, b) eq, (a, r))) filter in
+# Revenue per nation, named, largest first.
+let per = same group map ((n, rs) -> (n, rs fold_add)) in
+let nat = (per map ((n, _) -> n), akeys) find in
+let names = (nat map ((lo, _) -> lo), anations) gather map ((_, name) -> name) in
+(names, per map ((_, r) -> r)) zip map ((name, r) -> ((18446744073709551615u64, r) sub, name, r)) sort map ((_, name, r) -> (name, r))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", z))))

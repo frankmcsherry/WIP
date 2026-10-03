@@ -1,0 +1,20 @@
+# TPC-H Q1, in integers: per (return flag, line status), shipped up to 1998-09-02: sums of quantity,
+# price, discounted price and charged price, the mean quantity, and the count.
+# sql: SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice),
+# sql:   sum(l_extendedprice * (100 - l_discount)), sum(l_extendedprice * (100 - l_discount) * (100 + l_tax)),
+# sql:   sum(l_quantity)::DOUBLE / count(*), count(*)
+# sql:   FROM lineitem WHERE l_shipdate <= 10471 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+# columns: l_returnflag l_linestatus l_quantity l_extendedprice l_discount l_tax l_shipdate
+# output: [s,s,u,u,u,u,f,u]
+let (rf, ls, qty, price, disc, tax, date) = input in
+let rows = (((rf, ls) zip, (qty, price) zip) zip, ((disc, tax) zip, date) zip) zip
+    map ((((f, s), (q, p)), ((d, t), dt)) ->
+        let dp = (p, (100u64, d) sub) mul in
+        ((dt, 10471u64) le, ((f, s), (q, p, dp, (dp, (100u64, t) add) mul))))
+    filter in
+rows group map (((f, s), vs) ->
+    let n = vs len in
+    let sq = vs map ((q, _, _, _) -> q) fold_add in
+    (f, s, sq, vs map ((_, p, _, _) -> p) fold_add, vs map ((_, _, dp, _) -> dp) fold_add,
+        vs map ((_, _, _, c) -> c) fold_add, (sq to_f64, n to_f64) div_f64, n))
+    try match (0 (r -> r), 1 (_ -> 0u64 iota map (z -> ("", "", z, z, z, z, 0f64, z))))

@@ -1,0 +1,28 @@
+# TPC-H Q3, in integers: the ten unshipped orders of BUILDING customers with the most revenue.
+# Joined the way a probe would: each line item looks its order up in the sorted orders, then the
+# matches are grouped by order.
+# sql: SELECT l_orderkey, sum(l_extendedprice * (100 - l_discount)) AS revenue, o_orderdate, o_shippriority
+# sql:   FROM customer, orders, lineitem WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey
+# sql:   AND l_orderkey = o_orderkey AND o_orderdate < 9204 AND l_shipdate > 9204
+# sql:   GROUP BY l_orderkey, o_orderdate, o_shippriority ORDER BY revenue DESC, o_orderdate, l_orderkey LIMIT 10
+# columns: c_custkey c_mktsegment o_orderkey o_custkey o_orderdate o_shippriority l_orderkey l_shipdate l_extendedprice l_discount
+# output: [u,u,u,u]
+let (ckey, seg, okey, ocust, odate, oprio, lkey, lship, price, disc) = input in
+# The BUILDING customers, as a sorted list of keys.
+let building = (ckey, seg) zip map ((k, s) -> ((s, "BUILDING") eq, k)) filter sort in
+# Orders before 1995-03-15 whose customer is one of them: look each customer key up in that list.
+let early = ((okey, ocust) zip, (odate, oprio) zip) zip
+    map (((k, c), (dt, pr)) -> ((dt, 9204u64) lt, (c, (k, dt, pr)))) filter in
+let found = (early map ((c, _) -> c), building) find in
+let orders = (found, early) zip map (((lo, hi), (_, o)) -> ((hi, lo) gt, o)) filter sort in
+# Line items shipped after 1995-03-15, each looked up by order key in those orders.
+let lines = ((lkey, lship) zip, (price, disc) zip) zip
+    map (((k, s), (p, d)) -> ((s, 9204u64) gt, (k, (p, (100u64, d) sub) mul))) filter in
+let at = (lines map ((k, _) -> k), orders map ((k, _, _) -> k)) find in
+let matched = (at, lines) zip map (((lo, hi), (_, rev)) -> ((hi, lo) gt, (lo, rev))) filter in
+let joined = (matched map ((lo, _) -> lo), orders) gather in
+# Revenue per order; the ten largest (ties: earlier order date, then order key).
+let per = (joined, matched map ((_, rev) -> rev)) zip group
+    map (((k, dt, pr), revs) -> let r = revs fold_add in ((18446744073709551615u64, r) sub, dt, k, pr, r)) sort in
+((0u64, (per len, 10u64) min) range, per) gather
+    try match (0 (top -> top map ((_, dt, k, pr, r) -> (k, r, dt, pr))), 1 (_ -> 0u64 iota map (z -> (z, z, z, z))))

@@ -1,0 +1,10 @@
+# Q16: SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
+# sql: SELECT UserID, SearchPhrase, COUNT(*) AS c FROM hits GROUP BY UserID, SearchPhrase
+# sql:   ORDER BY c DESC, UserID, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# columns: UserID SearchPhrase
+# output: [i,s,u]
+let (user, phrase) = input in
+let ranked = (user, phrase) zip map ((u, s) -> ((u, s), 1u64)) group
+    map (((u, s), ones) -> ((18446744073709551615u64, ones len) sub, u, s)) sort in
+((0u64, ((ranked len, 10u64) min)) range, ranked) gather
+    try match (0 (top -> top map ((d, u, s) -> (u, s, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, "", z))))

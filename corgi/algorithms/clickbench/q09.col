@@ -1,0 +1,13 @@
+# Q9: SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10
+# sql: SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits
+# sql:   GROUP BY RegionID ORDER BY c DESC, RegionID LIMIT 10
+# columns: RegionID AdvEngineID ResolutionWidth UserID
+# output: [u,u,u,f,u]
+let (region, adv, width, user) = input in
+let ranked = (region, (adv, (width, user) zip) zip) zip group map ((r, vs) ->
+    let n = vs len in
+    ((18446744073709551615u64, n) sub, r, vs map ((a, _) -> a) fold_add, n,
+     (vs map ((_, (w, _)) -> w) fold_add to_f64, n to_f64) div_f64,
+     vs map ((_, (_, u)) -> u) dedup len)) sort in
+((0u64, ((ranked len, 10u64) min)) range, ranked) gather
+    try match (0 (top -> top map ((_, r, a, c, w, u) -> (r, a, c, w, u))), 1 (_ -> 0u64 iota map (z -> (z, z, z, 0f64, z))))

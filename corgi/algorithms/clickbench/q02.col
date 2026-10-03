@@ -1,0 +1,7 @@
+# Q2: SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+# sql: SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+# columns: AdvEngineID ResolutionWidth
+# output: u,u,f
+let (adv, width) = input in
+let n = adv len in
+(adv fold_add, n, (width fold_add to_f64, n to_f64) div_f64)

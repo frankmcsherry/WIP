@@ -1,0 +1,10 @@
+# Q12: SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+# sql: SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase
+# sql:   ORDER BY c DESC, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# columns: SearchPhrase
+# output: [s,u]
+# corgi orders strings shorter first, so ties break by length, then bytes.
+let ranked = input map (s -> ((s len, 0u64) gt, (s, 1u64))) filter group
+    map ((s, ones) -> ((18446744073709551615u64, ones len) sub, s)) sort in
+((0u64, (ranked len, 10u64) min) range, ranked) gather
+    try match (0 (top -> top map ((d, s) -> (s, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> ("", z))))

@@ -1,0 +1,14 @@
+# Q42: SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000
+# sql: SELECT EventTime // 60 * 60 AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15900
+# sql:   AND EventDate <= 15901 AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY M ORDER BY M LIMIT 10 OFFSET 1000
+# columns: CounterID EventDate IsRefresh DontCountHits EventTime
+# output: [u,u]
+# EventTime is Unix seconds, so the minute it falls in starts at t / 60 * 60.
+let (counter, date, refresh, dont, time) = input in
+let minutes = (counter, (date, (refresh, (dont, time) zip) zip) zip) zip
+    map ((c, (d, (r, (x, t)))) ->
+        ((((c, 62u64) eq, ((d, 15900u64) ge, (d, 15901u64) le) mul) mul, ((r, 0u64) eq, (x, 0u64) eq) mul) mul,
+         (((t, 60u64) div_u64, 60u64) mul, 1u64))) filter in
+let counts = minutes group map ((m, ones) -> (m, ones len)) in
+((1000u64, ((counts len, 1010u64) min)) range, counts) gather
+    try match (0 (top -> top map ((m, c) -> (m, c))), 1 (_ -> 0u64 iota map (z -> (z, z))))

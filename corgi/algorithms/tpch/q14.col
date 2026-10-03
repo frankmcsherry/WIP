@@ -1,0 +1,19 @@
+# TPC-H Q14, in integers: September 1995 revenue from PROMO parts, and all revenue (the SQL's
+# percentage is 100 times their ratio; both sums are given so the answer stays exact).
+# sql: SELECT sum(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (100 - l_discount) ELSE 0 END),
+# sql:   sum(l_extendedprice * (100 - l_discount)) FROM lineitem, part
+# sql:   WHERE l_partkey = p_partkey AND l_shipdate >= 9374 AND l_shipdate < 9404
+# columns: p_partkey p_type l_partkey l_shipdate l_extendedprice l_discount
+# output: u,u
+let (pkey, ptype, lpart, lship, price, disc) = input in
+# Each part, and whether its type starts with PROMO, sorted by part key.
+let parts = (pkey, ptype) zip
+    map ((k, t) -> (k, (((0u64, 5u64) range, t) gather, "PROMO") eq)) sort in
+# Line items shipped in September 1995, each looked up by part key.
+let lines = ((lpart, lship) zip, (price, disc) zip) zip
+    map (((k, s), (p, d)) -> (((s, 9374u64) ge, (s, 9404u64) lt) mul, (k, (p, (100u64, d) sub) mul))) filter in
+let at = (lines map ((k, _) -> k), parts map ((k, _) -> k)) find in
+let promo = (at map ((lo, _) -> lo), parts) gather map ((_, f) -> f) in
+let revs = lines map ((_, r) -> r) in
+((promo, revs) zip map ((f, r) -> (f, r) mul) fold_add, revs fold_add)
+    try match (0 (x -> x), 1 (_ -> (0u64, 0u64)))

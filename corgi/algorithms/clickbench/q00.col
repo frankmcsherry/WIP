@@ -1,0 +1,5 @@
+# Q0: SELECT COUNT(*) FROM hits
+# sql: SELECT COUNT(*) FROM hits
+# columns: AdvEngineID
+# output: u
+input len

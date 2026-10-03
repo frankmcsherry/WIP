@@ -1,0 +1,8 @@
+# Q26: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10
+# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# columns: EventTime SearchPhrase
+# output: [s]
+let (time, phrase) = input in
+let sorted = (time, phrase) zip map ((t, s) -> ((s len, 0u64) gt, (t, s))) filter sort in
+((0u64, ((sorted len, 10u64) min)) range, sorted) gather
+    try match (0 (top -> top map ((_, s) -> s)), 1 (_ -> 0u64 iota map (z -> "")))

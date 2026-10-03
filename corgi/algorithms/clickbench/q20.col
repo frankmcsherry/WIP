@@ -1,0 +1,18 @@
+# Q20: SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
+# sql: SELECT COUNT(*) FROM hits WHERE decode(URL) LIKE '%google%'
+# columns: URL
+# output: u
+# corgi has no substring search: a string contains "google" when, split at "e" (its last byte, which
+# occurs once in it), some piece other than the last ends with "googl" (its last bytes read with
+# gather_try, since a piece may be shorter).
+input map (u ->
+    let pieces = u split "e" in
+    let n = pieces len in
+    let ends = pieces map (p ->
+        let m = p len in
+        let long = (m, 5u64) ge in
+        let lo = (long, (m, 5u64) sub, 0u64) select in
+        let tail = ((lo, (lo, 5u64) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0u8))) in
+        (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
+    (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1u64) add, n) lt, e) mul) fold_any) fold_add
+    try match (0 (n -> n), 1 (_ -> 0u64))

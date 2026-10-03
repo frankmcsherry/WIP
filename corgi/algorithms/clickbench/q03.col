@@ -1,0 +1,12 @@
+# Q3: SELECT AVG(UserID) FROM hits
+# sql: SELECT AVG(UserID) FROM hits
+# columns: UserID
+# output: g
+# UserID is signed and stored sign-flipped; corgi's sums are unsigned and there is no float sum or
+# signed-to-float conversion. So: sum the stored values in two 32-bit halves (neither overflows),
+# average them as floats, and undo the flip (subtract 2^63).
+let u = input in
+let n = u len to_f64 in
+let hi = u map (x -> x shr 32) fold_add to_f64 in
+let lo = u map (x -> x and 4294967295) fold_add to_f64 in
+((((hi, 4294967296f64) mul_f64, lo) add_f64, n) div_f64, 9223372036854775808f64) sub_f64

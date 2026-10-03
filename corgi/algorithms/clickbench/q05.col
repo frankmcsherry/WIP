@@ -1,0 +1,5 @@
+# Q5: SELECT COUNT(DISTINCT SearchPhrase) FROM hits
+# sql: SELECT COUNT(DISTINCT SearchPhrase) FROM hits
+# columns: SearchPhrase
+# output: u
+input dedup len
