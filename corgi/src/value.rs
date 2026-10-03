@@ -609,6 +609,20 @@ macro_rules! prim {
                 }
             }
 
+            /// the bits this leaf's values use: none above the highest bit set in any of them.
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn width(&self) -> u32 {
+                match self { $( Prim::$V(v) => 64 - v.iter().fold(0u64, |a, &x| a | x as u64).leading_zeros(), )+ }
+            }
+
+            /// `words[q] = (words[q] << bits) | self[q]`: this leaf's rows packed below the bits
+            /// already there, at `bits` (at least [`Prim::width`]).
+            #[allow(clippy::unnecessary_cast)]
+            pub(crate) fn pack_below(&self, bits: u32, words: &mut [u64]) {
+                let shift = |w: u64| if bits >= 64 { 0 } else { w << bits };
+                match self { $( Prim::$V(v) => words.iter_mut().zip(v.iter()).for_each(|(w, &x)| *w = shift(*w) | x as u64), )+ }
+            }
+
             /// the rows `index[..]` widened to `u64`, appended to `out` — the one indirect read the
             /// indexed sort makes; every pass after it is sequential.
             #[allow(clippy::unnecessary_cast)]

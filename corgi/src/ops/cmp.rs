@@ -13,9 +13,9 @@ pub(crate) mod survey;
 
 use crate::engine::gather;
 use order::{compare_adjacent, compare_cols, compare_idx, run_starts, runs_per_row, segment_labels};
-use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
+use sort::{contains_list, sort_blocks, sort_values, sort_values_only, sort_words};
 use crate::shape::{same, shape_of_value};
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Prim, Value};
 use search::find_leaf;
 use std::hint::select_unpredictable;
 
@@ -111,10 +111,15 @@ impl CmpOp {
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
             }
 
-            // the sort moves the keys; the payload follows the permutation, unless there is none.
+            // leaves that fit one word sort as packed words, the payload riding below the key;
+            // otherwise the sort moves the keys and the payload follows its permutation (a unit
+            // payload carries nothing, and the sort no index).
             CmpOp::SortBy => {
                 let (bounds, vals) = input.into_list("SortBy")?;
                 let (k, v) = vals.into_pair("SortBy elements")?;
+                if let Some(out) = sort_by_packed(&bounds, &k, &v) {
+                    return Ok(out);
+                }
                 let labels = row_labels(&bounds);
                 let (sk, sv, refined) = if let Value::Unit(n) = v {
                     let (refined, sk) = sort_values_only(&labels, &k);
@@ -367,6 +372,81 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
         s = e;
     }
     Value::List(out_ends.into(), Box::new(gather(vals, &take)))
+}
+
+/// `sort_by` on leaves that fit one word together: each element's key fields and its payload are
+/// packed into one u64 at the widths their values use (not their declared widths), the payload in
+/// the lowest bits, and the words are sorted on the bits above the payload, which rides along
+/// uncompared: no index is carried and nothing is gathered. A leading key field already in order
+/// within each row (the runs of a sort before) splits the rows into blocks sorted one at a time.
+/// None when the leaves don't fit one word, or there is nothing to pack together (one key field
+/// and no payload, which the general sort already sorts as its keys alone).
+fn sort_by_packed(bounds: &Bounds, k: &Value, v: &Value) -> Option<Value> {
+    let fields: Vec<&Prim> = match k {
+        Value::Prim(p) => vec![p],
+        Value::Prod(fs) if !fs.is_empty() => fs.iter().map(|f| match f { Value::Prim(p) => Some(p), _ => None }).collect::<Option<_>>()?,
+        _ => return None,
+    };
+    let payload = match v {
+        Value::Prim(p) => Some(p),
+        Value::Unit(_) if fields.len() > 1 => None,
+        _ => return None,
+    };
+    let kbits: Vec<u32> = fields.iter().map(|p| p.width()).collect();
+    let vbits = payload.map_or(0, |p| p.width());
+    let key_bits: u32 = kbits.iter().sum();
+    if key_bits + vbits > 64 {
+        return None;
+    }
+    let mut words = vec![0u64; k.len()];
+    for (p, &b) in fields.iter().zip(&kbits) {
+        p.pack_below(b, &mut words);
+    }
+    if let Some(p) = payload {
+        p.pack_below(vbits, &mut words);
+    }
+    let shr = |w: u64, b: u32| if b >= 64 { 0 } else { w >> b };
+    let lead = |w: u64| shr(w, vbits + key_bits - kbits[0]);
+    let lead_sorted = fields.len() > 1 && (0..bounds.len()).all(|r| {
+        let (s, e) = bounds.span(r);
+        words[s..e].windows(2).all(|w| lead(w[0]) <= lead(w[1]))
+    });
+    let mut ends = Vec::with_capacity(bounds.len());
+    for r in 0..bounds.len() {
+        let (s, e) = bounds.span(r);
+        if lead_sorted {
+            ends.extend((s + 1..e).filter(|&q| lead(words[q]) != lead(words[q - 1])));
+        }
+        if s < e {
+            ends.push(e);
+        }
+    }
+    if key_bits > 0 {
+        sort_words(&mut words, ends.into_iter(), vbits);
+    }
+    // each element's run of equal keys, numbered densely over the column; a row starts a run
+    let (mut runs, mut next) = (Vec::with_capacity(words.len()), 0u64);
+    for r in 0..bounds.len() {
+        let (s, e) = bounds.span(r);
+        for q in s..e {
+            if q > 0 && (q == s || shr(words[q], vbits) != shr(words[q - 1], vbits)) {
+                next += 1;
+            }
+            runs.push(next);
+        }
+    }
+    let mask = |b: u32| if b >= 64 { u64::MAX } else { (1u64 << b) - 1 };
+    let mut shift = vbits + key_bits;
+    let mut out: Vec<Value> = fields.iter().zip(&kbits).map(|(p, &b)| {
+        shift -= b;
+        Value::Prim(p.like_from(words.iter().map(|&w| shr(w, shift) & mask(b))))
+    }).collect();
+    let sk = if matches!(k, Value::Prim(_)) { out.pop().unwrap() } else { Value::Prod(out) };
+    let sv = match payload {
+        Some(p) => Value::Prim(p.like_from(words.iter().map(|&w| w & mask(vbits)))),
+        None => v.clone(),
+    };
+    Some(Value::List(bounds.clone(), Box::new(Value::Prod(vec![sk, sv, Value::u64(runs)]))))
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
