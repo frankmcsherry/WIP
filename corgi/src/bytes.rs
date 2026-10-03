@@ -32,15 +32,16 @@
 //!   List  = 3, 0, n, u64*n, Value                    `Offsets` form: one end offset per row
 //!         | 3, 1, stride, rows, Value                `Stride` form: the uniform partition
 //!   Unit  = 4, n
-//!   Ref   = 5, n, (lo, hi)*n, Value                spans of the payload that follows: the arena
-//!                                                    goes once, however many rows reference it
+//!   Ref   = 5, n, u64*n, Value                     row numbers into the list that follows (the
+//!                                                    arena), u64::MAX for none: the arena goes once,
+//!                                                    however many rows reference it
 //! ```
 //!
-//! A `Ref` keeps its shape and its sharing across the wire: its payload is written whole, once,
-//! whatever the spans name of it (to ship only the named rows, `clone` first). Two `Ref` columns
+//! A `Ref` keeps its shape and its sharing across the wire: its arena is written whole, once,
+//! whatever rows of it are named (to ship only the named rows, `clone` first). Two `Ref` columns
 //! of one value that share an arena each carry a copy of it, and decode to separate arenas.
 
-use crate::value::{Bounds, Prim, Tags, Value};
+use crate::value::{Bounds, Prim, Tags, Value, NO_ROW};
 
 /// Round a byte count up to a whole number of 64-bit words.
 #[inline]
@@ -58,7 +59,7 @@ pub fn length_in_bytes(v: &Value) -> usize {
         }
         Value::List(bounds, values) => 8 + bounds_len(bounds) + length_in_bytes(values),
         Value::Unit(_) => 16,
-        Value::Ref(payload, spans) => 16 + 16 * spans.len() + length_in_bytes(payload),
+        Value::Ref(list, rows) => 16 + 8 * rows.len() + length_in_bytes(list),
     }
 }
 
@@ -91,14 +92,13 @@ pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result
             word(writer, 4)?;
             word(writer, *n as u64)
         }
-        Value::Ref(payload, spans) => {
+        Value::Ref(list, rows) => {
             word(writer, 5)?;
-            word(writer, spans.len() as u64)?;
-            for &(lo, hi) in spans.iter() {
-                word(writer, lo as u64)?;
-                word(writer, hi as u64)?;
+            word(writer, rows.len() as u64)?;
+            for &r in rows.iter() {
+                word(writer, if r == NO_ROW { u64::MAX } else { r as u64 })?;
             }
-            write_to(payload, writer)
+            write_to(list, writer)
         }
     }
 }
@@ -193,7 +193,7 @@ pub fn declared_rows(v: &Value) -> u64 {
             .max(bounds_total(bounds))
             .max(declared_rows(values)),
         Value::Unit(n) => *n as u64,
-        Value::Ref(payload, spans) => (spans.len() as u64).max(declared_rows(payload)),
+        Value::Ref(list, rows) => (rows.len() as u64).max(declared_rows(list)),
     }
 }
 
@@ -432,17 +432,25 @@ fn read_value(r: &mut Reader) -> Result<Value, String> {
         }
         4 => Ok(Value::Unit(r.word()? as usize)),
         5 => {
-            let n = r.count(16, "ref spans")?;
-            let mut spans = Vec::with_capacity(n);
+            let n = r.count(8, "ref rows")?;
+            let mut words = Vec::with_capacity(n);
             for _ in 0..n {
-                spans.push((r.word()? as usize, r.word()? as usize));
+                words.push(r.word()?);
             }
-            let payload = r.nested(read_value)?;
-            let len = payload.len();
-            if let Some(&(lo, hi)) = spans.iter().find(|&&(lo, hi)| lo > hi || hi > len) {
-                return Err(format!("corgi::bytes: ref span ({lo}, {hi}) outside a payload of {len} values"));
+            let list = r.nested(read_value)?;
+            if !matches!(list, Value::List(..)) {
+                return Err(format!("corgi::bytes: a ref names rows of a list, not of {}", crate::shape::shape_of_value(&list)));
             }
-            Ok(Value::Ref(std::sync::Arc::new(payload), std::sync::Arc::new(spans)))
+            let len = list.len();
+            let mut rows = Vec::with_capacity(n);
+            for w in words {
+                rows.push(match w {
+                    u64::MAX => NO_ROW,
+                    w if w < len as u64 => w as usize,
+                    w => return Err(format!("corgi::bytes: ref row {w} outside a list of {len} rows")),
+                });
+            }
+            Ok(Value::Ref(std::sync::Arc::new(list), std::sync::Arc::new(rows)))
         }
         other => Err(format!("corgi::bytes: bad value tag {other}")),
     }

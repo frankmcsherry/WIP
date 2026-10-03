@@ -68,11 +68,12 @@ src/
   hash.rs      structural hashing, one stable u64 per row, over the same structure the comparator reads.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
-               Value::Ref(Arc<payload>, Arc<spans>) = referenced LIST ROWS (shape Ref<List<T>>, Rust's &[T]):
-               row j is the (lo,hi) span j of the shared payload. `ref` takes them (through products and sums;
-               bounded rows stay by value), `clone` copies out (deep; the only copy of referenced rows),
-               `gather` moves spans only; `gather_lanes` too over one arena, and over distinct arenas
-               copies the union of the picked spans once (live rows only, never once per reference).
+               Value::Ref(Arc<list>, Arc<rows>) = referenced LIST ROWS (shape Ref<List<T>>, Rust's &[T]):
+               row j is row rows[j] of the shared list (the arena), or NO_ROW, the empty list. `ref` takes
+               them (through products and sums; bounded rows stay by value), `clone` copies out (deep; the
+               only copy of referenced rows), `gather` moves row numbers only; `gather_lanes` too over one
+               arena, and over distinct arenas copies the named rows once into a new arena (live rows only,
+               never once per reference).
                `Rows` = the reader's borrowed view (List or Ref) via `rows_of`; `into_list` takes only a
                List, so a Ref elsewhere is the shape error "clone first". Compare/sort read through refs.
   shape.rs     Shape (Prim(width) | Prod | Sum | List | Ref) + shape_of_value + Display.

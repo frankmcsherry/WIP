@@ -4,7 +4,7 @@
 
 use crate::shape::shape_of_value;
 use std::sync::Arc;
-use crate::value::{Bounds, Prim, Rows, Tags, Value};
+use crate::value::{Bounds, Prim, Rows, Tags, Value, NO_ROW};
 
 pub(crate) use generators::*;
 
@@ -30,15 +30,16 @@ pub(crate) fn fill(row: &Value, n: usize) -> Value {
     }
 }
 
-/// TAKE REFERENCES: `Ref` = reference every top-level list row of `v` — a list's rows become spans
-/// of its payload (the payload is the arena). Passes through products and sums, and leaves bounded
-/// rows (leaves, units, rows already referenced) by value: only a list row is unbounded, so only a
-/// list row is worth a reference. O(rows), nothing copied — the by-reference half of the pair.
+/// TAKE REFERENCES: `Ref` = reference every top-level list row of `v` — a list becomes the arena,
+/// and each of its rows a reference to itself by number. Passes through products and sums, and
+/// leaves bounded rows (leaves, units, rows already referenced) by value: only a list row is
+/// unbounded, so only a list row is worth a reference. O(rows), nothing copied — the
+/// by-reference half of the pair.
 pub(crate) fn take_ref(v: Value) -> Value {
     match v {
-        Value::List(bounds, payload) => {
-            let spans = (0..bounds.len()).map(|i| bounds.span(i)).collect();
-            Value::Ref(Arc::new(*payload), Arc::new(spans))
+        list @ Value::List(..) => {
+            let rows = (0..list.len()).collect();
+            Value::Ref(Arc::new(list), Arc::new(rows))
         }
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(take_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(take_ref).collect()),
@@ -51,7 +52,8 @@ pub(crate) fn take_ref(v: Value) -> Value {
 /// `clone` undoes `ref`; a value without references comes back as it is.
 pub(crate) fn clone_ref(v: Value) -> Value {
     match v {
-        Value::Ref(payload, spans) => clone_ref(materialize_spans(&spans, &payload)),
+        // the named rows, copied (a reference to no row copies as the empty list).
+        Value::Ref(list, rows) => clone_ref(gather_or_zero(&list, &rows).expect("a list has a zero")),
         Value::List(bounds, vals) => Value::List(bounds, Box::new(clone_ref(*vals))),
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(clone_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(clone_ref).collect()),
@@ -130,8 +132,9 @@ mod generators {
     /// row `r` names a position outside its row; such a position is recorded as `usize::MAX`, which
     /// [`IndexPlan::fill_or_zero`] reads as zero and [`IndexPlan::fill`] must never see.
     pub(crate) fn index_plan(index: &Value, owners: &Owners, hay: Rows, ok: &mut [bool]) -> Result<IndexPlan, String> {
-        fn resolve(hay: Rows, ok: &mut [bool], r: usize, x: u64, pos: &mut Vec<usize>) {
-            let (hs, he) = hay.span(r);
+        // a position `x` in owner row `r`, whose span is `(hs, he)`: its place in the payload, or
+        // `usize::MAX` (and `r` marked) when it lies outside the row.
+        fn resolve(ok: &mut [bool], r: usize, (hs, he): (usize, usize), x: u64, pos: &mut Vec<usize>) {
             let inside = x < (he - hs) as u64;
             ok[r] &= inside;
             pos.push(if inside { hs + x as usize } else { usize::MAX });
@@ -140,8 +143,14 @@ mod generators {
             Value::Prim(p) => {
                 let mut pos = Vec::with_capacity(p.len());
                 match p {
-                    Prim::U64(xs) => xs.iter().enumerate().for_each(|(j, &x)| resolve(hay, ok, owners.get(j), x, &mut pos)),
-                    _ => (0..p.len()).for_each(|j| resolve(hay, ok, owners.get(j), p.u64_at(j), &mut pos)),
+                    Prim::U64(xs) => xs.iter().enumerate().for_each(|(j, &x)| {
+                        let r = owners.get(j);
+                        resolve(ok, r, hay.span(r), x, &mut pos)
+                    }),
+                    _ => (0..p.len()).for_each(|j| {
+                        let r = owners.get(j);
+                        resolve(ok, r, hay.span(r), p.u64_at(j), &mut pos)
+                    }),
                 }
                 IndexPlan::Leaf(pos)
             }
@@ -154,10 +163,12 @@ mod generators {
             Value::List(bounds, vals) => match &**vals {
                 Value::Prim(Prim::U64(xs)) => {
                     let mut pos = Vec::with_capacity(xs.len());
+                    // one owner per row of positions, so its span is read once per row.
                     for i in 0..bounds.len() {
                         let r = owners.get(i);
                         let (s, e) = bounds.span(i);
-                        xs[s..e].iter().for_each(|&x| resolve(hay, ok, r, x, &mut pos));
+                        let span = hay.span(r);
+                        xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x, &mut pos));
                     }
                     IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(pos)))
                 }
@@ -212,18 +223,6 @@ mod generators {
         }
     }
 
-    /// spans over a payload as a by-value list: the partition of their lengths over a gather of
-    /// exactly the spanned elements. What `clone` of a Ref builds.
-    pub(crate) fn materialize_spans(spans: &[(usize, usize)], payload: &Value) -> Value {
-        let mut elem = Vec::with_capacity(spans.iter().map(|(s, e)| e - s).sum());
-        let mut nb = Vec::with_capacity(spans.len());
-        for &(s, e) in spans {
-            elem.extend(s..e);
-            nb.push(elem.len());
-        }
-        Value::List(nb.into(), Box::new(gather(payload, &elem)))
-    }
-
 }
 
 /// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape.
@@ -266,9 +265,10 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
             Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
-        // a reference column: move the spans, never the arena. This one arm is the entire cost model
-        // of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Ref they are free.
-        Value::Ref(payload, spans) => Value::Ref(payload.clone(), Arc::new(idx.iter().map(|&i| spans[i]).collect())),
+        // a reference column: move the row numbers, never the arena. This one arm is the entire cost
+        // model of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Ref they move
+        // one number per row.
+        Value::Ref(list, rows) => Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows[i]).collect())),
     }
 }
 
@@ -310,8 +310,8 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
             }
             Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
-        Value::Ref(payload, spans) => {
-            Value::Ref(payload.clone(), Arc::new(idx.iter().map(|&i| spans.get(i).copied().unwrap_or((0, 0))).collect()))
+        Value::Ref(list, rows) => {
+            Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows.get(i).copied().unwrap_or(NO_ROW)).collect()))
         }
     })
 }
@@ -456,78 +456,66 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
-        // pick spans, never elements. Sources over ONE arena (by pointer) merge spans only — the
-        // case of a loop state or a branch that keeps what it was handed. Over distinct arenas, each
-        // arena contributes only what the result still references: the union of its picked spans,
-        // copied once and rebased. So the result holds live rows only (a fold rebuilding its state
-        // every round does not accumulate dead arenas), and a row referenced many times is still
-        // copied once. (An empty span names nothing, so neither it nor an empty source's arena —
-        // often a fresh `Value::empty` — counts.)
+        // pick row numbers, never elements. Sources over ONE arena (by pointer) merge row numbers
+        // only — the case of a loop state or a branch that keeps what it was handed. Over distinct
+        // arenas, each arena contributes only what the result still references: the rows it names,
+        // copied once into one new arena, and the numbers rebased. So the result holds live rows only
+        // (a fold rebuilding its state every round does not accumulate dead arenas), and a row
+        // referenced many times is still copied once. (A source naming no rows — often a fresh
+        // `Value::empty` — and a reference to no row don't count.)
         Value::Ref(..) => {
-            let parts: Vec<_> = filled
+            let parts: Vec<(&Arc<Value>, &[usize])> = filled
                 .iter()
                 .map(|v| match v {
-                    Value::Ref(p, s) => (p, &s[..]),
+                    Value::Ref(list, rows) => (list, &rows[..]),
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
             let picked = |i: usize| parts[tags[i]].1[off[i]];
             let mut arenas: Vec<&Arc<Value>> = Vec::new();
             let mut arena_of = vec![0usize; parts.len()];
-            for (k, (p, s)) in parts.iter().enumerate() {
-                if s.is_empty() {
+            for (k, (list, rows)) in parts.iter().enumerate() {
+                if rows.is_empty() {
                     continue;
                 }
-                arena_of[k] = arenas.iter().position(|a| Arc::ptr_eq(a, p)).unwrap_or_else(|| {
-                    arenas.push(p);
+                arena_of[k] = arenas.iter().position(|a| Arc::ptr_eq(a, list)).unwrap_or_else(|| {
+                    arenas.push(list);
                     arenas.len() - 1
                 });
             }
             if arenas.len() <= 1 {
-                let payload = arenas.first().copied().unwrap_or(parts[0].0).clone();
-                return Value::Ref(payload, Arc::new((0..tags.len()).map(picked).collect()));
+                let list = arenas.first().copied().unwrap_or(parts[0].0).clone();
+                return Value::Ref(list, Arc::new((0..tags.len()).map(picked).collect()));
             }
-            // per arena, the union of the picked non-empty spans as disjoint sorted intervals.
-            let mut used: Vec<Vec<(usize, usize)>> = vec![Vec::new(); arenas.len()];
+            // per arena, the distinct rows the result names, in order; the new arena holds each
+            // arena's rows in turn, so a row's new number is its arena's base plus its rank.
+            let mut used: Vec<Vec<usize>> = vec![Vec::new(); arenas.len()];
             for i in 0..tags.len() {
-                let (lo, hi) = picked(i);
-                if lo < hi {
-                    used[arena_of[tags[i]]].push((lo, hi));
+                let r = picked(i);
+                if r != NO_ROW {
+                    used[arena_of[tags[i]]].push(r);
                 }
             }
-            // each interval's elements are gathered into the new payload; `(lo, hi, base)` rebases.
-            let (mut atags, mut aoff) = (Vec::new(), Vec::new());
-            let mut kept: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(arenas.len());
-            for (a, spans) in used.iter_mut().enumerate() {
-                spans.sort_unstable();
-                let mut ivs: Vec<(usize, usize, usize)> = Vec::new();
-                for &(lo, hi) in spans.iter() {
-                    match ivs.last_mut() {
-                        Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
-                        _ => ivs.push((lo, hi, 0)),
-                    }
-                }
-                for iv in ivs.iter_mut() {
-                    iv.2 = atags.len();
-                    atags.extend(std::iter::repeat_n(a, iv.1 - iv.0));
-                    aoff.extend(iv.0..iv.1);
-                }
-                kept.push(ivs);
+            let (mut atags, mut aoff, mut base) = (Vec::new(), Vec::new(), Vec::with_capacity(arenas.len()));
+            for (a, rows) in used.iter_mut().enumerate() {
+                rows.sort_unstable();
+                rows.dedup();
+                base.push(atags.len());
+                atags.extend(std::iter::repeat_n(a, rows.len()));
+                aoff.extend(rows.iter().copied());
             }
             let srcs: Vec<Option<&Value>> = arenas.iter().map(|a| Some(&***a)).collect();
-            let payload = Arc::new(gather_lanes(&srcs, &atags, &aoff));
-            let spans = (0..tags.len())
-                .map(|i| {
-                    let (lo, hi) = picked(i);
-                    if lo == hi {
-                        return (0, 0);
+            let list = Arc::new(gather_lanes(&srcs, &atags, &aoff));
+            let rows = (0..tags.len())
+                .map(|i| match picked(i) {
+                    NO_ROW => NO_ROW,
+                    r => {
+                        let a = arena_of[tags[i]];
+                        base[a] + used[a].binary_search(&r).expect("a picked row is used")
                     }
-                    let ivs = &kept[arena_of[tags[i]]];
-                    let (ilo, _, base) = ivs[ivs.partition_point(|iv| iv.0 <= lo) - 1];
-                    (base + lo - ilo, base + hi - ilo)
                 })
                 .collect();
-            Value::Ref(payload, Arc::new(spans))
+            Value::Ref(list, Arc::new(rows))
         }
     }
 }

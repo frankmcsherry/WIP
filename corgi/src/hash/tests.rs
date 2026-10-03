@@ -173,12 +173,10 @@ fn fused_product_hashes_match_scalar_rows() {
                     combine(a, row(vals, i))
                 })
             }
-            Value::Ref(payload, spans) => {
-                let (s, e) = spans[r];
-                (s..e).fold(combine(LIST, (e - s) as u64), |a, i| {
-                    combine(a, row(payload, i))
-                })
-            }
+            Value::Ref(list, rows) => match rows[r] {
+                crate::value::NO_ROW => combine(LIST, 0),
+                named => row(list, named),
+            },
         }
     }
     for n in [0, 1, 2, 31, 257] {
