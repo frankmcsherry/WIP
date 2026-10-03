@@ -1,0 +1,7 @@
+# Q15: SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10
+# The variant with `sort_limit`: sorting only what can reach the limit.
+# sql: SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID ORDER BY c DESC, UserID LIMIT 10
+# columns: UserID
+# output: [i,u]
+let ranked = input map (u -> (u, 1u64)) group map ((u, ones) -> ((18446744073709551615u64, ones len) sub, u)) sort_limit 10 in
+ranked map ((d, u) -> (u, (18446744073709551615u64, d) sub))

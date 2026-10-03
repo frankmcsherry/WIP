@@ -1,0 +1,12 @@
+# Q32: SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10
+# The variant with `sort_limit`: sorting only what can reach the limit.
+# sql: SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits 
+# sql:   GROUP BY WatchID, ClientIP ORDER BY c DESC, WatchID, ClientIP LIMIT 10
+# columns: WatchID ClientIP IsRefresh ResolutionWidth
+# output: [i,i,u,u,f]
+let (watchid, ip, refresh, width) = input in
+let rows = (watchid, (ip, (refresh, width) zip) zip) zip map ((e, (i, (r, w))) -> ((e, i), (r, w))) in
+let ranked = rows group map (((e, i), vs) -> let n = vs len in
+    ((18446744073709551615u64, n) sub, e, i, n, vs map ((r, _) -> r) fold_add, (vs map ((_, w) -> w) fold_add to_f64, n to_f64) div_f64)) sort_limit 10 in
+ranked map ((_, e, i, n, r, w) -> (e, i, n, r, w))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, z, z, 0f64))))

@@ -1,0 +1,24 @@
+# Q23: SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10
+# The variant with `sort_limit`: sorting only what can reach the limit.
+# sql: SELECT EventTime, WatchID, URL FROM hits WHERE decode(URL) LIKE '%google%'
+# sql:   ORDER BY EventTime, WatchID, octet_length(URL), URL LIMIT 10
+# columns: EventTime WatchID URL
+# output: [u,i,s]
+# Approximated: three columns stand for SELECT * (the bench exports only the columns queries read).
+# corgi has no substring search: a string contains "google" when, split at "e" (its last byte, which
+# occurs once in it), some piece other than the last ends with "googl" (its last bytes read with
+# gather_try, since a piece may be shorter).
+let (time, watch, url) = input in
+let google = url map (u ->
+    let pieces = u split "e" in
+    let n = pieces len in
+    let ends = pieces map (p ->
+        let m = p len in
+        let long = (m, 5u64) ge in
+        let lo = (long, (m, 5u64) sub, 0u64) select in
+        let tail = ((lo, (lo, 5u64) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0u8))) in
+        (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
+    (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1u64) add, n) lt, e) mul) fold_any) in
+let sorted = (google, (time, (watch, url) zip) zip) zip map ((g, (t, (w, u))) -> (g, (t, w, u))) filter sort_limit 10 in
+sorted map ((t, w, u) -> (t, w, u))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, ""))))

@@ -1,0 +1,32 @@
+# Q22: SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+# The variant with `sort_limit`: sorting only what can reach the limit.
+# sql: SELECT SearchPhrase, arg_min(URL, {'l': octet_length(URL), 'u': URL}), arg_min(Title, {'l': octet_length(Title), 't': Title}),
+# sql:   COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits
+# sql:   WHERE decode(Title) LIKE '%Google%' AND decode(URL) NOT LIKE '%.google.%' AND SearchPhrase <> ''
+# sql:   GROUP BY SearchPhrase ORDER BY c DESC, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# columns: SearchPhrase URL Title UserID
+# output: [s,s,s,u,u]
+# corgi has no substring search. Title contains "Google" when, split at "G", a piece after the first
+# starts with "oogle"; URL contains ".google." when, split at ".", a piece other than the first and
+# last is exactly "google". MIN is the first in corgi's string order (shorter first).
+let (phrase, url, title, user) = input in
+let google = title map (u ->
+    let pieces = u split "G" in
+    let starts = pieces map (p ->
+        let head = ((0u64, 5u64) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0u8))) in
+        (head, "oogle") zip map ((a, c) -> (a, c) eq) fold_all) in
+    (pieces len iota, starts) zip map ((i, s) -> ((i, 0u64) gt, s) mul) fold_any) in
+let dotted = url map (u ->
+    let pieces = u split "." in
+    let n = pieces len in
+    let google = pieces map (p ->
+        let head = ((0u64, 6u64) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0u8))) in
+        ((p len, 6u64) eq, (head, "google") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
+    (n, (n iota, google) zip) cap_list map ((n, (i, g)) -> (((i, 0u64) gt, ((i, 1u64) add, n) lt) mul, g) mul) fold_any) in
+let keep = (phrase, (google, dotted) zip) zip map ((s, (g, d)) -> (((s len, 0u64) gt, g) mul, (d, 0u64) eq) mul) in
+let ranked = (keep, (phrase, (url, (title, user) zip) zip) zip) zip filter group
+    map ((s, rows) ->
+        ((18446744073709551615u64, rows len) sub, s, rows map ((u, _) -> u) sort head, rows map ((_, (t, _)) -> t) sort head,
+         rows len, rows map ((_, (_, x)) -> x) dedup len)) sort_limit 10 in
+ranked map ((_, s, u, t, c, x) -> (s, u, t, c, x))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", "", "", z, z))))
