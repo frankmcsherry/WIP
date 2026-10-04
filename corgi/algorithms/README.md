@@ -46,6 +46,7 @@ top_pairs programs).
 | kadane_prefix | the same from prefix sums | 133 | 11.7 | 11.3 |
 | levenshtein | edit distance, the textbook table | 2800 | 79.6 | 35.2 |
 | linear_regression | least-squares slope and intercept | 238 | 8.9 | 26.8 |
+| linear_regression_sums | the same from four `fold_add_f64` sums | 73.4 | 9.2 | 8.0 |
 | luhn | Luhn check of a digit string | 105 | 6.9 | 15.2 |
 | median_percentile | median and 90th percentile | 242 | 76.6 | 3.2 |
 | mode | most frequent value | 477 | 114 | 4.2 |
@@ -227,7 +228,9 @@ The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Th
 
 8. **Folds whose state is a monoid or an affine map become reductions and scans.**
    - A fold that updates each field independently, `acc.k ⊕ f_k(x)`, is a `map` plus one reduction
-     per field: linear_regression's four sums. This needs an ordered float sum, which corgi lacks.
+     per field: linear_regression's four sums. With `fold_add_f64` (float sums in row order, so
+     bit-identical to the fold) linear_regression_sums runs 241 → 73 ns/row, and on rows 1024×
+     longer 692 → 66 µs per row (65× → 6.2× Rust).
    - A running max carried in a foldscan is an exclusive `scan_max` (interval_merge).
    - `acc * c + x` composes as affine maps and so is associative (ipv4_parse's `acc*256 + v`,
      horner).
