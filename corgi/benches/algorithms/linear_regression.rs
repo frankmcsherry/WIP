@@ -45,5 +45,6 @@ pub fn run(cfg: &Cfg) {
         Value::u64(out.iter().map(|o| enc_f64(o.1)).collect()),
     ]);
     let rust = || rows.iter().map(|r| fit(r)).collect::<Vec<_>>();
-    run_case(cfg, "linear_regression", "0-32 points, f64", include_str!("../../algorithms/linear_regression.col"), input, expected, rust);
+    run_case(cfg, "linear_regression", "0-32 points, f64", include_str!("../../algorithms/linear_regression.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "linear_regression_sums", "0-32 points, f64", include_str!("../../algorithms/linear_regression_sums.col"), input, expected, rust);
 }

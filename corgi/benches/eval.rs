@@ -73,7 +73,7 @@ fn main() {
     }
     let n = 1 << 20;
     // ReduceSum over one big list — into_list + into_u64.
-    report("reduce_add", n, bench(&graph(ArithOp::Reduce(corgi::Red::Add)), &one_list(n), reps));
+    report("reduce_add", n, bench(&graph(ArithOp::Reduce(corgi::Red::Add, Kind::U, 64)), &one_list(n), reps));
     // `sort` over one big list — the word over `sort_by`, the discrimination / byte-radix leaf sort.
     report("sort_list", n, bench(&corgi::parse_ml("input sort").unwrap(), &one_list(n), reps));
 
@@ -81,7 +81,7 @@ fn main() {
     // one bulk ReduceSum (corgi's columnar regime) vs m separate evals (row-at-a-time, where roto's
     // per-item host calls live). The ratio is what the bulk pass amortizes away.
     let (m, l) = (50_000usize, 1024usize);
-    let sums = graph(ArithOp::Reduce(corgi::Red::Add));
+    let sums = graph(ArithOp::Reduce(corgi::Red::Add, Kind::U, 64));
     report("sum_list/bulk", m * l, bench(&sums, &lists(m, l), reps));
     {
         let one = Value::List(vec![l].into(), Box::new(Value::u64(scrambled(l))));

@@ -123,7 +123,8 @@ src/
                kernel, rank at a time (dev/lane-survey.md).
     host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi.
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
-               (op × kind × width) grid + ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+               (op × kind × width) grid + Reduce/Scan (sums and products at a kind and width; min, max, all,
+               any on stored bits) + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` checked
                producers (gather/zip/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
@@ -266,7 +267,10 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
-  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. The
+  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Sums and
+  products come at every kind and width of the grid (`fold_add_f64`, `scan_mul_i32`; plain `fold_add`
+  is u64) and combine in row order, so a float sum is the fold of `add_f64` bit for bit; min, max,
+  all and any read stored bits and take any width. The
   all-active fast path (move `acc` through the body, skip the identity acc-gather + scatter) is built,
   but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
   all ragged input, take the general per-round gather and scatter.

@@ -229,3 +229,54 @@ fn integer_division_grid() {
     assert_eq!(shape_of(&g, &shape_of_value(&input)).unwrap(), Shape::Prim(64));
     assert_eq!(dec_col(eval_graph(&g, input)), vec![-3]);
 }
+
+/// a list column of rows of `f64`, in the float encoding the `_f64` ops store.
+fn f64_rows(rows: &[&[f64]]) -> Value {
+    let enc = |f: f64| { let b = f.to_bits(); if b >> 63 == 1 { !b } else { b ^ (1 << 63) } };
+    let ends: Vec<usize> = rows.iter().scan(0, |e, r| { *e += r.len(); Some(*e) }).collect();
+    Value::List(ends.into(), Box::new(Value::u64(rows.iter().flat_map(|r| r.iter().map(|&f| enc(f))).collect())))
+}
+
+fn run(src: &str, input: Value) -> Value {
+    corgi::Program::compile_ml(src).unwrap_or_else(|e| panic!("{src}: {e}")).run(input)
+}
+
+/// the f64 sum and product add in row order, so they are a fold of `add_f64`/`mul_f64` bit for bit,
+/// including where order changes the rounding; the scans are that fold's running values.
+#[test]
+fn float_reductions_are_the_fold_in_row_order() {
+    let rows = f64_rows(&[&[1e16, 1.0, -1e16, 0.5], &[], &[0.1, 0.2, 0.3], &[-0.0], &[3.0, -2.5, 1e-300, 1e300]]);
+    for (reduce, op, seed) in [("fold_add_f64", "add_f64", "0f64"), ("fold_mul_f64", "mul_f64", "1f64")] {
+        let fold = format!("({seed}, input) fold ((a, x) -> (a, x) {op})");
+        assert_eq!(run(&format!("input {reduce}"), rows.clone()), run(&fold, rows.clone()), "{reduce}");
+        let scan = reduce.replacen("fold", "scan", 1);
+        let foldscan = format!("({seed}, input) foldscan ((a, x) -> let s = (a, x) {op} in (s, s)) .1");
+        assert_eq!(run(&format!("input {scan}"), rows.clone()), run(&foldscan, rows.clone()), "{scan}");
+    }
+}
+
+/// signed sums and products go through the order-preserving encoding, at any width.
+#[test]
+fn signed_reductions_decode_their_values() {
+    let rows = Value::List(vec![3, 3, 5].into(), Box::new(i64col(&[-3, 5, -10, 7, -2])));
+    assert_eq!(dec_col(run("input fold_add_i64", rows.clone())), vec![-8, 0, 5]);
+    assert_eq!(dec_col(run("input fold_mul_i64", rows.clone())), vec![150, 1, -14]);
+    let Value::List(_, prefixes) = run("input scan_add_i64", rows) else { panic!("a list") };
+    assert_eq!(dec_col(*prefixes), vec![-3, 2, -8, 7, 5]);
+    // at 32 bits: the encoding flips bit 31
+    let i32s = Value::List(vec![3].into(), Box::new(Value::u32([-3i32, 5, -10].iter().map(|&x| x as u32 ^ (1 << 31)).collect())));
+    assert_eq!(run("input fold_add_i32", i32s), Value::u32(vec![-8i32 as u32 ^ (1 << 31)]));
+}
+
+/// min, max, all and any compare stored bits, so they take any width; the sum and product insist
+/// on theirs.
+#[test]
+fn order_reductions_take_any_width() {
+    let narrow = Value::List(vec![2, 2, 3].into(), Box::new(Value::u32(vec![9, 2, 200])));
+    assert_eq!(run("input fold_min", narrow.clone()), Value::u32(vec![2, u32::MAX, 200])); // empty: the identity
+    assert_eq!(run("input fold_max", narrow.clone()), Value::u32(vec![9, 0, 200]));
+    let Value::List(_, running) = run("input scan_max", narrow.clone()) else { panic!("a list") };
+    assert_eq!(*running, Value::u32(vec![9, 9, 200]));
+    let wrong = corgi::Program::compile_ml("input fold_add").unwrap();
+    assert!(wrong.shape(&shape_of_value(&narrow)).is_err(), "the u64 sum takes only u64 values");
+}

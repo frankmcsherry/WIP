@@ -57,6 +57,11 @@ fn typed_arith(name: &str) -> Option<NumOp> {
         "div" => bin(BinOp::Div),
         "rem" => bin(BinOp::Rem),
         "neg" => Some(ArithOp::Neg(k, w).into()),
+        // sums and products at a kind and width: `fold_add_f64`, `scan_mul_i32`, …
+        "fold_add" => Some(ArithOp::Reduce(Red::Add, k, w).into()),
+        "fold_mul" => Some(ArithOp::Reduce(Red::Mul, k, w).into()),
+        "scan_add" => Some(ArithOp::Scan(Red::Add, k, w).into()),
+        "scan_mul" => Some(ArithOp::Scan(Red::Mul, k, w).into()),
         // min/max take no kind/width suffix — they're kind-blind and width-inferred (`min`/`max`).
         _ => None,
     }
@@ -139,21 +144,23 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "select" => Op::Select.into(),
         "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
         "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
-        // named monoid reductions, each `fold_<binop>` (fold_add = sum, fold_mul = product):
-        "fold_add" => ArithOp::Reduce(Red::Add).into(),
-        "fold_mul" => ArithOp::Reduce(Red::Mul).into(),
-        "fold_min" => ArithOp::Reduce(Red::Min).into(),
-        "fold_max" => ArithOp::Reduce(Red::Max).into(),
-        "fold_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)
-        "fold_any" => ArithOp::Reduce(Red::Any).into(), // 1 iff any element nonzero (mask OR)
+        // named monoid reductions, each `fold_<binop>` (fold_add = sum, fold_mul = product). The sum
+        // and product here are u64; `fold_add_f64` and the rest of the typed forms are in
+        // `typed_arith`. min, max, all and any read the stored order and take any kind and width.
+        "fold_add" => ArithOp::Reduce(Red::Add, Kind::U, 64).into(),
+        "fold_mul" => ArithOp::Reduce(Red::Mul, Kind::U, 64).into(),
+        "fold_min" => ArithOp::Reduce(Red::Min, Kind::U, 64).into(),
+        "fold_max" => ArithOp::Reduce(Red::Max, Kind::U, 64).into(),
+        "fold_all" => ArithOp::Reduce(Red::All, Kind::U, 64).into(), // 1 iff every element nonzero (mask AND)
+        "fold_any" => ArithOp::Reduce(Red::Any, Kind::U, 64).into(), // 1 iff any element nonzero (mask OR)
         // the inclusive-prefix monoid scans — `scan_<binop>`, the one-pass fast paths for `scan` with a
         // monoid body (the `fold_*` siblings that KEEP each prefix instead of dropping to the total).
-        "scan_add" => ArithOp::Scan(Red::Add).into(),
-        "scan_mul" => ArithOp::Scan(Red::Mul).into(),
-        "scan_min" => ArithOp::Scan(Red::Min).into(),
-        "scan_max" => ArithOp::Scan(Red::Max).into(), // the running maximum
-        "scan_all" => ArithOp::Scan(Red::All).into(),
-        "scan_any" => ArithOp::Scan(Red::Any).into(),
+        "scan_add" => ArithOp::Scan(Red::Add, Kind::U, 64).into(),
+        "scan_mul" => ArithOp::Scan(Red::Mul, Kind::U, 64).into(),
+        "scan_min" => ArithOp::Scan(Red::Min, Kind::U, 64).into(),
+        "scan_max" => ArithOp::Scan(Red::Max, Kind::U, 64).into(), // the running maximum
+        "scan_all" => ArithOp::Scan(Red::All, Kind::U, 64).into(),
+        "scan_any" => ArithOp::Scan(Red::Any, Kind::U, 64).into(),
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
         "parse_u64" => TextOp::ParseU64.into(),

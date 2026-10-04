@@ -1,0 +1,14 @@
+# linear_regression with its four sums as f64 reductions instead of a fold: each is `fold_add_f64`
+# over one mapped column, adding in row order as the fold did, so the answer is the same bit for bit.
+let pts = input in
+let n = pts len to_f64 in
+let sx = pts map ((x, _) -> x) fold_add_f64 in
+let sy = pts map ((_, y) -> y) fold_add_f64 in
+let sxx = pts map ((x, _) -> (x, x) mul_f64) fold_add_f64 in
+let sxy = pts map ((x, y) -> (x, y) mul_f64) fold_add_f64 in
+let num = ((n, sxy) mul_f64, (sx, sy) mul_f64) sub_f64 in
+let den = ((n, sxx) mul_f64, (sx, sx) mul_f64) sub_f64 in
+let slope = ((den, 0f64) eq, 0f64, (num, den) div_f64) select in
+let intercept = ((sy, (slope, sx) mul_f64) sub_f64, n) div_f64 in
+let empty = (pts len, 0u64) eq in
+((empty, 0f64, slope) select, (empty, 0f64, intercept) select)

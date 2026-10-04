@@ -14,7 +14,7 @@ use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
 
-use crate::value::{Prim, Value};
+use crate::value::{Bounds, Prim, Value};
 use std::sync::Arc;
 
 /// order-preserving encode/decode for signed 64-bit integers.
@@ -106,11 +106,16 @@ pub enum ArithOp {
                            // the same width, total-order encoded. `to_f32`/`to_f64`: how iota becomes floats.
     Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
     And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
-    Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
-    Scan(Red),             // List<U64> -> List<U64>  per-row inclusive monoid PREFIX scan. The monoid
-                           // fast path for `scan` with a monoid body: one in-place pass, where the
-                           // general `FoldScan` re-evals the body per element (catastrophic on one long
-                           // row — see performance.md). `Reduce` is its drop-the-prefix sibling.
+    Reduce(Red, Kind, u32), // List<X> -> X      per-row monoid reduction (sum/prod/min/max/all/any),
+                           // in row order. Sum and product are at a kind and width, as `Bin` is
+                           // (`fold_add` is the u64 sum, `fold_add_f64` the f64 one, which adds in
+                           // row order and so matches a fold of `add_f64` bit for bit); min, max, all
+                           // and any read the stored order, so they ignore the kind and take any width.
+    Scan(Red, Kind, u32),  // List<X> -> List<X>  per-row inclusive monoid PREFIX scan of the same
+                           // monoids. The fast path for `scan` with a monoid body: one in-place pass,
+                           // where the general `FoldScan` re-evals the body per element (catastrophic
+                           // on one long row — see performance.md). `Reduce` is its drop-the-prefix
+                           // sibling.
 }
 
 // deswizzle the order-preserving signed encoding (XOR the top bit `m`), apply a native wrapping op,
@@ -348,61 +353,105 @@ impl ArithOp {
                 xs.iter_mut().for_each(|x| *x &= *m);
                 Value::u64(xs)
             }
-            ArithOp::Reduce(r) => {
+            ArithOp::Reduce(r, kind, w) => {
                 let (bounds, vals) = input.into_list("reduce")?;
-                let xs = vals.as_u64("reduce values")?;
-                let mut out = Vec::with_capacity(bounds.len());
-                let mut start = 0;
-                for end in bounds.ends() {
-                    let s = &xs[start..end]; // empty row -> the monoid identity
-                    out.push(match r {
-                        // Wrapping, to match the Scan sibling (prefix!) and the Kind::U BinOp add — so
-                        // reducing raw two's-complement diffs (a negative diff is a large u64) yields
-                        // the correct i64 sum instead of a checked-overflow panic in debug.
-                        Red::Add => s.iter().fold(0u64, |a, &x| a.wrapping_add(x)),
-                        Red::Mul => s.iter().fold(1u64, |a, &x| a.wrapping_mul(x)),
-                        Red::Min => s.iter().copied().min().unwrap_or(u64::MAX),
-                        Red::Max => s.iter().copied().max().unwrap_or(0),
-                        Red::All => s.iter().all(|&x| x != 0) as u64,
-                        Red::Any => s.iter().any(|&x| x != 0) as u64,
-                    });
-                    start = end;
-                }
-                Value::u64(out)
+                Value::Prim(monoid_rows(&bounds, vals.into_prim("reduce values")?, *r, *kind, *w, false)?)
             }
-            ArithOp::Scan(r) => {
+            ArithOp::Scan(r, kind, w) => {
                 let (bounds, vals) = input.into_list("scan")?;
-                let mut xs = vals.into_u64("scan values")?; // owned -> inclusive prefix written in place
-                // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
-                // sequential within a row, so this is a single memory pass, not a vectorizable one.
-                macro_rules! prefix {
-                    ($id:expr, $a:ident, $x:ident => $comb:expr) => {{
-                        let mut start = 0;
-                        for end in bounds.ends() {
-                            let mut $a = $id;
-                            for slot in &mut xs[start..end] {
-                                let $x = *slot;
-                                $a = $comb;
-                                *slot = $a;
-                            }
-                            start = end;
-                        }
-                    }};
-                }
-                match r {
-                    // integer Add/Mul wrap (the totality invariant); identities seed each row.
-                    Red::Add => prefix!(0u64, a, x => a.wrapping_add(x)),
-                    Red::Mul => prefix!(1u64, a, x => a.wrapping_mul(x)),
-                    Red::Min => prefix!(u64::MAX, a, x => a.min(x)),
-                    Red::Max => prefix!(0u64, a, x => a.max(x)),
-                    Red::All => prefix!(1u64, a, x => a & (x != 0) as u64), // running "all nonzero so far"
-                    Red::Any => prefix!(0u64, a, x => a | (x != 0) as u64), // running "any nonzero so far"
-                }
-                Value::List(bounds, Box::new(Value::u64(xs)))
+                let prefixes = monoid_rows(&bounds, vals.into_prim("scan values")?, *r, *kind, *w, true)?;
+                Value::List(bounds, Box::new(Value::Prim(prefixes)))
             }
         })
     }
 
+}
+
+/// Each row of `xs` reduced by the monoid `(id, f)` in row order (`scan` false: one value per row,
+/// the identity for an empty row, reading `xs` in place), or replaced by its inclusive prefixes
+/// (`scan` true: written over `xs`, which is copied first only if it is shared). The monoid works on
+/// decoded values (`dec`, `enc` between the stored bits and them), so a running total stays decoded
+/// and only what is stored is encoded.
+fn fold_rows<T: Copy, A: Copy>(
+    bounds: &Bounds,
+    xs: Arc<Vec<T>>,
+    scan: bool,
+    id: A,
+    dec: impl Fn(T) -> A,
+    f: impl Fn(A, A) -> A,
+    enc: impl Fn(A) -> T,
+) -> Vec<T> {
+    let mut start = 0;
+    if !scan {
+        let mut out = Vec::with_capacity(bounds.len());
+        for end in bounds.ends() {
+            out.push(enc(xs[start..end].iter().fold(id, |a, &x| f(a, dec(x)))));
+            start = end;
+        }
+        return out;
+    }
+    let mut xs = Arc::unwrap_or_clone(xs);
+    for end in bounds.ends() {
+        let mut acc = id;
+        for slot in &mut xs[start..end] {
+            acc = f(acc, dec(*slot));
+            *slot = enc(acc);
+        }
+        start = end;
+    }
+    xs
+}
+
+/// A monoid reduction or inclusive scan of each row of `p`, on its stored bits. Sum and product
+/// combine at `kind` (unsigned wrapping; signed wrapping through the order-preserving encoding; float
+/// in IEEE arithmetic) and need values `w` bits wide. Min and max compare the stored bits, which is
+/// the value's order for every kind, and all and any test them against zero; those four take any
+/// width.
+fn monoid_rows(bounds: &Bounds, p: Prim, r: Red, kind: Kind, w: u32, scan: bool) -> Result<Prim, String> {
+    let typed = matches!(r, Red::Add | Red::Mul);
+    if typed && p.bits() != w {
+        return Err(format!("a {kind:?}{w} sum or product expects U{w} values, got U{}", p.bits()));
+    }
+    fn same<T>(x: T) -> T {
+        x
+    }
+    macro_rules! ints {
+        ($v:expr, $V:ident, $u:ty, $i:ty) => {{
+            let xs = $v;
+            let m: $u = !(<$u>::MAX >> 1); // the sign bit, which the signed encoding flips
+            Prim::$V(Arc::new(match (r, kind) {
+                // signed: the order-preserving encoding flips the sign bit; the total is kept decoded
+                (Red::Add, Kind::I) => fold_rows(bounds, xs, scan, 0 as $i, |x: $u| (x ^ m) as $i, <$i>::wrapping_add, |a: $i| a as $u ^ m),
+                (Red::Mul, Kind::I) => fold_rows(bounds, xs, scan, 1 as $i, |x: $u| (x ^ m) as $i, <$i>::wrapping_mul, |a: $i| a as $u ^ m),
+                // integer sums and products wrap (the totality invariant), so reducing raw
+                // two's-complement differences (a negative one is a large u64) gives the right sum.
+                (Red::Add, _) => fold_rows(bounds, xs, scan, 0, same, <$u>::wrapping_add, same),
+                (Red::Mul, _) => fold_rows(bounds, xs, scan, 1, same, <$u>::wrapping_mul, same),
+                (Red::Min, _) => fold_rows(bounds, xs, scan, <$u>::MAX, same, <$u>::min, same),
+                (Red::Max, _) => fold_rows(bounds, xs, scan, 0, same, <$u>::max, same),
+                (Red::All, _) => fold_rows(bounds, xs, scan, 1, same, |a: $u, x: $u| a & (x != 0) as $u, same),
+                (Red::Any, _) => fold_rows(bounds, xs, scan, 0, same, |a: $u, x: $u| a | (x != 0) as $u, same),
+            }))
+        }};
+    }
+    macro_rules! floats {
+        ($v:expr, $V:ident, $u:ty, $dec:ident, $enc:ident) => {{
+            let xs = $v;
+            Prim::$V(Arc::new(match r {
+                Red::Add => fold_rows(bounds, xs, scan, 0.0, $dec, |a, x| a + x, $enc),
+                _ => fold_rows(bounds, xs, scan, 1.0, $dec, |a, x| a * x, $enc),
+            }))
+        }};
+    }
+    Ok(match p {
+        Prim::U32(v) if typed && kind == Kind::F => floats!(v, U32, u32, dec_f32, enc_f32),
+        Prim::U64(v) if typed && kind == Kind::F => floats!(v, U64, u64, dec_f64, enc_f64),
+        _ if typed && kind == Kind::F => return Err(format!("float sums and products only at width 32/64, got {w}")),
+        Prim::U8(v) => ints!(v, U8, u8, i8),
+        Prim::U16(v) => ints!(v, U16, u16, i16),
+        Prim::U32(v) => ints!(v, U32, u32, i32),
+        Prim::U64(v) => ints!(v, U64, u64, i64),
+    })
 }
 
 /// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),

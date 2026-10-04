@@ -306,8 +306,9 @@ item in NOTES.md, an execution strategy rather than a graph rewrite.
 - **`eq` on lists was thought missing.** The comments described `eq` as comparing leaves, though it
   compares any shape structurally. query_param first compared `hash`es for that reason.
 - **Arithmetic:**
-  - No unsuffixed `div` (though `rem` exists), `shl`, `or`, shift by a variable amount, or float and
-    signed reductions and scans.
+  - No unsuffixed `div` (though `rem` exists), `shl`, `or`, or shift by a variable amount. (Float and
+    signed reductions and scans were missing too; `fold_add_f64`, `scan_add_i64` and the rest exist
+    now.)
   - `n - 1` wraps, so a safe spelling is `((n, 1u64) max, 1u64) sub`. Without it, `range` to 2^64
     allocates that much.
 - **Closed bodies:**
