@@ -146,20 +146,6 @@ pub(crate) fn sort_values_only(labels: &[u64], v: &Value) -> (Vec<u64>, Value) {
     (labels, out.expect("emit was requested"))
 }
 
-/// Sort packed words within each block (`ends`, each block's end) by their bits above `base`,
-/// stably; the bits below `base` ride along uncompared. A block already in order is left alone.
-pub(crate) fn sort_words(words: &mut [u64], ends: impl Iterator<Item = usize>, base: u32) {
-    let mut scratch = SortScratch::default();
-    let mut lo = 0;
-    for hi in ends {
-        let block = &mut words[lo..hi];
-        if block.windows(2).any(|w| (w[0] >> base) > (w[1] >> base)) {
-            sort_block_impl::<false>(block, &mut [], &mut scratch, base);
-        }
-        lo = hi;
-    }
-}
-
 // ---- the arms -------------------------------------------------------------------------------
 
 /// A leaf: one indirect read per position, then sequential passes; the sorted keys, narrowed
@@ -470,7 +456,7 @@ fn sort_keys_only(keys: &mut [u64], labels: &mut Vec<u64>, scratch: &mut SortScr
         return;
     }
     if labels.is_empty() {
-        sort_block_impl::<false>(keys, &mut [], scratch, 0);
+        sort_block_impl::<false>(keys, &mut [], scratch);
         label_runs(labels, m, |q| keys[q] != keys[q - 1]);
         return;
     }
@@ -481,7 +467,7 @@ fn sort_keys_only(keys: &mut [u64], labels: &mut Vec<u64>, scratch: &mut SortScr
             hi += 1;
         }
         if hi - lo > 1 {
-            sort_block_impl::<false>(&mut keys[lo..hi], &mut [], scratch, 0);
+            sort_block_impl::<false>(&mut keys[lo..hi], &mut [], scratch);
         }
         lo = hi;
     }
@@ -512,17 +498,16 @@ fn refine_if_ordered(keys: &[u64], labels: &mut Vec<u64>) -> bool {
 /// block ([`digit_width`]). One sweep counts every digit at once; a digit on which every key
 /// agrees is skipped, as are the leading all-zero digits.
 fn sort_block(keys: &mut [u64], rows: &mut [usize], scratch: &mut SortScratch) {
-    sort_block_impl::<true>(keys, rows, scratch, 0)
+    sort_block_impl::<true>(keys, rows, scratch)
 }
 
 /// [`sort_block`], with (`ROWS`) or without the positions travelling alongside.
-/// The bits of each key below `base` are not compared: a payload riding with the key.
-fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scratch: &mut SortScratch, base: u32) {
+fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scratch: &mut SortScratch) {
     let n = keys.len();
     if n <= 32 {
         for k in 1..n {
             let mut j = k;
-            while j > 0 && (keys[j - 1] >> base) > (keys[j] >> base) {
+            while j > 0 && keys[j - 1] > keys[j] {
                 keys.swap(j - 1, j);
                 if ROWS {
                     rows.swap(j - 1, j);
@@ -535,18 +520,18 @@ fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scrat
     if n > COUNTED_MAX {
         if ROWS {
             let mut pairs: Vec<(u64, usize)> = keys.iter().copied().zip(rows.iter().copied()).collect();
-            pairs.sort_by_key(|p| p.0 >> base);
+            pairs.sort_by_key(|p| p.0);
             for (i, (k, q)) in pairs.into_iter().enumerate() {
                 keys[i] = k;
                 rows[i] = q;
             }
         } else {
-            keys.sort_by_key(|k| k >> base); // stable: a payload below `base` keeps its order
+            keys.sort_unstable(); // equal keys are indistinguishable
         }
         return;
     }
     let max = keys.iter().copied().max().unwrap_or(0);
-    let sig = (64 - max.leading_zeros()).saturating_sub(base);
+    let sig = 64 - max.leading_zeros();
     if sig == 0 {
         return;
     }
@@ -564,7 +549,7 @@ fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scrat
     counts.iter_mut().for_each(|c| *c = 0);
     for &k in keys.iter() {
         for p in 0..passes {
-            counts[p * buckets + ((k >> (base + p as u32 * d)) & mask) as usize] += 1;
+            counts[p * buckets + ((k >> (p as u32 * d)) & mask) as usize] += 1;
         }
     }
     let keys_alt = &mut keys_alt[..n];
@@ -575,7 +560,7 @@ fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scrat
         if counts.iter().any(|&c| c as usize == n) {
             continue; // every key agrees on this digit
         }
-        let shift = base + p as u32 * d;
+        let shift = p as u32 * d;
         let mut start = 0u32;
         for c in counts.iter_mut() {
             let cnt = *c;

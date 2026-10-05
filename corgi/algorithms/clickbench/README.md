@@ -34,7 +34,7 @@ q36, q38–q40) were measured again after that change; the rest are as first wri
 table in memory and runs on one thread; its per-query overhead is about 0.1 ms. The last column is
 from one `--profile` run, taken while `sort`, `dedup` and `group` were the kernels `SortList`,
 `DedupList` and `GroupKey`. They are words over `sort_by` now: across the queries that use them,
-1.02× those times, the slowest q27 at 1.38× and q04, q05 and q10 at 1.08–1.09×.
+1.01× those times, the slowest q27 at 1.19×.
 
 | query | corgi | DuckDB 1 thread | × | what dominates |
 |---|---|---|---|---|

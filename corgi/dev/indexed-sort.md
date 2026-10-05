@@ -105,14 +105,13 @@ Two things decided the shape, measured as words against the kernels:
   inside the sort for every caller cost 5-13% on small integer rows that never read them. Run
   numbers cost nothing to hand out, and marks from them are an integer compare.
 
-**Packed.** When the key is a leaf or a product of leaves and the payload a leaf, and their values
-fit one `u64` together at the bits they use (each column's width is the highest bit set in it),
-each element becomes one word, the payload lowest; the words sort on the bits above the payload,
-which rides uncompared, so no index is carried and nothing is gathered. A leading key field
-already in order within each row splits the rows into blocks sorted one at a time. This is the
-adaptive packing set aside above, in a narrower form: one word or nothing, decided per call. It
-is taken up here because what `sort_by` packs has no narrow declared width to pack by: positions
-(`iota`) and run numbers are `U64` by type, and the payload is not part of the key at all.
+**Not packed.** An experiment packed each element's key fields and a leaf payload into one `u64`
+at the widths their values use, the payload in the low bits riding uncompared, so no index was
+carried and nothing gathered. It made multi-field keys and positions-out about 2× faster
+(sort_pairs, argsort_pairs, mode). It was taken out: it was a second packer beside `sort_packed`,
+and it decided the plan from the data, where `sort_packed` decides from the shape. What it needs
+is narrow positions and run numbers, which are `U64` by type today; it returns if integer lanes
+get variable widths.
 
 **Against Datatoad's** `sort(groups, indexs, last)`, which reads a column at `indexs`, sorts
 `(group, value, i)`, makes one item per distinct `(group, value)` and one list per group, and
