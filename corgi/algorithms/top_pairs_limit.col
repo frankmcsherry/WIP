@@ -1,0 +1,3 @@
+# top_pairs by `sort_limit`: each column is sorted only for the pairs that can still reach the
+# first ten.
+input sort_limit 10

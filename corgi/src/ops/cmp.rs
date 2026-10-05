@@ -1,6 +1,6 @@
 //! The comparison/order op bucket. The leaf compare `Rel` (two columns → mask; `RelImm` when one side
-//! is a constant) — plus the list ops `SortList`/`DedupList`/`GroupKey`
-//! (discrimination via `sort_blocks`/`run_starts`) and `Find` (a search per needle on leaves, `search`;
+//! is a constant) — plus the list ops `SortBy` (the sort's own output; `sort`, `dedup` and `group`
+//! are words over it), `SortLimit`, `Adjacent` and `Find` (a search per needle on leaves, `search`;
 //! a batched binary search via `compare_idx` otherwise). All are
 //! kind-blind: they read the stored bytes, correct for unsigned and order-preserving signed alike. A
 //! flat enum (no sub-graphs); `NumOp` embeds it as the `Cmp` bucket alongside `Core`/`Arith`.
@@ -12,8 +12,8 @@ pub(crate) mod sort;
 pub(crate) mod survey;
 
 use crate::engine::gather;
-use order::{compare_cols, compare_idx, run_starts, runs_per_row, segment_labels};
-use sort::{contains_list, sort_blocks, sort_values, sort_values_only};
+use order::{compare_adjacent, compare_cols, compare_idx, segment_labels};
+use sort::{sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
 use search::find_leaf;
@@ -53,9 +53,12 @@ pub enum CmpOp {
     Max,       // (X, X) -> X   lane-wise maximum
     MinImm(u32, u64), // X -> X   lane-wise min with a constant (stored bits at width w), in place
     MaxImm(u32, u64), // X -> X   lane-wise max with a constant
-    SortList,  // List<X> -> List<X>   structural order
-    DedupList, // List<X> -> List<X>   distinct, per row (sorted)
-    GroupKey,  // List<(K,V)> -> List<(K, List<V>)>   group by key, per row (sorted)
+    SortBy,    // List<(K,V)> -> List<(K,V,U64)>   stable order by K alone, V carried along (a Unit
+               // V carries nothing), and each element's run of equal keys (numbered densely)
+    SortLimit(usize), // List<X> -> List<X>   the first k of each row in structural order (`sort`,
+               // then take k), sorting only what can reach the first k: see `sort_limit`
+    Adjacent,  // List<X> -> List<U64>   1 where an element differs from the one before it in its
+               // row, and at each row's first element: where runs of equal elements start
     Find,      // (needle:List<X>, haystack:List<X>) -> List<(lo,hi)>  equal_range / needle elem
 }
 
@@ -105,36 +108,43 @@ impl CmpOp {
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
             }
 
-            // the sort produces the sorted column itself; nothing is gathered afterwards.
-            CmpOp::SortList => {
-                let (bounds, vals) = input.into_list("SortList")?;
-                let (_, sorted) = sort_values_only(&row_labels(&bounds), &vals);
-                Value::List(bounds, Box::new(sorted))
+            // the sort moves the keys; the payload follows the permutation, unless there is none.
+            CmpOp::SortBy => {
+                let (bounds, vals) = input.into_list("SortBy")?;
+                let (k, v) = vals.into_pair("SortBy elements")?;
+                let labels = row_labels(&bounds);
+                let (sk, sv, refined) = if let Value::Unit(n) = v {
+                    let (refined, sk) = sort_values_only(&labels, &k);
+                    (sk, Value::Unit(n), refined)
+                } else {
+                    let (perm, refined, sk) = sort_values(&labels, &k);
+                    (sk, gather(&v, &perm), refined)
+                };
+                // the runs the sort found, as it found them: each element's run, numbered densely
+                // over the whole column (a run never spans two rows)
+                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::u64(refined)])))
             }
 
-            CmpOp::DedupList => {
-                // distinct, per row: sort, then keep one representative per run.
-                let (bounds, vals) = input.into_list("DedupList")?;
-                let (kept, firsts, _perm) = representatives(&row_labels(&bounds), &vals, false);
-                // outer bounds: cumulative distinct count per row (runs never cross rows).
-                let nb = runs_per_row(&bounds, &firsts);
-                Value::List(nb.into(), Box::new(kept))
+            CmpOp::SortLimit(k) => {
+                let (bounds, vals) = input.into_list("SortLimit")?;
+                sort_limit(&bounds, &vals, *k)
             }
 
-            CmpOp::GroupKey => {
-                // group by key, per row: sort by K (stable → V keeps order); the K-runs are the
-                // groups, and each run's V-span is its inner list. The payload follows the
-                // permutation; the keys are one representative per run.
-                let (bounds, vals) = input.into_list("GroupKey")?;
-                let (k_col, v_col) = vals.into_pair("GroupKey values")?;
-                let (keys, firsts, perm) = representatives(&row_labels(&bounds), &k_col, true);
-                // a run ends where the next begins, the last at the column's end.
-                let ends: Vec<usize> = firsts.iter().skip(1).copied().chain((!firsts.is_empty()).then_some(k_col.len())).collect();
-                let v_sorted = gather(&v_col, &perm);
-                let inner = Value::List(ends.into(), Box::new(v_sorted));
-                // outer bounds: cumulative #groups per row.
-                let no = runs_per_row(&bounds, &firsts);
-                Value::List(no.into(), Box::new(Value::Prod(vec![keys, inner])))
+            // one structural compare of each element with the next, over the whole column; a row's
+            // first element starts a run whatever it follows.
+            CmpOp::Adjacent => {
+                let (bounds, vals) = input.into_list("Adjacent")?;
+                let mut mask = vec![1u64; vals.len()];
+                for (k, s) in compare_adjacent(&vals).into_iter().enumerate() {
+                    mask[k + 1] = (s != 0) as u64;
+                }
+                for r in 0..bounds.len() {
+                    let (s, e) = bounds.span(r);
+                    if s < e {
+                        mask[s] = 1;
+                    }
+                }
+                Value::List(bounds, Box::new(Value::u64(mask)))
             }
 
             // for each needle element, equal_range it in the matching haystack row: leaves by a
@@ -189,31 +199,145 @@ impl CmpOp {
 
 }
 
+/// one level of the structural order of a column's rows: a column sorted whole, or a list's elements,
+/// position by position (each position its own level, made only for the rows still in play).
+enum Level {
+    Col(Value),
+    Elems(Value),
+}
+
+/// the levels whose lexicographic order is the structural order of `v`'s rows, most significant
+/// first: a product's fields' in turn, a list's length and then its elements by position (lists
+/// order shorter first), anything else itself.
+fn order_levels(v: &Value, out: &mut Vec<Level>) {
+    match v {
+        Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
+        Value::List(inner, _) => {
+            out.push(Level::Col(Value::u64((0..inner.len()).map(|i| {
+                let (s, e) = inner.span(i);
+                (e - s) as u64
+            }).collect())));
+            out.push(Level::Elems(v.clone()));
+        }
+        other => out.push(Level::Col(other.clone())),
+    }
+}
+
+/// the rows still in play, in order so far: `idx` (rows of the column), `labels` (equal where the
+/// levels so far tie), `ends` (each row's end in `idx`).
+struct InPlay {
+    idx: Vec<usize>,
+    labels: Vec<u64>,
+    ends: Vec<usize>,
+}
+
+impl InPlay {
+    /// sort the rows in play by `col` (one value per row in play) within their ties, then keep each
+    /// row's first `k` and the whole run of ties at the `k`-th.
+    fn level(&mut self, col: &Value, k: usize) {
+        let (perm, refined) = sort_blocks(&self.labels, col);
+        let sorted: Vec<usize> = perm.iter().map(|&p| self.idx[p]).collect();
+        let (mut keep, mut lab, mut ends) = (Vec::new(), Vec::new(), Vec::with_capacity(self.ends.len()));
+        let mut s = 0;
+        for &e in &self.ends {
+            let mut stop = e.min(s + k);
+            while stop > s && stop < e && refined[stop] == refined[stop - 1] {
+                stop += 1; // the run of ties at the k-th position comes whole
+            }
+            keep.extend_from_slice(&sorted[s..stop]);
+            lab.extend_from_slice(&refined[s..stop]);
+            ends.push(keep.len());
+            s = e;
+        }
+        (self.idx, self.labels, self.ends) = (keep, lab, ends);
+    }
+    /// no ties left: later levels cannot change the order.
+    fn settled(&self) -> bool {
+        self.labels.windows(2).all(|w| w[0] != w[1])
+    }
+}
+
+/// `sort` then the first `k` of each row, sorting only what can still reach the first `k`. The order's
+/// levels (see `order_levels`) are sorted one at a time, each within the ties the levels before it
+/// left. After each level a row keeps its first `k` positions and the whole run of ties at the
+/// `k`-th: nothing past that run can reach the first `k`, so the later levels sort only what is kept.
+/// A list's elements are levels position by position, an MSD radix sort that stops where the rows in
+/// play stop tying. Not a word over `sort_by` yet: the levels come from the key's type, which the
+/// lowering does not know, and a list key's levels are data (dev/indexed-sort.md).
+fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
+    let mut levels = Vec::new();
+    order_levels(vals, &mut levels);
+    let mut play = InPlay { idx: (0..vals.len()).collect(), labels: row_labels(bounds), ends: bounds.ends().collect() };
+    for (l, level) in levels.iter().enumerate() {
+        if l > 0 && play.settled() {
+            break;
+        }
+        match level {
+            Level::Col(c) if l == 0 => play.level(c, k),
+            Level::Col(c) => play.level(&gather(c, &play.idx), k),
+            Level::Elems(list) => {
+                let Value::List(inner, elems) = list else { unreachable!("a list level is a List") };
+                // bytes go eight at a time, packed big-endian into one u64 level; rows in play tie on
+                // their length, so a short row's zero padding is compared only with its own length's.
+                // Eight bytes every tied run agrees on (a shared prefix) change nothing: no sort.
+                if let Ok(bytes) = elems.as_u8("bytes") {
+                    for j in (0..).step_by(8) {
+                        if play.settled() {
+                            break;
+                        }
+                        let mut any = false;
+                        let col: Vec<u64> = play.idx.iter().map(|&r| {
+                            let (s, e) = inner.span(r);
+                            let mut word = 0u64;
+                            for b in 0..8 {
+                                let at = s + j + b;
+                                word = (word << 8) | if at < e { any = true; bytes[at] as u64 } else { 0 };
+                            }
+                            word
+                        }).collect();
+                        if !any {
+                            break;
+                        }
+                        let splits = (1..col.len()).any(|p| play.labels[p] == play.labels[p - 1] && col[p] != col[p - 1]);
+                        if splits {
+                            play.level(&Value::u64(col), k);
+                        }
+                    }
+                    continue;
+                }
+                for j in 0.. {
+                    if play.settled() {
+                        break;
+                    }
+                    // element j of each row in play; a row without one reads zero, and sorts only
+                    // among rows of its own length, so the zero is never compared.
+                    let mut any = false;
+                    let at: Vec<usize> = play.idx.iter().map(|&r| {
+                        let (s, e) = inner.span(r);
+                        if s + j < e { any = true; s + j } else { usize::MAX }
+                    }).collect();
+                    if !any {
+                        break;
+                    }
+                    let col = crate::engine::gather_or_zero(elems, &at).expect("a list's elements have a zero");
+                    play.level(&col, k);
+                }
+            }
+        }
+    }
+    // every level sorted: each row's first k positions are its answer
+    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(play.ends.len()), 0);
+    for &e in &play.ends {
+        take.extend_from_slice(&play.idx[s..e.min(s + k)]);
+        out_ends.push(take.len());
+        s = e;
+    }
+    Value::List(out_ends.into(), Box::new(gather(vals, &take)))
+}
+
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
 fn row_labels(bounds: &Bounds) -> Vec<u64> {
     if bounds.len() == 1 { Vec::new() } else { segment_labels(bounds) }
-}
-
-/// Sort within `labels`' blocks and keep one row per run of equal rows: `(kept, run starts, the
-/// sort's permutation)`, the permutation empty unless `with_perm`. A leaf or a product of leaves
-/// comes straight out of the sort, sorted, and the runs are read off it in ascending order; a shape
-/// with a `List` in it has a sorted form that is itself a gather of every element, so there the kept
-/// rows alone are gathered from the source.
-fn representatives(labels: &[u64], v: &Value, with_perm: bool) -> (Value, Vec<usize>, Vec<usize>) {
-    if contains_list(v) {
-        let (perm, refined) = sort_blocks(labels, v);
-        let firsts = run_starts(&refined);
-        let idx: Vec<usize> = firsts.iter().map(|&f| perm[f]).collect();
-        (gather(v, &idx), firsts, perm)
-    } else if with_perm {
-        let (perm, refined, sorted) = sort_values(labels, v);
-        let firsts = run_starts(&refined);
-        (gather(&sorted, &firsts), firsts, perm)
-    } else {
-        let (refined, sorted) = sort_values_only(labels, v);
-        let firsts = run_starts(&refined);
-        (gather(&sorted, &firsts), firsts, Vec::new())
-    }
 }
 
 /// one batched lower/upper-bound search: every needle element advances its window `[lo,hi)` in

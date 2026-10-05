@@ -1,0 +1,15 @@
+# top_pairs a column at a time, pruning between the steps: once column a is sorted, only the first
+# ten and the run of ties at the tenth can reach the first ten. They are a prefix, whose end is
+# found by searching the sorted run numbers; column b is read and sorted for those pairs only.
+let xs = input in
+let s1 = (xs map ((a, _) -> a), xs len iota) zip sort_by in
+let runs = s1 map ((_, _, r) -> r) in
+let last = (((runs len, 10u64) min, 1u64) sub, runs) get in
+let end = (last enlist, runs) find map ((_, hi) -> hi) fold_max in
+let keep = ((0u64, end) range, s1) gather in
+let p1 = keep map ((_, q, _) -> q) in
+let b1 = (p1, xs map ((_, b) -> b)) gather in
+let s2 = ((keep map ((_, _, r) -> r), b1) zip, p1) zip sort_by in
+let top = (keep map ((a, _, _) -> a), s2 map (((_, b), _, _) -> b)) zip in
+((0u64, (top len, 10u64) min) range, top) gather
+    try match (0 (r -> r), 1 (_ -> 0u64 iota map (z -> (z, z))))

@@ -3,6 +3,6 @@
 # columns: RegionID UserID
 # output: [u,u]
 let (region, user) = input in
-let ranked = (region, user) zip group map ((r, us) -> ((18446744073709551615u64, us dedup len) sub, r)) sort in
-((0u64, (ranked len, 10u64) min) range, ranked) gather
-    try match (0 (top -> top map ((d, r) -> (r, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, z))))
+let ranked = (region, user) zip group map ((r, us) -> ((18446744073709551615u64, us dedup len) sub, r)) sort_limit 10 in
+ranked map ((d, r) -> (r, (18446744073709551615u64, d) sub))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z))))

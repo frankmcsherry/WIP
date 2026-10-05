@@ -42,9 +42,9 @@ fn segment_labels_offsets_and_stride_agree() {
 }
 
 #[test]
-fn roundtrip_matches_sortlist_op() {
+fn roundtrip_matches_the_sort_word() {
     // build List<u64> with ragged rows, segmented-sort it via the arrange surface, and check
-    // it reproduces exactly what the ML `sort` op (CmpOp::SortList) produces on the same list.
+    // it reproduces exactly what the ML `sort` produces on the same list.
     let bounds = Bounds::offsets(vec![3, 3, 6]); // rows [3,1,2], [], [5,0,4]
     let vals = Value::u64(vec![3, 1, 2, 5, 0, 4]);
     let list = Value::List(bounds.clone(), Box::new(vals.clone()));
@@ -54,8 +54,8 @@ fn roundtrip_matches_sortlist_op() {
     let (perm, _refined) = sort_blocks(&labels, &vals);
     let ours = Value::List(bounds.clone(), Box::new(gather(&vals, &perm)));
 
-    // the ML op.
-    let theirs = crate::ops::cmp::CmpOp::SortList.eval(list).unwrap();
+    // the ML word.
+    let theirs = crate::Program::compile_ml("input sort").unwrap().run(list);
     assert_eq!(ours, theirs);
 }
 

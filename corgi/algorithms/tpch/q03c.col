@@ -19,6 +19,6 @@ let lines = ((lkey, lship) zip, (price, disc) zip) zip
 # Each order's range of line items, and the revenue summed over it.
 let ranges = (orders map ((k, _, _) -> k), lines map ((k, _) -> k)) find in
 let revs = (ranges, lines map ((_, r) -> r)) slices map (rs -> rs fold_add) in
-let per = (orders, revs) zip map (((k, dt, pr), r) -> ((r, 0u64) gt, ((18446744073709551615u64, r) sub, dt, k, pr, r))) filter sort in
-((0u64, (per len, 10u64) min) range, per) gather
-    try match (0 (top -> top map ((_, dt, k, pr, r) -> (k, r, dt, pr))), 1 (_ -> 0u64 iota map (z -> (z, z, z, z))))
+let per = (orders, revs) zip map (((k, dt, pr), r) -> ((r, 0u64) gt, ((18446744073709551615u64, r) sub, dt, k, pr, r))) filter sort_limit 10 in
+per map ((_, dt, k, pr, r) -> (k, r, dt, pr))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, z, z))))

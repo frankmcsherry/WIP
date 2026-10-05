@@ -1,0 +1,5 @@
+# The ten smallest (a, b) pairs of each row, in order: ORDER BY a, b LIMIT 10.
+# Input a `List<(U64, U64)>` per row. Output up to ten pairs per row.
+let s = input sort in
+((0u64, (s len, 10u64) min) range, s) gather
+    try match (0 (r -> r), 1 (_ -> 0u64 iota map (z -> (z, z))))

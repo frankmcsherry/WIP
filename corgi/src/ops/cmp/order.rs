@@ -23,8 +23,7 @@ pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
 /// Segment ends of the maximal equal-value runs in a structurally-sorted column `keys`: `out[g]` is
 /// the exclusive end of group `g`, so group `g` occupies `out[g-1]..out[g]` (with an implicit
 /// `out[-1] = 0`) and `out.last() == keys.len()`. One columnar adjacent-compare pass — the
-/// single-column analogue of the equal-key boundaries a survey reveals across two runs, and the
-/// `Value`-column counterpart of the run ends [`run_starts`] implies (it reads a precomputed labels vector).
+/// single-column analogue of the equal-key boundaries a survey reveals across two runs.
 pub fn group_bounds(keys: &Value) -> Vec<usize> {
     let n = keys.len();
     if n == 0 {
@@ -266,32 +265,6 @@ mod labels {
             start = end;
         }
         labels
-    }
-
-    /// the first index of each run of equal labels in non-decreasing `labels` (e.g. a sort's refined
-    /// labels), ascending. Runs are maximal equal-label spans — equal value within a block. A run ends
-    /// where the next begins (the last at `labels.len()`): `group` reads those ends as inner bounds,
-    /// `dedup` keeps the starts.
-    pub fn run_starts(labels: &[u64]) -> Vec<usize> {
-        if labels.is_empty() {
-            return Vec::new();
-        }
-        let mut firsts = vec![0];
-        firsts.extend((1..labels.len()).filter(|&k| labels[k] != labels[k - 1]));
-        firsts
-    }
-
-    /// project run starts onto outer rows: `out[r]` is the count of run firsts strictly before
-    /// `bounds[r]`, cumulative (both are ascending). This is the new outer-bounds `dedup`/`group`
-    /// emit — a run never crosses a row, so each falls under exactly one outer row.
-    pub fn runs_per_row(bounds: &Bounds, firsts: &[usize]) -> Vec<usize> {
-        let mut out = Vec::with_capacity(bounds.len());
-        let mut g = 0;
-        for end in bounds.ends() {
-            while g < firsts.len() && firsts[g] < end { g += 1; }
-            out.push(g);
-        }
-        out
     }
 }
 

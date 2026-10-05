@@ -700,6 +700,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
+                Apply::Op(name, _) if matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(sort_word(b, id, name)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
@@ -753,6 +754,66 @@ fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
     let positions = b.add(Op::MapList(Box::new(range)), vec![ranges]);
     let args = b.tuple(vec![positions, list]);
     b.add(Op::TryGather, vec![args])
+}
+
+/// `sort`, `dedup` and `group` as words over `sort_by` (stable by key, a payload carried along, and
+/// each element's run of equal keys), `adjacent`, `filter` and `cut`. `dedup` and `group` sort a
+/// list key by reference, so that only the keys they keep are copied out:
+/// - `xs sort` = `sort_by` with a unit payload;
+/// - `xs dedup` = the sorted elements that start a run;
+/// - `kvs group` = the keys that start a run, and the values cut where a run starts.
+fn sort_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
+    use crate::ops::CmpOp;
+    let pair_up = |b: &mut Builder<NumOp>, l: usize, r: usize| {
+        let pair = b.tuple(vec![l, r]);
+        b.add(Op::Zip, vec![pair])
+    };
+    // an op on each element: `ref` makes a list element a reference (a leaf stays itself)
+    let each = |b: &mut Builder<NumOp>, op: NumOp, xs: usize| {
+        let mut bb = Builder::default();
+        let i = bb.input();
+        let u = bb.add(op, vec![i]);
+        b.add(Op::MapList(Box::new(bb.finish(u))), vec![xs])
+    };
+    // (k, v) -> the sorted keys, the values carried along, and a mark where each run starts (its
+    // run number changes, or a row starts)
+    let sort_by = |b: &mut Builder<NumOp>, k: usize, v: usize, marks: bool| {
+        let kv = pair_up(b, k, v);
+        let s = b.add(CmpOp::SortBy, vec![kv]);
+        let t = b.add(Op::Transpose, vec![s]);
+        let (sk, sv) = (b.add(Op::Field(0), vec![t]), b.add(Op::Field(1), vec![t]));
+        let mark = marks.then(|| {
+            let runs = b.add(Op::Field(2), vec![t]);
+            b.add(CmpOp::Adjacent, vec![runs])
+        });
+        (sk, sv, mark.unwrap_or(t))
+    };
+    match name {
+        "sort" => {
+            let units = each(b, Op::Unit.into(), xs);
+            sort_by(b, xs, units, false).0
+        }
+        "dedup" => {
+            let r = each(b, Op::Ref.into(), xs);
+            let units = each(b, Op::Unit.into(), xs);
+            let (sk, _, mark) = sort_by(b, r, units, true);
+            let marked = pair_up(b, mark, sk);
+            let kept = b.add(Op::Filter, vec![marked]);
+            each(b, Op::Clone.into(), kept)
+        }
+        _ => {
+            let kv = b.add(Op::Transpose, vec![xs]);
+            let (k, v) = (b.add(Op::Field(0), vec![kv]), b.add(Op::Field(1), vec![kv]));
+            let kr = each(b, Op::Ref.into(), k);
+            let (sk, sv, mark) = sort_by(b, kr, v, true);
+            let mk = pair_up(b, mark, sk);
+            let kept = b.add(Op::Filter, vec![mk]);
+            let keys = each(b, Op::Clone.into(), kept);
+            let mv = pair_up(b, mark, sv);
+            let pieces = b.add(Op::Cut, vec![mv]);
+            pair_up(b, keys, pieces)
+        }
+    }
 }
 
 /// parse an ML-flavoured expression into a `Graph` (with `input` bound to the root).

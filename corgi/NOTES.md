@@ -106,7 +106,14 @@ src/
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
                eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
-    cmp.rs     CmpOp: Rel(Pred) + SortList/DedupList/GroupKey/Find. Kind-blind comparisons.
+    cmp.rs     CmpOp: Rel(Pred) + SortBy/SortLimit/Find/Adjacent. Kind-blind comparisons. SortBy is
+               the sort's own output (stable by key, payload carried, runs numbered;
+               dev/indexed-sort.md); `sort`/`dedup`/`group` are words over it (ml.rs::sort_word).
+               SortLimit sorts the order's levels one at a time, keeping per row the first k and the
+               ties at the k-th after each; it is not a word yet (dev/indexed-sort.md says why).
+               Adjacent marks where runs of equal elements start (a structural compare of each
+               element with the one before it); with `Cut` it splits a row into those runs without
+               sorting, the cheap form of `group` when the order is already known.
                `find` on leaves (`cmp/search.rs`): a dense row of needles in order is walked into
                its haystack row (galloping, `survey::walk_ranges`); every other needle gets a
                branch-free binary search, sixteen in lockstep. Structured values: `batched_bound`.

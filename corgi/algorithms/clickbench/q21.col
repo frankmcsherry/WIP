@@ -21,6 +21,6 @@ let google = url map (u ->
         (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
     (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1u64) add, n) lt, e) mul) fold_any) in
 let ranked = (phrase, (url, google) zip) zip map ((s, (u, g)) -> (((s len, 0u64) gt, g) mul, (s, u))) filter group
-    map ((s, us) -> ((18446744073709551615u64, us len) sub, s, us sort head)) sort in
-((0u64, ((ranked len, 10u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((d, s, u) -> (s, u, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> ("", "", z))))
+    map ((s, us) -> ((18446744073709551615u64, us len) sub, s, us sort head)) sort_limit 10 in
+ranked map ((d, s, u) -> (s, u, (18446744073709551615u64, d) sub))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", "", z))))

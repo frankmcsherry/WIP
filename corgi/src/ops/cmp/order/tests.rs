@@ -263,8 +263,3 @@ fn labels_mark_runs() {
     assert_eq!(labels, vec![0, 0, 1, 2, 3]);
 }
 
-#[test]
-fn run_starts_reads_runs() {
-    // labels [0,0,1,2,2] → 3 runs: [0,2), [2,3), [3,5)
-    assert_eq!(run_starts(&[0, 0, 1, 2, 2]), vec![0, 2, 3]);
-}

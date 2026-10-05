@@ -34,6 +34,6 @@ let keyed = refs map (r ->
 let ranked = keyed group
     map ((k, rs) -> let c = rs len in
         ((c, 1000u64) gt, (k, (rs map (r -> r len) fold_add to_f64, c to_f64) div_f64, c, rs sort head))) filter
-    map ((k, l, c, m) -> ((18446744073709551615u64, l) sub, k, l, c, m)) sort in
-((0u64, ((ranked len, 25u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((_, k, l, c, m) -> (k, l, c, m))), 1 (_ -> 0u64 iota map (z -> ("", 0f64, z, ""))))
+    map ((k, l, c, m) -> ((18446744073709551615u64, l) sub, k, l, c, m)) sort_limit 25 in
+ranked map ((_, k, l, c, m) -> (k, l, c, m))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", 0f64, z, ""))))

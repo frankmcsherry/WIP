@@ -33,6 +33,7 @@ mod normalize_whitespace;
 mod query_param;
 mod run_length_encode;
 mod sessionize;
+mod sort_pairs;
 mod soundex;
 mod text_misc;
 mod top_k;
@@ -68,6 +69,7 @@ const CASES: &[Family] = &[
     ("query_param", query_param::run),
     ("run_length_encode", run_length_encode::run),
     ("sessionize", sessionize::run),
+    ("sort_pairs argsort_pairs top_pairs", sort_pairs::run),
     ("soundex", soundex::run),
     ("substring_count itoa word_topk", text_misc::run),
     ("top_k", top_k::run),

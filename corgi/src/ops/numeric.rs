@@ -453,7 +453,7 @@ impl NumOp {
     }
 }
 
-// ergonomic embedding: `b.add(Field(1), …)` / `b.add(SortList, …)` work without wrapping.
+// ergonomic embedding: `b.add(Field(1), …)` / `b.add(SortBy, …)` work without wrapping.
 impl From<Op<NumOp>> for NumOp {
     fn from(o: Op<NumOp>) -> Self {
         NumOp::Core(o)

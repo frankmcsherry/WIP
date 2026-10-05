@@ -5,6 +5,6 @@
 # output: [u,s,u]
 let (phone, model, user) = input in
 let ranked = (phone, (model, user) zip) zip map ((p, (m, u)) -> ((m len, 0u64) gt, ((p, m), u))) filter group
-    map (((p, m), us) -> ((18446744073709551615u64, us dedup len) sub, p, m)) sort in
-((0u64, ((ranked len, 10u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((d, p, m) -> (p, m, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, "", z))))
+    map (((p, m), us) -> ((18446744073709551615u64, us dedup len) sub, p, m)) sort_limit 10 in
+ranked map ((d, p, m) -> (p, m, (18446744073709551615u64, d) sub))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, "", z))))

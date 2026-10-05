@@ -1,0 +1,3 @@
+# Each row's (a, b) pairs in order, by one sort whose key is both columns.
+# Input a `List<(U64, U64)>` per row. Output the same pairs, sorted.
+input sort

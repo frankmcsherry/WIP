@@ -6,6 +6,6 @@
 # EventTime is Unix seconds, so the minute is (t / 60) % 60.
 let (user, time, phrase) = input in
 let ranked = (user, (time, phrase) zip) zip map ((u, (t, s)) -> ((u, ((t, 60u64) div_u64, 60u64) rem, s), 1u64)) group
-    map (((u, m, s), ones) -> ((18446744073709551615u64, ones len) sub, u, m, s)) sort in
-((0u64, ((ranked len, 10u64) min)) range, ranked) gather
-    try match (0 (top -> top map ((d, u, m, s) -> (u, m, s, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> (z, z, "", z))))
+    map (((u, m, s), ones) -> ((18446744073709551615u64, ones len) sub, u, m, s)) sort_limit 10 in
+ranked map ((d, u, m, s) -> (u, m, s, (18446744073709551615u64, d) sub))
+    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, "", z))))

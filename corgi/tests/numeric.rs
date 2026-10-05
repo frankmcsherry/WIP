@@ -38,13 +38,10 @@ fn signed_subtraction_mixes_core_and_arith() {
 
 #[test]
 fn core_sort_orders_signed_values() {
-    // the headline: SortList is a kind-blind CMP op (u64/byte order). Because the layer
-    // encoded the integers order-preserving, the sort comes out in *signed* order.
+    // the headline: the sort is kind-blind (u64/byte order). Because the layer encoded the
+    // integers order-preserving, the sort comes out in *signed* order.
     let input = Value::List(vec![4].into(), Box::new(i64col(&[5, -3, 10, -8])));
-    let mut b = Builder::<NumOp>::default();
-    let inp = b.input();
-    let out = b.add(NumOp::Cmp(CmpOp::SortList), vec![inp]);
-    let g = b.finish(out);
+    let g = corgi::parse_ml("input sort").unwrap();
     let result = eval_graph(&g, input);
     let inner = match result {
         Value::List(_, v) => *v,
@@ -90,7 +87,7 @@ fn relational_compare_to_mask() {
     assert_eq!(eval_graph(&rel(Pred::Ge), pair(u64(&[1, 5, 3]), u64(&[2, 5, 1]))), u64(&[0, 1, 1]));
 
     // kind-blind: i64 columns stored order-preserving compare by VALUE under a plain (unsigned) lane
-    // compare — -3 < 1 holds, 2 < -5 does not — exactly as for SortList.
+    // compare — -3 < 1 holds, 2 < -5 does not — exactly as `sort` orders them.
     assert_eq!(eval_graph(&rel(Pred::Lt), pair(i64col(&[-3, 2]), i64col(&[1, -5]))), u64(&[1, 0]));
 }
 

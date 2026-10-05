@@ -5,6 +5,5 @@
 # output: [s,u]
 # corgi orders strings shorter first, so ties break by length, then bytes.
 let ranked = input map (s -> ((s len, 0u64) gt, (s, 1u64))) filter group
-    map ((s, ones) -> ((18446744073709551615u64, ones len) sub, s)) sort in
-((0u64, (ranked len, 10u64) min) range, ranked) gather
-    try match (0 (top -> top map ((d, s) -> (s, (18446744073709551615u64, d) sub))), 1 (_ -> 0u64 iota map (z -> ("", z))))
+    map ((s, ones) -> ((18446744073709551615u64, ones len) sub, s)) sort_limit 10 in
+ranked map ((d, s) -> (s, (18446744073709551615u64, d) sub))

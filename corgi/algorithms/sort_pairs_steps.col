@@ -1,0 +1,11 @@
+# sort_pairs a column at a time, as Datatoad sorts: the first step sorts column a, carrying each
+# pair's position; the second reads column b at those positions and sorts it within the first
+# step's runs of equal a (their run numbers lead its key), carrying the positions on. Each step's
+# sorted column is its output, since a is constant within the runs the second step permutes.
+let xs = input in
+let s1 = (xs map ((a, _) -> a), xs len iota) zip sort_by in
+let p1 = s1 map ((_, q, _) -> q) in
+let b1 = (p1, xs map ((_, b) -> b)) gather in
+let s2 = ((s1 map ((_, _, r) -> r), b1) zip, p1) zip sort_by in
+(s1 map ((a, _, _) -> a), s2 map (((_, b), _, _) -> b)) zip
+    try match (0 (r -> r), 1 (_ -> 0u64 iota map (z -> (z, z))))
