@@ -15,6 +15,7 @@ use crate::value::Value;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Shape {
+    Int, // logical integers: no storage-width or signedness parameter
     Prim(u32), // a leaf column, by bit width (8/16/32/64, matching the `Prim` widths)
     Prod(Vec<Shape>),
     Sum(Vec<Shape>), // one shape per variant lane (a lane no row carries is an empty column of it)
@@ -31,6 +32,7 @@ pub fn same(a: &Shape, b: &Shape) -> Result<Shape, String> {
 /// the structural shape of a concrete value.
 pub fn shape_of_value(v: &Value) -> Shape {
     match v {
+        Value::Int(_) => Shape::Int,
         Value::Prim(p) => Shape::Prim(p.bits()),
         Value::Prod(cols) => Shape::Prod(cols.iter().map(shape_of_value).collect()),
         Value::Sum(_, variants) => Shape::Sum(variants.iter().map(shape_of_value).collect()),
@@ -43,6 +45,7 @@ pub fn shape_of_value(v: &Value) -> Shape {
 impl std::fmt::Display for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Shape::Int => write!(f, "Integer"),
             Shape::Prim(w) => write!(f, "U{w}"),
             Shape::Prod(ts) => {
                 let inner: Vec<String> = ts.iter().map(|t| t.to_string()).collect();

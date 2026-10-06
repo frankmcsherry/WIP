@@ -81,6 +81,26 @@ pub(crate) fn sort_indexed(
         return emit.values().then(|| gather(v, index));
     }
     match v {
+        Value::Int(i) => {
+            if let Some((p, frame)) = i.native() {
+                return sort_leaf(p, labels, index, emit, scratch).map(|v| {
+                    let Value::Prim(p) = v else { unreachable!() };
+                    Value::Int(crate::integer::Integer::from_native(p, frame, i))
+                });
+            }
+            // Bit and wide escapes use a stable comparison sort for this spike.
+            // Preserve input segments; labels are refined against integer values.
+            if labels.is_empty() { labels.resize(m, 0); }
+            let mut lo = 0;
+            while lo < m {
+                let mut hi = lo + 1;
+                while hi < m && labels[hi] == labels[lo] { hi += 1; }
+                index[lo..hi].sort_by_key(|&r| i.at(r));
+                lo = hi;
+            }
+            refine(labels, |q| i.at(index[q]) != i.at(index[q - 1]));
+            emit.values().then(|| gather(v, index))
+        }
         Value::Prim(p) => sort_leaf(p, labels, index, emit, scratch),
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
         // a sum's lanes and a list's elements are read through the index after their sorts.
@@ -692,7 +712,7 @@ pub(crate) fn contains_list(v: &Value) -> bool {
         Value::List(..) => true,
         Value::Prod(cols) => cols.iter().any(contains_list),
         Value::Sum(_, lanes) => lanes.iter().any(contains_list),
-        Value::Prim(_) | Value::Unit(_) => false,
+        Value::Prim(_) | Value::Int(_) | Value::Unit(_) => false,
         // a referenced row IS a list row (its sorted form gathers the spanned elements).
         Value::Ref(..) => true,
     }

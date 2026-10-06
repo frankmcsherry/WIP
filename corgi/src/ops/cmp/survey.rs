@@ -137,6 +137,7 @@ impl Rows for &[usize] {
 /// index lists the classes' local offsets refer to; each class's rows are `ia[la..la + len]`.
 fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
     match (a, b) {
+        (Value::Int(a), Value::Int(b)) => merge(|j| a.at(ia.row(j)), |j| b.at(ib.row(j)), open, tree),
         (Value::Prim(pa), Value::Prim(pb)) => leaf(pa, pb, ia, ib, open, tree),
         (Value::Unit(_), Value::Unit(_)) => merge(|_| 0u8, |_| 0u8, open, tree),
         (Value::Prod(ca), Value::Prod(cb)) => {

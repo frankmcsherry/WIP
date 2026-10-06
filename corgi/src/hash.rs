@@ -65,6 +65,7 @@ fn combine(acc: u64, x: u64) -> u64 {
 /// else pays for it.
 pub fn hash(v: &Value) -> Vec<u64> {
     match v {
+        Value::Int(i) => i.hashes(),
         Value::Prim(p) => p.hashes(),
 
         // product = fold the fields in order, each seeded from the PROD salt. A fieldless product has
@@ -287,6 +288,7 @@ mod tests {
         // unlike the columnar implementation it has no intermediate hash columns.
         fn row(v: &Value, r: usize) -> u64 {
             match v {
+                Value::Int(i) => i.hashes()[r],
                 Value::Prim(p) => mix64(match p {
                     Prim::U8(v) => v[r] as u64,
                     Prim::U16(v) => v[r] as u64,

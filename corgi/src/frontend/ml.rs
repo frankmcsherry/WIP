@@ -296,6 +296,7 @@ impl P {
                 Ok(Shape::Prod(fields))
             }
             Some(Tok::Ident(k)) => match k.as_str() {
+                "Integer" | "int" => Ok(Shape::Int),
                 "u8" => Ok(Shape::Prim(8)),
                 "u16" => Ok(Shape::Prim(16)),
                 "u32" => Ok(Shape::Prim(32)),

@@ -1,0 +1,20 @@
+use corgi::{Int as Col, IntBin, Value};
+pub const SPIKE: &str = "arbitrary-frame";
+pub fn pack(xs: &[i128], wide: bool) -> Result<Col, String> {
+    if !wide { return Col::from_i128s(xs); }
+    // The other spike has no public force-width constructor with tight bounds.
+    // Construct its documented wire layout to keep the forced-64 inputs' bounds
+    // identical. adopt_u64s would set span=u64::MAX and confound the comparison.
+    let mut bytes = Vec::new();
+    let span = xs.iter().copied().max().unwrap_or(0) as u64;
+    for word in [6u64, 0, 0, span, 64, xs.len() as u64] { bytes.extend_from_slice(&word.to_le_bytes()); }
+    for &x in xs { bytes.extend_from_slice(&u64::try_from(x).map_err(|_| "force64 requires unsigned values")?.to_le_bytes()); }
+    let (v, used) = corgi::bytes::read_from(&bytes)?;
+    assert_eq!(used, bytes.len());
+    let Value::Int(c) = v else { panic!("expected Int") }; Ok(c)
+}
+pub fn add(a: &Col, b: &Col) -> Result<Col, String> { corgi::int_bin(IntBin::Add, a.clone(), b.clone()) }
+pub fn values(c: &Col) -> Vec<i128> { c.values() }
+pub fn payload(c: &Col) -> usize { (c.len() * c.width().bits() as usize).div_ceil(64) * 8 }
+pub fn width(c: &Col) -> u32 { c.width().bits() }
+pub fn into_value(c: Col) -> Value { Value::Int(c) }

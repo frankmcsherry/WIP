@@ -110,6 +110,12 @@ mod compare {
     pub(crate) fn compare_pairs(a: &Value, b: &Value, pairs: Pairs) -> Vec<i8> {
         let m = pairs.len();
         match (a, b) {
+            (Value::Int(a), Value::Int(b)) => match pairs {
+                Pairs::Diagonal(_) => a.compare(b).expect("integer compare: lengths"),
+                p => (0..m).map(|k| match a.compare_at(p.left(k), b, p.right(k)) {
+                    Ordering::Less => -1, Ordering::Equal => 0, Ordering::Greater => 1,
+                }).collect(),
+            },
             // leaf: read all pairs in one width-dispatched pass. An implicit form reads BOTH sides
             // densely (`i` and `i`, or `k` and `k+1`), which vectorizes; the indexed form is two
             // gathers per lane and does not.
@@ -325,6 +331,7 @@ mod tests {
     /// O(n²) standard the bulk `compare_idx` is checked against, and the order `sort` must materialise.
     fn compare2(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
         match (a, b) {
+            (Value::Int(a), Value::Int(b)) => a.compare_at(i, b, j),
             // i8 sign back to the oracle's `Ordering` (the one i8→Ordering boundary, test-only).
             (Value::Prim(pa), Value::Prim(pb)) => pa.cmp_idx(&[i], &[j], pb)[0].cmp(&0),
             (Value::Prod(ca), Value::Prod(cb)) => {

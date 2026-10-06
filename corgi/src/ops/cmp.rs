@@ -74,6 +74,9 @@ impl CmpOp {
             CmpOp::Min | CmpOp::Max => {
                 let take_max = matches!(self, CmpOp::Max);
                 let (a, b) = input.into_pair("min/max")?;
+                if let (Value::Int(ca), Value::Int(cb)) = (&a, &b) {
+                    return Ok(Value::Int(ca.pick(cb, take_max)?));
+                }
                 let (pa, pb) = (a.into_prim("min/max lhs")?, b.into_prim("min/max rhs")?);
                 if pa.bits() != pb.bits() {
                     return Err(format!("min/max expects two equal-width leaves, got U{} and U{}", pa.bits(), pb.bits()));
@@ -83,6 +86,9 @@ impl CmpOp {
             }
 
             CmpOp::Gt(c) => {
+                if let Value::Int(n) = &input {
+                    return Ok(Value::u64((0..n.len()).map(|i| (n.at(i) > *c as i128) as u64).collect()));
+                }
                 let xs = input.as_u64("Gt")?;
                 Value::u64(xs.iter().map(|&x| (x > *c) as u64).collect())
             }

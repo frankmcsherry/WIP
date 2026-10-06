@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
+    Int(crate::integer::Integer), // one logical shape; storage width/frame are adaptive
     Prim(Prim),                   // a leaf column at one byte width
     Prod(Vec<Value>),             // parallel columns, equal length
     Sum(Tags, Vec<Value>),        // per-row discriminant + within-variant offset (see `Tags`) + one
@@ -673,6 +674,10 @@ fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
 }
 
 impl Value {
+    pub fn integer(xs: Vec<i128>) -> Value { Value::Int(crate::integer::Integer::new(xs)) }
+    pub fn into_integer(self, who: &str) -> Result<crate::integer::Integer, String> {
+        match self { Value::Int(i) => Ok(i), other => Err(format!("{who}: expected Integer, got {}", shape_of_value(&other))) }
+    }
     /// leaf-column constructors — the funnel results pass through, so the representation lives in one place.
     pub fn  u8(xs: Vec<u8 >) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
     pub fn u16(xs: Vec<u16>) -> Value { Value::Prim(Prim::U16(Arc::new(xs))) }
@@ -698,6 +703,7 @@ impl Value {
     /// fills the lanes it does not carry with this; the recursion mirrors `shape_of_value` inverted.
     pub fn empty(shape: &Shape) -> Value {
         match shape {
+            Shape::Int => Value::integer(Vec::new()),
             Shape::Prim(w) => Value::Prim(Prim::empty(*w)),
             Shape::Prod(ss) => Value::Prod(ss.iter().map(Value::empty).collect()),
             Shape::Sum(ss) => {
@@ -715,6 +721,7 @@ impl Value {
     /// SEQ length: how many rows this column holds.
     pub fn len(&self) -> usize {
         match self {
+            Value::Int(i) => i.len(),
             Value::Prim(p) => p.len(),
             Value::Prod(c) => c.first().map_or(0, |c| c.len()),
             Value::Sum(t, _) => t.len(),
@@ -828,6 +835,7 @@ impl Value {
 /// human-readable rendering used by tests and demos.
 pub fn show(v: &Value) -> String {
     match v {
+        Value::Int(i) => format!("{:?}", i.to_vec()),
         Value::Prim(p) => p.show(),
         Value::Prod(c) => format!("({})", c.iter().map(show).collect::<Vec<_>>().join(", ")),
         Value::Sum(t, vs) => {

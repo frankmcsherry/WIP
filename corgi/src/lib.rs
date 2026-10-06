@@ -20,8 +20,12 @@
 //! Layers: [`value`] (the data) → [`engine`] (`gather`/`concat` + index gen) →
 //! [`ops`] (the vocabulary; `ops::cmp` carries its own `compare_idx`/structural-order
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
+//!
+//! The [`integer`] spike adds a logical integer leaf beside `Prim`: width and
+//! signed bias are runtime storage choices (see `dev/adaptive-integer-preparation.md`).
 
 pub mod bytes;
+pub mod integer;
 pub(crate) mod effect;
 pub(crate) mod engine;
 pub(crate) mod frontend;
@@ -41,6 +45,7 @@ pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Re
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
 pub use value::{show, Bounds, Tags, Value};
+pub use integer::{Binary as IntegerBinary, Encoding as IntegerEncoding, Frame as IntegerFrame, Integer, IntegerOp};
 
 /// Arrangement-substrate support: row-level primitives for using corgi columns directly as a
 /// differential-dataflow batch (merge/sort/gather/compare over flat columns), without decoding

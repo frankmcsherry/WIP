@@ -1,0 +1,11 @@
+use corgi::{Integer as Col, IntegerBinary, IntegerEncoding, IntegerFrame, Value};
+pub const SPIKE: &str = "bounded-preparation";
+pub fn pack(xs: &[i128], wide: bool) -> Result<Col, String> {
+    if wide { Col::with_encoding(xs.to_vec(), IntegerEncoding::Native { width: 64, frame: IntegerFrame::Zero }) }
+    else { Ok(Col::new(xs.to_vec())) }
+}
+pub fn add(a: &Col, b: &Col) -> Result<Col, String> { a.binary(b, IntegerBinary::Add) }
+pub fn values(c: &Col) -> Vec<i128> { c.to_vec() }
+pub fn payload(c: &Col) -> usize { c.payload_bytes() }
+pub fn width(c: &Col) -> u32 { c.encoding().width() }
+pub fn into_value(c: Col) -> Value { Value::Int(c) }

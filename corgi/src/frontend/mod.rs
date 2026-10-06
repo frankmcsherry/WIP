@@ -22,7 +22,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
 /// (`branch` also takes one but is parsed specially: its count may be an enum name.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "chunk")
+    matches!(name, "field" | "gt" | "lit" | "add_u64" | "shr" | "and" | "cast" | "chunk" | "wrap_add" | "wrap_sub" | "wrap_mul")
         || name.starts_with("lit_") // typed literals `lit_<k><w> N`
 }
 
@@ -83,7 +83,24 @@ pub(crate) fn pair_imm(name: &str) -> bool {
 /// they carry sub-graphs and are built by the surface itself.
 pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     let n = || arg.ok_or_else(|| format!("op '{name}' needs a numeric argument"));
+    let word_width = || {
+        let w = n()?;
+        if matches!(w, 8 | 16 | 32 | 64) { Ok(w as u32) }
+        else { Err("word arithmetic requires width 8/16/32/64".to_string()) }
+    };
     Ok(match name {
+        "lit_int" => Op::Lit(Value::integer(vec![arg.ok_or("lit_int needs N")? as i128])).into(),
+        "integer" => crate::IntegerOp::FromUnsigned.into(),
+        "integer_signed" => crate::IntegerOp::FromSigned.into(),
+        "integer_bytes" => crate::IntegerOp::FromBytes.into(),
+        "to_bytes" => crate::IntegerOp::ToBytes.into(),
+        "int_add" => crate::IntegerOp::Binary(crate::IntegerBinary::Add).into(),
+        "int_sub" => crate::IntegerOp::Binary(crate::IntegerBinary::Sub).into(),
+        "int_mul" => crate::IntegerOp::Binary(crate::IntegerBinary::Mul).into(),
+        "int_sum" => crate::IntegerOp::Sum.into(),
+        "wrap_add" => crate::IntegerOp::Wrapping(crate::IntegerBinary::Add, word_width()?).into(),
+        "wrap_sub" => crate::IntegerOp::Wrapping(crate::IntegerBinary::Sub, word_width()?).into(),
+        "wrap_mul" => crate::IntegerOp::Wrapping(crate::IntegerBinary::Mul, word_width()?).into(),
         "field" => Op::Field(n()? as usize).into(),
         "gt" => CmpOp::Gt(n()?).into(), // column vs immediate (the threshold-filter sugar)
         "cast" => Op::Cast(n()? as u32).into(),

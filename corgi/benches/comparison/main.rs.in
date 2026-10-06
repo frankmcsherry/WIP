@@ -1,0 +1,70 @@
+// Shared timing/correctness harness. compare_spikes.py supplies adapter.rs.
+mod adapter;
+use adapter::*;
+use std::{hint::black_box, time::Instant};
+
+fn time<T>(mut f: impl FnMut() -> T) -> f64 {
+    black_box(f());
+    let mut times = Vec::new();
+    for _ in 0..7 {
+        let start = Instant::now(); black_box(f()); times.push(start.elapsed().as_secs_f64());
+    }
+    times.sort_by(f64::total_cmp); times[3]
+}
+fn add_case(name: &str, a: &[i128], b: &[i128], wide_a: bool, wide_b: bool) {
+    let (Ok(a_col), Ok(b_col)) = (pack(a, wide_a), pack(b, wide_b)) else {
+        println!("{SPIKE},{name},{},input-rejected,,,,", a.len()); return;
+    };
+    let input_bytes = payload(&a_col) + payload(&b_col);
+    match add(&a_col, &b_col) {
+        Ok(out) => {
+            assert_eq!(values(&out), a.iter().zip(b).map(|(&x, &y)| x + y).collect::<Vec<_>>());
+            let seconds = time(|| add(black_box(&a_col), black_box(&b_col)).unwrap());
+            println!("{SPIKE},{name},{},ok,{input_bytes},{},{},{:.3}", a.len(), payload(&out), width(&out), seconds * 1e9 / a.len() as f64);
+        }
+        Err(_) => println!("{SPIKE},{name},{},output-rejected,{input_bytes},,,", a.len()),
+    }
+}
+fn main() {
+    let n: usize = std::env::args().nth(1).unwrap_or_else(|| "1048576".into()).parse().unwrap();
+    assert!(n > 0);
+    let a: Vec<_> = (0..n).map(|i| ((i * 73) % 64) as i128).collect();
+    let b: Vec<_> = (0..n).map(|i| ((i * 31) % 64) as i128).collect();
+    add_case("add8-compatible", &a, &b, false, false);
+    add_case("add8-mixed-width", &a, &b, false, true);
+    add_case("add8-both-stored-wide", &a, &b, true, true);
+    let neg: Vec<_> = a.iter().map(|&x| x - 32).collect();
+    add_case("add-negative", &neg, &neg, false, false);
+    add_case("add-mixed-frames", &a, &neg, false, false);
+    let large: Vec<_> = (0..n).map(|i| ((i * 73) % 65536) as i128).collect();
+    add_case("add16-promotes32", &large, &large, false, false);
+    let bit: Vec<_> = (0..n).map(|i| (i % 2) as i128).collect();
+    add_case("add-packed-bits", &bit, &bit, false, false);
+    let far: Vec<_> = a.iter().map(|&x| (1i128 << 50) + x).collect();
+    add_case("add-far-narrow-band", &far, &b, false, false);
+    add_case("add-constant", &vec![42; n], &vec![7; n], false, false);
+    let cross: Vec<_> = (0..n).map(|i| if i % 2 == 0 { -1 } else { u64::MAX as i128 }).collect();
+    add_case("add-full-u64-spread", &cross, &vec![0; n], false, false);
+    let high: Vec<_> = a.iter().map(|&x| u64::MAX as i128 - x).collect();
+    let minus: Vec<_> = b.iter().map(|&x| -x - 1).collect();
+    add_case("add-full-u64-and-negative", &high, &minus, false, false);
+
+    let col = pack(&large, false).unwrap();
+    let bytes = payload(&col); let value = into_value(col);
+    let mut expected: Vec<_> = (0..n).collect(); expected.sort_by_key(|&i| large[i]);
+    assert_eq!(corgi::arrange::sort_perm(&value), expected);
+    let seconds = time(|| corgi::arrange::sort_perm(black_box(&value)));
+    println!("{SPIKE},sort16,{n},ok,{bytes},{},64,{:.3}", n * 8, seconds * 1e9 / n as f64);
+    // Boundary correctness outside timing. These columns fit each input
+    // representation; a bounded-i128 implementation must report overflow.
+    for (name, xs) in [("edge-constant-overflow", vec![i128::MAX]),
+        ("edge-shift-top-overflow", vec![i128::MAX - 1, i128::MAX])] {
+        let a = pack(&xs, false).unwrap(); let b = pack(&vec![1; xs.len()], false).unwrap();
+        let status = match std::panic::catch_unwind(|| add(&a, &b)) {
+            Ok(Err(_)) => "overflow-rejected",
+            Ok(Ok(_)) => "overflow-accepted",
+            Err(_) => "overflow-panicked",
+        };
+        println!("{SPIKE},{name},{},{status},{},,,", xs.len(), payload(&a) + payload(&b));
+    }
+}

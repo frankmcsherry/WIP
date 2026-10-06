@@ -17,6 +17,7 @@ pub(crate) fn row_span(b: &Bounds, i: usize) -> (usize, usize) {
 /// shape) and `eval` agree.
 pub(crate) fn fill(row: &Value, n: usize) -> Value {
     match row {
+        Value::Int(i) => if n == 0 { Value::integer(Vec::new()) } else { Value::integer(vec![i.at(0); n]) },
         // a FIXED-WIDTH row broadcasts directly: one `vec![x; n]` per leaf, and no index column
         // to describe an index that is constant. (`Op::Lit` is the caller, and a literal is
         // overwhelmingly a leaf or a product of them.)
@@ -42,7 +43,7 @@ pub(crate) fn take_ref(v: Value) -> Value {
         }
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(take_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(take_ref).collect()),
-        bounded @ (Value::Prim(_) | Value::Unit(_) | Value::Ref(..)) => bounded,
+        bounded @ (Value::Prim(_) | Value::Int(_) | Value::Unit(_) | Value::Ref(..)) => bounded,
     }
 }
 
@@ -55,7 +56,7 @@ pub(crate) fn clone_ref(v: Value) -> Value {
         Value::List(bounds, vals) => Value::List(bounds, Box::new(clone_ref(*vals))),
         Value::Prod(cols) => Value::Prod(cols.into_iter().map(clone_ref).collect()),
         Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(clone_ref).collect()),
-        leaf @ (Value::Prim(_) | Value::Unit(_)) => leaf,
+        leaf @ (Value::Prim(_) | Value::Int(_) | Value::Unit(_)) => leaf,
     }
 }
 
@@ -152,6 +153,7 @@ mod generators {
 /// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape.
 pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     match v {
+        Value::Int(i) => Value::Int(i.gather(idx)),
         Value::Prim(p) => Value::Prim(p.gather(idx)),
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather(c, idx)).collect()),
         Value::List(bounds, vals) => {
@@ -206,6 +208,12 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
     let ws = shape_of_value(witness);
     let filled: Vec<Value> = srcs.iter().map(|s| s.map_or_else(|| Value::empty(&ws), |v| v.clone())).collect();
     match &filled[0] {
+        Value::Int(_) => {
+            let ints: Vec<_> = filled.iter().map(|v| match v {
+                Value::Int(i) => i, _ => panic!("gather_lanes: integer shape mismatch"),
+            }).collect();
+            Value::Int(crate::integer::Integer::interleave(&ints, tags, off))
+        }
         Value::Prim(_) => {
             let prims: Vec<&Prim> = filled
                 .iter()
@@ -395,6 +403,9 @@ pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
 #[cfg(test)]
 pub(crate) fn concat(parts: &[Value]) -> Value {
     match &parts[0] {
+        Value::Int(_) => Value::integer(parts.iter().flat_map(|v| match v {
+            Value::Int(i) => i.to_vec(), _ => panic!("concat: integer shape mismatch"),
+        }).collect()),
         Value::Prim(_) => {
             let prims: Vec<&Prim> = parts
                 .iter()

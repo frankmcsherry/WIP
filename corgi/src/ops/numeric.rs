@@ -347,6 +347,7 @@ impl ArithOp {
 /// `arith`, and `text` buckets — the layer the `ml` surface and the optimizer are typed at.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum NumOp {
+    Integer(crate::integer::IntegerOp),
     Core(Op<NumOp>),
     Cmp(CmpOp),
     Arith(ArithOp),
@@ -358,6 +359,7 @@ pub enum NumOp {
 impl OpLike for NumOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
         match self {
+            NumOp::Integer(i) => i.eval(input),
             NumOp::Core(c) => c.eval(input),
             NumOp::Cmp(c) => c.eval(input),
             NumOp::Arith(a) => a.eval(input),
@@ -368,7 +370,7 @@ impl OpLike for NumOp {
     fn children(&self) -> Vec<&Graph<NumOp>> {
         match self {
             NumOp::Core(c) => c.children(), // core bodies are Graph<NumOp>
-            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) => Vec::new(),
+            NumOp::Cmp(_) | NumOp::Arith(_) | NumOp::Text(_) | NumOp::Host(_) | NumOp::Integer(_) => Vec::new(),
         }
     }
 }
@@ -393,4 +395,8 @@ impl From<TextOp> for NumOp {
     fn from(t: TextOp) -> Self {
         NumOp::Text(t)
     }
+}
+
+impl From<crate::integer::IntegerOp> for NumOp {
+    fn from(i: crate::integer::IntegerOp) -> Self { NumOp::Integer(i) }
 }

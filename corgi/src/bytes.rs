@@ -21,7 +21,7 @@
 //! different leaf type, not a different codec.
 //!
 //! ```text
-//! Value ::= Prim | Prod | Sum | List | Unit          (all quantities are u64 little-endian words)
+//! Value ::= Prim | Int | Prod | Sum | List | Ref | Unit  (headers are u64 little-endian words)
 //!   Prim  = 0, bits, len, payload[len * bits/8]      payload padded to a word boundary
 //!   Prod  = 1, fields, Value*fields
 //!   Sum   = 2, 0, bits, len, payload[..],            `Column` form: the discriminant leaf, inline
@@ -34,6 +34,7 @@
 //!   Unit  = 4, n
 //!   Ref   = 5, n, (lo, hi)*n, Value                spans of the payload that follows: the arena
 //!                                                    goes once, however many rows reference it
+//!   Int   = 6, frame, width, n, payload             adaptive integer spike (frame 0/1)
 //! ```
 //!
 //! A `Ref` keeps its shape and its sharing across the wire: its payload is written whole, once,
@@ -49,6 +50,7 @@ fn pad8(n: usize) -> usize { (n + 7) & !7 }
 /// The exact number of bytes [`write_to`] emits for `v` — always a multiple of 8.
 pub fn length_in_bytes(v: &Value) -> usize {
     match v {
+        Value::Int(i) => 32 + pad8(i.payload_bytes()),
         Value::Prim(p) => 24 + pad8(prim_payload_len(p)),
         Value::Prod(cols) => 16 + cols.iter().map(length_in_bytes).sum::<usize>(),
         Value::Sum(tags, lanes) => {
@@ -65,6 +67,24 @@ pub fn length_in_bytes(v: &Value) -> usize {
 /// Serialize `v`. The byte count matches [`length_in_bytes`] exactly.
 pub fn write_to<W: std::io::Write>(v: &Value, writer: &mut W) -> std::io::Result<()> {
     match v {
+        Value::Int(i) => {
+            use crate::integer::{Frame, Storage};
+            word(writer, 6)?;
+            match &i.storage {
+                Storage::Native(p, frame) => {
+                    word(writer, (*frame == Frame::Biased) as u64)?;
+                    write_prim(p, writer)
+                }
+                Storage::Bits { words, len } => {
+                    word(writer, 0)?; word(writer, 1)?; word(writer, *len as u64)?;
+                    write_le(writer, words.iter().map(|x| x.to_le_bytes()))
+                }
+                Storage::Wide(xs) => {
+                    word(writer, 0)?; word(writer, 128)?; word(writer, xs.len() as u64)?;
+                    write_le(writer, xs.iter().map(|x| x.to_le_bytes()))
+                }
+            }
+        }
         Value::Prim(p) => {
             word(writer, 0)?;
             write_prim(p, writer)
@@ -185,6 +205,7 @@ pub const MAX_DEPTH: usize = 128;
 /// Cost is O(nodes), not O(rows) — it reads declarations, never payloads.
 pub fn declared_rows(v: &Value) -> u64 {
     match v {
+        Value::Int(i) => i.len() as u64,
         Value::Prim(p) => prim_len(p) as u64,
         Value::Prod(cols) => cols.iter().map(declared_rows).max().unwrap_or(0),
         Value::Sum(tags, lanes) => (tags.len() as u64)
@@ -396,6 +417,34 @@ const MIN_VALUE_BYTES: usize = 16;
 
 fn read_value(r: &mut Reader) -> Result<Value, String> {
     match r.word()? {
+        6 => {
+            use crate::integer::{Frame, Integer, Storage};
+            use std::sync::Arc;
+            let frame = match r.word()? {
+                0 => Frame::Zero, 1 => Frame::Biased,
+                _ => return Err("corgi::bytes: bad integer frame".into()),
+            };
+            let width = r.word()?;
+            let storage = match width {
+                8 | 16 | 32 | 64 => Storage::Native(read_prim_width(r, width)?, frame),
+                1 if frame == Frame::Zero => {
+                    let len = usize::try_from(r.word()?).map_err(|_| "corgi::bytes: integer bit length overflow")?;
+                    let words = len.div_ceil(64);
+                    if words > r.remaining() / 8 { return Err("corgi::bytes: truncated integer bits".into()); }
+                    let xs = read_le(r.payload(words * 8)?, u64::from_le_bytes);
+                    if len % 64 != 0 && xs.last().is_some_and(|x| *x >> (len % 64) != 0) {
+                        return Err("corgi::bytes: nonzero integer bit padding".into());
+                    }
+                    Storage::Bits { words: Arc::new(xs), len }
+                }
+                128 if frame == Frame::Zero => {
+                    let len = r.count(16, "wide integer")?;
+                    Storage::Wide(Arc::new(read_le(r.payload(len * 16)?, i128::from_le_bytes)))
+                }
+                _ => return Err("corgi::bytes: bad integer width/frame".into()),
+            };
+            Ok(Value::Int(Integer::from_storage(storage)))
+        }
         0 => Ok(Value::Prim(read_prim(r)?)),
         1 => {
             let n = r.count(MIN_VALUE_BYTES, "product fields")?;
@@ -551,8 +600,12 @@ fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
 }
 
 fn read_prim(r: &mut Reader) -> Result<Prim, String> {
-    use std::sync::Arc;
     let bits = r.word()?;
+    read_prim_width(r, bits)
+}
+
+fn read_prim_width(r: &mut Reader, bits: u64) -> Result<Prim, String> {
+    use std::sync::Arc;
     // Bound the element count by the width BEFORE multiplying: a wire-supplied length near
     // `u64::MAX` would otherwise wrap `len * width` — to something small in release (a corrupt
     // header decoding "successfully" to an empty leaf, desyncing the frame) or to something huge

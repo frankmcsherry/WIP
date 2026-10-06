@@ -8,6 +8,10 @@ edition = "2021"
 serde = { version = "1", features = ["derive"], optional = true }
 
 [[bench]]
+name = "integer"
+harness = false
+
+[[bench]]
 name = "eval"
 harness = false   # plain `fn main()` timing — no framework, no dependency
 

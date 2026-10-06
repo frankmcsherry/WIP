@@ -25,6 +25,8 @@ use crate::ops::{NumOp, Op};
 fn is_fail_op(op: &NumOp) -> bool {
     matches!(
         op,
+        NumOp::Integer(crate::integer::IntegerOp::Binary(_) | crate::integer::IntegerOp::Sum | crate::integer::IntegerOp::ToBytes)
+        |
         NumOp::Core(
             Op::TryGet
                 | Op::TryGather
