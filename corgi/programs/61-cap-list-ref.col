@@ -5,7 +5,7 @@
 # n = 6
 # = Sum tags=[0] [(List ends=[6] <[0, 0, 1, 1, 2, 2]>, List ends=[6] <[0, 0, 1, 1, 2, 2]>), ()x0]
 let xs = input iota in
-let ys = xs map (y -> y shr 1) in
+let ys = xs map (y -> (y, 2) div) in
 let by_ref = (xs ref, ys) cap_list map ((c, y) -> (y, c) get) in
 let by_val = (xs, ys) cap_list map ((c, y) -> (y, c) get) in
 (by_ref, by_val)

@@ -80,7 +80,7 @@ fn optimize_preserves_eval_everywhere() {
         ("(input.0, input.1 transpose .1) cap_list map (p -> p add)", sample),
         ("input.2 map_variant 1 (h -> (h, 1000000) add) unwrap", sample),
         // map fusion: a three-deep MapList chain must collapse without changing the result.
-        ("input.1 transpose .1 map (x -> (x, 1) add) map (x -> x shr 1) map (x -> (x, 5) add)", sample),
+        ("input.1 transpose .1 map (x -> (x, 1) add) map (x -> (x, 2) div) map (x -> (x, 5) add)", sample),
         // iso cancellation under composition with a real op between the pair.
         ("input.1 transpose zip map (p -> p.0)", sample),
         (INLINED_JOIN, join_input),

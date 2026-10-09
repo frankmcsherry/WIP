@@ -1074,8 +1074,9 @@ impl Value {
         }
     }
 
-    /// borrow a byte leaf — text, which is a list of integers held as bytes.
-    pub fn as_u8(&self, who: &str) -> Result<&[u8], String> {
+    /// borrow a byte leaf — text, which is a list of integers held as bytes. Crate-private: a host
+    /// reads integers by shape (`as_i64`), never by storage.
+    pub(crate) fn as_u8(&self, who: &str) -> Result<&[u8], String> {
         match self {
             Value::Prim(Prim::U8(xs)) => Ok(&xs[..]),
             other => Err(format!("{who}: expected Int bytes, got {}", shape_of_value(other))),

@@ -51,15 +51,17 @@ pub mod arrange {
     use crate::value::{Bounds, Value};
     use std::cmp::Ordering;
 
-    /// Borrow a column's integers held as `i64`s, if they are — peeling single-field products,
-    /// which order identically to the field they wrap.
+    /// A column's integers as `i64`s, if it is an integer leaf — peeling single-field products,
+    /// which order identically to the field they wrap. `None` for any other shape: whether a
+    /// column is a bare integer is a question about its shape, never its storage.
     ///
-    /// The zero-copy read. Without it every leaf inspection from outside corgi has to
-    /// `gather(..).into_i64(..)` or clone, because a shared column's `Arc` cannot be
-    /// unwrapped: callers pay a full column copy to look at values they only read.
-    pub fn leaf_slice(v: &Value) -> Option<&[i64]> {
+    /// Borrowed where the integers are held as `i64`s, widened where they are held narrower.
+    /// Without it every leaf inspection from outside corgi has to `gather(..).into_i64(..)` or
+    /// clone, because a shared column's `Arc` cannot be unwrapped: callers pay a full column copy
+    /// to look at values they only read.
+    pub fn leaf_slice(v: &Value) -> Option<std::borrow::Cow<'_, [i64]>> {
         match v {
-            Value::Prim(crate::value::Prim::I64(xs)) => Some(&xs[..]),
+            Value::Prim(_) => v.as_i64("leaf_slice").ok(),
             Value::Prod(fs) if fs.len() == 1 => leaf_slice(&fs[0]),
             _ => None,
         }

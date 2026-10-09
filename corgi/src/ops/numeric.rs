@@ -8,8 +8,8 @@
 //! division, `x / 0 = 0` and `x % 0 = x`, so nothing fails on data). `Float` is an `f64`, with IEEE
 //! arithmetic. The plain ops (`add`, `mul`, ..) take either, two of one kind; a mix is a shape
 //! error. Integers a program wants to treat as 64-bit words (hashing, bit banging) use the `_b64`
-//! verbs and the bitwise ops ([`BitOp`], [`ShiftOp`]): each takes the low 64 bits of its operands,
-//! does the `u64` operation, and reads the result back as an `i64`.
+//! verbs, the shifts and the bitwise ops ([`BitOp`], [`ShiftOp`]): each takes the low 64 bits of
+//! its operands, does the `u64` operation, and reads the result back as an `i64`.
 
 use super::cmp::CmpOp;
 use super::core::Op;
@@ -59,13 +59,12 @@ pub enum BitOp {
     Xor,
 }
 
-/// shifts by a constant. `Shr` is the integer one, `floor(x / 2^k)` (an arithmetic shift); the
-/// `_b64` ones treat the integer as its 64-bit word: `ShlB64` drops the bits shifted past 64,
-/// `ShrB64` fills with zeros (a logical shift), and the rotates move bits around the word. A shift
-/// by 64 or more leaves no bits of the word (`Shr`: the sign); a rotate turns by `k mod 64`.
+/// shifts by a constant, each on the integer as its 64-bit word: `ShlB64` drops the bits shifted
+/// past 64, `ShrB64` fills with zeros (a logical shift), and the rotates move bits around the
+/// word. A shift by 64 or more leaves no bits; a rotate turns by `k mod 64`. (There is no
+/// integer shift: dividing by a power of two is `div`, which runs as a shift.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShiftOp {
-    Shr,
     ShlB64,
     ShrB64,
     RotlB64,
@@ -232,6 +231,15 @@ fn imm_eval(op: BinOp, a: Prim, c: Scalar) -> Result<Prim, String> {
     }
     Ok(match (a, c) {
         (Prim::F64(x), Scalar::Float(k)) => float_body!(op, float_imm(x, k)),
+        // by a power of two, `div` and `rem` are shifts: a negative dividend is biased by `c - 1`
+        // first, so the quotient still rounds toward zero (and the remainder takes its sign).
+        (a, Scalar::Int(c)) if a.is_int() && c > 1 && c.count_ones() == 1 && matches!(op, BinOp::Div | BinOp::Rem) => {
+            let k = c.trailing_zeros();
+            match op {
+                BinOp::Div => int_map(a, move |x| (x + ((x >> 63) & (c - 1))) >> k),
+                _ => int_map(a, move |x| x - (((x + ((x >> 63) & (c - 1))) >> k) << k)),
+            }
+        }
         (a, Scalar::Int(c)) if a.is_int() => int_body!(op, int_imm(a, c)),
         (a, c) => return Err(format!("{op:?}: {} with the constant {c:?}", if a.is_int() { "an Int" } else { "a Float" })),
     })
@@ -270,10 +278,6 @@ fn shift_eval(op: ShiftOp, a: Prim, k: u32) -> Result<Prim, String> {
         return Err(format!("{op:?}: a Float"));
     }
     Ok(match op {
-        ShiftOp::Shr => {
-            let k = k.min(63);
-            int_map(a, move |x| x >> k)
-        }
         ShiftOp::ShlB64 if k >= 64 => int_map(a, |_| 0),
         ShiftOp::ShrB64 if k >= 64 => int_map(a, |_| 0),
         ShiftOp::ShlB64 => int_map(a, move |x| ((x as u64) << k) as i64),

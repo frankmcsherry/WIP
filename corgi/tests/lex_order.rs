@@ -31,9 +31,9 @@ fn one_row(strs: &[Vec<u8>]) -> Value {
 fn rows_of(v: &Value) -> Vec<Vec<u8>> {
     let Value::List(_, inner) = v else { panic!("a list") };
     let Value::List(b, bytes) = &**inner else { panic!("a list of strings") };
-    let bytes = bytes.as_u8("bytes").unwrap();
+    let bytes = bytes.as_i64("bytes").unwrap();
     let ends = b.to_vec();
-    (0..ends.len()).map(|i| bytes[if i == 0 { 0 } else { ends[i - 1] }..ends[i]].to_vec()).collect()
+    (0..ends.len()).map(|i| bytes[if i == 0 { 0 } else { ends[i - 1] }..ends[i]].iter().map(|&x| x as u8).collect()).collect()
 }
 
 #[test]

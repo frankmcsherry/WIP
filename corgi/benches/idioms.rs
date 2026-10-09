@@ -121,7 +121,7 @@ fn sum_map(rows: usize, pct: i64, param: &str) {
 fn sum_heavy(rows: usize, pct: i64, param: &str) {
     let mut rng = Rng(0x5eed);
     let (rs, input) = results(rows, pct, 1_000_000, &mut rng);
-    let p = corgi("input map_variant 0 (x -> ((((x, 3) mul, 7) add) shr 1, 11) mul) map_variant 1 (e -> ((e shr 2, 5) mul, e) add)");
+    let p = corgi("input map_variant 0 (x -> ((((x, 3) mul, 7) add) shr_b64 1, 11) mul) map_variant 1 (e -> ((e shr_b64 2, 5) mul, e) add)");
     let r = best(rows, || {
         black_box(black_box(&rs).iter().map(|r| match r { Ok(x) => Ok(((x * 3 + 7) >> 1) * 11), Err(e) => Err((e >> 2) * 5 + e) }).collect::<Vec<_>>());
     });

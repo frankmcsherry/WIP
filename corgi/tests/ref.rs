@@ -173,17 +173,17 @@ fn readers_agree_through_a_box() {
 #[test]
 fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
     let by_ref = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in \
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in \
          (xs ref, ys) cap_list map ((c, y) -> (y, c) get)",
         seed(6),
     );
     let by_value = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in \
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in \
          (xs, ys) cap_list map ((c, y) -> (y, c) get)",
         seed(6),
     );
     let via_gather = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in (ys, xs) gather",
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in (ys, xs) gather",
         seed(6),
     );
     assert_eq!(by_ref, by_value);
@@ -196,18 +196,18 @@ fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
 #[test]
 fn field_of_a_referenced_product() {
     let out = run(
-        "let xs = input iota in let p = (xs, xs map (y -> y shr 1)) in let b = p ref in (b.1 clone, b.0 clone)",
+        "let xs = input iota in let p = (xs, xs map (y -> (y, 2) div)) in let b = p ref in (b.1 clone, b.0 clone)",
         seed(6),
     );
-    let expect = run("let xs = input iota in (xs map (y -> y shr 1), xs)", seed(6));
+    let expect = run("let xs = input iota in (xs map (y -> (y, 2) div), xs)", seed(6));
     assert_eq!(out, expect);
     // and a list field of a referenced product comes back as a referenced LIST (spans), readable by `gather`
     let by_ref = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in let b = (xs, xs) ref in (ys, b.1) gather",
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in let b = (xs, xs) ref in (ys, b.1) gather",
         seed(6),
     );
     let by_value = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in (ys, xs) gather",
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in (ys, xs) gather",
         seed(6),
     );
     assert_eq!(by_ref, by_value);

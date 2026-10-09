@@ -166,9 +166,9 @@ now, at about the same cost (above).
    - Repeated `len`, compares, `iota`s and constant seeds today run once per occurrence.
    - Measured with `--optimize`: gcd 11% faster, the rest unchanged. Cheap, but small on its own.
 4. **Division and remainder by a constant become a multiply-high and a shift.** A power of two
-   becomes `shr` or `and` (for a dividend known not to be negative: `div` truncates, `shr`
-   floors), and `select` with a constant operand becomes an immediate.
-   - Today the divide runs the scalar divider, and NEON has no integer divide.
+   already does: `div` and `rem` by one run as shifts (toward zero, so a negative dividend is
+   biased first). `select` with a constant operand should become an immediate too.
+   - Any other constant divisor runs the scalar divider, and NEON has no integer divide.
    - At stake: days_from_civil's five constant divisions are 37% of it; histogram (`/125`); itoa
      (19 rounds of `/10`, `%10`); gcd's `select` with 0 (lit 20 plus part of Select 82).
 

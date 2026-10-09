@@ -3,7 +3,7 @@
 let (s1, s2) = input in
 let (l1, l2) = (s1 len, s2 len) in
 # The match window: max(l1, l2) / 2 - 1, saturating at zero.
-let d = ((((l1, l2) max shr 1), 1) max, 1) sub in
+let d = ((((l1, l2) max, 2) div, 1) max, 1) sub in
 # Number the bytes: s1 as (i, c), s2 as (j, c, matched).
 let s1x = ((0, s1) foldscan ((i, c) -> ((i, 1) add, (i, c)))) .1 in
 let s2x = ((0, s2) foldscan ((j, c) -> ((j, 1) add, (j, c, 0)))) .1 in
@@ -24,7 +24,7 @@ let rank1 = ((0, per1) foldscan ((k, (hit, _, _, c)) -> let k2 = (k, hit) add in
 let t2 = (rank2, rank1) cap_list map ((rank2, (c, hit, k)) ->
     let mis = ((c, k), rank2) cap_list map (((c, k), (ch, mm, k2)) -> ((mm, (k2, k) eq) min, (ch, c) ne) min) fold_any in
     (mis, hit) min) fold_add in
-let t = t2 shr 1 in
+let t = (t2, 2) div in
 # The common prefix, up to four bytes.
 let prefix = (((0, 1), per1) fold (((p, alive), (_, same, lt4, _)) ->
     let a2 = ((alive, same) min, lt4) min in

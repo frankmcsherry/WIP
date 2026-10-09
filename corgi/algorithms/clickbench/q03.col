@@ -3,12 +3,12 @@
 # columns: UserID
 # output: g
 # The ids spread over all of i64 and sum to about 2^80, past where an Int's sum is exact (it wraps
-# at the i64 edge). So: split each id into 32-bit halves, x = hi * 2^32 + lo exactly, with
-# hi = x shr 32 (floor division, so signed) and lo = x and 4294967295; sum each half (neither sum
-# leaves i64 below 2^31 rows), and put them together as floats. With an exact wide integer this
-# would be `(u fold_add to_float, n) div`.
+# at the i64 edge). So: split each id by 2^32, x = hi * 2^32 + lo exactly, with hi = x div 2^32 and
+# lo = x rem 2^32 (both toward zero, so lo takes x's sign); sum each part (neither sum leaves i64
+# below 2^31 rows), and put them together as floats. With an exact wide integer this would be
+# `(u fold_add to_float, n) div`.
 let u = input in
 let n = u len to_float in
-let hi = u map (x -> x shr 32) fold_add to_float in
-let lo = u map (x -> x and 4294967295) fold_add to_float in
+let hi = u map (x -> (x, 4294967296) div) fold_add to_float in
+let lo = u map (x -> (x, 4294967296) rem) fold_add to_float in
 (((hi, 4294967296.0) mul, lo) add, n) div

@@ -12,7 +12,7 @@ let text = (input, zeros) append chunk 3 map (g ->
     (v, 4 iota) cap_list map ((v, j) ->
         # the j-th six bits of the group (shifts take constants, so pick among four), then the
         # character for that six-bit value.
-        let s = ((j, 0) eq, v shr 18, ((j, 1) eq, v shr 12, ((j, 2) eq, v shr 6, v) select) select) select and 63 in
+        let s = ((j, 0) eq, v shr_b64 18, ((j, 1) eq, v shr_b64 12, ((j, 2) eq, v shr_b64 6, v) select) select) select and 63 in
         ((s, 26) lt, (s, 65) add, ((s, 52) lt, (s, 71) add, ((s, 62) lt, (s, 4) sub, ((s, 62) eq, 43, 47) select) select) select) select)) flatten .1 in
 let cut = (text len, pad) sub in
 (cut, (text len iota, text) zip) cap_list map ((cut, (k, ch)) -> ((k, cut) ge, 61, ch) select)

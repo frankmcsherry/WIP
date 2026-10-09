@@ -177,11 +177,19 @@ fn word_verbs_match_u64_arithmetic() {
     let xs = [0, 1, -1, 12345, i64::MAX, i64::MIN];
     let want: Vec<i64> = xs.iter().map(|&x| splitmix64(x as u64) as i64).collect();
     assert_eq!(run(src, int(&xs)), Value::i64(want));
-    // `shr` is the integer shift, floor(x / 2^k); `shr_b64` the logical one on the word.
+    // `shr_b64` is the logical shift of the word; dividing by a power of two is `div` (toward
+    // zero, as a shift), and its remainder takes the dividend's sign. Plain `shr` is retired.
     let xs = int(&[-8, -7, 7, i64::MIN]);
-    assert_eq!(run("input shr 1", xs.clone()), int(&[-4, -4, 3, i64::MIN / 2]));
     assert_eq!(run("input shr_b64 1", xs.clone()), int(&[i64::MAX - 3, i64::MAX - 3, 3, 1 << 62]));
-    assert_eq!(run("(input shr 64, input shr_b64 64)", xs.clone()), Value::Prod(vec![int(&[-1, -1, 0, -1]), int(&[0; 4])]));
+    assert_eq!(run("input shr_b64 64", xs.clone()), int(&[0; 4]));
+    assert_eq!(run("((input, 2) div, (input, 2) rem)", xs.clone()),
+        Value::Prod(vec![int(&[-4, -3, 3, i64::MIN / 2]), int(&[0, -1, 1, 0])]));
+    let big = int(&[-1 << 40, (-1 << 40) - 1, (1 << 40) + 5, i64::MAX, i64::MIN]);
+    let c = 1i64 << 32;
+    let want = |f: fn(i64, i64) -> i64| int(&[-1 << 40, (-1 << 40) - 1, (1 << 40) + 5, i64::MAX, i64::MIN].map(|x| f(x, c)));
+    assert_eq!(run("(input, 4294967296) div", big.clone()), want(|x, c| x / c));
+    assert_eq!(run("(input, 4294967296) rem", big.clone()), want(|x, c| x % c));
+    assert!(corgi::parse_ml("input shr 1").unwrap_err().contains("shr_b64"));
     // shifts left drop the bits past 64; rotates turn by k mod 64.
     assert_eq!(run("(input shl_b64 63, input rotl_b64 1, input rotr_b64 1, input rotl_b64 65)", int(&[1, i64::MIN])),
         Value::Prod(vec![int(&[i64::MIN, 0]), int(&[2, 1]), int(&[i64::MIN, 1 << 62]), int(&[2, 1])]));

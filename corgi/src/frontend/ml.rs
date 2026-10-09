@@ -33,7 +33,7 @@
 //!
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
-//! the scope. A NUM after an op that takes one is its parameter (`shr 3`, `branch 2`); anywhere
+//! the scope. A NUM after an op that takes one is its parameter (`chunk 3`, `branch 2`); anywhere
 //! else it is an Int, as `-3` is. `#` starts a comment to the end of the line. (What runs is not
 //! always what is written here: `Program` turns a binary op on a pair holding a literal,
 //! `(x, 1) sub`, into one op that carries the constant, so no column of the constant is built; see
@@ -66,7 +66,7 @@ enum Tok {
     Eq,
     Bar, // | — the variant separator in an `enum` declaration
     Ident(String),
-    Num(u64),   // a non-negative integer: an op's parameter (`shr 3`, `branch 2`), or an Int
+    Num(u64),   // a non-negative integer: an op's parameter (`chunk 3`, `branch 2`), or an Int
     Lit(Value), // a constant no parameter can be: a negative Int (`-3`) or a Float (`0.7`)
     Str(Vec<u8>),
 }

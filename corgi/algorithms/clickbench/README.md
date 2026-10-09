@@ -40,7 +40,7 @@ from one `--profile` run, taken while `sort`, `dedup` and `group` were the kerne
 | q00 | 0.00 | 0.09 | 0 | Nothing to do: the row count is in the bounds. |
 | q01 | 0.45 | 0.40 | 1.12 | At parity: one compare pass and a sum. |
 | q02 | 0.16 | 0.40 | 0.40 | Ahead: two SIMD sums; DuckDB pays its per-query overhead (~0.1 ms) at this size. |
-| q03 | 0.90 | 0.74 | 1.22 | Approximated in method: corgi has no integer wider than i64. Two extra passes (shr, and). |
+| q03 | 0.90 | 0.74 | 1.22 | Approximated in method: corgi has no integer wider than i64. Two extra passes (div and rem by 2^32). |
 | q04 | 15.57 | 3.65 | 4.27 | Sort-based distinct (DedupList 21 ms) against DuckDB's hash set. |
 | q05 | 45.60 | 5.70 | 8.00 | Structural sort of 1M byte strings (47 ms) against a hash set. |
 | q06 | 0.22 | 0.63 | 0.35 | Ahead: two SIMD passes. |

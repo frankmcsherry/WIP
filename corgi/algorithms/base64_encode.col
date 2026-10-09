@@ -10,9 +10,9 @@ let text = (input, zeros) append chunk 3 map (g ->
     let b = (1, g) get in
     let c = (2, g) get in
     # Four six-bit values from the 24 bits.
-    let s0 = a shr 2 in
-    let s1 = ((a and 3, 16) mul, b shr 4) add in
-    let s2 = ((b and 15, 4) mul, c shr 6) add in
+    let s0 = a shr_b64 2 in
+    let s1 = ((a and 3, 16) mul, b shr_b64 4) add in
+    let s2 = ((b and 15, 4) mul, c shr_b64 6) add in
     let s3 = c and 63 in
     let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" in
     (((s0, alphabet) get enlist, (s1, alphabet) get enlist) append,

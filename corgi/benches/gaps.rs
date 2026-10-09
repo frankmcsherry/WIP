@@ -270,7 +270,7 @@ fn family_a(n: usize, reps: u32) {
     row_chain("A2 add_chain8", n, ck, rk, r1);
 
     // A3 mixed_chain — 4 heterogeneous kernels: (((x+5)*3)-2)>>1.
-    let g = compile("(((input, 5) add, 3) mul, 2) sub shr 1");
+    let g = compile("(((input, 5) add, 3) mul, 2) sub shr_b64 1");
     let ck = corgi_t(&g, &lf, reps);
     let rk = rust_t(reps, || {
         let s = black_box(&src);
@@ -520,8 +520,8 @@ fn family_e(n: usize, reps: u32) {
 
     // E1 single-key equi-join (find + slices) over a SORTED haystack — the join primitives, no sort cost.
     let g = compile(
-        "let bn = input in let build = bn map (x -> (x shr 8, x)) in \
-         let probes = bn map (x -> x shr 8) dedup in let t = build transpose in \
+        "let bn = input in let build = bn map (x -> (x shr_b64 8, x)) in \
+         let probes = bn map (x -> x shr_b64 8) dedup in let t = build transpose in \
          let r = (probes, t.0) find in (r, t.1) slices",
     );
     let sl = sorted_list(n);
@@ -930,7 +930,7 @@ fn family_safety(n: usize, reps: u32) {
     let idx_seq: Vec<i64> = (0..n as i64).collect();
     let g_plain = compile("input gather");
     let g_add = compile("input gather map (v -> (v, 7) add)");
-    let g_chain = compile("input gather map (v -> (v, 7) add shr 1 and 255)");
+    let g_chain = compile("input gather map (v -> (v, 7) add shr_b64 1 and 255)");
     type GatherCase<'a> = (&'a str, &'a Graph<NumOp>, fn(i64) -> i64);
     let cases: [GatherCase<'_>; 3] = [
         ("gather", &g_plain, |v| v),

@@ -23,7 +23,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// (`branch` also takes one but is parsed specially: its count may be an enum name; `and` takes
 /// one optionally: `x and 255` masks by a constant, `(x, y) and` is the pair form.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "shr" | "shl_b64" | "shr_b64" | "rotl_b64" | "rotr_b64" | "chunk" | "sort_limit")
+    matches!(name, "shl_b64" | "shr_b64" | "rotl_b64" | "rotr_b64" | "chunk" | "sort_limit")
 }
 
 /// the spellings the integer change retired, each pointed at what replaces it: a typed op such as
@@ -43,6 +43,9 @@ pub(crate) fn retired(name: &str) -> Option<String> {
         "signed" => "'signed' is retired: integers are signed values already".into(),
         "to_f32" | "to_f64" => format!("'{name}' is retired: use to_float"),
         "parse_u64" => "'parse_u64' is retired: use parse_int".into(),
+        // two right shifts that agree on non-negative integers and differ on negative ones made a
+        // wrong answer easy to write; the word shift and division are each spelled for what they are
+        "shr" => "'shr' is retired: `shr_b64 k` shifts the 64-bit word (zeros in from the top), and `(x, 2^k) div` divides (toward zero)".into(),
         _ => return None,
     })
 }
@@ -119,7 +122,6 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "to_float" => ArithOp::ToFloat.into(), // Int -> Float (how iota becomes floats)
         // branchless blend: (mask, then, else) -> picked column (the SIMD bitselect, see Op::Select)
         "select" => Op::Select.into(),
-        "shr" => ArithOp::Shift(ShiftOp::Shr, k()?).into(), // x >> k, floor(x / 2^k)
         // integers as 64-bit words, and bitwise:
         "and" => match arg {
             Some(m) => ArithOp::BitsImm(BitOp::And, m as i64).into(), // x & m   (mod 2^k via m = 2^k-1)

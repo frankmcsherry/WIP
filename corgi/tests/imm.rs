@@ -59,16 +59,13 @@ fn rows(col: Col, n: usize, rng: &mut Rng) -> Value {
     }
 }
 
-/// a freshly allocated copy of a leaf column, so the immediate kernels, which write into an
-/// operand they own, take that path.
+/// a freshly allocated copy of a leaf column at the same storage, so the immediate kernels, which
+/// write into an operand they own, take that path. (A round trip through the byte codec, which
+/// keeps storage.)
 fn fresh(v: &Value) -> Value {
-    if let Ok(xs) = v.as_u8("fresh") {
-        Value::u8(xs.to_vec())
-    } else if let Ok(xs) = v.as_f64("fresh") {
-        Value::f64(xs)
-    } else {
-        Value::i64(v.as_i64("fresh").unwrap().into_owned())
-    }
+    let mut buf = Vec::new();
+    corgi::bytes::write_to(v, &mut buf).unwrap();
+    corgi::bytes::read_from(&buf).unwrap().0
 }
 
 /// the constants a column of `col` meets: for an Int, small ones, the byte edges and the ends of

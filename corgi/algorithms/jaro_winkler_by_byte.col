@@ -3,7 +3,7 @@
 # compete for a position, so the match splits into one two-pointer merge per byte value.
 let (s1, s2) = input in
 let (l1, l2) = (s1 len, s2 len) in
-let d = ((((l1, l2) max shr 1), 1) max, 1) sub in
+let d = ((((l1, l2) max, 2) div, 1) max, 1) sub in
 # Positions grouped by byte: List<(byte, List<position>)>.
 let g1 = ((0, s1) foldscan ((i, c) -> ((i, 1) add, (c, i)))) .1 group in
 let g2 = ((0, s2) foldscan ((j, c) -> ((j, 1) add, (c, j)))) .1 group in
@@ -29,7 +29,7 @@ let m = per map ((_, _, n) -> n) fold_add in
 # Transpositions: the matched bytes of each string in position order, compared rank by rank.
 let c1 = per map ((x, _, _) -> x) flatten .1 sort map ((_, c) -> c) in
 let c2 = per map ((_, x, _) -> x) flatten .1 sort map ((_, c) -> c) in
-let t = (c1, c2) zip try match (0 (z -> z map ((a, b) -> (a, b) ne) fold_add), 1 (_ -> 0)) shr 1 in
+let t = ((c1, c2) zip try match (0 (z -> z map ((a, b) -> (a, b) ne) fold_add), 1 (_ -> 0)), 2) div in
 # The common prefix, up to four bytes.
 let n4 = ((l1, l2) min, 4) min in
 let pr1 = ((0, n4) enlist, s1) slices try match (0 (ok -> ok flatten .1), 1 (_ -> "")) in

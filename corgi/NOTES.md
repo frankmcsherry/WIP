@@ -205,7 +205,9 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   `x%0 = x`, and `MIN/-1` wraps. Code that treats an integer as a 64-bit word (hashing, bit banging)
   says so with the `_b64` verbs (`add_b64`, `mul_b64`, `shr_b64` the logical shift, rotates) and the
   bitwise ops, each defined on the integer's low 64 bits read back as an `i64`; they will keep their
-  meaning when plain arithmetic becomes exact. Text, masks and sum tags are held as bytes, every
+  meaning when plain arithmetic becomes exact. There is no integer shift: dividing by a power of
+  two is `div` (run as a shift), so the word's logical shift and integer division can't be
+  mistaken for each other. Text, masks and sum tags are held as bytes, every
   other integer as `i64`. A reduction of an empty row reads the zero of an integer: `fold_min` and
   `fold_max` give 0 (not an identity, which unbounded integers would not have), and a program that
   wants another default tests `len` and `select`s it.
@@ -250,7 +252,7 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
   *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
-  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`Shr` does).
+  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (the shifts do).
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
   *Reuse policy:* an op that is elementwise AND same-storage (shifts, `bin_into`, `map_into`,
@@ -439,7 +441,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
   naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
-  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are literals (`(x, 1) sub`; the core's `And`/`Shr`/`Gt` immediate kernels are ops with a parameter, `x shr 3`).
+  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are literals (`(x, 1) sub`; the core's `And`/`Shr`/`Gt` immediate kernels are ops with a parameter, `x shr 3`; `shr` later retired for `shr_b64` and `div`).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).
