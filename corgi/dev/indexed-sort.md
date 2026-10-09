@@ -19,7 +19,7 @@ in block `labels[k]`; checked in debug builds), and every `index[k]` a row of `v
   the same way.
 - With `emit`, the returned column is `gather(v, &new_index)`, produced by the sort.
 
-Structural order: leaf by stored unsigned bytes; `Prod` lexicographic by field; `Sum` by tag
+Structural order: leaf by value (an integer as a signed number, a float by its total order); `Prod` lexicographic by field; `Sum` by tag
 then payload; `List` lexicographically, element by element, a proper prefix first; `Unit` all
 equal.
 
@@ -33,9 +33,13 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
 
 ## Design
 
-- **Leaf.** Each key is read once through the index into a `(key, position)` buffer; the radix
-  runs per block with every pass sequential; the sorted keys, narrowed to the leaf's width, are
-  the output column.
+- **Leaf.** Each element's order key (its storage's `Elem::key`: a byte as itself, an `i64` with
+  its sign bit flipped, a float's total-order key) is read once through the index into a
+  `(key, position)` buffer; the radix runs per block with every pass sequential, over only the
+  digits that can differ: one sweep finds the keys' least and greatest and their AND and OR, and
+  the keys are read either as they are (only digits holding a differing bit) or less the least
+  (only digits below the spread, which is what signed values either side of zero need), whichever
+  leaves fewer digits; the sorted keys, read back at the leaf's storage, are the output column.
 - **Prod.** Each field in turn at the same positions, under the labels the previous field
   refined. A field's emitted column is final: later fields permute only within its classes, on
   which it is constant. Once no two positions are tied, the remaining fields are read out by
@@ -80,7 +84,7 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
 
 ## `sort_by`: the sort as a primitive
 
-    sort_by : List<(K, V)> -> List<(K, V, U64)>
+    sort_by : List<(K, V)> -> List<(K, V, Int)>
 
 Each row's elements in stable order by `K` alone, `V` carried along, and each element's run of
 equal keys: the refined labels, numbered densely over the column (a run never spans two rows). A

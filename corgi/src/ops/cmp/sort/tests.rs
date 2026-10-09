@@ -18,9 +18,9 @@ impl Rng {
 fn leaf(rng: &mut Rng, rows: usize) -> Value {
     match rng.below(4) {
         0 => Value::u8((0..rows).map(|_| rng.below(6) as u8).collect()),
-        1 => Value::u16((0..rows).map(|_| rng.below(1000) as u16).collect()),
-        2 => Value::u32((0..rows).map(|_| rng.below(3) as u32 * 70000).collect()),
-        _ => Value::u64((0..rows).map(|_| if rng.below(2) == 0 { rng.below(5) as u64 } else { rng.next() }).collect()),
+        1 => Value::i64((0..rows).map(|_| rng.below(1000) as i64 - 500).collect()),
+        2 => Value::f64((0..rows).map(|_| [0.0, -0.0, 1.5, -2.5, f64::NAN][rng.below(5)]).collect()),
+        _ => Value::i64((0..rows).map(|_| if rng.below(2) == 0 { rng.below(5) as i64 } else { rng.next() as i64 }).collect()),
     }
 }
 
@@ -121,20 +121,20 @@ fn ordered_refinements_preserve_labels_and_stable_positions() {
     // Each label class is ordered, but keys decrease across class boundaries.
     // Non-identity source coordinates must stay in their original tie order.
     for n in [0, 1, 2, 33, 257, 32769] {
-        let keys: Vec<u64> = (0..n).map(|i| (1u64 << 63) + ((i % 129) / 3) as u64).collect();
+        let keys: Vec<i64> = (0..n).map(|i| i64::MIN + ((i % 129) / 3) as i64).collect();
         let labels: Vec<u64> = (0..n).map(|i| 7 + 9 * (i / 129) as u64).collect();
         let mut stored = keys.clone();
         stored.reverse();
         let index: Vec<usize> = (0..n).rev().collect();
-        check(&Value::u64(stored), &labels, &index);
+        check(&Value::i64(stored), &labels, &index);
         let mut sorted = keys;
         sorted.sort();
-        check(&Value::u64(sorted.clone()), &[], &(0..n).collect::<Vec<_>>());
+        check(&Value::i64(sorted.clone()), &[], &(0..n).collect::<Vec<_>>());
         // A late inversion must still take the normal sort, without partially
         // refining the labels before the fast path rejects the input.
         if n > 3 {
             sorted[n - 1] = 0;
-            check(&Value::u64(sorted), &labels, &(0..n).collect::<Vec<_>>());
+            check(&Value::i64(sorted), &labels, &(0..n).collect::<Vec<_>>());
         }
     }
 }
@@ -173,16 +173,16 @@ fn subsets_in_any_order_sort_without_a_gather() {
 fn emitted_columns_are_the_sorted_data_at_scale() {
     let n = 5000usize;
     let mut rng = Rng(7);
-    let full: Vec<u64> = (0..n).map(|_| rng.next()).collect();
-    let narrow: Vec<u64> = (0..n).map(|_| rng.below(50) as u64).collect();
+    let full: Vec<i64> = (0..n).map(|_| rng.next() as i64).collect();
+    let narrow: Vec<i64> = (0..n).map(|_| rng.below(50) as i64).collect();
     let index: Vec<usize> = (0..n).collect();
     let zeros = vec![0u64; n];
-    check(&Value::u64(full.clone()), &zeros, &index);
-    check(&Value::u64(narrow.clone()), &zeros, &index);
-    check(&Value::Prod(vec![Value::u64(narrow.clone()), Value::u64(full.clone())]), &zeros, &index);
+    check(&Value::i64(full.clone()), &zeros, &index);
+    check(&Value::i64(narrow.clone()), &zeros, &index);
+    check(&Value::Prod(vec![Value::i64(narrow.clone()), Value::i64(full.clone())]), &zeros, &index);
     let tags: Vec<usize> = (0..n).map(|_| rng.below(3)).collect();
     let lanes: Vec<Value> = (0..3)
-        .map(|t| Value::u64(narrow.iter().zip(&tags).filter(|(_, &x)| x == t).map(|(&v, _)| v).collect()))
+        .map(|t| Value::i64(narrow.iter().zip(&tags).filter(|(_, &x)| x == t).map(|(&v, _)| v).collect()))
         .collect();
     check(&Value::sum(tags, lanes), &zeros, &index);
     let mut ends = Vec::with_capacity(n);
@@ -191,8 +191,8 @@ fn emitted_columns_are_the_sorted_data_at_scale() {
         total += rng.below(4);
         ends.push(total);
     }
-    let elems: Vec<u64> = (0..total).map(|_| rng.below(4) as u64).collect();
-    check(&Value::List(ends.into(), Box::new(Value::u64(elems))), &zeros, &index);
+    let elems: Vec<i64> = (0..total).map(|_| rng.below(4) as i64).collect();
+    check(&Value::List(ends.into(), Box::new(Value::i64(elems))), &zeros, &index);
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn byte_records_pack_and_unpack() {
 
 #[test]
 fn the_labels_form_is_the_identity_index() {
-    let v = Value::Prod(vec![Value::u64(vec![2, 1, 2, 1, 3, 1]), Value::u64(vec![10, 20, 5, 30, 7, 20])]);
+    let v = Value::Prod(vec![Value::i64(vec![2, 1, 2, 1, 3, 1]), Value::i64(vec![10, 20, 5, 30, 7, 20])]);
     let labels = [0, 0, 0, 1, 1, 1];
     let (perm, refined) = sort_blocks(&labels, &v);
     let (_, rows, labels_ref) = reference(&v, &labels, &[0, 1, 2, 3, 4, 5]);
@@ -220,4 +220,43 @@ fn the_labels_form_is_the_identity_index() {
     let (perm2, refined2, sorted) = sort_values(&labels, &v);
     assert_eq!((perm2, refined2), (perm, refined));
     assert_eq!(sorted, gather(&v, &rows));
+}
+
+/// Signed values either side of zero: +1 and -1 differ in every bit of their keys, so the radix
+/// reads such keys less the least. Checked at the block sizes where the kernel changes (insertion
+/// up to 32, then 8-, 11- and 16-bit digits), alone, among the extremes, and as product fields and
+/// list elements.
+#[test]
+fn signed_values_around_zero() {
+    let mut rng = Rng(23);
+    let sets: [&[i64]; 4] = [&[-1, 1], &[-1, 0, 1], &[-3, -2, -1, 0, 1, 2, 3], &[i64::MIN, -1, 0, 1, i64::MAX]];
+    for n in [5usize, 33, 1000, 1 << 15, 1 << 20] {
+        for vals in sets {
+            let xs: Vec<i64> = (0..n).map(|_| vals[rng.below(vals.len())]).collect();
+            // a leaf's whole answer: the stable order of its values, and their dense ranks
+            let mut want: Vec<usize> = (0..n).collect();
+            want.sort_by_key(|&i| xs[i]);
+            let mut ranks = Vec::with_capacity(n);
+            for k in 0..n {
+                let next = ranks.last().copied().unwrap_or(0) + (k > 0 && xs[want[k]] != xs[want[k - 1]]) as u64;
+                ranks.push(next);
+            }
+            let (perm, labels) = sort_blocks(&[], &Value::i64(xs.clone()));
+            assert_eq!(perm, want, "order of {vals:?} at {n} rows");
+            assert_eq!(labels, ranks, "runs of {vals:?} at {n} rows");
+            if n <= 1000 {
+                let index: Vec<usize> = (0..n).collect();
+                let ys: Vec<i64> = (0..n).map(|_| vals[rng.below(vals.len())]).collect();
+                check(&Value::Prod(vec![Value::i64(xs.clone()), Value::i64(ys)]), &[], &index);
+                let mut ends = Vec::with_capacity(n);
+                let mut total = 0;
+                for _ in 0..n {
+                    total += rng.below(4);
+                    ends.push(total);
+                }
+                let elems: Vec<i64> = (0..total).map(|_| vals[rng.below(vals.len())]).collect();
+                check(&Value::List(ends.into(), Box::new(Value::i64(elems))), &[], &index);
+            }
+        }
+    }
 }

@@ -72,7 +72,7 @@ mod generators {
 
     /// the mask family: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
     /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`.
-    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u8]) -> (Vec<usize>, Vec<usize>) {
         let mut idx = Vec::new();
         let mut nb = Vec::with_capacity(bounds.len());
         let mut start = 0;
@@ -143,14 +143,15 @@ mod generators {
             Value::Prim(p) => {
                 let mut pos = Vec::with_capacity(p.len());
                 match p {
-                    Prim::U64(xs) => xs.iter().enumerate().for_each(|(j, &x)| {
+                    Prim::I64(xs) => xs.iter().enumerate().for_each(|(j, &x)| {
                         let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), x, &mut pos)
+                        resolve(ok, r, hay.span(r), x as u64, &mut pos)
                     }),
-                    _ => (0..p.len()).for_each(|j| {
+                    Prim::U8(_) => (0..p.len()).for_each(|j| {
                         let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), p.u64_at(j), &mut pos)
+                        resolve(ok, r, hay.span(r), p.word_at(j), &mut pos)
                     }),
+                    Prim::F64(_) => return Err("gather: positions are integers, not floats".into()),
                 }
                 IndexPlan::Leaf(pos)
             }
@@ -161,14 +162,14 @@ mod generators {
             // a list of positions (the common case) resolves row by row with no owner column; a list
             // of anything else hands its elements their rows.
             Value::List(bounds, vals) => match &**vals {
-                Value::Prim(Prim::U64(xs)) => {
+                Value::Prim(Prim::I64(xs)) => {
                     let mut pos = Vec::with_capacity(xs.len());
                     // one owner per row of positions, so its span is read once per row.
                     for i in 0..bounds.len() {
                         let r = owners.get(i);
                         let (s, e) = bounds.span(i);
                         let span = hay.span(r);
-                        xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x, &mut pos));
+                        xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x as u64, &mut pos));
                     }
                     IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(pos)))
                 }
@@ -325,7 +326,7 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
 /// `filter`'s values in one pass per leaf: the rows whose mask element is nonzero, in order, for a
 /// leaf, a unit, or a product of those. `None` for a list, sum or reference, which keep the
 /// positions-then-gather path.
-pub(crate) fn compress(v: &Value, mask: &[u64]) -> Option<Value> {
+pub(crate) fn compress(v: &Value, mask: &[u8]) -> Option<Value> {
     match v {
         Value::Prim(p) => Some(Value::Prim(p.compress(mask))),
         Value::Prod(fields) => fields.iter().map(|f| compress(f, mask)).collect::<Option<_>>().map(Value::Prod),
@@ -528,7 +529,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
 /// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`]
 /// — the same split `scatter` makes, and for the same reason. The split is per LEVEL, not per value:
 /// a product blends each leaf field directly and only gathers the fields that need it.
-pub(crate) fn blend(mask: &[u64], then: Value, els: Value) -> Value {
+pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
     match (then, els) {
         (Value::Prim(t), Value::Prim(e)) => Value::Prim(t.blend(e, mask)),
         (Value::Prod(ts), Value::Prod(es)) => {

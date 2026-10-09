@@ -1,7 +1,7 @@
 //! The discrimination sort: `(labels, index)` in, sorted data out.
 //!
 //! [`sort_indexed`] orders the rows `index[..]` of a column within the blocks `labels` describes,
-//! by structural order: a leaf by its stored unsigned bytes, `Prod` lexicographically by field,
+//! by structural order: a leaf by its order keys (an integer's value, a float's total order), `Prod` lexicographically by field,
 //! `Sum` by tag then payload, `List` lexicographically (a proper prefix first), `Unit` all equal.
 //! Nothing is gathered before a level sorts. A leaf pulls its keys through the index once and
 //! radixes them with the index's rows alongside, every pass sequential, and the sorted keys are
@@ -159,13 +159,13 @@ fn sort_leaf(
 ) -> Option<Value> {
     let mut keys = std::mem::take(&mut scratch.keys);
     keys.clear();
-    p.pull_u64(index, &mut keys);
+    p.pull_keys(index, &mut keys);
     if emit == Emit::Values {
         sort_keys_only(&mut keys, labels, scratch);
     } else {
         sort_keys(&mut keys, labels, index, scratch);
     }
-    let out = emit.values().then(|| Value::Prim(p.like(&keys)));
+    let out = emit.values().then(|| Value::Prim(p.like_keys(&keys)));
     scratch.keys = keys;
     out
 }
@@ -240,9 +240,9 @@ fn sort_packed(
     }
     let mut keys = std::mem::take(&mut scratch.keys);
     keys.clear();
-    leaf(&cols[f]).pull_u64(index, &mut keys);
+    leaf(&cols[f]).pull_keys(index, &mut keys);
     for c in &cols[f + 1..g] {
-        leaf(c).pack_u64(index, &mut keys);
+        leaf(c).pack_keys(index, &mut keys);
     }
     if emit == Emit::Values && g == cols.len() {
         sort_keys_only(&mut keys, labels, scratch);
@@ -256,7 +256,7 @@ fn sort_packed(
             let p = leaf(c);
             shift -= p.bits();
             let mask = if p.bits() == 64 { u64::MAX } else { (1u64 << p.bits()) - 1 };
-            outs.push(Value::Prim(p.like_from(keys.iter().map(|&k| (k >> shift) & mask))));
+            outs.push(Value::Prim(p.like_keys_iter(keys.iter().map(|&k| (k >> shift) & mask))));
         }
     }
     scratch.keys = keys;
@@ -405,7 +405,7 @@ fn sort_list(
                     ends += 1;
                 } else {
                     if let Some(p) = leaf {
-                        keys.push(p.u64_at(s + pos));
+                        keys.push(p.key_at(s + pos));
                     }
                     rows.push(r);
                 }
@@ -533,8 +533,8 @@ fn refine_if_ordered(keys: &[u64], labels: &mut Vec<u64>) -> bool {
 
 /// Stable sort of one block by `keys`, `rows` moving with them. Blocks of 32 or fewer take an
 /// insertion sort; the rest an LSD radix with every pass sequential, a digit widening with the
-/// block ([`digit_width`]). One sweep counts every digit at once; a digit on which every key
-/// agrees is skipped, as are the leading all-zero digits.
+/// block ([`digit_width`]). One sweep finds which digits can differ (see the body), one more counts
+/// them all at once, and a digit on which every key agrees is skipped.
 fn sort_block(keys: &mut [u64], rows: &mut [usize], scratch: &mut SortScratch) {
     sort_block_impl::<true>(keys, rows, scratch)
 }
@@ -568,37 +568,62 @@ fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scrat
         }
         return;
     }
-    let max = keys.iter().copied().max().unwrap_or(0);
-    let sig = 64 - max.leading_zeros();
-    if sig == 0 {
+    // Which digits can differ. One sweep finds the keys' least and greatest and the bits they
+    // differ in (their AND against their OR), and a key's digits are read one of two ways,
+    // whichever leaves fewer to sort: as the key is, sorting only the digits that hold a differing
+    // bit; or less the least key, sorting only the digits below the spread. The first skips a
+    // digit every key shares wherever it sits; the second is the one for signed values either side
+    // of zero (+1 and -1 differ in every bit, but by 2).
+    let (lo, hi, all, any) =
+        keys.iter().fold((u64::MAX, 0, u64::MAX, 0), |(lo, hi, a, o), &k| (lo.min(k), hi.max(k), a & k, o | k));
+    if lo == hi {
         return;
     }
     let d = digit_width(n);
     let buckets = 1usize << d;
     let mask = (buckets - 1) as u64;
-    let passes = sig.div_ceil(d) as usize;
+    let varying = all ^ any;
+    let mut shifts = [0u32; 64];
+    let mut live = 0;
+    for p in 0..(64 - varying.leading_zeros()).div_ceil(d) {
+        if (varying >> (p * d)) & mask != 0 {
+            shifts[live] = p * d;
+            live += 1;
+        }
+    }
+    let spread = (64 - (hi - lo).leading_zeros()).div_ceil(d) as usize;
+    let base = if spread < live {
+        live = spread;
+        for (p, s) in shifts.iter_mut().take(spread).enumerate() {
+            *s = p as u32 * d;
+        }
+        lo
+    } else {
+        0
+    };
+    let shifts = &shifts[..live];
     let SortScratch { keys_alt, rows_alt, counts, .. } = scratch;
     keys_alt.resize(keys_alt.len().max(n), 0);
     if ROWS {
         rows_alt.resize(rows_alt.len().max(n), 0);
     }
-    counts.resize(counts.len().max(passes * buckets), 0);
-    let counts = &mut counts[..passes * buckets];
+    counts.resize(counts.len().max(live * buckets), 0);
+    let counts = &mut counts[..live * buckets];
     counts.iter_mut().for_each(|c| *c = 0);
     for &k in keys.iter() {
-        for p in 0..passes {
-            counts[p * buckets + ((k >> (p as u32 * d)) & mask) as usize] += 1;
+        let k = k - base;
+        for (p, &shift) in shifts.iter().enumerate() {
+            counts[p * buckets + ((k >> shift) & mask) as usize] += 1;
         }
     }
     let keys_alt = &mut keys_alt[..n];
     let rows_alt = if ROWS { &mut rows_alt[..n] } else { &mut rows_alt[..0] };
     let mut primary = true;
-    for p in 0..passes {
+    for (p, &shift) in shifts.iter().enumerate() {
         let counts = &mut counts[p * buckets..(p + 1) * buckets];
         if counts.iter().any(|&c| c as usize == n) {
-            continue; // every key agrees on this digit
+            continue; // every key agrees on this digit (a digit below the spread can)
         }
-        let shift = p as u32 * d;
         let mut start = 0u32;
         for c in counts.iter_mut() {
             let cnt = *c;
@@ -608,7 +633,7 @@ fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scrat
         if primary {
             for j in 0..n {
                 let k = keys[j];
-                let b = ((k >> shift) & mask) as usize;
+                let b = (((k - base) >> shift) & mask) as usize;
                 let slot = counts[b] as usize;
                 counts[b] += 1;
                 keys_alt[slot] = k;
@@ -619,7 +644,7 @@ fn sort_block_impl<const ROWS: bool>(keys: &mut [u64], rows: &mut [usize], scrat
         } else {
             for j in 0..n {
                 let k = keys_alt[j];
-                let b = ((k >> shift) & mask) as usize;
+                let b = (((k - base) >> shift) & mask) as usize;
                 let slot = counts[b] as usize;
                 counts[b] += 1;
                 keys[slot] = k;

@@ -4,10 +4,10 @@
 //! the "1:1 map" taken literally. There is no `arity()`: a node's shape requirement
 //! lives in its input's type, which the typer needs anyway.
 //!
-//! The leaf is a width-tagged `Prim` column (`u8`/`u16`/`u32`/`u64`); signed and float are
-//! KINDS the numeric layer encodes onto it, so the core stays kind-blind. Booleans use the
-//! idiom `0 = false, nonzero = true` (a mask is just a leaf) — no `Bool` leaf. `Unit` is
-//! deferred until JSON `null` needs it.
+//! A leaf holds integers (`Int`) or floats (`Float`, an `f64`). An integer's storage is the
+//! engine's choice — bytes for text, masks and tags, `i64` otherwise — and never its value.
+//! Booleans use the idiom `0 = false, nonzero = true` (a mask is an integer leaf, stored as
+//! bytes) — no `Bool` leaf.
 //!
 //! Structural nodes (the only arity != 1 nodes):
 //!   * `Input` — arity 0, the stratum root (reads the parameter)
@@ -38,10 +38,10 @@ pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;
 pub use ops::host::{HostKernel, HostOp};
-pub use ops::{dec_i64, enc_i64, ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
+pub use ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred, Red, ShiftOp, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, immediates, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
-pub use value::{show, Bounds, Tags, Value};
+pub use value::{show, Bounds, Scalar, Tags, Value};
 
 /// Arrangement-substrate support: row-level primitives for using corgi columns directly as a
 /// differential-dataflow batch (merge/sort/gather/compare over flat columns), without decoding
@@ -51,15 +51,15 @@ pub mod arrange {
     use crate::value::{Bounds, Value};
     use std::cmp::Ordering;
 
-    /// Borrow a column's `u64` leaf, if it is one — peeling single-field products, which
-    /// order identically to the field they wrap.
+    /// Borrow a column's integers held as `i64`s, if they are — peeling single-field products,
+    /// which order identically to the field they wrap.
     ///
     /// The zero-copy read. Without it every leaf inspection from outside corgi has to
-    /// `gather(..).into_u64(..)` or clone, because a shared column's `Arc` cannot be
+    /// `gather(..).into_i64(..)` or clone, because a shared column's `Arc` cannot be
     /// unwrapped: callers pay a full column copy to look at values they only read.
-    pub fn leaf_slice(v: &Value) -> Option<&[u64]> {
+    pub fn leaf_slice(v: &Value) -> Option<&[i64]> {
         match v {
-            Value::Prim(crate::value::Prim::U64(xs)) => Some(&xs[..]),
+            Value::Prim(crate::value::Prim::I64(xs)) => Some(&xs[..]),
             Value::Prod(fs) if fs.len() == 1 => leaf_slice(&fs[0]),
             _ => None,
         }

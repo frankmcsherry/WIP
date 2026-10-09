@@ -289,7 +289,7 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
         assert_eq!(idx.len(), hb.len(), "TryGather: indices/haystack row count");
         // the leaf fast path indexes the payload directly, so row 0 must BE the payload (a
         // partition); a referenced haystack takes the row-relative path.
-        matches!(idx, Value::List(ib, ivals) if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::U64(_))))
+        matches!(idx, Value::List(ib, ivals) if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::I64(_))))
             && matches!(hvals, Value::Prim(_))
             && matches!(hb, Rows::Part(_))
     };
@@ -301,9 +301,9 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
         let (ib, ivals) = idx.into_list("TryGather indices")?;
         let (hb, hvals) = haystack.into_list("TryGather haystack")?;
         let Value::Prim(p) = &hvals else { unreachable!("checked above") };
-        let idxs = ivals.into_u64("TryGather indices")?;
+        let idxs = ivals.into_words("TryGather indices")?;
         let ib = ib.compact();
-        return Ok(match p.gather_u64_checked_owned(idxs, hb.end(0)) {
+        return Ok(match p.gather_words_checked_owned(idxs, hb.end(0)) {
             Some(g) => fail(&[false], Value::List(ib, Box::new(Value::Prim(g)))),
             None => fail(&[true], Value::List(Bounds::offsets(Vec::new()), Box::new(Value::Prim(p.gather(&[]))))),
         });

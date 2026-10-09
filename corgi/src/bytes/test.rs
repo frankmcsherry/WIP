@@ -18,23 +18,22 @@ fn corpus() -> Vec<Value> {
         Value::Unit(7),
         Value::u8(vec![]),
         Value::u8(vec![1, 2, 3]),                       // an odd payload length, to exercise padding
-        Value::u16(vec![1, 2, 3, 4, 5]),
-        Value::u32(vec![7; 9]),
-        Value::u64(vec![u64::MAX, 0, 12345]),
+        Value::f64(vec![1.5, -0.0, f64::NAN, 4.0, 5.0]),
+        Value::i64(vec![-1, 0, 12345, i64::MIN]),
         Value::Prod(vec![]),
-        Value::Prod(vec![Value::u64(vec![1, 2]), Value::u8(vec![3, 4])]),
-        Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::u32(vec![9, 8, 7, 6]))),
-        Value::List(Bounds::Stride(2, 3), Box::new(Value::u64(vec![1, 2, 3, 4, 5, 6]))),
-        Value::sum(vec![0, 1, 0], vec![Value::u64(vec![10, 20]), Value::u16(vec![30])]),
+        Value::Prod(vec![Value::i64(vec![1, 2]), Value::u8(vec![3, 4])]),
+        Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::f64(vec![9.0, 8.0, 7.0, 6.0]))),
+        Value::List(Bounds::Stride(2, 3), Box::new(Value::i64(vec![1, 2, 3, 4, 5, 6]))),
+        Value::sum(vec![0, 1, 0], vec![Value::i64(vec![10, 20]), Value::u8(vec![30])]),
         // a lane no row uses: an empty column of its shape, which must survive as such
-        Value::sum(vec![0, 0], vec![Value::u64(vec![1, 2]), Value::u16(vec![])]),
+        Value::sum(vec![0, 0], vec![Value::i64(vec![1, 2]), Value::f64(vec![])]),
         // the `Const` assignment: every row one tag, so neither witness column is on the wire
-        Value::sum_tagged(Tags::Const(1, 3), vec![Value::u64(vec![]), Value::u16(vec![4, 5, 6])]),
+        Value::sum_tagged(Tags::Const(1, 3), vec![Value::i64(vec![]), Value::u8(vec![4, 5, 6])]),
         // nesting: the recursion has to keep alignment across every level
         Value::Prod(vec![
             Value::List(Bounds::offsets(vec![2, 3]), Box::new(Value::Prod(vec![
                 Value::u8(vec![1, 2, 3]),
-                Value::u64(vec![4, 5, 6]),
+                Value::i64(vec![4, 5, 6]),
             ]))),
             Value::Unit(2),
         ]),
@@ -85,7 +84,7 @@ fn truncation_is_an_error() {
 /// not per-row, cost the codec exists to deliver.
 #[test]
 fn wide_leaves_cost_their_payload() {
-    let v = Value::u64((0..10_000u64).collect());
+    let v = Value::i64((0..10_000i64).collect());
     assert_eq!(length_in_bytes(&v), 24 + 8 * 10_000);
 }
 
@@ -114,11 +113,10 @@ fn random_value(rng: &mut Rng, rows: usize, depth: usize) -> Value {
     // At depth 0 only leaves, so recursion always terminates.
     let arms = if depth == 0 { 2 } else { 5 };
     match rng.below(arms) {
-        0 => match rng.below(4) {
+        0 => match rng.below(3) {
             0 => Value::u8((0..rows).map(|_| rng.next() as u8).collect()),
-            1 => Value::u16((0..rows).map(|_| rng.next() as u16).collect()),
-            2 => Value::u32((0..rows).map(|_| rng.next() as u32).collect()),
-            _ => Value::u64((0..rows).map(|_| rng.next()).collect()),
+            1 => Value::f64((0..rows).map(|_| f64::from_bits(rng.next())).collect()),
+            _ => Value::i64((0..rows).map(|_| rng.next() as i64).collect()),
         },
         1 => Value::Unit(rows),
         2 => {
@@ -345,7 +343,7 @@ fn structurally_impossible_columns_are_refused() {
     let bad_tag = patched(
         &Value::sum_tagged(
             Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
-            vec![Value::u64(vec![7])],
+            vec![Value::i64(vec![7])],
         ),
         4,
         5,
@@ -356,7 +354,7 @@ fn structurally_impossible_columns_are_refused() {
     let bad_offset = patched(
         &Value::sum_tagged(
             Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
-            vec![Value::u64(vec![7])],
+            vec![Value::i64(vec![7])],
         ),
         6, // [Sum][form][bits][len][tags][n_offsets][offsets[0]]
         9,
@@ -364,17 +362,17 @@ fn structurally_impossible_columns_are_refused() {
     assert!(read_from(&bad_offset).is_err(), "an offset outside its lane must be refused");
 
     // A list whose partition reaches past its values. Words: [List][form][n][ends[0]]…
-    let over_reach = patched(&Value::List(Bounds::offsets(vec![2]), Box::new(Value::u64(vec![1, 2]))), 3, 10);
+    let over_reach = patched(&Value::List(Bounds::offsets(vec![2]), Box::new(Value::i64(vec![1, 2]))), 3, 10);
     assert!(read_from(&over_reach).is_err(), "bounds reaching past the values must be refused");
 
     // The `Stride` form of the same thing: three rows of two over a two-element leaf.
-    let over_stride = patched(&Value::List(Bounds::Stride(2, 1), Box::new(Value::u64(vec![1, 2]))), 3, 3);
+    let over_stride = patched(&Value::List(Bounds::Stride(2, 1), Box::new(Value::i64(vec![1, 2]))), 3, 3);
     assert!(read_from(&over_stride).is_err(), "a stride reaching past the values must be refused");
 
     // A product whose fields disagree on length — `Value::len` reads field 0, so the column
     // would silently lie about how many rows it holds. Words:
     // [Prod][2] [Prim][64][2][payload×2] [Prim][64][2][payload×2], so field 1's count is word 9.
-    let ragged = patched(&Value::Prod(vec![Value::u64(vec![1, 2]), Value::u64(vec![3, 4])]), 9, 1);
+    let ragged = patched(&Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]), 9, 1);
     assert!(read_from(&ragged).is_err(), "a product with ragged fields must be refused");
 
     // A sum discriminant at a width corgi cannot construct (`sum_opt` stores u8 and asserts
@@ -382,12 +380,12 @@ fn structurally_impossible_columns_are_refused() {
     let wide_tags = patched(
         &Value::sum_tagged(
             Tags::Column(Prim::U8(std::sync::Arc::new(vec![0])), std::sync::Arc::new(vec![0])),
-            vec![Value::u64(vec![7])],
+            vec![Value::i64(vec![7])],
         ),
         2,
         64,
     );
-    assert!(read_from(&wide_tags).is_err(), "a non-u8 sum discriminant must be refused");
+    assert!(read_from(&wide_tags).is_err(), "a non-int sum discriminant must be refused");
 }
 
 /// `declared_rows` has to see what `Value::len` cannot, or the advice attached to it is

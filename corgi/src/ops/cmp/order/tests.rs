@@ -2,8 +2,9 @@ use super::*;
 use crate::engine::gather;
 use crate::ops::cmp::sort::sort_blocks;
 
+/// integers from their 64-bit words (so the full range, negatives included, is easy to write).
 fn u(xs: &[u64]) -> Value {
-    Value::u64(xs.to_vec())
+    Value::i64(xs.iter().map(|&x| x as i64).collect())
 }
 
 /// single-block sort of `v`'s rows → the permutation.
@@ -182,13 +183,13 @@ fn leaf() {
 }
 
 #[test]
-fn narrow_widths() {
-    // the new u8/u16/u32 leaves sort/gather/compare through the same width-generic kernel; each must agree
-    // with the compare2 reference, alone and inside a product.
+fn every_storage() {
+    // byte, i64 (negatives included) and float leaves sort/gather/compare through the same
+    // storage-generic kernel; each must agree with the compare2 reference, alone and inside a product.
     agree(&Value::u8(vec![5, 3, 8, 1, 3, 9, 2]));
-    agree(&Value::u16(vec![500, 30, 800, 1, 30, 30]));
-    agree(&Value::u32(vec![70000, 3, 70000, 3, 2]));
-    agree(&Value::Prod(vec![Value::u8(vec![2, 1, 2, 1]), Value::u32(vec![10, 20, 5, 30])]));
+    agree(&Value::i64(vec![500, -30, 800, i64::MIN, -30, 30, i64::MAX]));
+    agree(&Value::f64(vec![0.5, -0.0, 0.0, f64::NAN, -1.5, 0.5]));
+    agree(&Value::Prod(vec![Value::u8(vec![2, 1, 2, 1]), Value::i64(vec![10, -20, 5, 30])]));
 }
 
 #[test]
