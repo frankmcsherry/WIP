@@ -3,7 +3,7 @@
 //! which `Rel` and `find` reduce to), `mod labels` (the block-label vocabulary the sort speaks and
 //! `dedup`/`group` read), and `group_bounds`; the merge kernel is `super::survey`.
 
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Prim, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
@@ -207,6 +207,23 @@ mod compare {
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
+                // leaf elements of one width: each pair is one slice compare (a memcmp on bytes),
+                // with no element pairs built.
+                macro_rules! slices {
+                    ($($V:ident),*) => {
+                        match (va, vb) {
+                            $( (Value::Prim(Prim::$V(x)), Value::Prim(Prim::$V(y))) => {
+                                return (0..m).map(|k| {
+                                    let ((s_a, e_a), (s_b, e_b)) = (ba.span(pairs.left(k)), bb.span(pairs.right(k)));
+                                    let (x, y) = (&x[s_a..e_a], &y[s_b..e_b]);
+                                    if eq { (x != y) as i8 } else { x.cmp(y) as i8 }
+                                }).collect();
+                            } )*
+                            _ => {}
+                        }
+                    };
+                }
+                slices!(U8, U16, U32, U64);
                 let mut ord = vec![0i8; m];
                 let (mut sia, mut sib) = (Vec::new(), Vec::new());
                 let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)
