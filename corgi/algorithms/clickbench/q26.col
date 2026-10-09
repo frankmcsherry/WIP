@@ -1,5 +1,5 @@
 # Q26: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10
-# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10
 # columns: EventTime SearchPhrase
 # output: [s]
 let (time, phrase) = input in

@@ -32,19 +32,14 @@ fn compare2(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
             let (si, ei) = crate::engine::row_span(ab, i);
             let (sj, ej) = crate::engine::row_span(bb, j);
             let (li, lj) = (ei - si, ej - sj);
-            // length-first: shorter list sorts first; equal lengths compare element-wise.
-            match li.cmp(&lj) {
-                Ordering::Equal => {
-                    for k in 0..li {
-                        match compare2(av, si + k, bv, sj + k) {
-                            Ordering::Equal => continue,
-                            o => return o,
-                        }
-                    }
-                    Ordering::Equal
+            // lexicographic: the first differing element decides; a proper prefix sorts first.
+            for k in 0..li.min(lj) {
+                match compare2(av, si + k, bv, sj + k) {
+                    Ordering::Equal => continue,
+                    o => return o,
                 }
-                o => o,
             }
+            li.cmp(&lj)
         }
         (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
             let (tav, tbv): (Vec<usize>, Vec<usize>) =

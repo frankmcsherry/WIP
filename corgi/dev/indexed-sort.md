@@ -20,7 +20,8 @@ in block `labels[k]`; checked in debug builds), and every `index[k]` a row of `v
 - With `emit`, the returned column is `gather(v, &new_index)`, produced by the sort.
 
 Structural order: leaf by stored unsigned bytes; `Prod` lexicographic by field; `Sum` by tag
-then payload; `List` length first, then element by element; `Unit` all equal.
+then payload; `List` lexicographically, element by element, a proper prefix first; `Unit` all
+equal.
 
 `labels` may arrive empty, meaning every position is one block, which is the first rank of any
 sort and the whole of a primitive column's; the refined labels always come back. `emit` is
@@ -42,9 +43,10 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
 - **Sum.** The tag as a virtual leaf, then each lane at the positions that carry its tag and are
   still tied, through the carried within-lane offsets. A lane whose rows were all sorted is
   emitted by the sort; otherwise it is read once at its final offsets.
-- **List.** The length as a virtual leaf, then one refining pass per element position over the
-  rows still tied and still that long, then one gather of the elements in final order, the only
-  gather in the file. Byte records up to 8 wide pack into one `u64` key.
+- **List.** One refining pass per element position over the rows still tied. In each tied block
+  the rows that end at that position move to the front as one class (each is a proper prefix of
+  the rest), and the others refine by their element. Then one gather of the elements in final
+  order, the only gather in the file. Byte records up to 8 wide pack into one `u64` key.
 - **Packed leaf runs.** Consecutive leaf fields of a `Prod` whose declared widths fit one `u64`
   sort as one key (`sort_packed`), most significant field first: one set of passes and one
   refinement for the run, and the digit skip below drops the zero digits a narrow value leaves.

@@ -316,5 +316,3 @@ item in NOTES.md, an execution strategy rather than a graph rewrite.
     `cap_list`.
   - Without functions, trigram_similarity's per-string pipeline is written twice.
 - **No loop until done**, only a fold over a fixed count.
-- **Lists order shorter-first, then by content**, unlike Rust's slices. word_topk's ties follow
-  corgi's order.

@@ -1,7 +1,6 @@
 # Q25: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10
-# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10
 # columns: SearchPhrase
 # output: [s]
-# corgi orders strings shorter first, then by bytes; the SQL sorts the same way.
 let sorted = input map (s -> ((s len, 0u64) gt, s)) filter sort_limit 10 in
 sorted map (s -> s)

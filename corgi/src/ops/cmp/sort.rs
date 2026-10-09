@@ -2,7 +2,7 @@
 //!
 //! [`sort_indexed`] orders the rows `index[..]` of a column within the blocks `labels` describes,
 //! by structural order: a leaf by its stored unsigned bytes, `Prod` lexicographically by field,
-//! `Sum` by tag then payload, `List` length first and then element by element, `Unit` all equal.
+//! `Sum` by tag then payload, `List` lexicographically (a proper prefix first), `Unit` all equal.
 //! Nothing is gathered before a level sorts. A leaf pulls its keys through the index once and
 //! radixes them with the index's rows alongside, every pass sequential, and the sorted keys are
 //! the output column. The index is the only positional state: it is the rows in their current
@@ -332,8 +332,8 @@ fn sort_sum(
     emit.values().then(|| Value::sum_tagged(Tags::from_tags(tags_out, lanes.len()), lanes_out))
 }
 
-/// A list: the length as a virtual leaf, then one refining pass per element position over the
-/// rows still tied and still that long, then one gather of the elements in final order, the
+/// A list, lexicographically: one refining pass per element position over the rows still tied,
+/// a row that ends there first in its block, then one gather of the elements in final order, the
 /// only gather this sort makes. Equal-width byte records up to 8 wide pack into one `u64` key
 /// and unpack from the sorted keys.
 fn sort_list(
@@ -368,40 +368,64 @@ fn sort_list(
         let (s, e) = bounds.span(r);
         e - s
     };
-    if bounds.strided().is_none() {
-        let mut keys = std::mem::take(&mut scratch.keys);
-        keys.clear();
-        keys.extend(index.iter().map(|&r| len_of(r) as u64));
-        sort_keys(&mut keys, labels, index, scratch);
-        scratch.keys = keys;
-    }
     if labels.is_empty() {
         labels.resize(m, 0);
     }
     run_starts(labels);
-    // a block holds rows of one length, so it is live or not as a whole.
-    let mut live: Vec<usize> = (0..m).filter(|&q| len_of(index[q]) > 0 && in_tie(labels, q)).collect();
+    // Lexicographic: position by position over the rows still tied. In each tied block the rows
+    // that end at `pos` go first, as one class (each is a proper prefix of the rest), and the
+    // rows that go on sort by their element at `pos`.
+    let mut live: Vec<usize> = (0..m).filter(|&q| in_tie(labels, q)).collect();
     let mut pos = 0;
-    let (mut elem, mut labels_j) = (Vec::new(), Vec::new());
+    let (mut elem, mut labels_j, mut going, mut moved) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut slot = std::mem::take(&mut scratch.slot);
     while !live.is_empty() {
-        // Each live row's element at `pos`; distinct rows have distinct elements, and `slot`
+        // `live` is whole blocks of consecutive positions; split each at the rows ending here.
+        going.clear();
+        let mut b = 0;
+        while b < live.len() {
+            let q0 = live[b];
+            let mut e = b + 1;
+            while e < live.len() && labels[live[e]] == labels[q0] {
+                e += 1;
+            }
+            let q1 = q0 + (e - b);
+            let ends = index[q0..q1].iter().filter(|&&r| len_of(r) == pos).count();
+            if ends > 0 && ends < q1 - q0 {
+                moved.clear();
+                moved.extend(index[q0..q1].iter().copied().filter(|&r| len_of(r) == pos));
+                moved.extend(index[q0..q1].iter().copied().filter(|&r| len_of(r) != pos));
+                index[q0..q1].copy_from_slice(&moved);
+                for label in &mut labels[q0 + ends..q1] {
+                    *label = (q0 + ends) as u64;
+                }
+            }
+            if ends < q1 - q0 {
+                going.extend(q0 + ends..q1);
+            }
+            b = e;
+        }
+        if going.is_empty() {
+            break;
+        }
+        // Each going row's element at `pos`; distinct rows have distinct elements, and `slot`
         // takes each element back to its row once the elements are sorted.
         elem.clear();
-        elem.extend(live.iter().map(|&q| bounds.span(index[q]).0 + pos));
+        elem.extend(going.iter().map(|&q| bounds.span(index[q]).0 + pos));
         reach(&mut slot, vals.len());
-        for (&e, &q) in elem.iter().zip(&live) {
+        for (&e, &q) in elem.iter().zip(&going) {
             slot[e] = index[q];
         }
         labels_j.clear();
-        labels_j.extend(live.iter().map(|&q| labels[q]));
+        labels_j.extend(going.iter().map(|&q| labels[q]));
         sort_indexed(vals, &mut labels_j, &mut elem, Emit::Index, scratch);
-        for (&e, &q) in elem.iter().zip(&live) {
+        for (&e, &q) in elem.iter().zip(&going) {
             index[q] = slot[e];
         }
-        write_starts(labels, &live, &labels_j);
+        write_starts(labels, &going, &labels_j);
         pos += 1;
-        live.retain(|&q| len_of(index[q]) > pos && in_tie(labels, q));
+        live.clear();
+        live.extend(going.iter().copied().filter(|&q| in_tie(labels, q)));
     }
     scratch.slot = slot;
     refine(labels, |_| false);

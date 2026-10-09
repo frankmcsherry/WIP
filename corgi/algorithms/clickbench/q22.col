@@ -1,13 +1,13 @@
 # Q22: SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
-# sql: SELECT SearchPhrase, arg_min(URL, {'l': octet_length(URL), 'u': URL}), arg_min(Title, {'l': octet_length(Title), 't': Title}),
+# sql: SELECT SearchPhrase, min(URL), min(Title),
 # sql:   COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits
 # sql:   WHERE decode(Title) LIKE '%Google%' AND decode(URL) NOT LIKE '%.google.%' AND SearchPhrase <> ''
-# sql:   GROUP BY SearchPhrase ORDER BY c DESC, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql:   GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase URL Title UserID
 # output: [s,s,s,u,u]
 # corgi has no substring search. Title contains "Google" when, split at "G", a piece after the first
 # starts with "oogle"; URL contains ".google." when, split at ".", a piece other than the first and
-# last is exactly "google". MIN is the first in corgi's string order (shorter first).
+# last is exactly "google". MIN is the first in corgi's string order.
 let (phrase, url, title, user) = input in
 let google = title map (u ->
     let pieces = u split "G" in

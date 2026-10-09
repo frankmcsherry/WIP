@@ -123,15 +123,17 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
             }
         }
         (Value::List(ba, va), Value::List(bb, vb)) => {
-            // the length first, then element by element over the classes still that long.
+            // lexicographically: element by element over the classes still equal, the rows that
+            // end at a position first in their class (each a proper prefix of the rest).
             let len = |bounds: &Bounds, r: usize| {
                 let (s, e) = bounds.span(r);
                 e - s
             };
-            merge(|j| len(ba, ia.row(j)), |j| len(bb, ib.row(j)), open, tree);
             let (mut cur, mut ra, mut rb) = tree.refined(open, ia, ib);
             let mut pos = 0;
             while !cur.is_empty() {
+                merge(|j| len(ba, ra[j]) > pos, |j| len(bb, rb[j]) > pos, &cur, tree);
+                (cur, ra, rb) = tree.refined(&cur, &ra[..], &rb[..]);
                 // the classes whose rows are longer than `pos` refine at it; the rest are equal
                 // throughout and stay as they are.
                 let (mut live, mut la, mut lb, mut live_ra, mut live_rb) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());

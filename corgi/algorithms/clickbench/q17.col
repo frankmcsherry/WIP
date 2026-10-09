@@ -1,6 +1,6 @@
 # Q17: SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10
 # sql: SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase
-# sql:   ORDER BY UserID, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql:   ORDER BY UserID, SearchPhrase LIMIT 10
 # columns: UserID SearchPhrase
 # output: [i,s,u]
 # Without ORDER BY the SQL's ten rows are any ten; corgi's groups come out in key order, so the

@@ -1,7 +1,7 @@
 # Q24: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10
 # q24 carrying the phrases by reference: the filter and the sort move row numbers, and only the ten
 # phrases kept are copied.
-# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10
 # columns: EventTime SearchPhrase
 # output: [s]
 let (time, phrase) = input in

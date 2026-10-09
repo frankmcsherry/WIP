@@ -43,7 +43,7 @@ pub fn group_bounds(keys: &Value) -> Vec<usize> {
 
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
-    //! leaf value, then Prod field-by-field, List LENGTH-FIRST (shorter first; equal lengths element-wise),
+    //! leaf value, then Prod field-by-field, List LEXICOGRAPHIC (first differing element; a proper prefix first),
     //! Sum tag-then-payload. The discrimination sort matches this order, so `find` stays consistent with `sort`.
     //!
     //! `compare_idx` is the kernel: it compares an explicit list of `(i, j)` index pairs in one descent per
@@ -193,9 +193,10 @@ mod compare {
                 ord
             }
 
-            // list = length-first: unequal-length pairs decided by length. Equal-length pairs expand
-            // to their element index pairs, recurse ONCE (no per-position loop — `sort` needs that
-            // refinement, `cmp` doesn't), then read each pair's first difference off its segment.
+            // list = lexicographic: each pair expands to its element index pairs up to the shorter
+            // length, recurse ONCE (no per-position loop — `sort` needs that refinement, `cmp`
+            // doesn't), then read each pair's first difference off its segment; a pair with none
+            // is decided by length, a proper prefix first.
             // A referenced list compares as the rows it names, read through its arena.
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
@@ -207,13 +208,11 @@ mod compare {
                     let (i, j) = (pairs.left(k), pairs.right(k));
                     let ((s_a, e_a), (s_b, e_b)) = (ba.span(i), bb.span(j));
                     let (la, lb) = (e_a - s_a, e_b - s_b);
-                    match la.cmp(&lb) {
-                        Ordering::Equal if la > 0 => {
-                            seg.push((k, sia.len(), la));
-                            for p in 0..la { sia.push(s_a + p); sib.push(s_b + p); }
-                        }
-                        Ordering::Equal => {}    // equal length 0 — stays Equal (0)
-                        ow => *o = ow as i8,     // length decides
+                    *o = la.cmp(&lb) as i8;
+                    let common = la.min(lb);
+                    if common > 0 {
+                        seg.push((k, sia.len(), common));
+                        for p in 0..common { sia.push(s_a + p); sib.push(s_b + p); }
                     }
                 }
                 let cmp = compare_pairs(va, vb, Pairs::Explicit(&sia, &sib));

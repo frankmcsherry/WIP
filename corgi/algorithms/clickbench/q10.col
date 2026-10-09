@@ -1,6 +1,6 @@
 # Q10: SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10
 # sql: SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel
-# sql:   ORDER BY u DESC, octet_length(MobilePhoneModel), MobilePhoneModel LIMIT 10
+# sql:   ORDER BY u DESC, MobilePhoneModel LIMIT 10
 # columns: MobilePhoneModel UserID
 # output: [s,u]
 let (key, user) = input in

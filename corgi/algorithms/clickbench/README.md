@@ -21,8 +21,6 @@ checks corgi's answers against DuckDB's, then times both.
 - **Cut down:** q23 returns three columns for `SELECT *`.
 - **Changes to the SQL itself:**
   - every ORDER BY breaks ties;
-  - string order is shorter-first, as corgi orders lists;
-  - a string MIN is corgi's first in that order;
   - HAVING thresholds are divided by 100 (this is 1M rows of the full 100M);
   - EventDate is compared as day numbers.
 
