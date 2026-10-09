@@ -19,8 +19,8 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{Bounds,
-    arrange, eval_graph, lower_effects, parse_ml, ArithOp, BinOp, Builder, Graph, Kind, NumOp,
-    Op, Program, Value,
+    arrange, eval_graph, lower_effects, parse_ml, ArithOp, BinOp, Builder, Graph, NumOp,
+    Op, Program, Scalar, Value,
 };
 use std::env;
 use std::hint::black_box;
@@ -86,7 +86,7 @@ fn ns_per(d: Duration, n: usize) -> f64 {
 }
 
 /// Eight-byte-equivalent throughput per reported work item. This is exact input GB/s for the common
-/// one-U64-per-item rows; for byte text and multi-column arrangement kernels it is a normalization,
+/// one-i64-per-item rows; for byte text and multi-column arrangement kernels it is a normalization,
 /// not an estimate of physical memory traffic.
 fn u64eq_gbs(d: Duration, n: usize) -> f64 {
     (n as f64 * 8.0) / d.as_secs_f64() / 1e9
@@ -142,32 +142,32 @@ fn row_safety(
 
 /// deterministic non-sorted column via an LCG step (no rng dep). Masked to 32 bits so the byte-radix
 /// sort runs four passes, not eight, and so group/dedup keys have a realistic distinct count.
-fn scrambled(n: usize) -> Vec<u64> {
+fn scrambled(n: usize) -> Vec<i64> {
     (0..n as u64)
         .map(|i| {
-            i.wrapping_mul(6364136223846793005)
+            (i.wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407)
-                >> 32
+                >> 32) as i64
         })
         .collect()
 }
 
 fn leaf(n: usize) -> Value {
-    Value::u64(scrambled(n))
+    Value::i64(scrambled(n))
 }
 
-/// one big `List<U64>` of a single `n`-wide row — per-row ops (reduce/sort/filter/group/scan) fold the
+/// one big `List<Int>` of a single `n`-wide row — per-row ops (reduce/sort/filter/group/scan) fold the
 /// whole column in one bulk pass.
 fn one_list(n: usize) -> Value {
-    Value::List(vec![n].into(), Box::new(Value::u64(scrambled(n))))
+    Value::List(vec![n].into(), Box::new(Value::i64(scrambled(n))))
 }
 
-/// a SORTED big `List<U64>` (one `n`-wide row of `0..n`) — the equi-join feeds find/slices a haystack
+/// a SORTED big `List<Int>` (one `n`-wide row of `0..n`) — the equi-join feeds find/slices a haystack
 /// already in key order, so the measurement isolates the join primitives from a sort cost.
 fn sorted_list(n: usize) -> Value {
     Value::List(
         vec![n].into(),
-        Box::new(Value::u64((0..n as u64).collect())),
+        Box::new(Value::i64((0..n as i64).collect())),
     )
 }
 
@@ -178,7 +178,7 @@ fn compile(src: &str) -> Graph<NumOp> {
 
 /// a fixed 5-letter lowercase word, base-26 of `v` — the word-count vocabulary generator (mod a vocab
 /// size at the call site, so a small distinct count makes dedup/find do real grouping work).
-fn word5(mut v: u64) -> [u8; 5] {
+fn word5(mut v: i64) -> [u8; 5] {
     let mut w = [0u8; 5];
     for c in w.iter_mut() {
         *c = b'a' + (v % 26) as u8;
@@ -188,9 +188,9 @@ fn word5(mut v: u64) -> [u8; 5] {
 }
 
 /// a space-separated text of `m` words drawn from `vocab` distinct words, returned BOTH as a one-row
-/// `List<U8>` (corgi's input) and as the raw bytes (so the Rust ceiling splits and sorts the same
-/// ragged words — no fixed-width-array advantage over corgi's structural string sort).
-fn words_text(m: usize, vocab: u64) -> (Value, Vec<u8>) {
+/// `List<Int>` of bytes (corgi's input) and as the raw bytes (so the Rust ceiling splits and sorts the
+/// same ragged words — no fixed-width-array advantage over corgi's structural string sort).
+fn words_text(m: usize, vocab: i64) -> (Value, Vec<u8>) {
     let src = scrambled(m);
     let mut bytes = Vec::with_capacity(m * 6);
     for (i, &v) in src.iter().enumerate() {
@@ -205,9 +205,9 @@ fn words_text(m: usize, vocab: u64) -> (Value, Vec<u8>) {
     )
 }
 
-/// a comma-separated CSV of `m` small integers, returned BOTH as a one-row `List<U8>` and as the raw
-/// bytes (so the Rust ceiling does the SAME split + atoi work corgi does, not a pre-parsed sum). All
-/// fields parse cleanly (the Err lane stays empty).
+/// a comma-separated CSV of `m` small integers, returned BOTH as a one-row `List<Int>` of bytes and as
+/// the raw bytes (so the Rust ceiling does the SAME split + atoi work corgi does, not a pre-parsed
+/// sum). All fields parse cleanly (the Err lane stays empty).
 fn csv_text(m: usize) -> (Value, Vec<u8>) {
     let nums = scrambled(m);
     let mut bytes = Vec::with_capacity(m * 6);
@@ -229,7 +229,7 @@ fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
     let mut cur = b.input();
     for _ in 0..k {
-        cur = b.add(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7), vec![cur]);
+        cur = b.add(ArithOp::BinImm(BinOp::Add, Scalar::Int(7)), vec![cur]);
     }
     b.finish(cur)
 }
@@ -242,11 +242,11 @@ fn family_a(n: usize, reps: u32) {
     let src = scrambled(n);
 
     // A1 add_const — the 1-pass ceiling control. Expect ~1x: a single SIMD pass is already at bandwidth.
-    let g = compile("(input, 7u64) add");
+    let g = compile("(input, 7) add");
     let c = corgi_t(&g, &lf, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().map(|&x| x.wrapping_add(7)).collect::<Vec<u64>>());
+        black_box(s.iter().map(|&x| x.wrapping_add(7)).collect::<Vec<i64>>());
     });
     row("A1 add_const", n, c, r, "1 pass — at-ceiling control");
 
@@ -255,7 +255,7 @@ fn family_a(n: usize, reps: u32) {
     let ck = corgi_t(&g, &lf, reps);
     let rk = rust_t(reps, || {
         let s = black_box(&src);
-        let mut v: Vec<u64> = s.to_vec();
+        let mut v: Vec<i64> = s.to_vec();
         for _ in 0..8 {
             for x in v.iter_mut() {
                 *x = x.wrapping_add(7);
@@ -265,16 +265,16 @@ fn family_a(n: usize, reps: u32) {
     });
     let r1 = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().map(|&x| x.wrapping_add(56)).collect::<Vec<u64>>());
+        black_box(s.iter().map(|&x| x.wrapping_add(56)).collect::<Vec<i64>>());
     });
     row_chain("A2 add_chain8", n, ck, rk, r1);
 
     // A3 mixed_chain — 4 heterogeneous kernels: (((x+5)*3)-2)>>1.
-    let g = compile("(((input, 5u64) add, 3u64) mul, 2u64) sub shr 1");
+    let g = compile("(((input, 5) add, 3) mul, 2) sub shr_b64 1");
     let ck = corgi_t(&g, &lf, reps);
     let rk = rust_t(reps, || {
         let s = black_box(&src);
-        let mut v: Vec<u64> = s.iter().map(|&x| x.wrapping_add(5)).collect();
+        let mut v: Vec<i64> = s.iter().map(|&x| x.wrapping_add(5)).collect();
         for x in v.iter_mut() {
             *x = x.wrapping_mul(3);
         }
@@ -291,26 +291,26 @@ fn family_a(n: usize, reps: u32) {
         black_box(
             s.iter()
                 .map(|&x| (x.wrapping_add(5).wrapping_mul(3).wrapping_sub(2)) >> 1)
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     row_chain("A3 mixed_chain", n, ck, rk, r1);
 
     // A4 map_then_reduce — sum of 2x. Fusion folds the map into the reduce (no intermediate column).
-    let g = compile("let xs = input in xs map (e -> (e, 2u64) mul) fold_add");
+    let g = compile("let xs = input in xs map (e -> (e, 2) mul) fold_add");
     let li = one_list(n);
     let ck = corgi_t(&g, &li, reps);
     let r1 = rust_t(reps, || {
         let s = black_box(&src);
         black_box(
             s.iter()
-                .fold(0u64, |a, &x| a.wrapping_add(x.wrapping_mul(2))),
+                .fold(0i64, |a, &x| a.wrapping_add(x.wrapping_mul(2))),
         );
     });
     let rk = rust_t(reps, || {
         let s = black_box(&src);
-        let m: Vec<u64> = s.iter().map(|&x| x.wrapping_mul(2)).collect();
-        black_box(m.iter().fold(0u64, |a, &x| a.wrapping_add(x)));
+        let m: Vec<i64> = s.iter().map(|&x| x.wrapping_mul(2)).collect();
+        black_box(m.iter().fold(0i64, |a, &x| a.wrapping_add(x)));
     });
     row_chain("A4 map_reduce", n, ck, rk, r1);
 }
@@ -319,10 +319,10 @@ fn family_a(n: usize, reps: u32) {
 fn family_b(n: usize, reps: u32) {
     let li = one_list(n);
     let src = scrambled(n);
-    let t = 0x8000_0000u64; // ~half pass the threshold (32-bit-masked inputs)
+    let t = 0x8000_0000i64; // ~half pass the threshold (32-bit-masked inputs)
 
     // B1 filter — keep values > T. corgi: mask pass + `filter_mask` scalar gather. rust: predicated push.
-    let g = compile("input map (e -> ((e, 2147483648u64) gt, e)) filter");
+    let g = compile("input map (e -> ((e, 2147483648) gt, e)) filter");
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -344,7 +344,7 @@ fn family_b(n: usize, reps: u32) {
 
     // B2 select/blend — min(x+7, 3x) via cmp + branchless select. corgi: add,mul,cmp,select passes.
     let g = compile(
-        "input map (x -> let a = (x, 7u64) add in let b = (x, 3u64) mul in ((a, b) lt, a, b) select)",
+        "input map (x -> let a = (x, 7) add in let b = (x, 3) mul in ((a, b) lt, a, b) select)",
     );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -360,7 +360,7 @@ fn family_b(n: usize, reps: u32) {
                         b
                     }
                 })
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     row(
@@ -382,7 +382,7 @@ fn family_c(n: usize, reps: u32) {
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().fold(0u64, |a, &x| a.wrapping_add(x)));
+        black_box(s.iter().fold(0i64, |a, &x| a.wrapping_add(x)));
     });
     row("C1 fold_add", n, c, r, "1 SIMD pass — at-ceiling control");
 
@@ -391,7 +391,7 @@ fn family_c(n: usize, reps: u32) {
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        black_box(s.iter().copied().fold(0u64, u64::max));
+        black_box(s.iter().copied().fold(i64::MIN, i64::max));
     });
     row("C2 fold_max", n, c, r, "1 SIMD pass");
 
@@ -402,7 +402,7 @@ fn family_c(n: usize, reps: u32) {
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        let mut acc = [0u64; 256];
+        let mut acc = [0i64; 256];
         for &x in s {
             acc[(x & 255) as usize] = acc[(x & 255) as usize].wrapping_add(x);
         }
@@ -417,18 +417,18 @@ fn family_c(n: usize, reps: u32) {
     );
 
     // C4 scan — inclusive prefix sum. Sequential within the row; rust is a tight cumsum loop.
-    let g = compile("let xs = input in (0u64, xs) scan ((a, x) -> (a, x) add)");
+    let g = compile("let xs = input in (0, xs) scan ((a, x) -> (a, x) add)");
     let c = corgi_t(&g, &li, reps.min(3)); // ~hundreds of ns/row; few reps suffice and save minutes
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        let mut acc = 0u64;
+        let mut acc = 0i64;
         black_box(
             s.iter()
                 .map(|&x| {
                     acc = acc.wrapping_add(x);
                     acc
                 })
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     row(
@@ -445,14 +445,14 @@ fn family_c(n: usize, reps: u32) {
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        let mut acc = 0u64;
+        let mut acc = 0i64;
         black_box(
             s.iter()
                 .map(|&x| {
                     acc = acc.wrapping_add(x);
                     acc
                 })
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     row(
@@ -464,12 +464,12 @@ fn family_c(n: usize, reps: u32) {
     );
 
     // C5 fold (sum, count) — heterogeneous accumulator, non-monoid shape.
-    let g = compile("let seed = (0u64, 0u64) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, (acc.1, 1u64) add))");
+    let g = compile("let seed = (0, 0) in (seed, input) fold ((acc, x) -> ((acc.0, x) add, (acc.1, 1) add))");
     let c = corgi_t(&g, &li, reps.min(3));
     let r = rust_t(reps, || {
         let s = black_box(&src);
-        let mut sum = 0u64;
-        let mut cnt = 0u64;
+        let mut sum = 0i64;
+        let mut cnt = 0i64;
         for &x in s {
             sum = sum.wrapping_add(x);
             cnt += 1;
@@ -498,7 +498,7 @@ fn family_d(n: usize, reps: u32) {
         v.sort_unstable();
         black_box(v);
     });
-    row("D1 sort_u64", n, c, r, "byte-radix vs pdqsort");
+    row("D1 sort_int", n, c, r, "byte-radix vs pdqsort");
 
     // D2 dedup — sort then unique.
     let g = compile("input dedup");
@@ -515,25 +515,25 @@ fn family_d(n: usize, reps: u32) {
 /// E — relational / index generators. `gather` is fresh-allocating by necessity; the open question is
 /// the SCALAR index generators (`resolve_indices`/`filter_mask`/`expand_ranges`) layered above it.
 fn family_e(n: usize, reps: u32) {
-    let mask = n as u64 - 1; // n is a power of two, so `& mask` is an in-bounds row-relative index
+    let mask = n as i64 - 1; // n is a power of two, so `& mask` is an in-bounds row-relative index
     let src = scrambled(n);
 
     // E1 single-key equi-join (find + slices) over a SORTED haystack — the join primitives, no sort cost.
     let g = compile(
-        "let bn = input in let build = bn map (x -> (x shr 8, x)) in \
-         let probes = bn map (x -> x shr 8) dedup in let t = build transpose in \
+        "let bn = input in let build = bn map (x -> (x shr_b64 8, x)) in \
+         let probes = bn map (x -> x shr_b64 8) dedup in let t = build transpose in \
          let r = (probes, t.0) find in (r, t.1) slices",
     );
     let sl = sorted_list(n);
     let c = corgi_t(&g, &sl, reps);
     let r = rust_t(reps, || {
-        let keys: Vec<u64> = (0..n as u64).map(|x| x >> 8).collect(); // sorted by construction
-        let vals: Vec<u64> = (0..n as u64).collect();
+        let keys: Vec<i64> = (0..n as i64).map(|x| x >> 8).collect(); // sorted by construction
+        let vals: Vec<i64> = (0..n as i64).collect();
         let mut probes = keys.clone();
         probes.dedup();
         // materialize the matched value ranges into a flat (values, bounds) list — corgi's `slices`
         // produces exactly this, so the ceiling must pay the same output copy, not reference ranges.
-        let mut flat: Vec<u64> = Vec::with_capacity(n);
+        let mut flat: Vec<i64> = Vec::with_capacity(n);
         let mut bounds: Vec<usize> = Vec::with_capacity(probes.len());
         let mut j = 0usize;
         for &p in &probes {
@@ -563,7 +563,7 @@ fn family_e(n: usize, reps: u32) {
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let idx: Vec<usize> = s.iter().map(|&e| (e & mask) as usize).collect();
-        black_box(idx.iter().map(|&i| s[i]).collect::<Vec<u64>>());
+        black_box(idx.iter().map(|&i| s[i]).collect::<Vec<i64>>());
     });
     row(
         "E2 gather",
@@ -603,7 +603,7 @@ fn family_f(n: usize, reps: u32) {
 
     // F1 branch+match — parity dispatch (50/50, unpredictable). corgi: mask+partition+per-lane+recombine.
     let g = compile(
-        "input map (x -> (x, x and 1) branch 2 match (0 (e -> (e, 3u64) add), 1 (o -> (o, 7u64) add)))",
+        "input map (x -> (x, x and 1) branch 2 match (0 (e -> (e, 3) add), 1 (o -> (o, 7) add)))",
     );
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
@@ -617,7 +617,7 @@ fn family_f(n: usize, reps: u32) {
                         x.wrapping_add(7)
                     }
                 })
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     row(
@@ -667,14 +667,14 @@ fn family_g(m: usize, reps: u32) {
         let bytes = black_box(&txt_bytes);
         let mut v: Vec<&[u8]> = bytes.split(|&b| b == b' ').collect();
         v.sort_unstable();
-        let mut counts: Vec<u64> = Vec::new();
+        let mut counts: Vec<i64> = Vec::new();
         let (mut i, mut run) = (0usize, 0usize);
         while i < v.len() {
             run = 1;
             while i + run < v.len() && v[i + run] == v[i] {
                 run += 1;
             }
-            counts.push(run as u64);
+            counts.push(run as i64);
             i += run;
         }
         black_box((v, counts, run));
@@ -687,22 +687,22 @@ fn family_g(m: usize, reps: u32) {
         "split+sort+dedup+find vs split+sort+run-count (same algo)",
     );
 
-    // G2 csv-sum: split, parse_u64 (total), default Err->0, unwrap, reduce. Ceiling does the SAME work:
+    // G2 csv-sum: split, parse_int (total), default Err->0, unwrap, reduce. Ceiling does the SAME work:
     // one pass over the bytes, atoi at each comma, accumulate (no pre-parsed shortcut).
     let (csv, csv_bytes) = csv_text(m);
     let g = compile(
-        "input split \",\" map (w -> w parse_u64 map_variant 1 (e -> 0u64) unwrap) fold_add",
+        "input split \",\" map (w -> w parse_int map_variant 1 (e -> 0) unwrap) fold_add",
     );
     let c = corgi_t(&g, &csv, reps);
     let r = rust_t(reps, || {
         let bytes = black_box(&csv_bytes);
-        let (mut sum, mut cur) = (0u64, 0u64);
+        let (mut sum, mut cur) = (0i64, 0i64);
         for &b in bytes {
             if b == b',' {
                 sum = sum.wrapping_add(cur);
                 cur = 0;
             } else {
-                cur = cur.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+                cur = cur.wrapping_mul(10).wrapping_add((b - b'0') as i64);
             }
         }
         black_box(sum.wrapping_add(cur));
@@ -712,7 +712,7 @@ fn family_g(m: usize, reps: u32) {
         m,
         c,
         r,
-        "split+parse_u64(Sum)+reduce vs split+atoi+sum",
+        "split+parse_int(Sum)+reduce vs split+atoi+sum",
     );
 }
 
@@ -721,7 +721,7 @@ fn family_g(m: usize, reps: u32) {
 /// ceilings return the same materialized products (permutations/comparisons/columns).
 fn family_arrange(n: usize, reps: u32) {
     let src = scrambled(n);
-    let col = Value::u64(src.clone());
+    let col = Value::i64(src.clone());
 
     let c = rust_t(reps, || {
         black_box(arrange::sort_perm(black_box(&col)));
@@ -742,16 +742,16 @@ fn family_arrange(n: usize, reps: u32) {
         "stable radix argsort vs stable cached-key Rust sort",
     );
 
-    // R7/R8 the structured sorts — a Sum of four u64 lanes and a List of u64 of lengths 0..=4 —
+    // R7/R8 the structured sorts — a Sum of four Int lanes and a List of Int of lengths 0..=4 —
     // against a stable typed Rust sort with the same order (tag then payload; length then elements).
     // The R1 row is the leaf ceiling; these say what the Sum and List arms of the discrimination
     // sort cost on top of it.
     {
         let tags: Vec<usize> = src.iter().map(|&x| (x % 4) as usize).collect();
-        let payload: Vec<u64> = scrambled(n).into_iter().map(|x| x ^ 0x5bd1e995).collect();
-        let mut lanes: Vec<Vec<u64>> = vec![Vec::new(); 4];
+        let payload: Vec<i64> = scrambled(n).into_iter().map(|x| x ^ 0x5bd1e995).collect();
+        let mut lanes: Vec<Vec<i64>> = vec![Vec::new(); 4];
         for (i, &t) in tags.iter().enumerate() { lanes[t].push(payload[i]); }
-        let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::u64).collect());
+        let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::i64).collect());
         let c = rust_t(reps, || {
             black_box(arrange::sort_perm(black_box(&col)));
         });
@@ -768,14 +768,14 @@ fn family_arrange(n: usize, reps: u32) {
         let mut ends = Vec::with_capacity(n);
         let mut total = 0;
         for &l in &lens { total += l; ends.push(total); }
-        let elems: Vec<u64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
-        let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u64(elems.clone())));
+        let elems: Vec<i64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
+        let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::i64(elems.clone())));
         let c = rust_t(reps, || {
             black_box(arrange::sort_perm(black_box(&col)));
         });
         let r = rust_t(reps, || {
             let (ends, elems) = (black_box(&ends), black_box(&elems));
-            let span = |i: usize| -> &[u64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
+            let span = |i: usize| -> &[i64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
             let mut perm: Vec<usize> = (0..ends.len()).collect();
             perm.sort_by(|&a, &b| (span(a).len(), span(a)).cmp(&(span(b).len(), span(b))));
             black_box(perm);
@@ -789,10 +789,10 @@ fn family_arrange(n: usize, reps: u32) {
     // its allocations n/4 times; the Rust side sorts each row's slice in place.
     {
         let tags: Vec<usize> = src.iter().map(|&x| (x % 4) as usize).collect();
-        let payload: Vec<u64> = scrambled(n).into_iter().map(|x| x ^ 0x5bd1e995).collect();
-        let mut lanes: Vec<Vec<u64>> = vec![Vec::new(); 4];
+        let payload: Vec<i64> = scrambled(n).into_iter().map(|x| x ^ 0x5bd1e995).collect();
+        let mut lanes: Vec<Vec<i64>> = vec![Vec::new(); 4];
         for (i, &t) in tags.iter().enumerate() { lanes[t].push(payload[i]); }
-        let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::u64).collect());
+        let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::i64).collect());
         let rows = n / 4;
         let outer = Bounds::offsets((1..=rows).map(|r| r * 4).collect());
         let labels = arrange::segment_labels(&outer);
@@ -814,8 +814,8 @@ fn family_arrange(n: usize, reps: u32) {
         let mut ends = Vec::with_capacity(n);
         let mut total = 0;
         for &l in &lens { total += l; ends.push(total); }
-        let elems: Vec<u64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
-        let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u64(elems.clone())));
+        let elems: Vec<i64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
+        let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::i64(elems.clone())));
         let rows = n / 4;
         let outer = Bounds::offsets((1..=rows).map(|r| r * 4).collect());
         let labels = arrange::segment_labels(&outer);
@@ -824,7 +824,7 @@ fn family_arrange(n: usize, reps: u32) {
         });
         let r = rust_t(reps, || {
             let (ends, elems) = (black_box(&ends), black_box(&elems));
-            let span = |i: usize| -> &[u64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
+            let span = |i: usize| -> &[i64] { let s = if i == 0 { 0 } else { ends[i - 1] }; &elems[s..ends[i]] };
             let mut perm: Vec<usize> = (0..rows * 4).collect();
             for chunk in perm.chunks_mut(4) {
                 chunk.sort_by(|&a, &b| (span(a).len(), span(a)).cmp(&(span(b).len(), span(b))));
@@ -834,11 +834,11 @@ fn family_arrange(n: usize, reps: u32) {
         row("R10 arrange_sort_list_seg", rows * 4, c, r, "List arm under per-row labels (a block per row) vs a stable Rust sort per row");
     }
 
-    let left: Vec<u64> = (0..n.div_ceil(2) as u64).map(|x| x * 2).collect();
-    let right: Vec<u64> = (0..(n / 2) as u64).map(|x| x * 2 + 1).collect();
+    let left: Vec<i64> = (0..n.div_ceil(2) as i64).map(|x| x * 2).collect();
+    let right: Vec<i64> = (0..(n / 2) as i64).map(|x| x * 2 + 1).collect();
     let tags: Vec<usize> = (0..n).map(|i| i & 1).collect();
     let offsets: Vec<usize> = (0..n).map(|i| i >> 1).collect();
-    let (left_col, right_col) = (Value::u64(left.clone()), Value::u64(right.clone()));
+    let (left_col, right_col) = (Value::i64(left.clone()), Value::i64(right.clone()));
     let c = rust_t(reps, || {
         black_box(arrange::gather_lanes(
             &[Some(black_box(&left_col)), Some(black_box(&right_col))],
@@ -857,7 +857,7 @@ fn family_arrange(n: usize, reps: u32) {
             ts.iter()
                 .zip(os)
                 .map(|(&tag, &off)| if tag == 0 { l[off] } else { rr[off] })
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     row(
@@ -879,14 +879,14 @@ fn bench_gather(
     label: &str,
     n: usize,
     reps: u32,
-    idx: &[u64],
-    hay: &[u64],
+    idx: &[i64],
+    hay: &[i64],
     g: &Graph<NumOp>,
-    arith: fn(u64) -> u64,
+    arith: fn(i64) -> i64,
 ) {
     let arg = Value::Prod(vec![
-        Value::List(vec![n].into(), Box::new(Value::u64(idx.to_vec()))),
-        Value::List(vec![n].into(), Box::new(Value::u64(hay.to_vec()))),
+        Value::List(vec![n].into(), Box::new(Value::i64(idx.to_vec()))),
+        Value::List(vec![n].into(), Box::new(Value::i64(hay.to_vec()))),
     ]);
     let cs = corgi_t(g, &arg, reps);
     let cr = corgi_raw_t(g, &arg, reps);
@@ -897,7 +897,7 @@ fn bench_gather(
         black_box(
             i.iter()
                 .map(|&x| arith(unsafe { *h.get_unchecked(x as usize) }))
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     let ri = rust_t(reps, || {
@@ -905,7 +905,7 @@ fn bench_gather(
         black_box(
             i.iter()
                 .map(|&x| arith(h[x as usize]))
-                .collect::<Vec<u64>>(),
+                .collect::<Vec<i64>>(),
         );
     });
     let ro = rust_t(reps, || {
@@ -913,7 +913,7 @@ fn bench_gather(
         black_box(
             i.iter()
                 .map(|&x| h.get(x as usize).map(|&v| arith(v)))
-                .collect::<Option<Vec<u64>>>(),
+                .collect::<Option<Vec<i64>>>(),
         );
     });
     row_safety(label, n, cs, cr, ru, ri, ro);
@@ -925,13 +925,13 @@ fn bench_gather(
 /// Rust's total `.get()` path re-pays the `Option` per element. RANDOM (scrambled) and SEQUENTIAL
 /// patterns; all indices are in range, so the check never actually fires.
 fn family_safety(n: usize, reps: u32) {
-    let hay: Vec<u64> = (0..n as u64).collect();
-    let idx_rand: Vec<u64> = scrambled(n).iter().map(|&x| x % n as u64).collect();
-    let idx_seq: Vec<u64> = (0..n as u64).collect();
+    let hay: Vec<i64> = (0..n as i64).collect();
+    let idx_rand: Vec<i64> = scrambled(n).iter().map(|&x| x % n as i64).collect();
+    let idx_seq: Vec<i64> = (0..n as i64).collect();
     let g_plain = compile("input gather");
-    let g_add = compile("input gather map (v -> (v, 7u64) add)");
-    let g_chain = compile("input gather map (v -> (v, 7u64) add shr 1 and 255)");
-    type GatherCase<'a> = (&'a str, &'a Graph<NumOp>, fn(u64) -> u64);
+    let g_add = compile("input gather map (v -> (v, 7) add)");
+    let g_chain = compile("input gather map (v -> (v, 7) add shr_b64 1 and 255)");
+    type GatherCase<'a> = (&'a str, &'a Graph<NumOp>, fn(i64) -> i64);
     let cases: [GatherCase<'_>; 3] = [
         ("gather", &g_plain, |v| v),
         ("gath+add", &g_add, |v| v.wrapping_add(7)),
@@ -954,8 +954,8 @@ fn family_safety(n: usize, reps: u32) {
 /// closes once Rust also exposes the independent loads. `get_unchecked` on BOTH Rust sides, so this
 /// isolates memory-level parallelism — safety is factored out entirely.
 fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
-    let h: Vec<u64> = scrambled(n).iter().map(|&x| x % n as u64).collect(); // random successor
-    let start: Vec<u64> = (0..r).map(|i| ((i * (n / r)) % n) as u64).collect(); // spread-out chain heads
+    let h: Vec<i64> = scrambled(n).iter().map(|&x| x % n as i64).collect(); // random successor
+    let start: Vec<i64> = (0..r).map(|i| ((i * (n / r)) % n) as i64).collect(); // spread-out chain heads
 
     // corgi: d chained gathers, each advancing the r positions one step (lockstep by construction).
     let mut b = Builder::<NumOp>::default();
@@ -968,8 +968,8 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
     }
     let g = b.finish(cur);
     let arg = Value::Prod(vec![
-        Value::List(vec![r].into(), Box::new(Value::u64(start.clone()))),
-        Value::List(vec![n].into(), Box::new(Value::u64(h.clone()))),
+        Value::List(vec![r].into(), Box::new(Value::i64(start.clone()))),
+        Value::List(vec![n].into(), Box::new(Value::i64(h.clone()))),
     ]);
     let craw = corgi_raw_t(&g, &arg, reps);
     let csafe = corgi_t(&g, &arg, reps);
@@ -977,7 +977,7 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
     // Rust naive chase: chain-outer, step-inner — each chain's loads are dependent (a = h[a]), serial.
     let naive = rust_t(reps, || {
         let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
-        let mut out = vec![0u64; r];
+        let mut out = vec![0i64; r];
         for ri in 0..r {
             let mut a = s[ri];
             for _ in 0..d {
@@ -990,7 +990,7 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
     // Rust lockstep, IN PLACE: step-outer, chain-inner — each step's r loads independent -> MLP.
     let lock = rust_t(reps, || {
         let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
-        let mut pos: Vec<u64> = s.to_vec();
+        let mut pos: Vec<i64> = s.to_vec();
         for _ in 0..d {
             for p in pos.iter_mut() {
                 *p = unsafe { *hh.get_unchecked(*p as usize) };
@@ -1002,7 +1002,7 @@ fn family_chase(r: usize, d: usize, n: usize, reps: u32) {
     // place) — isolates the per-step allocation cost from corgi's remaining dispatch/double-pass tax.
     let lock_alloc = rust_t(reps, || {
         let (s, hh) = (black_box(start.as_slice()), black_box(h.as_slice()));
-        let mut pos: Vec<u64> = s.to_vec();
+        let mut pos: Vec<i64> = s.to_vec();
         for _ in 0..d {
             pos = pos
                 .iter()

@@ -8,11 +8,11 @@
 let xs = input iota in
 let sums = xs map (x -> (x, x and 1) branch 2) in
 let strip = xs map (x ->
-    ((x, 100u64) add, (x, x and 1) branch 2) cap_sum
+    ((x, 100) add, (x, x and 1) branch 2) cap_sum
     map_variant 0 (p -> p.1) map_variant 1 (p -> p.1)) in
 let used = xs map (x ->
-    ((x, 100u64) add, (x, x and 1) branch 2) cap_sum
+    ((x, 100) add, (x, x and 1) branch 2) cap_sum
     match (0 (p -> (p.0, p.1) add), 1 (p -> p.1))) in
 let direct = xs map (x ->
-    (x, ((1u64, x and 1) sub, (x, 100u64) add) mul) add) in
-((strip, sums) eq, (used, direct) eq) mul
+    (x, ((1, x and 1) sub, (x, 100) add) mul) add) in
+((strip, sums) eq, (used, direct) eq) min

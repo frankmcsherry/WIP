@@ -1,4 +1,4 @@
-# A polynomial evaluated at x by Horner's rule, with wrapping arithmetic. Input `(coeffs, x)`:
-# coefficients highest degree first as a `List<U64>`, and a `U64`. Output a `U64`.
+# A polynomial evaluated at x by Horner's rule. Input `(coeffs, x)`: coefficients highest degree
+# first as a `List<Int>`, and an `Int`. Output an `Int`.
 let (coeffs, x) = input in
-(0u64, (x, coeffs) cap_list) fold ((acc, (x, c)) -> ((acc, x) mul, c) add)
+(0, (x, coeffs) cap_list) fold ((acc, (x, c)) -> ((acc, x) mul, c) add)

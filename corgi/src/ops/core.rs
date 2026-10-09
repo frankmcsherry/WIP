@@ -103,7 +103,7 @@ pub enum Op<L> {
     // witness column), so map is projection+rebuild and capture is `tuple` itself: no ops needed.
     Field(usize),   // elim:  (.., X_i, ..) -> X_i
     // SUM — witness: the tag column.
-    Branch(usize),  // intro: (X, U64-tags) -> Sum{X × n}  data-driven demux: row i -> variant
+    Branch(usize),  // intro: (X, Int-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
                     //        Total: a tag of n-1 or more goes to the last lane, so on a mask any
                     //        nonzero tag is "true", as `filter` reads masks.
@@ -163,10 +163,10 @@ pub enum Op<L> {
 
     // ---- fused forms & producers -------------------------------------------------------------
     Lit(Value),     // a constant element, filled to the input's length (anchored)
-    Cast(u32),      // leaf -> leaf  re-width to N bits (low bytes / zero-pad), kind-blind
-    Hash,           // X -> U64   stable content hash of each row: structural, kind-blind, one pass
+    Hash,           // X -> Int   stable content hash of each row (all 64 bits, read as an i64):
+                    //        structural, by value, one pass
                     // (the boundary id function — see [`crate::hash`]). TOTAL over any shape.
-    Filter,         // List<(U64-mask, X)> -> List<X>  keep the elements whose mask is nonzero, in one
+    Filter,         // List<(Int-mask, X)> -> List<X>  keep the elements whose mask is nonzero, in one
                     // pass. Total by construction: a list of pairs can't disagree in length. (The
                     // kernel expansion is map(branch); unweave; field — see the law.)
     // point access — fetch haystack elements by position. `Gather` is the one fetch kernel: per row,
@@ -181,16 +181,16 @@ pub enum Op<L> {
                     // Total but lossy: a position outside its row reads the ZERO of the element's
                     // shape (zero bits, the empty list, a sum's lane 0). `TryGather` reports it as an
                     // error row instead; when positions are proven in range the two agree.
-    Range,          // (lo:U64, hi:U64) -> List<U64>  per row [lo, hi), empty when lo >= hi: `iota` with
+    Range,          // (lo:Int, hi:Int) -> List<Int>  per row [lo, hi), empty when lo >= hi: `iota` with
                     // a start. Total.
-    GatherTry,      // (idx:List<U64>, haystack:List<T>) -> List<Sum{Found:T | Missing}>  TOTAL vector
+    GatherTry,      // (idx:List<Int>, haystack:List<T>) -> List<Sum{Found:T | Missing}>  TOTAL vector
                     // access: each index found or missing, the failure shape `Fail<T>` has (Ok first,
                     // the misses only counted). A bounds-proof pass demotes `GatherTry` to `Gather` +
                     // `inject 0` when the Missing lane is provably empty.
-    Iota,           // U64 -> List<U64>  per row [0,1,…,n-1] — a List-introducer / data generator
+    Iota,           // Int -> List<Int>  per row [0,1,…,n-1] (empty for n <= 0) — a List-introducer / data generator
     Unit,           // X -> Unit  forget the payload, keep the length — how a column becomes the `None`
                     // lane of `Option = Sum{Unit | T}` (e.g. `branch 2 map_variant 1 (x -> x unit)`).
-    Select,         // (mask:U64, then:T, else:T) -> T  branchless per-row blend (the SIMD bitselect):
+    Select,         // (mask:Int, then:T, else:T) -> T  branchless per-row blend (the SIMD bitselect):
                     // row i takes `then` if mask[i] != 0 else `else`. The dual of `Branch(2)`+`Weave` —
                     // Branch avoids computing the unused side, Select avoids the partition; cheap bodies
                     // favour Select. Shape-generic: it IS `gather_lanes([else, then], mask, identity)`.
@@ -198,9 +198,9 @@ pub enum Op<L> {
     // the List monoid + measure (both 1:1 on the SEQ — cardinality stays inside the list).
     Append,         // (List<X>, List<X>) -> List<X>   row-wise concat: row i = a[i] ++ b[i] (the ⊕ of
                     // the list monoid, [] its unit). Same-shape elements, as in Zip.
-    Len,            // List<X> -> U64                  each row's element count, read straight off the
+    Len,            // List<X> -> Int                  each row's element count, read straight off the
                     // bounds (O(1) — the count the structure already holds, not a fold over the row).
-    Cut,            // List<(U64-mask, X)> -> List<List<X>>  cut each row into pieces: a piece starts
+    Cut,            // List<(Int-mask, X)> -> List<List<X>>  cut each row into pieces: a piece starts
                     // at each marked element and at the row's first. Only bounds are written; the
                     // values don't move. With `adjacent`'s marks, the pieces are runs of equal elements.
     Chunk(usize),   // List<X> -> List<List<X>>        partition each row into fixed `k`-wide sub-rows
@@ -407,20 +407,15 @@ impl<L: OpLike> Op<L> {
                 Value::Sum(tags, new)
             }
 
-            Op::Cast(bits) => {
-                if !matches!(*bits, 8 | 16 | 32 | 64) {
-                    return Err(format!("Cast: unsupported width {bits}"));
-                }
-                Value::Prim(input.into_prim("Cast")?.cast(*bits))
-            }
-
-            // stable structural hash: one U64 per row, kind-blind over any shape (see `crate::hash`).
-            Op::Hash => Value::u64(crate::hash::hash(&input)),
+            // stable structural hash: one 64-bit word per row, read as an i64, over any shape (see
+            // `crate::hash`).
+            Op::Hash => Value::i64(crate::value::i64s_of_words(crate::hash::hash(&input))),
 
             Op::Filter => {
                 let (bounds, pairs) = input.into_list("Filter")?;
                 let (mask, vals) = pairs.into_pair("Filter element")?;
-                let m = mask.as_u64("Filter mask")?;
+                let m = mask.as_mask("Filter mask")?;
+                let m = &m[..];
                 // leaves (and products of them) compress in one pass each; the new row ends are a
                 // count of each row's kept elements. Lists, sums and references build positions
                 // and gather them.
@@ -471,8 +466,8 @@ impl<L: OpLike> Op<L> {
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
                 let (rows, _vals) = input.rows_of("Len")?;
-                let lens = (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as u64 }).collect();
-                Value::u64(lens)
+                let lens = (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as i64 }).collect();
+                Value::i64(lens)
             }
 
             // re-partition each row into k-wide sub-rows. Pure: the values never move — only the bounds
@@ -480,7 +475,7 @@ impl<L: OpLike> Op<L> {
             Op::Cut => {
                 let (bounds, pairs) = input.into_list("Cut")?;
                 let (mask, vals) = pairs.into_pair("Cut element")?;
-                cut(&bounds, mask.as_u64("Cut mask")?, vals)
+                cut(&bounds, &mask.as_mask("Cut mask")?, vals)
             }
 
             Op::Chunk(k) => {
@@ -496,7 +491,8 @@ impl<L: OpLike> Op<L> {
             // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch")?;
-                let tags = tags_v.as_u64("Branch tags")?;
+                // a tag is read as its word, so a negative one is past every lane and goes to the last
+                let tags = tags_v.as_words("Branch tags")?;
                 assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
                 if *n > 256 {
                     return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
@@ -751,15 +747,15 @@ impl<L: OpLike> Op<L> {
                 // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
                 // payload (a partition); a referenced haystack takes the general path below.
                 if let (Value::List(ib, ivals), Value::Prim(p), Rows::Part(_)) = (&idx, hvals, hb) {
-                    if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::U64(_))) {
+                    if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::I64(_))) {
                         // Raw Gather reads zero out of range, not an all-or-nothing error row: a
                         // clamped read and a select, no separate scan. This is the one path that
                         // CONSUMES the indices — it rewrites that buffer into the result — so it is
                         // also the only one that takes ownership.
                         let p = p.clone();
                         let Value::List(ib, ivals) = idx else { unreachable!() };
-                        let idxs = ivals.into_u64("Gather indices")?;
-                        return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_u64_owned(idxs)))));
+                        let idxs = ivals.into_words("Gather indices")?;
+                        return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_words_owned(idxs)))));
                     }
                 }
                 let mut ok = vec![true; idx.len()];
@@ -775,7 +771,7 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
                 let (hb, hvals) = haystack.rows_of("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
-                let idxs = ivals.as_u64("GatherTry indices")?;
+                let idxs = ivals.as_words("GatherTry indices")?;
                 // the clean case first: one branch-free pass resolves every index and notes whether
                 // any is out of its row. Only when one is does the routing below run.
                 let mut pos = Vec::with_capacity(idxs.len());
@@ -835,14 +831,14 @@ impl<L: OpLike> Op<L> {
                     let base = if prev == 0 { 0 } else { ib.end(prev - 1) }; // top row's flat start
                     for kk in prev..e {
                         let g_lo = if kk == 0 { 0 } else { ib.end(kk - 1) };
-                        lo_c.push((g_lo - base) as u64);
-                        hi_c.push((ib.end(kk) - base) as u64);
+                        lo_c.push((g_lo - base) as i64);
+                        hi_c.push((ib.end(kk) - base) as i64);
                     }
                     prev = e;
                 }
                 let ranges = Value::List(
                     ob,
-                    Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])),
+                    Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])),
                 );
                 let flat = Value::List(new_ob.into(), Box::new(vals));
                 Value::Prod(vec![ranges, flat])
@@ -858,30 +854,28 @@ impl<L: OpLike> Op<L> {
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
             Op::Iota => {
-                let ns = input.as_u64("Iota")?;
+                let ns = input.as_i64("Iota")?;
                 let mut bounds = Vec::with_capacity(ns.len());
                 let mut vals = Vec::new();
-                let mut end = 0usize;
-                for &n in ns {
-                    vals.extend(0..n);
-                    end += n as usize;
-                    bounds.push(end);
+                for &n in ns.iter() {
+                    vals.extend(0..n); // empty when n <= 0
+                    bounds.push(vals.len());
                 }
-                Value::List(bounds.into(), Box::new(Value::u64(vals)))
+                Value::List(bounds.into(), Box::new(Value::i64(vals)))
             }
 
             // per row [lo, hi): iota with a start, empty when lo >= hi.
             Op::Range => {
                 let (lo, hi) = input.into_pair("Range")?;
-                let (lo, hi) = (lo.as_u64("Range lo")?, hi.as_u64("Range hi")?);
+                let (lo, hi) = (lo.as_i64("Range lo")?, hi.as_i64("Range hi")?);
                 assert_eq!(lo.len(), hi.len(), "Range: lo/hi row count");
                 let mut bounds = Vec::with_capacity(lo.len());
                 let mut vals = Vec::new();
-                for (&a, &z) in lo.iter().zip(hi) {
+                for (&a, &z) in lo.iter().zip(hi.iter()) {
                     vals.extend(a..z.max(a));
                     bounds.push(vals.len());
                 }
-                Value::List(bounds.into(), Box::new(Value::u64(vals)))
+                Value::List(bounds.into(), Box::new(Value::i64(vals)))
             }
 
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
@@ -900,14 +894,14 @@ impl<L: OpLike> Op<L> {
             Op::Select => {
                 let mut cols = input.into_prod("Select")?;
                 if cols.len() != 3 {
-                    return Err("Select expects (U64 mask, T, T)".into());
+                    return Err("Select expects (Int mask, T, T)".into());
                 }
                 let els = cols.pop().unwrap();
                 let then = cols.pop().unwrap();
                 let mask_col = cols.pop().unwrap();
-                let mask = mask_col.as_u64("Select mask")?;
+                let mask = mask_col.as_mask("Select mask")?;
                 same(&shape_of_value(&then), &shape_of_value(&els)).map_err(|e| format!("Select: {e}"))?;
-                blend(mask, then, els)
+                blend(&mask, then, els)
             }
         })
     }
@@ -952,7 +946,7 @@ fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
 /// `Chunk(k)`: each row split into `k`-wide sub-rows; a row that doesn't divide by `k` drops its
 /// remainder, and then the kept elements are no longer contiguous, so they are gathered (cold).
 /// `Cut`: each row's pieces end where the next marked element starts one, and at the row's end.
-fn cut(bounds: &Bounds, mask: &[u64], vals: Value) -> Value {
+fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
     let mut outer = Vec::with_capacity(bounds.len());
     let mut inner = Vec::new();
     let mut start = 0usize;

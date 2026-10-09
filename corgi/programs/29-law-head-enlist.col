@@ -6,5 +6,5 @@
 # = Sum tags=[0] [[1], ()x0]
 let xs = input iota in
 let retract = (xs map (x -> x enlist head), xs) eq in
-let minima = (xs map (x -> (x, 1u64) add iota) map (r -> r sort head), xs map (x -> 0u64)) eq in
-(retract, minima) mul
+let minima = (xs map (x -> (x, 1) add iota) map (r -> r sort head), xs map (x -> 0)) eq in
+(retract, minima) min

@@ -10,64 +10,52 @@ pub(crate) mod program;
 pub use ml::parse_ml;
 pub use program::Program;
 
-use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred, Red, TextOp};
+use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred, Red, ShiftOp, TextOp};
 use crate::value::Value;
 
-/// a string literal as a `List<U8>` value (one list of its UTF-8 bytes). `"…"` lowers to `Op::Lit`
-/// of this, broadcasting it to the input's length like any constant.
+/// a string literal as a `List<Int>` value (one list of its UTF-8 bytes, held as bytes). `"…"`
+/// lowers to `Op::Lit` of this, broadcasting it to the input's length like any constant.
 pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
     Value::List(vec![bytes.len()].into(), Box::new(Value::u8(bytes)))
 }
 
 /// which op idents take a trailing numeric argument — i.e. where a number follows the name.
-/// (`branch` also takes one but is parsed specially: its count may be an enum name.)
+/// (`branch` also takes one but is parsed specially: its count may be an enum name; `and` takes
+/// one optionally: `x and 255` masks by a constant, `(x, y) and` is the pair form.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "shr" | "and" | "cast" | "chunk" | "sort_limit")
+    matches!(name, "shl_b64" | "shr_b64" | "rotl_b64" | "rotr_b64" | "chunk" | "sort_limit")
 }
 
-/// parse a `<kind><width>` suffix like `i32` / `u8` / `f64` into `(Kind, width)`, validating the
-/// width (and that floats are only 32/64). The basis for the typed-arithmetic surface (`add_i32`, …)
-/// and for typed literals (`5i32`).
-fn parse_kw(suf: &str) -> Option<(Kind, u32)> {
-    let kind = match suf.as_bytes().first()? {
-        b'u' => Kind::U,
-        b'i' => Kind::I,
-        b'f' => Kind::F,
-        _ => return None,
-    };
-    let width: u32 = suf.get(1..)?.parse().ok()?;
-    let ok = match kind {
-        Kind::F => matches!(width, 32 | 64), // no f8/f16 (no native type); a kind that projects onto 32/64
-        _ => matches!(width, 8 | 16 | 32 | 64),
-    };
-    ok.then_some((kind, width))
-}
-
-/// the typed-arithmetic surface: `<op>_<k><w>` (`add_i32`, `div_f64`, `neg_u8`, …), surfacing the
-/// (op × kind × width) grid. Returns `None` for a name that isn't a typed form, so `resolve` falls
-/// through to its fixed table. Width/kind validity is enforced by `parse_kw`.
-fn typed_arith(name: &str) -> Option<NumOp> {
-    let (base, suf) = name.rsplit_once('_')?;
-    let (k, w) = parse_kw(suf)?;
-    let bin = |op| Some(ArithOp::Bin(op, k, w).into());
-    match base {
-        "add" => bin(BinOp::Add),
-        "sub" => bin(BinOp::Sub),
-        "mul" => bin(BinOp::Mul),
-        "div" => bin(BinOp::Div),
-        "rem" => bin(BinOp::Rem),
-        "neg" => Some(ArithOp::Neg(k, w).into()),
-        // min/max take no kind/width suffix — they're kind-blind and width-inferred (`min`/`max`).
-        _ => None,
+/// the spellings the integer change retired, each pointed at what replaces it: a typed op such as
+/// `add_u64` or `div_f64` (integers have no width, and an op takes its kind from its operands), and
+/// the conversions that existed only because integers had widths and signs.
+pub(crate) fn retired(name: &str) -> Option<String> {
+    let typed = name.rsplit_once('_').filter(|(base, suf)| {
+        matches!(*base, "add" | "sub" | "mul" | "div" | "rem" | "neg")
+            && matches!(*suf, "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64")
+    });
+    if let Some((base, _)) = typed {
+        let word = if matches!(base, "add" | "sub" | "mul") { format!(" (`{base}_b64` for 64-bit word arithmetic)") } else { String::new() };
+        return Some(format!("'{name}' is retired: integers have no width, and `{base}` takes its kind from its operands{word}"));
     }
+    Some(match name {
+        "cast" => "'cast' is retired: an integer's width is its storage, which the engine picks".into(),
+        "signed" => "'signed' is retired: integers are signed values already".into(),
+        "to_f32" | "to_f64" => format!("'{name}' is retired: use to_float"),
+        "parse_u64" => "'parse_u64' is retired: use parse_int".into(),
+        // two right shifts that agree on non-negative integers and differ on negative ones made a
+        // wrong answer easy to write; the word shift and division are each spelled for what they are
+        "shr" => "'shr' is retired: `shr_b64 k` shifts the 64-bit word (zeros in from the top), and `(x, 2^k) div` divides (toward zero)".into(),
+        _ => return None,
+    })
 }
 
 /// the op-name -> `NumOp` table the front-end lowers through. `map` / `map_variant` are NOT here:
 /// they carry sub-graphs and are built by the surface itself.
 pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     let n = || arg.ok_or_else(|| format!("op '{name}' needs a numeric argument"));
+    let k = || -> Result<u32, String> { n().map(|k| k.min(u32::MAX as u64) as u32) };
     Ok(match name {
-        "cast" => Op::Cast(n()? as u32).into(),
         "transpose" => Op::Transpose.into(),
         // One name per fallible method — each is its checked `Try*` form (a row the lossy kernel
         // would read zeros for, truncate or cut short lands in Err); `effect::lower_effects` threads
@@ -91,7 +79,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // `sort`, `dedup` and `group` are words over `sort_by`, built in ml.rs (`sort_word`).
         "sort_by" => CmpOp::SortBy.into(), // [(k, v)] -> [(k, v, run)]: stable by k, v carried along, each run of equal k numbered
         "sort_limit" => CmpOp::SortLimit(n()? as usize).into(), // `sort`, then the first k of each row
-        "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<U64>: 1 where a run of equal elements starts
+        "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<Int>: 1 where a run of equal elements starts
         "cut" => Op::Cut.into(),              // [(mask, x)] -> [[x]]: a piece starts at each marked x
         "find" => CmpOp::Find.into(),
         // point access — `gather` (per row, positions of any shape into that row's list, each integer
@@ -106,39 +94,48 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
         "append" => Op::Append.into(), // (List<X>, List<X>) -> List<X>  row-wise concat (the list-monoid ⊕)
-        "len" => Op::Len.into(),       // List<X> -> U64  per-row element count, read off the bounds
+        "len" => Op::Len.into(),       // List<X> -> Int  per-row element count, read off the bounds
         "chunk" => Op::TryChunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records; a row must divide by k
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),
-        "hash" => Op::Hash.into(), // X -> U64  stable structural content hash (the boundary id fn)
+        "hash" => Op::Hash.into(), // X -> Int  stable structural content hash, all 64 bits (the boundary id fn)
         // relational compares: two columns of one shape -> 0/1 mask, in structural order (leaves by
-        // lane; lists, products and sums as `sort` orders them, so `(s, "MAIL") eq` compares
+        // value; lists, products and sums as `sort` orders them, so `(s, "MAIL") eq` compares
         // strings). A leaf constant on either side becomes an immediate (`optimize::immediates`),
-        // so `(x, 2u64) gt` builds no column of 2s; a list constant is still filled per row.
+        // so `(x, 2) gt` builds no column of 2s; a list constant is still filled per row.
         "eq" => CmpOp::Rel(Pred::Eq).into(),
         "ne" => CmpOp::Rel(Pred::Ne).into(),
         "lt" => CmpOp::Rel(Pred::Lt).into(),
         "le" => CmpOp::Rel(Pred::Le).into(),
         "gt" => CmpOp::Rel(Pred::Gt).into(),
         "ge" => CmpOp::Rel(Pred::Ge).into(),
-        // numeric layer — the kind-blind front-end reaches the u64-unsigned row of the grid:
-        "add" => ArithOp::Bin(BinOp::Add, Kind::U, 64).into(),
-        "sub" => ArithOp::Bin(BinOp::Sub, Kind::U, 64).into(),
-        "mul" => ArithOp::Bin(BinOp::Mul, Kind::U, 64).into(),
-        "rem" => ArithOp::Bin(BinOp::Rem, Kind::U, 64).into(),
-        "min" => CmpOp::Min.into(), // kind-blind lane min/max — order ops, in `cmp` not the arith grid
+        // arithmetic, on two Ints or two Floats:
+        "add" => ArithOp::Bin(BinOp::Add).into(),
+        "sub" => ArithOp::Bin(BinOp::Sub).into(),
+        "mul" => ArithOp::Bin(BinOp::Mul).into(),
+        "div" => ArithOp::Bin(BinOp::Div).into(),
+        "rem" => ArithOp::Bin(BinOp::Rem).into(),
+        "neg" => ArithOp::Neg.into(),
+        "min" => CmpOp::Min.into(), // lane min/max — order ops, in `cmp` not arithmetic
         "max" => CmpOp::Max.into(),
-        "neg" => ArithOp::Neg(Kind::U, 64).into(),
-        // the typed grid (signed/float/narrow) is reached by suffix: `add_i32`, `div_f64`, … — see
-        // `typed_arith`. Plus the two kind conversions:
-        "signed" => ArithOp::ToSigned.into(), // unsigned <-> signed encoding (XOR sign bit; involution)
-        "to_f32" => ArithOp::ToFloat(32).into(), // unsigned int -> f32 (how iota becomes floats)
-        "to_f64" => ArithOp::ToFloat(64).into(),
+        "to_float" => ArithOp::ToFloat.into(), // Int -> Float (how iota becomes floats)
         // branchless blend: (mask, then, else) -> picked column (the SIMD bitselect, see Op::Select)
         "select" => Op::Select.into(),
-        "shr" => ArithOp::Shr(n()? as u32).into(), // x >> k  (divide by 2^k)
-        "and" => ArithOp::And(n()?).into(),         // x & m   (mod 2^k via m = 2^k-1)
+        // integers as 64-bit words, and bitwise:
+        "and" => match arg {
+            Some(m) => ArithOp::BitsImm(BitOp::And, m as i64).into(), // x & m   (mod 2^k via m = 2^k-1)
+            None => ArithOp::Bits(BitOp::And).into(),
+        },
+        "or" => ArithOp::Bits(BitOp::Or).into(),
+        "xor" => ArithOp::Bits(BitOp::Xor).into(),
+        "add_b64" => ArithOp::Bits(BitOp::AddB64).into(),
+        "sub_b64" => ArithOp::Bits(BitOp::SubB64).into(),
+        "mul_b64" => ArithOp::Bits(BitOp::MulB64).into(),
+        "shl_b64" => ArithOp::Shift(ShiftOp::ShlB64, k()?).into(),
+        "shr_b64" => ArithOp::Shift(ShiftOp::ShrB64, k()?).into(), // the logical shift
+        "rotl_b64" => ArithOp::Shift(ShiftOp::RotlB64, k()?).into(),
+        "rotr_b64" => ArithOp::Shift(ShiftOp::RotrB64, k()?).into(),
         // named monoid reductions, each `fold_<binop>` (fold_add = sum, fold_mul = product):
         "fold_add" => ArithOp::Reduce(Red::Add).into(),
         "fold_mul" => ArithOp::Reduce(Red::Mul).into(),
@@ -156,9 +153,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "scan_any" => ArithOp::Scan(Red::Any).into(),
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
-        "parse_u64" => TextOp::ParseU64.into(),
-        // the typed-arithmetic grid by suffix (`add_i32`, `mul_f64`, …); falls through to an error
-        // only if it's neither a fixed op above nor a well-formed typed form.
-        other => return typed_arith(other).ok_or_else(|| format!("unknown op '{other}'")),
+        "parse_int" => TextOp::ParseInt.into(),
+        other => return Err(retired(other).unwrap_or_else(|| format!("unknown op '{other}'"))),
     })
 }

@@ -6,5 +6,5 @@
 # n = 6
 # = List ends=[8] <[0, 1, 4, 9, 16, 25, 0, 0]>
 let table = input iota map (x -> (x, x) mul) in
-let queries = (input, 2u64) add iota in
-(queries, table) gather_try map (e -> e match (0 (v -> v), 1 (miss -> 0u64)))
+let queries = (input, 2) add iota in
+(queries, table) gather_try map (e -> e match (0 (v -> v), 1 (miss -> 0)))

@@ -7,7 +7,7 @@ use corgi::{show, Program, Shape, Value};
 use std::path::Path;
 
 /// parse a `.col` file into (seed `n`, program). `#` lines are headers; the rest is the program.
-fn parse_col(text: &str) -> (u64, String) {
+fn parse_col(text: &str) -> (i64, String) {
     let mut n = 8;
     let mut prog = String::new();
     for line in text.lines() {
@@ -37,8 +37,8 @@ fn main() {
         let desc = stem.split_once('-').map_or(stem.as_ref(), |(_, r)| r).replace('-', " ");
         let (n, prog) = parse_col(&std::fs::read_to_string(&path).unwrap());
         let p = Program::compile_ml(&prog).expect("parse error");
-        let seed = Value::u64(vec![n]);
-        let shape = p.shape(&Shape::Prim(64)).map_or_else(|e| format!("type error: {e}"), |s| s.to_string());
+        let seed = Value::i64(vec![n]);
+        let shape = p.shape(&Shape::Int).map_or_else(|e| format!("type error: {e}"), |s| s.to_string());
         let out = show(&p.run(seed));
         println!("• {desc}  (n = {n})");
         println!("    {prog}");

@@ -6,4 +6,4 @@
 # n = 5
 # = Sum tags=[1] [([], []), ()x1]
 let hay = input iota in
-(((input, 1u64) sub, hay) get, (input, hay) get)
+(((input, 1) sub, hay) get, (input, hay) get)

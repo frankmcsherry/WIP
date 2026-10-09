@@ -8,8 +8,9 @@ hits_N.parquet, a million rows each). Needs the `duckdb` and `numpy` Python pack
 
 Writes to OUT_DIR:
 - one file per column the queries read: `NAME.u64` (little-endian u64 values) for numbers, or
-  `NAME.ends` (u64 row ends) and `NAME.bytes` for strings. Columns that can be negative are stored in
-  corgi's signed encoding (the sign bit flipped), so corgi's order is the signed order.
+  `NAME.ends` (u64 row ends) and `NAME.bytes` for strings. Columns that can be negative are stored
+  with the sign bit flipped (so the words' unsigned order is the signed order); the bench flips it
+  back, and reads every number as an i64.
 - `expected/QUERY.txt`: DuckDB's answer to each query in `algorithms/clickbench/`, in the canonical
   form the bench prints corgi's in (one row per line, tab-separated, strings in hex, `f` floats to
   four decimals, `g` floats to twelve significant digits).

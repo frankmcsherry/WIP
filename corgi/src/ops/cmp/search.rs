@@ -35,22 +35,23 @@ const LANES: usize = 16;
 /// falling behind.
 const WALK_DENSITY: usize = 4;
 
-/// Every needle's `[lo, hi)` relative to its haystack row, for leaf needles and haystacks of the
-/// same width; `None` for any other shape.
-pub(crate) fn find_leaf(nb: &Bounds, needles: &Value, hb: Rows, hay: &Value) -> Option<(Vec<u64>, Vec<u64>)> {
-    match (needles, hay) {
-        (Value::Prim(Prim::U8(nv)), Value::Prim(Prim::U8(hv))) => Some(find_rows(nb, hb, nv, hv)),
-        (Value::Prim(Prim::U16(nv)), Value::Prim(Prim::U16(hv))) => Some(find_rows(nb, hb, nv, hv)),
-        (Value::Prim(Prim::U32(nv)), Value::Prim(Prim::U32(hv))) => Some(find_rows(nb, hb, nv, hv)),
-        (Value::Prim(Prim::U64(nv)), Value::Prim(Prim::U64(hv))) => Some(find_rows(nb, hb, nv, hv)),
-        _ => None,
+/// Every needle's `[lo, hi)` relative to its haystack row, for leaf needles and haystacks; `None`
+/// for any other shape. Integer needles and haystacks at different storages meet first.
+pub(crate) fn find_leaf(nb: &Bounds, needles: &Value, hb: Rows, hay: &Value) -> Option<(Vec<i64>, Vec<i64>)> {
+    let (Value::Prim(np), Value::Prim(hp)) = (needles, hay) else { return None };
+    let (np, hp) = Prim::meet_ref(np, hp);
+    match (&*np, &*hp) {
+        (Prim::U8(nv), Prim::U8(hv)) => Some(find_rows(nb, hb, nv, hv)),
+        (Prim::I64(nv), Prim::I64(hv)) => Some(find_rows(nb, hb, nv, hv)),
+        (Prim::F64(nv), Prim::F64(hv)) => Some(find_rows(nb, hb, nv, hv)),
+        _ => unreachable!("meet brings both to one storage"),
     }
 }
 
 /// [`find_leaf`] over typed columns: needle row `r` is `needles[nb(r)]`, its haystack `hay[hb(r)]`.
-pub(crate) fn find_rows<T: Ord + Copy>(nb: &Bounds, hb: Rows, needles: &[T], hay: &[T]) -> (Vec<u64>, Vec<u64>) {
+pub(crate) fn find_rows<T: Ord + Copy>(nb: &Bounds, hb: Rows, needles: &[T], hay: &[T]) -> (Vec<i64>, Vec<i64>) {
     let n = needles.len();
-    let (mut lo, mut hi) = (vec![0u64; n], vec![0u64; n]);
+    let (mut lo, mut hi) = (vec![0i64; n], vec![0i64; n]);
     if n == 0 {
         return (lo, hi);
     }
@@ -65,8 +66,8 @@ pub(crate) fn find_rows<T: Ord + Copy>(nb: &Bounds, hb: Rows, needles: &[T], hay
             if xs.len() * WALK_DENSITY >= row.len() && xs.windows(2).all(|w| w[0] <= w[1]) {
                 let mut k = ns;
                 walk_ranges(xs, row, |l, h| {
-                    lo[k] = l as u64;
-                    hi[k] = h as u64;
+                    lo[k] = l as i64;
+                    hi[k] = h as i64;
                     k += 1;
                 });
             } else {
@@ -76,8 +77,8 @@ pub(crate) fn find_rows<T: Ord + Copy>(nb: &Bounds, hb: Rows, needles: &[T], hay
                     let group: &[T; LANES] = group.try_into().unwrap();
                     let at = lower_bounds(row, group);
                     for g in 0..LANES {
-                        lo[k + g] = at[g] as u64;
-                        hi[k + g] = run_end(row, at[g], group[g]) as u64;
+                        lo[k + g] = at[g] as i64;
+                        hi[k + g] = run_end(row, at[g], group[g]) as i64;
                     }
                     k += LANES;
                 }
@@ -162,7 +163,7 @@ impl<T: Ord + Copy> Lanes<T> {
     /// span per lane: as many halvings as the longest span needs, a lane whose span is down to one
     /// position probing it again and staying put (its `half` is 0). A partial group (the last one)
     /// runs one needle at a time.
-    fn flush(&mut self, hay: &[T], lo: &mut [u64], hi: &mut [u64]) {
+    fn flush(&mut self, hay: &[T], lo: &mut [i64], hi: &mut [i64]) {
         if self.len == LANES {
             let mut base = self.start;
             let mut n = self.span;
@@ -178,15 +179,15 @@ impl<T: Ord + Copy> Lanes<T> {
             for g in 0..LANES {
                 let at = base[g] + (hay[base[g]] < self.x[g]) as usize - self.start[g];
                 let row = &hay[self.start[g]..self.start[g] + self.span[g]];
-                lo[self.k[g]] = at as u64;
-                hi[self.k[g]] = run_end(row, at, self.x[g]) as u64;
+                lo[self.k[g]] = at as i64;
+                hi[self.k[g]] = run_end(row, at, self.x[g]) as i64;
             }
         } else {
             for g in 0..self.len {
                 let row = &hay[self.start[g]..self.start[g] + self.span[g]];
                 let at = lower_bound(row, self.x[g]);
-                lo[self.k[g]] = at as u64;
-                hi[self.k[g]] = run_end(row, at, self.x[g]) as u64;
+                lo[self.k[g]] = at as i64;
+                hi[self.k[g]] = run_end(row, at, self.x[g]) as i64;
             }
         }
         self.len = 0;

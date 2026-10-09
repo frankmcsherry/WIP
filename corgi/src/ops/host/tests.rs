@@ -10,7 +10,7 @@ impl HostKernel for Repeat {
     fn output(&self) -> &Shape { &self.output }
     fn eval(&self, input: Value) -> Result<Value, String> {
         let args = input.into_prod("repeat")?;
-        let (xs, ks) = (args[0].as_u64("repeat")?, args[1].as_u64("repeat")?);
+        let (xs, ks) = (args[0].as_i64("repeat")?, args[1].as_i64("repeat")?);
         let (mut x, mut i, mut ends) = (Vec::new(), Vec::new(), Vec::new());
         for r in 0..xs.len() {
             for k in 0..ks[r] {
@@ -19,11 +19,11 @@ impl HostKernel for Repeat {
             }
             ends.push(x.len());
         }
-        Ok(Value::List(crate::value::Bounds::offsets(ends), Box::new(Value::Prod(vec![Value::u64(x), Value::u64(i)]))))
+        Ok(Value::List(crate::value::Bounds::offsets(ends), Box::new(Value::Prod(vec![Value::i64(x), Value::i64(i)]))))
     }
 }
 fn repeat() -> HostOp {
-    let p = Shape::Prim(64);
+    let p = Shape::Int;
     HostOp(Arc::new(Repeat {
         input: Shape::Prod(vec![p.clone(), p.clone()]),
         output: Shape::List(Box::new(Shape::Prod(vec![p.clone(), p]))),
@@ -32,7 +32,7 @@ fn repeat() -> HostOp {
 
 #[test]
 fn a_host_kernel_types_runs_and_checks() {
-    let p = Shape::Prim(64);
+    let p = Shape::Int;
     let mut b = Builder::<NumOp>::default();
     let x = b.input();
     let out = b.add(NumOp::Host(repeat()), vec![x]);
@@ -42,12 +42,12 @@ fn a_host_kernel_types_runs_and_checks() {
     assert_eq!(shape_of(&g, &input_shape).unwrap(), Shape::List(Box::new(Shape::Prod(vec![p.clone(), p.clone()]))));
     // A mismatched input is a type error.
     assert!(shape_of(&g, &p).is_err());
-    let v = eval_graph(&g, Value::Prod(vec![Value::u64(vec![7, 9]), Value::u64(vec![2, 0])]));
+    let v = eval_graph(&g, Value::Prod(vec![Value::i64(vec![7, 9]), Value::i64(vec![2, 0])]));
     let (bounds, vals) = v.into_list("test").unwrap();
     assert_eq!(bounds.to_vec(), vec![2, 2]);
     let cols = vals.into_prod("test").unwrap();
-    assert_eq!(cols[0].as_u64("t").unwrap(), &[7, 7]);
-    assert_eq!(cols[1].as_u64("t").unwrap(), &[0, 1]);
+    assert_eq!(&*cols[0].as_i64("t").unwrap(), &[7, 7]);
+    assert_eq!(&*cols[1].as_i64("t").unwrap(), &[0, 1]);
 }
 
 /// Input or output shapes that lose their row count are type errors, at typing time.
@@ -60,7 +60,7 @@ fn shapes_without_a_row_count_are_type_errors() {
         fn output(&self) -> &Shape { &self.1 }
         fn eval(&self, input: Value) -> Result<Value, String> { Ok(input) }
     }
-    let p = Shape::Prim(64);
+    let p = Shape::Int;
     let empty = Shape::Prod(vec![]);
     let nested = Shape::Prod(vec![empty.clone(), p.clone()]);
     let typed = |input: &Shape, output: &Shape| {

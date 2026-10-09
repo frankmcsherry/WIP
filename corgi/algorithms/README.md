@@ -37,8 +37,8 @@ top_pairs programs).
 | horner | polynomial at x | 57.7 | 5.4 | 10.7 |
 | interval_merge | merge overlapping intervals | 349 | 128 | 2.7 |
 | interval_merge_cut | the same, merged intervals cut at their marks | 283 | 130 | 2.2 |
-| ipv4_parse | dotted quad to `{U64 \| ()}` | 83.2 | 14.0 | 5.9 |
-| itoa | a u64's decimal digits | 355 | 22.4 | 15.8 |
+| ipv4_parse | dotted quad to `{Int \| ()}` | 83.2 | 14.0 | 5.9 |
+| itoa | a non-negative Int's decimal digits | 355 | 22.4 | 15.8 |
 | jaccard_sets | \|A∩B\| / \|A∪B\| of two lists as sets | 569 | 548 | 1.0 |
 | jaro_winkler_direct | Jaro-Winkler, the textbook loop | 2417 | 96.2 | 25.1 |
 | jaro_winkler_by_byte | the same, matched per byte value | 1088 | 96.5 | 11.3 |
@@ -155,7 +155,7 @@ now, at about the same cost (above).
    - Rewrite: a gather whose haystack is a literal reads the literal's one row.
    - At stake: soundex `lit` 196 (45%), base64_encode `lit` 370 (53%). base64_encode_arith removes
      the table by hand and is 45% faster.
-2. **`get` with a zero default is the raw gather.** `(i, xs) get try match (0 (v -> v), 1 (_ -> 0u64))`
+2. **`get` with a zero default is the raw gather.** `(i, xs) get try match (0 (v -> v), 1 (_ -> 0))`
    reads zero out of range, which is exactly what the lossy `Gather` does.
    - The rewrite removes the per-element check and the lane merge at the end.
    - It also removes the failure path: whenever any row misses, the checked gather first copies the
@@ -166,10 +166,11 @@ now, at about the same cost (above).
    - Repeated `len`, compares, `iota`s and constant seeds today run once per occurrence.
    - Measured with `--optimize`: gcd 11% faster, the rest unchanged. Cheap, but small on its own.
 4. **Division and remainder by a constant become a multiply-high and a shift.** A power of two
-   becomes `shr` or `and`, and `select` with a constant operand becomes an immediate.
-   - Today the divide runs the scalar divider, and NEON has no integer divide.
+   already does: `div` and `rem` by one run as shifts (toward zero, so a negative dividend is
+   biased first). `select` with a constant operand should become an immediate too.
+   - Any other constant divisor runs the scalar divider, and NEON has no integer divide.
    - At stake: days_from_civil's five constant divisions are 37% of it; histogram (`/125`); itoa
-     (20 rounds of `/10`, `%10`); gcd's `select` with 0 (lit 20 plus part of Select 82).
+     (19 rounds of `/10`, `%10`); gcd's `select` with 0 (lit 20 plus part of Select 82).
 
 ### Rewrites that need a structural fact
 
@@ -235,7 +236,7 @@ The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Th
    - A field the body hands back unchanged is still gathered and scattered every round:
      Levenshtein carries `s2`, JW carries the window `d`.
    - A per-row constant that a body needs is copied to every element by `cap_list`: horner's x,
-     luhn's n, two_sum's t (twice), top_k's n, mode's top, normalize_whitespace's total.
+     luhn's n, two_sum's t, top_k's n, mode's top, normalize_whitespace's total.
    - Rewrites: keep invariant fields out of the round state and read them by row; give binary ops a
      per-row scalar operand, so `(s, xs) cap_list map ((s, x) -> f(s, x))` needs no copy of s.
 10. **A fold that ignores its element is a counted loop, and a row whose state stops changing can
@@ -283,8 +284,8 @@ prefix, with no gather or scatter.
     row of integer pairs it takes 11 ms against 20 for sorting everything (top_pairs), and it took
     ClickBench q24–q26 from 18–26× DuckDB to 4×.
 15. **Tuples of narrow leaves sort as one packed leaf.** trigram_similarity's `dedup` and `find` on
-    `(U8, U8, U8)` grams take 801 (69%) as structured comparisons. Packed into one integer (order
-    preserved by big-endian concatenation) they are a radix sort and a leaf search.
+    three-byte grams `(Int, Int, Int)` take 801 (69%) as structured comparisons. Packed into one
+    integer (order preserved by big-endian concatenation) they are a radix sort and a leaf search.
 16. **Counting over a small domain is a bincount.**
     - histogram, `(xs, 8 iota) cap_list map ((xs, k) -> xs map (x == k) fold_add)`, copies the list
       8 times: CapList 373 (73%).
@@ -300,16 +301,15 @@ item in NOTES.md, an execution strategy rather than a graph rewrite.
 
 - **Defaults and empty values:**
   - A default costs four ops: `get try match (0 (v -> v), 1 (_ -> d))`. `get_or d` would be one.
-  - A typed empty list for a fallback arm is spelled `0u64 iota map (z -> …)`.
+  - A typed empty list for a fallback arm is spelled `0 iota map (z -> …)`.
 - **Missing list words:** lag or shift, exclusive scan, take, drop, slice, split-where-mask,
   pairwise, descending sort or top-k, and tuple to list.
 - **`eq` on lists was thought missing.** The comments described `eq` as comparing leaves, though it
   compares any shape structurally. query_param first compared `hash`es for that reason.
 - **Arithmetic:**
-  - No unsuffixed `div` (though `rem` exists), `shl`, `or`, shift by a variable amount, or float and
-    signed reductions and scans.
-  - `n - 1` wraps, so a safe spelling is `((n, 1u64) max, 1u64) sub`. Without it, `range` to 2^64
-    allocates that much.
+  - No shift by a variable amount, and no float reductions or scans.
+  - When integers were unsigned, `n - 1` wrapped, so the programs spell it `((n, 1) max, 1) sub`.
+    Ints are signed now: `n - 1` is -1, and `iota` or `range` to it is empty.
 - **Closed bodies:**
   - Match arms are closed too.
   - A per-row constant inside a body must be carried in the accumulator or copied per element with

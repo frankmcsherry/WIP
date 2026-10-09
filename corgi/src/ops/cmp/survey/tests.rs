@@ -20,7 +20,7 @@ impl Rng {
 /// a random column of `rows` rows over a small value space, so that two draws share rows.
 fn random_value(rng: &mut Rng, rows: usize, depth: usize) -> Value {
     if depth == 0 {
-        return Value::u64((0..rows).map(|_| rng.below(4) as u64).collect());
+        return Value::i64((0..rows).map(|_| rng.below(4) as i64 - 2).collect());
     }
     match rng.below(6) {
         0 => Value::u8((0..rows).map(|_| rng.below(3) as u8).collect()),
@@ -167,7 +167,7 @@ fn nested_product_reports_can_be_refined_by_an_enclosing_field() {
 #[test]
 fn long_lists_one_row_a_side() {
     let n = 200_000usize;
-    let mk = |last: u64| Value::List(Bounds::offsets(vec![n]), Box::new(Value::u64((0..n as u64).map(|i| if i + 1 == n as u64 { last } else { 7 }).collect())));
+    let mk = |last: i64| Value::List(Bounds::offsets(vec![n]), Box::new(Value::i64((0..n as i64).map(|i| if i + 1 == n as i64 { last } else { 7 }).collect())));
     let (a, b) = (mk(1), mk(2));
     assert_eq!(survey_groups(&a, &b), vec![GroupRun::A(0, 1), GroupRun::B(0, 1)]);
     assert_eq!(survey_groups(&b, &a), vec![GroupRun::B(0, 1), GroupRun::A(0, 1)]);
@@ -176,7 +176,7 @@ fn long_lists_one_row_a_side() {
 
 #[test]
 fn one_side_empty_is_one_run() {
-    let (a, e) = (Value::u64(vec![1, 2, 2]), Value::u64(vec![]));
+    let (a, e) = (Value::i64(vec![1, 2, 2]), Value::i64(vec![]));
     assert_eq!(survey_groups(&a, &e), vec![GroupRun::A(0, 3)]);
     assert_eq!(survey_groups(&e, &a), vec![GroupRun::B(0, 3)]);
     assert!(survey_groups(&e, &e).is_empty());

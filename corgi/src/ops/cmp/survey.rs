@@ -193,30 +193,32 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
 /// A leaf level: one width dispatch, then the merge over every open class with the keys read
 /// through the index.
 fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
+    let (pa, pb) = Prim::meet_ref(pa, pb);
     macro_rules! go {
         ($($V:ident),*) => {
-            match (pa, pb) {
+            match (&*pa, &*pb) {
                 $( (Prim::$V(va), Prim::$V(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree), )*
-                _ => panic!("survey: leaf width mismatch"),
+                _ => unreachable!("meet brings both to one storage"),
             }
         };
     }
-    go!(U8, U16, U32, U64)
+    go!(U8, I64, F64)
 }
 
 /// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
 /// are leaves: one slice comparison. `None` for any other element shape.
 fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize, usize), from: usize) -> Option<std::cmp::Ordering> {
     let (Value::Prim(pa), Value::Prim(pb)) = (va, vb) else { return None };
+    let (pa, pb) = Prim::meet_ref(pa, pb);
     macro_rules! go {
         ($($V:ident),*) => {
-            match (pa, pb) {
+            match (&*pa, &*pb) {
                 $( (Prim::$V(x), Prim::$V(y)) => Some(x[sa + from..ea].cmp(&y[sb + from..eb])), )*
-                _ => panic!("survey: leaf width mismatch"),
+                _ => unreachable!("meet brings both to one storage"),
             }
         };
     }
-    go!(U8, U16, U32, U64)
+    go!(U8, I64, F64)
 }
 
 /// The leaf lanes of `a` and `b`, in structural order, when the shape is nothing but leaves,
@@ -251,19 +253,26 @@ fn leaf_run<'a>(ca: &'a [Value], cb: &'a [Value], f: usize) -> (Vec<(&'a Prim, &
 }
 
 /// A level keyed by a run of leaf lanes, compared as a tuple: what a structural comparison of
-/// those fields does, in one gallop. Every lane `u64` reads the leaves directly.
-/// The lanes as `u64` slices, when every one is a `u64` leaf: the common shape, read directly.
-fn wide<'a>(lanes: &[(&'a Prim, &'a Prim)]) -> Option<Vec<(&'a [u64], &'a [u64])>> {
+/// those fields does, in one gallop. Every lane `i64` reads the leaves directly.
+/// The lanes as `i64` slices, when every one is an `i64` leaf: the common shape, read directly.
+fn wide<'a>(lanes: &[(&'a Prim, &'a Prim)]) -> Option<Vec<(&'a [i64], &'a [i64])>> {
     lanes
         .iter()
         .map(|(pa, pb)| match (pa, pb) {
-            (Prim::U64(va), Prim::U64(vb)) => Some((&va[..], &vb[..])),
+            (Prim::I64(va), Prim::I64(vb)) => Some((&va[..], &vb[..])),
             _ => None,
         })
         .collect()
 }
 
 fn lanes_level<IA: Rows, IB: Rows>(lanes: &[(&Prim, &Prim)], ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
+    // a lane whose two sides are held at different storages meets first, so that each lane's keys
+    // read alike on both sides.
+    if lanes.iter().any(|(pa, pb)| pa.bits() != pb.bits()) {
+        let met: Vec<(Prim, Prim)> = lanes.iter().map(|(pa, pb)| Prim::meet((*pa).clone(), (*pb).clone())).collect();
+        let refs: Vec<(&Prim, &Prim)> = met.iter().map(|(a, b)| (a, b)).collect();
+        return lanes_level(&refs, ia, ib, open, tree);
+    }
     if let Some(w) = wide(lanes) {
         return match w.len() {
             1 => merge(|j| w[0].0[ia.row(j)], |j| w[0].1[ib.row(j)], open, tree),
@@ -272,8 +281,8 @@ fn lanes_level<IA: Rows, IB: Rows>(lanes: &[(&Prim, &Prim)], ia: IA, ib: IB, ope
             _ => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r], w[2].0[r], w[3].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r], w[2].1[r], w[3].1[r]) }, open, tree),
         };
     }
-    let at = |x: usize, j: usize| lanes[x].0.usize_at(ia.row(j));
-    let bt = |x: usize, j: usize| lanes[x].1.usize_at(ib.row(j));
+    let at = |x: usize, j: usize| lanes[x].0.key_at(ia.row(j));
+    let bt = |x: usize, j: usize| lanes[x].1.key_at(ib.row(j));
     match lanes.len() {
         1 => leaf(lanes[0].0, lanes[0].1, ia, ib, open, tree),
         2 => merge(|j| (at(0, j), at(1, j)), |j| (bt(0, j), bt(1, j)), open, tree),

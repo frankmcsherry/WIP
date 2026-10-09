@@ -8,12 +8,12 @@
 let (pkey, ptype, lpart, lship, price, disc) = input in
 # Each part, and whether its type starts with PROMO, sorted by part key.
 let parts = (pkey, ptype) zip
-    map ((k, t) -> (k, (((0u64, 5u64) range, t) gather, "PROMO") eq)) sort in
+    map ((k, t) -> (k, (((0, 5) range, t) gather, "PROMO") eq)) sort in
 # Line items shipped in September 1995, each looked up by part key.
 let lines = ((lpart, lship) zip, (price, disc) zip) zip
-    map (((k, s), (p, d)) -> (((s, 9374u64) ge, (s, 9404u64) lt) mul, (k, (p, (100u64, d) sub) mul))) filter in
+    map (((k, s), (p, d)) -> (((s, 9374) ge, (s, 9404) lt) min, (k, (p, (100, d) sub) mul))) filter in
 let at = (lines map ((k, _) -> k), parts map ((k, _) -> k)) find in
 let promo = (at map ((lo, _) -> lo), parts) gather map ((_, f) -> f) in
 let revs = lines map ((_, r) -> r) in
 ((promo, revs) zip map ((f, r) -> (f, r) mul) fold_add, revs fold_add)
-    try match (0 (x -> x), 1 (_ -> (0u64, 0u64)))
+    try match (0 (x -> x), 1 (_ -> (0, 0)))

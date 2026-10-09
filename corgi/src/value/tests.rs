@@ -1,27 +1,41 @@
 use super::*;
 
-/// `cast` to the width a leaf already has is the identity, and must not copy the column: the
-/// stored bytes ARE the result's bytes, so the result shares the buffer (an `Arc` bump).
+/// An integer is the same value whatever storage holds it: a byte leaf and an `i64` leaf of the
+/// same integers are equal and hash alike, and a float leaf is never equal to an integer one.
 #[test]
-fn identity_cast_reuses_the_buffer() {
-    let xs = Arc::new(vec![10u32, 20, 30]);
-    let p = Prim::U32(xs.clone());
-    let Prim::U32(out) = p.cast(32) else { panic!("cast(32) must stay a U32 leaf") };
-    assert!(Arc::ptr_eq(&out, &xs), "same-width cast copied the column");
+fn integers_are_equal_across_storages() {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let h = |v: &Value| {
+        let mut s = DefaultHasher::new();
+        v.hash(&mut s);
+        s.finish()
+    };
+    let (bytes, wide) = (Value::u8(vec![0, 7, 255]), Value::i64(vec![0, 7, 255]));
+    assert_eq!(bytes, wide);
+    assert_eq!(h(&bytes), h(&wide));
+    assert_ne!(Value::u8(vec![1]), Value::i64(vec![-255]));
+    assert_ne!(Value::i64(vec![0]), Value::f64(vec![0.0]));
 }
 
-/// A genuine re-width keeps the low bytes (narrowing) or zero-extends (widening), for every
-/// (source, destination) pair the `prim!` grid generates.
+/// Two integer leaves at different storages meet at `i64`; one storage meets as it is.
 #[test]
-fn rewidth_keeps_the_low_bytes() {
-    let wide = Prim::U64(Arc::new(vec![0x0102_0304_0506_0708, 0xff, 0x1_0000]));
-    assert_eq!(wide.cast(8), Prim::U8(Arc::new(vec![0x08, 0xff, 0x00])));
-    assert_eq!(wide.cast(16), Prim::U16(Arc::new(vec![0x0708, 0x00ff, 0x0000])));
-    assert_eq!(wide.cast(32), Prim::U32(Arc::new(vec![0x0506_0708, 0xff, 0x1_0000])));
+fn meet_widens_bytes() {
+    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![1, 2])), Prim::I64(Arc::new(vec![-1, 3])));
+    assert!(matches!((&a, &b), (Prim::I64(_), Prim::I64(_))));
+    assert_eq!(a, Prim::I64(Arc::new(vec![1, 2])));
+    let xs = Arc::new(vec![5u8]);
+    let (a, _) = Prim::meet(Prim::U8(xs.clone()), Prim::U8(Arc::new(vec![6])));
+    assert!(matches!(a, Prim::U8(v) if Arc::ptr_eq(&v, &xs)), "one storage meets without a copy");
+}
 
-    let narrow = Prim::U8(Arc::new(vec![0, 1, 255]));
-    assert_eq!(narrow.cast(16), Prim::U16(Arc::new(vec![0, 1, 255])));
-    assert_eq!(narrow.cast(64), Prim::U64(Arc::new(vec![0, 1, 255])));
+/// The `i64` words a position reader sees are the integers' two's complement, in the same buffer.
+#[test]
+fn words_round_trip() {
+    let xs = vec![-1i64, 0, 5, i64::MIN];
+    let w = words_of_i64s(xs.clone());
+    assert_eq!(w, vec![u64::MAX, 0, 5, 1 << 63]);
+    assert_eq!(i64s_of_words(w), xs);
+    assert_eq!(words_of(&xs), &[u64::MAX, 0, 5, 1 << 63]);
 }
 
 /// A `Value` clone must be a refcount bump, not a column copy: `eval_graph` clones at every
@@ -29,7 +43,7 @@ fn rewidth_keeps_the_low_bytes() {
 /// `Vec` here made a shared edge cost as much again as the data it carried.
 #[test]
 fn cloning_a_list_shares_its_partition() {
-    let list = Value::List(Bounds::offsets(vec![1, 3, 6]), Box::new(Value::u64(vec![0; 6])));
+    let list = Value::List(Bounds::offsets(vec![1, 3, 6]), Box::new(Value::i64(vec![0; 6])));
     let copy = list.clone();
     let (Value::List(Bounds::Offsets(a), _), Value::List(Bounds::Offsets(b), _)) = (&list, &copy)
     else {
@@ -76,12 +90,4 @@ fn const_and_column_assignments_agree() {
     assert_eq!(h(&konst), h(&column));
     // a mixed assignment is not equal to either.
     assert_ne!(konst, Tags::from_tags(vec![1, 0, 1], 2));
-}
-
-/// Narrowing then widening back is `mod 2^bits` — the documented truncating semantics, not a
-/// round trip. Pinned so a future "make cast lossless" change has to face the corpus.
-#[test]
-fn narrow_then_widen_truncates() {
-    let wide = Prim::U64(Arc::new(vec![0x1_0000, 0x1_0001]));
-    assert_eq!(wide.cast(16).cast(64), Prim::U64(Arc::new(vec![0, 1])));
 }

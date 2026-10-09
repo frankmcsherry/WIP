@@ -4,7 +4,7 @@
 //! (run the bench binary under perf → pollard). Kept deliberately small and factored: it touches no
 //! `src`, and criterion is the upgrade path if statistical rigor is ever wanted.
 
-use corgi::{eval_graph, ArithOp, BinOp, Builder, Graph, Kind, NumOp, Value};
+use corgi::{eval_graph, ArithOp, BinOp, Builder, Graph, NumOp, Scalar, Value};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -28,20 +28,20 @@ fn report(name: &str, n: usize, d: Duration) {
 
 /// a deterministic, non-sorted leaf column (no rng dependency); masked to 32 bits so the byte-radix
 /// sort does a few passes rather than the full eight.
-fn scrambled(n: usize) -> Vec<u64> {
-    (0..n as u64).map(|i| i.wrapping_mul(2654435761) & 0xffff_ffff).collect()
+fn scrambled(n: usize) -> Vec<i64> {
+    (0..n as i64).map(|i| i.wrapping_mul(2654435761) & 0xffff_ffff).collect()
 }
 
-/// one big list of `n` scrambled values: `List<U64>` with a single row.
+/// one big list of `n` scrambled values: `List<Int>` with a single row.
 fn one_list(n: usize) -> Value {
-    Value::List(vec![n].into(), Box::new(Value::u64(scrambled(n))))
+    Value::List(vec![n].into(), Box::new(Value::i64(scrambled(n))))
 }
 
-/// a `List<U64>` of `m` rows each `l` wide — `m` independent sub-lists in one column. `ReduceSum`
+/// a `List<Int>` of `m` rows each `l` wide — `m` independent sub-lists in one column. `ReduceSum`
 /// folds each row separately, so this is `m` list-sums delivered in a single bulk pass.
 fn lists(m: usize, l: usize) -> Value {
     let bounds: Vec<usize> = (1..=m).map(|r| r * l).collect();
-    Value::List(bounds.into(), Box::new(Value::u64(scrambled(m * l))))
+    Value::List(bounds.into(), Box::new(Value::i64(scrambled(m * l))))
 }
 
 fn graph(op: impl Into<NumOp>) -> Graph<NumOp> {
@@ -58,7 +58,7 @@ fn add_chain(k: usize) -> Graph<NumOp> {
     let mut b = Builder::default();
     let mut cur = b.input();
     for _ in 0..k {
-        cur = b.add(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7), vec![cur]);
+        cur = b.add(ArithOp::BinImm(BinOp::Add, Scalar::Int(7)), vec![cur]);
     }
     b.finish(cur)
 }
@@ -68,23 +68,23 @@ fn main() {
     // sweep two sizes: 8 MB (fits the M2 P-cluster's ~16 MB L2) vs 64 MB (streams from DRAM). The
     // arithmetic workloads' per-pass cost should jump across that cliff; sort shouldn't care.
     for n in [1usize << 20, 1 << 23] {
-        report("add_const", n, bench(&graph(ArithOp::BinImm(BinOp::Add, Kind::U, 64, 7)), &Value::u64(scrambled(n)), reps));
-        report("add_chain8", n, bench(&add_chain(8), &Value::u64(scrambled(n)), reps));
+        report("add_const", n, bench(&graph(ArithOp::BinImm(BinOp::Add, Scalar::Int(7))), &Value::i64(scrambled(n)), reps));
+        report("add_chain8", n, bench(&add_chain(8), &Value::i64(scrambled(n)), reps));
     }
     let n = 1 << 20;
-    // ReduceSum over one big list — into_list + into_u64.
+    // ReduceSum over one big list — into_list + as_i64.
     report("reduce_add", n, bench(&graph(ArithOp::Reduce(corgi::Red::Add)), &one_list(n), reps));
     // `sort` over one big list — the word over `sort_by`, the discrimination / byte-radix leaf sort.
     report("sort_list", n, bench(&corgi::parse_ml("input sort").unwrap(), &one_list(n), reps));
 
-    // sum_list, after roto's HN benchmark: m lists of l u64 each. Two regimes for the SAME work —
+    // sum_list, after roto's HN benchmark: m lists of l Ints each. Two regimes for the SAME work —
     // one bulk ReduceSum (corgi's columnar regime) vs m separate evals (row-at-a-time, where roto's
     // per-item host calls live). The ratio is what the bulk pass amortizes away.
     let (m, l) = (50_000usize, 1024usize);
     let sums = graph(ArithOp::Reduce(corgi::Red::Add));
     report("sum_list/bulk", m * l, bench(&sums, &lists(m, l), reps));
     {
-        let one = Value::List(vec![l].into(), Box::new(Value::u64(scrambled(l))));
+        let one = Value::List(vec![l].into(), Box::new(Value::i64(scrambled(l))));
         let t = Instant::now();
         for _ in 0..m {
             black_box(eval_graph(&sums, black_box(one.clone())));

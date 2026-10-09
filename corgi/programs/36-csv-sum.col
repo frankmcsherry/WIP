@@ -6,5 +6,5 @@
 # = [4021]
 enum Parsed = Ok | Err in
 "1,20,x,4000" split ","
-map (w -> w parse_u64 map_variant Err (e -> 0u64) unwrap)
+map (w -> w parse_int map_variant Err (e -> 0) unwrap)
 fold_add

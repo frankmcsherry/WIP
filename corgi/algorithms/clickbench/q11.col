@@ -4,7 +4,7 @@
 # columns: MobilePhone MobilePhoneModel UserID
 # output: [u,s,u]
 let (phone, model, user) = input in
-let ranked = (phone, (model, user) zip) zip map ((p, (m, u)) -> ((m len, 0u64) gt, ((p, m), u))) filter group
-    map (((p, m), us) -> ((18446744073709551615u64, us dedup len) sub, p, m)) sort_limit 10 in
-ranked map ((d, p, m) -> (p, m, (18446744073709551615u64, d) sub))
-    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, "", z))))
+let ranked = (phone, (model, user) zip) zip map ((p, (m, u)) -> ((m len, 0) gt, ((p, m), u))) filter group
+    map (((p, m), us) -> (us dedup len neg, p, m)) sort_limit 10 in
+ranked map ((d, p, m) -> (p, m, d neg))
+    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, "", z))))

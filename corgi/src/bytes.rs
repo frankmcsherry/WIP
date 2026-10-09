@@ -22,9 +22,11 @@
 //!
 //! ```text
 //! Value ::= Prim | Prod | Sum | List | Unit          (all quantities are u64 little-endian words)
-//!   Prim  = 0, bits, len, payload[len * bits/8]      payload padded to a word boundary
+//!   Prim  = 0, storage, len, payload[..]             storage: 8 an integer per byte, 64 an integer
+//!                                                    per i64 (two's complement), 0xF64 a float per
+//!                                                    f64 total-order key; payload padded to a word
 //!   Prod  = 1, fields, Value*fields
-//!   Sum   = 2, 0, bits, len, payload[..],            `Column` form: the discriminant leaf, inline
+//!   Sum   = 2, 0, 8, len, payload[..],               `Column` form: the discriminant leaf, inline
 //!               offsets, u64*offsets,                  the carried within-lane offset per row
 //!               lanes, Value*lanes                     one column per variant (empty if unused)
 //!         | 2, 1, tag, rows, lanes, Value*lanes       `Const` form: every row carries `tag`, so
@@ -219,11 +221,13 @@ fn bounds_total(bounds: &Bounds) -> u64 {
 fn prim_len(p: &Prim) -> usize {
     match p {
         Prim::U8(v) => v.len(),
-        Prim::U16(v) => v.len(),
-        Prim::U32(v) => v.len(),
-        Prim::U64(v) => v.len(),
+        Prim::I64(v) => v.len(),
+        Prim::F64(v) => v.len(),
     }
 }
+
+/// the storage word of a float leaf (an integer leaf's is its width in bits).
+const FLOAT: u64 = 0xF64;
 
 // --- encoding helpers ---------------------------------------------------------------------------
 
@@ -237,32 +241,29 @@ fn word<W: std::io::Write>(writer: &mut W, x: u64) -> std::io::Result<()> {
 fn prim_payload_len(p: &Prim) -> usize {
     match p {
         Prim::U8(v) => v.len(),
-        Prim::U16(v) => 2 * v.len(),
-        Prim::U32(v) => 4 * v.len(),
-        Prim::U64(v) => 8 * v.len(),
+        Prim::I64(v) => 8 * v.len(),
+        Prim::F64(v) => 8 * v.len(),
     }
 }
 
-/// A leaf as `bits, len, payload` — the shared body of `Prim` and of a `Sum`'s discriminant.
+/// A leaf as `storage, len, payload` — the shared body of `Prim` and of a `Sum`'s discriminant.
 /// The payload goes out as ONE `write_all` per column (the point of the exercise) and is padded
 /// with zeros to keep whatever follows word-aligned.
 fn write_prim<W: std::io::Write>(p: &Prim, writer: &mut W) -> std::io::Result<()> {
-    let (bits, len) = match p {
+    let (storage, len) = match p {
         Prim::U8(v) => (8u64, v.len()),
-        Prim::U16(v) => (16, v.len()),
-        Prim::U32(v) => (32, v.len()),
-        Prim::U64(v) => (64, v.len()),
+        Prim::I64(v) => (64, v.len()),
+        Prim::F64(v) => (FLOAT, v.len()),
     };
-    word(writer, bits)?;
+    word(writer, storage)?;
     word(writer, len as u64)?;
-    // A column of `uN` has no byte view without a cast, and corgi takes no dependencies, so the
-    // widths above u8 go out through a word-at-a-time loop over a reusable stack buffer. This is
+    // A column of words has no byte view without a cast, and corgi takes no dependencies, so the
+    // wide storages go out through a word-at-a-time loop over a reusable stack buffer. This is
     // still a linear scan of the column with no per-row allocation or dispatch.
     match p {
         Prim::U8(v) => writer.write_all(v)?,
-        Prim::U16(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
-        Prim::U32(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
-        Prim::U64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
+        Prim::I64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
+        Prim::F64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
     }
     let pad = pad8(prim_payload_len(p)) - prim_payload_len(p);
     if pad > 0 { writer.write_all(&[0u8; 8][..pad])?; }
@@ -562,24 +563,22 @@ fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
 
 fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     use std::sync::Arc;
-    let bits = r.word()?;
+    let storage = r.word()?;
     // Bound the element count by the width BEFORE multiplying: a wire-supplied length near
     // `u64::MAX` would otherwise wrap `len * width` — to something small in release (a corrupt
     // header decoding "successfully" to an empty leaf, desyncing the frame) or to something huge
     // that walks off the buffer.
-    let payload = match bits {
-        8 => r.count(1, "u8 leaf")?,
-        16 => 2 * r.count(2, "u16 leaf")?,
-        32 => 4 * r.count(4, "u32 leaf")?,
-        64 => 8 * r.count(8, "u64 leaf")?,
-        other => return Err(format!("corgi::bytes: bad leaf width {other}")),
+    let payload = match storage {
+        8 => r.count(1, "byte leaf")?,
+        64 => 8 * r.count(8, "i64 leaf")?,
+        FLOAT => 8 * r.count(8, "f64 leaf")?,
+        other => return Err(format!("corgi::bytes: bad leaf storage {other}")),
     };
     let bytes = r.payload(payload)?;
-    Ok(match bits {
+    Ok(match storage {
         8 => Prim::U8(Arc::new(bytes.to_vec())),
-        16 => Prim::U16(Arc::new(read_le(bytes, u16::from_le_bytes))),
-        32 => Prim::U32(Arc::new(read_le(bytes, u32::from_le_bytes))),
-        _ => Prim::U64(Arc::new(read_le(bytes, u64::from_le_bytes))),
+        64 => Prim::I64(Arc::new(read_le(bytes, i64::from_le_bytes))),
+        _ => Prim::F64(Arc::new(read_le(bytes, u64::from_le_bytes))),
     })
 }
 

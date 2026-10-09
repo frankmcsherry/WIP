@@ -4,12 +4,12 @@
 let xs = input in
 let s1 = (xs map ((a, _) -> a), xs len iota) zip sort_by in
 let runs = s1 map ((_, _, r) -> r) in
-let last = (((runs len, 10u64) min, 1u64) sub, runs) get in
+let last = (((runs len, 10) min, 1) sub, runs) get in
 let end = (last enlist, runs) find map ((_, hi) -> hi) fold_max in
-let keep = ((0u64, end) range, s1) gather in
+let keep = ((0, end) range, s1) gather in
 let p1 = keep map ((_, q, _) -> q) in
 let b1 = (p1, xs map ((_, b) -> b)) gather in
 let s2 = ((keep map ((_, _, r) -> r), b1) zip, p1) zip sort_by in
 let top = (keep map ((a, _, _) -> a), s2 map (((_, b), _, _) -> b)) zip in
-((0u64, (top len, 10u64) min) range, top) gather
-    try match (0 (r -> r), 1 (_ -> 0u64 iota map (z -> (z, z))))
+((0, (top len, 10) min) range, top) gather
+    try match (0 (r -> r), 1 (_ -> 0 iota map (z -> (z, z))))

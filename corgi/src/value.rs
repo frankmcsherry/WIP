@@ -325,13 +325,114 @@ impl std::hash::Hash for Tags {
     }
 }
 
-/// a leaf column at one byte width, each width its own naturally-aligned `Vec<uN>` behind an `Arc`
-/// (leaves are write-once read-many; `eval` clones freely for shared edges, so a leaf clone must be a
-/// refcount bump, not a buffer copy). The `prim!` macro lists the widths ONCE and generates the enum +
-/// every method, so adding a width is one line here.
+/// a leaf's element type: how it orders, and what an integer it holds is. The three storages are
+/// `u8` (an integer from 0 to 255: bytes, masks, tags), `i64` (an integer, two's complement) and a
+/// float's total-order key (`u64`).
+pub(crate) trait Elem: Copy + Ord + Default + std::fmt::Debug {
+    /// the storage width in bits.
+    const BITS: u32;
+    /// an unsigned key in the element's order: the sort radixes these, and packs them.
+    fn key(self) -> u64;
+    /// the element whose key is `k`.
+    fn from_key(k: u64) -> Self;
+    /// the element's 64-bit word: an integer's two's complement, a float's key. Positions, tags
+    /// and hashes read this, so a byte 5 and an `i64` 5 read alike.
+    fn word(self) -> u64;
+}
+
+const SIGN: u64 = 1 << 63;
+
+impl Elem for u8 {
+    const BITS: u32 = 8;
+    #[inline] fn key(self) -> u64 { self as u64 }
+    #[inline] fn from_key(k: u64) -> Self { k as u8 }
+    #[inline] fn word(self) -> u64 { self as u64 }
+}
+impl Elem for i64 {
+    const BITS: u32 = 64;
+    #[inline] fn key(self) -> u64 { (self as u64) ^ SIGN }
+    #[inline] fn from_key(k: u64) -> Self { (k ^ SIGN) as i64 }
+    #[inline] fn word(self) -> u64 { self as u64 }
+}
+impl Elem for u64 {
+    const BITS: u32 = 64;
+    #[inline] fn key(self) -> u64 { self }
+    #[inline] fn from_key(k: u64) -> Self { k }
+    #[inline] fn word(self) -> u64 { self }
+}
+
+/// the order-preserving key of an `f64`: negatives flip every bit, the rest flip the sign bit, so
+/// the unsigned order of keys is `f64::total_cmp`. A float leaf stores these.
+pub(crate) fn f64_key(f: f64) -> u64 {
+    let b = f.to_bits();
+    if b >> 63 == 1 { !b } else { b ^ SIGN }
+}
+/// the `f64` whose key is `k`.
+pub(crate) fn f64_of_key(k: u64) -> f64 {
+    f64::from_bits(if k >> 63 == 1 { k ^ SIGN } else { !k })
+}
+
+/// the slice of `i64`s as their two's complement words: the same bytes, read as `u64`.
+pub(crate) fn words_of(xs: &[i64]) -> &[u64] {
+    // SAFETY: `i64` and `u64` have one size and alignment, and every bit pattern is a `u64`.
+    unsafe { std::slice::from_raw_parts(xs.as_ptr() as *const u64, xs.len()) }
+}
+
+/// the `u64` words as the `i64`s whose two's complement they are, in the same buffer.
+pub(crate) fn i64s_of_words(xs: Vec<u64>) -> Vec<i64> {
+    let mut xs = std::mem::ManuallyDrop::new(xs);
+    // SAFETY: `u64` and `i64` have one size and alignment, every bit pattern is an `i64`, and the
+    // buffer's ownership moves to the new `Vec` (the old one is never dropped).
+    unsafe { Vec::from_raw_parts(xs.as_mut_ptr() as *mut i64, xs.len(), xs.capacity()) }
+}
+
+/// the `i64`s as their two's complement words, in the same buffer.
+pub(crate) fn words_of_i64s(xs: Vec<i64>) -> Vec<u64> {
+    let mut xs = std::mem::ManuallyDrop::new(xs);
+    // SAFETY: as `i64s_of_words`, the other way.
+    unsafe { Vec::from_raw_parts(xs.as_mut_ptr() as *mut u64, xs.len(), xs.capacity()) }
+}
+
+/// a one-row constant an immediate op carries: an integer, or a float as its total-order key
+/// (a key, not an `f64`, so that ops holding it are `Eq` and `Hash`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scalar {
+    Int(i64),
+    Float(u64),
+}
+
+impl Scalar {
+    /// row `i` of a leaf, as a constant.
+    pub(crate) fn of(p: &Prim, i: usize) -> Scalar {
+        match p {
+            Prim::U8(v) => Scalar::Int(v[i] as i64),
+            Prim::I64(v) => Scalar::Int(v[i]),
+            Prim::F64(v) => Scalar::Float(v[i]),
+        }
+    }
+    /// the constant as an element of a leaf of its kind (a byte one only when it fits a byte):
+    /// its key read back at that storage.
+    pub(crate) fn elem<T: Elem>(self) -> T {
+        T::from_key(match self {
+            Scalar::Int(x) => x.key(),
+            Scalar::Float(k) => k,
+        })
+    }
+    /// does this constant agree in kind with the leaf (an integer for an integer, a float for a float)?
+    pub(crate) fn kind_of(&self, p: &Prim) -> bool {
+        matches!((self, p), (Scalar::Int(_), Prim::U8(_) | Prim::I64(_)) | (Scalar::Float(_), Prim::F64(_)))
+    }
+}
+
+/// a leaf column: one storage per variant, each a naturally aligned `Vec` behind an `Arc` (leaves
+/// are write-once read-many; `eval` clones freely for shared edges, so a leaf clone must be a
+/// refcount bump, not a buffer copy). `U8` and `I64` both hold integers, the same values at two
+/// widths: a kernel reading two integer leaves at different storages widens the byte one first
+/// ([`Prim::meet`]). `F64` holds floats, as their total-order keys. The `prim!` macro lists the
+/// storages ONCE and generates the enum and every per-storage method.
 macro_rules! prim {
     ($($V:ident => $t:ty),+ $(,)?) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        #[derive(Clone, Debug)]
         pub enum Prim {
             $( $V(Arc<Vec<$t>>), )+
         }
@@ -341,9 +442,9 @@ macro_rules! prim {
                 match self { $( Prim::$V(v) => v.len(), )+ }
             }
 
-            /// the leaf's bit width (the shape-level reflection of which variant this is).
+            /// the storage width in bits.
             pub(crate) fn bits(&self) -> u32 {
-                match self { $( Prim::$V(_) => (std::mem::size_of::<$t>() * 8) as u32, )+ }
+                match self { $( Prim::$V(_) => <$t as Elem>::BITS, )+ }
             }
 
             /// row `i` as a `usize`, read in place — how a small-int column (a `Sum`'s
@@ -351,49 +452,20 @@ macro_rules! prim {
             /// producing one to look at some of a column made a scalar `compare_at` O(column).
             #[inline]
             pub(crate) fn usize_at(&self, i: usize) -> usize {
-                match self { $( Prim::$V(v) => v[i] as usize, )+ }
+                match self { $( Prim::$V(v) => v[i].word() as usize, )+ }
             }
 
-            /// row `i`'s stored bits, zero-extended to a `u64`: how a literal's value is read. Not
-            /// `usize_at`, which truncates to 32 bits where `usize` is 32 bits (WebAssembly).
+            /// row `i`'s word: an integer's two's complement, a float's key. A position or a tag
+            /// is read this way, so a negative one is past every row.
             #[inline]
-            pub(crate) fn u64_at(&self, i: usize) -> u64 {
-                match self { $( Prim::$V(v) => v[i] as u64, )+ }
+            pub(crate) fn word_at(&self, i: usize) -> u64 {
+                match self { $( Prim::$V(v) => v[i].word(), )+ }
             }
 
-            /// re-width every record to `bits`, kind-blind: read it zero-extended to u64,
-            /// then keep the low bytes. (Signed/sign-extending widen is a numeric-layer job.)
-            ///
-            /// Same width is the IDENTITY: the leaf is already correct storage for the result, so
-            /// this is an `Arc` bump, not a column copy. A genuine re-width is ONE pass — the
-            /// (source, destination) pair is dispatched ABOVE the loop, so the lane body is a single
-            /// `as` and there is no intermediate `u64` column between the two widths.
-            #[allow(clippy::unnecessary_cast)]
-            pub(crate) fn cast(&self, bits: u32) -> Prim {
-                /// the destination half of the grid: collect zero-extended values at `bits`.
-                /// Each arm MOVES `src` — they are exclusive, so only one loop ever runs.
-                fn to_width(src: impl Iterator<Item = u64>, bits: u32) -> Prim {
-                    match bits {
-                        $( b if b == (std::mem::size_of::<$t>() * 8) as u32 =>
-                            Prim::$V(Arc::new(src.map(|x| x as $t).collect())), )+
-                        _ => panic!("cast: unsupported width {bits}"),
-                    }
-                }
-                if bits == self.bits() {
-                    return self.clone();
-                }
-                match self {
-                    $( Prim::$V(v) => to_width(v.iter().map(|&x| x as u64), bits), )+
-                }
-            }
-
-            /// an empty (zero-row) leaf at `bits`, the leaf case of `Value::empty` (matches
-            /// `cast`'s width dispatch). Used to fill the unselected variants of an `Inject`.
-            pub(crate) fn empty(bits: u32) -> Prim {
-                match bits {
-                    $( b if b == (std::mem::size_of::<$t>() * 8) as u32 => Prim::$V(Arc::new(Vec::new())), )+
-                    _ => panic!("empty: unsupported width {bits}"),
-                }
+            /// row `i`'s order key (see [`Elem::key`]).
+            #[inline]
+            pub(crate) fn key_at(&self, i: usize) -> u64 {
+                match self { $( Prim::$V(v) => v[i].key(), )+ }
             }
 
             /// `n` copies of row `i` — the leaf case of a constant column ([`crate::engine::fill`]).
@@ -417,7 +489,7 @@ macro_rules! prim {
             /// mask: every row is written to the next free slot, and the slot is kept only if the
             /// mask says so. The buffer has room for every row (plus the one slot written past the
             /// last kept row); a sparse mask touches only its front, so the rest costs no memory.
-            pub(crate) fn compress(&self, mask: &[u64]) -> Prim {
+            pub(crate) fn compress(&self, mask: &[u8]) -> Prim {
                 match self {
                     $( Prim::$V(v) => {
                         let mut out = vec![<$t>::default(); v.len() + 1];
@@ -432,24 +504,6 @@ macro_rules! prim {
                 }
             }
 
-            /// A U64 index column is also correctly typed storage for a U64 gather result. Rewrite
-            /// that owned buffer in place; other haystack widths allocate their native vector. The
-            /// raw caller deliberately materializes even an identity gather rather than adding an
-            /// identity-detection scan to its single indexing pass. An index past the leaf reads
-            /// zero. (A clamped read and a select, with no branch, measured 10–18% slower on pointer
-            /// chasing than this bounds test, whose branch is predicted when indices are in range.)
-            pub(crate) fn gather_u64_owned(&self, mut idx: Vec<u64>) -> Prim {
-                if let Prim::U64(v) = self {
-                    for x in idx.iter_mut() {
-                        *x = v.get(*x as usize).copied().unwrap_or(0);
-                    }
-                    Prim::U64(Arc::new(idx))
-                } else {
-                    let idx: Vec<usize> = idx.into_iter().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).collect();
-                    self.gather_or_zero(&idx)
-                }
-            }
-
             /// `gather` with every position past the leaf reading zero (zero bits).
             pub(crate) fn gather_or_zero(&self, idx: &[usize]) -> Prim {
                 match self {
@@ -457,46 +511,112 @@ macro_rules! prim {
                 }
             }
 
-            /// Validate one row of indices and gather it. Exact identity indices reuse the
-            /// haystack leaf; U64 gathers otherwise validate and rewrite the owned index buffer in
-            /// one pass, while other widths retain an all-or-nothing validation pass.
-            pub(crate) fn gather_u64_checked_owned(
-                &self,
-                mut idx: Vec<u64>,
-                rowlen: usize,
-            ) -> Option<Prim> {
-                // A List invariant guarantees the flattened one-row leaf has exactly `rowlen`
-                // elements. Identity reuse and checked indexing both rely on that correspondence.
-                debug_assert_eq!(self.len(), rowlen, "gather: bounds/leaf length mismatch");
-                let identity = idx.len() == rowlen
-                    && (rowlen == 0
-                        || (idx[0] == 0
-                            && idx.iter().enumerate().all(|(i, &x)| x == i as u64)));
-                if identity {
-                    return Some(self.clone());
+            /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]`. The
+            /// leaf of [`crate::engine::gather_lanes`]; `gather` is the 1-source case. The tags may
+            /// be a `Sum`'s own `u8` discriminants, read in place, or any `usize` column. Integer
+            /// sources at different storages are widened first.
+            pub(crate) fn gather_lanes<T: Copy>(srcs: &[&Prim], tags: &[T], off: &[usize]) -> Prim
+            where
+                usize: From<T>,
+            {
+                if srcs.iter().any(|s| s.bits() != srcs[0].bits()) {
+                    let wide: Vec<Prim> = srcs.iter().map(|s| s.widen()).collect();
+                    let refs: Vec<&Prim> = wide.iter().collect();
+                    return Prim::gather_lanes(&refs, tags, off);
                 }
-                if let Prim::U64(v) = self {
-                    for x in idx.iter_mut() {
-                        if *x >= rowlen as u64 {
-                            return None;
-                        }
-                        *x = v[*x as usize];
-                    }
-                    return Some(Prim::U64(Arc::new(idx)));
+                match srcs[0] {
+                    $( Prim::$V(_) => {
+                        let cols: Vec<&[$t]> = srcs.iter().map(|s| match s {
+                            Prim::$V(v) => v.as_slice(),
+                            _ => panic!("gather_lanes: an integer meets a float"),
+                        }).collect();
+                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)][o]).collect()))
+                    } )+
                 }
-                (!idx.iter().any(|&x| x >= rowlen as u64))
-                    .then(|| self.gather_u64_owned(idx))
             }
 
-            /// lane-wise min (`take_max=false`) or max (`true`) of two same-width columns, KIND-BLIND:
-            /// the leaf is stored order-preserving (unsigned native, signed/float swizzled), so byte
-            /// min/max IS value min/max for every kind — no deswizzle. An order op, hence `cmp`'s, not
-            /// arithmetic's. (The `cmp` analogue of `rel`: same kind-blindness, picks a value not a mask.)
-            /// CONSUMES both operands and writes in place into whichever is uniquely owned (same
-            /// opportunistic reuse as arithmetic's `bin_into`; min/max is a same-width elementwise binary
-            /// like add/sub/mul, so it shares that path); only when both are shared do we allocate.
+            /// the rows `index[..]` as order keys, appended to `out` — the one indirect read the
+            /// indexed sort makes; every pass after it is sequential.
+            pub(crate) fn pull_keys(&self, index: &[usize], out: &mut Vec<u64>) {
+                match self { $( Prim::$V(v) => out.extend(index.iter().map(|&i| v[i].key())), )+ }
+            }
+
+            /// a leaf of this storage holding the elements whose keys are `keys`: the sorted keys
+            /// are the sorted column.
+            pub(crate) fn like_keys(&self, keys: &[u64]) -> Prim {
+                self.like_keys_iter(keys.iter().copied())
+            }
+
+            /// `keys[q] = (keys[q] << width) | key(self[index[q]])`: this leaf's rows packed below
+            /// the keys already there, at the leaf's storage width.
+            pub(crate) fn pack_keys(&self, index: &[usize], keys: &mut [u64]) {
+                match self {
+                    $( Prim::$V(v) => {
+                        let bits = <$t as Elem>::BITS;
+                        for (k, &i) in keys.iter_mut().zip(index) { *k = k.checked_shl(bits).unwrap_or(0) | v[i].key(); }
+                    } )+
+                }
+            }
+
+            /// a leaf of this storage holding the elements whose keys `it` yields.
+            pub(crate) fn like_keys_iter(&self, it: impl Iterator<Item = u64>) -> Prim {
+                match self { $( Prim::$V(_) => Prim::$V(Arc::new(it.map(<$t>::from_key).collect())), )+ }
+            }
+
+            /// stable per-element hash: each element's word (an integer's two's complement, a
+            /// float's key) mixed by the splitmix64 finalizer. The leaf of [`crate::hash::hash`]. An
+            /// integer hashes by its value, so a byte 5 and an `i64` 5 hash alike.
+            pub(crate) fn hashes(&self) -> Vec<u64> {
+                match self {
+                    $( Prim::$V(v) => v.iter().map(|&x| crate::hash::mix64(x.word())).collect(), )+
+                }
+            }
+
+            /// Fold leaf hashes into an existing structural accumulator without materializing
+            /// a temporary hash column. The leaf encoding and hash are identical to `hashes`.
+            pub(crate) fn fold_hashes(&self, acc: &mut [u64], mut fold: impl FnMut(u64, u64) -> u64) {
+                match self {
+                    $( Prim::$V(v) => {
+                        for (a, &x) in acc.iter_mut().zip(v.iter()) {
+                            *a = fold(*a, crate::hash::mix64(x.word()));
+                        }
+                    } )+
+                }
+            }
+
+            /// append same-storage leaves end to end. Test-only: the leaf of `engine::concat`, the
+            /// `gather_lanes` reference oracle (no production path concatenates leaves).
+            #[cfg(test)]
+            pub(crate) fn concat(parts: &[&Prim]) -> Prim {
+                if parts.iter().any(|s| s.bits() != parts[0].bits()) {
+                    let wide: Vec<Prim> = parts.iter().map(|s| s.widen()).collect();
+                    return Prim::concat(&wide.iter().collect::<Vec<_>>());
+                }
+                match parts[0] {
+                    $( Prim::$V(_) => {
+                        let mut o = Vec::new();
+                        for &p in parts {
+                            match p {
+                                Prim::$V(x) => o.extend_from_slice(x),
+                                _ => panic!("concat: an integer meets a float"),
+                            }
+                        }
+                        Prim::$V(Arc::new(o))
+                    } )+
+                }
+            }
+        }
+
+        /// the pairwise kernels: each brings its two leaves to one storage ([`Prim::meet`]) and then
+        /// runs one loop per storage.
+        impl Prim {
+            /// lane-wise min (`take_max=false`) or max (`true`) of two columns, by value — an order
+            /// op, hence `cmp`'s, not arithmetic's. CONSUMES both operands and writes in place into
+            /// whichever is uniquely owned (the opportunistic reuse of arithmetic's `bin_into`);
+            /// only when both are shared do we allocate.
             pub(crate) fn lane_pick(self, other: Prim, take_max: bool) -> Prim {
-                match (self, other) {
+                let (a, b) = Prim::meet(self, other);
+                match (a, b) {
                     $( (Prim::$V(mut a), Prim::$V(mut b)) => {
                         let pick = |x: $t, y: $t| if take_max { x.max(y) } else { x.min(y) };
                         Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
@@ -509,36 +629,17 @@ macro_rules! prim {
                             Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| pick(x, y)).collect())
                         })
                     } )+
-                    _ => panic!("min/max: prim width mismatch"),
+                    _ => unreachable!("meet brings both to one storage"),
                 }
             }
 
-            /// lane-wise min (or max, with `take_max`) against the constant `c`, given as stored
-            /// bits that fit this width. Kind-blind, like `lane_pick`; in place when uniquely owned.
-            #[allow(clippy::unnecessary_cast)]
-            pub(crate) fn pick_imm(self, c: u64, take_max: bool) -> Prim {
-                match self {
-                    $( Prim::$V(mut a) => {
-                        let c = c as $t;
-                        let pick = |x: $t| if take_max { x.max(c) } else { x.min(c) };
-                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
-                            for x in dst.iter_mut() { *x = pick(*x); }
-                            a
-                        } else {
-                            Arc::new(a.iter().map(|&x| pick(x)).collect())
-                        })
-                    } )+
-                }
-            }
-
-            /// lane-wise blend of two same-width columns by a 0/1 selector: `out[i]` is `self[i]`
-            /// where `pick[i]` is nonzero, else `other[i]`. KIND-BLIND — it moves stored bytes and
-            /// never interprets them — and BRANCHLESS: the lane body is an unconditional select, so
-            /// it vectorizes, where reading the chosen side through an index would not. The leaf of
-            /// [`crate::engine::blend`]. CONSUMES both and writes into whichever is uniquely owned
-            /// (the `lane_pick` reuse policy: same width, elementwise, so the shape allows it).
-            pub(crate) fn blend(self, other: Prim, pick: &[u64]) -> Prim {
-                match (self, other) {
+            /// lane-wise blend of two columns by a selector: `out[i]` is `self[i]` where `pick[i]`
+            /// is nonzero, else `other[i]`. It moves elements and never interprets them, and is
+            /// BRANCHLESS: the lane body is an unconditional select, so it vectorizes. The leaf of
+            /// [`crate::engine::blend`]. CONSUMES both and writes into whichever is uniquely owned.
+            pub(crate) fn blend(self, other: Prim, pick: &[u8]) -> Prim {
+                let (a, b) = Prim::meet(self, other);
+                match (a, b) {
                     $( (Prim::$V(mut a), Prim::$V(mut b)) => {
                         Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
                             for (x, (&y, &m)) in dst.iter_mut().zip(b.iter().zip(pick)) {
@@ -555,121 +656,37 @@ macro_rules! prim {
                                 .map(|((&x, &y), &m)| if m != 0 { x } else { y }).collect())
                         })
                     } )+
-                    _ => panic!("select: prim width mismatch"),
+                    _ => unreachable!("meet brings both to one storage"),
                 }
             }
 
-            /// XOR the top (sign) bit of every element, at this width — the order-preserving signed
-            /// swizzle (`enc_i64` generalized), an involution. Converts an unsigned column to the
-            /// signed encoding of the same non-negative values and back; the numeric layer's `signed`.
-            /// CONSUMES self and rewrites in place when uniquely owned (same elementwise/same-width
-            /// shape as `bin_into`/`neg_into`/`lane_pick` — reuse where we can; see the policy note).
-            pub(crate) fn xor_signbit(self) -> Prim {
-                match self {
-                    $( Prim::$V(mut v) => {
-                        let m = !(<$t>::MAX >> 1);
-                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut v) {
-                            for x in dst.iter_mut() { *x ^= m; }
-                            v
-                        } else {
-                            Arc::new(v.iter().map(|&x| x ^ m).collect())
-                        })
-                    } )+
-                }
-            }
-
-            /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives the
-            /// buffer mutably when uniquely owned (the common case), or clones it once if shared. Touches
-            /// only the `active` rows; no allocation in the unique case. The leaf of [`scatter`].
+            /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives
+            /// the buffer mutably when uniquely owned (the common case), or clones it once if shared.
+            /// Touches only the `active` rows. A byte leaf receiving `i64` rows widens first. The
+            /// leaf of [`scatter`].
             pub(crate) fn scatter_into(&mut self, active: &[usize], src: &Prim) {
-                match (self, src) {
+                if self.bits() < src.bits() {
+                    *self = self.widen();
+                }
+                let src = if src.bits() < self.bits() { std::borrow::Cow::Owned(src.widen()) } else { std::borrow::Cow::Borrowed(src) };
+                match (self, &*src) {
                     $( (Prim::$V(dst), Prim::$V(s)) => {
                         let dst = Arc::make_mut(dst);
                         for (p, &r) in active.iter().enumerate() { dst[r] = s[p]; }
                     } )+
-                    _ => panic!("scatter_into: prim width mismatch"),
-                }
-            }
-
-            /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]` (all
-            /// same width). The leaf of [`crate::engine::gather_lanes`]; `gather` is the 1-source case.
-            /// The tags may be a `Sum`'s own `u8` discriminants, read in place, or any `usize` column.
-            pub(crate) fn gather_lanes<T: Copy>(srcs: &[&Prim], tags: &[T], off: &[usize]) -> Prim
-            where
-                usize: From<T>,
-            {
-                match srcs[0] {
-                    $( Prim::$V(_) => {
-                        let cols: Vec<&[$t]> = srcs.iter().map(|s| match s {
-                            Prim::$V(v) => v.as_slice(),
-                            _ => panic!("gather_lanes: prim width mismatch"),
-                        }).collect();
-                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)][o]).collect()))
-                    } )+
-                }
-            }
-
-            /// the rows `index[..]` widened to `u64`, appended to `out` — the one indirect read the
-            /// indexed sort makes; every pass after it is sequential.
-            #[allow(clippy::unnecessary_cast)]
-            pub(crate) fn pull_u64(&self, index: &[usize], out: &mut Vec<u64>) {
-                match self { $( Prim::$V(v) => out.extend(index.iter().map(|&i| v[i] as u64)), )+ }
-            }
-
-            /// a leaf of this width holding `keys`, narrowed: the sorted keys are the sorted column.
-            pub(crate) fn like(&self, keys: &[u64]) -> Prim {
-                self.like_from(keys.iter().copied())
-            }
-
-            /// `keys[q] = (keys[q] << width) | self[index[q]]`: this leaf's rows packed below the
-            /// keys already there, at the leaf's declared width.
-            #[allow(clippy::unnecessary_cast)]
-            pub(crate) fn pack_u64(&self, index: &[usize], keys: &mut [u64]) {
-                match self {
-                    $( Prim::$V(v) => {
-                        let bits = (std::mem::size_of::<$t>() * 8) as u32;
-                        for (k, &i) in keys.iter_mut().zip(index) { *k = (*k << bits) | v[i] as u64; }
-                    } )+
-                }
-            }
-
-            /// a leaf of this width holding the keys `it` yields, narrowed.
-            #[allow(clippy::unnecessary_cast)]
-            pub(crate) fn like_from(&self, it: impl Iterator<Item = u64>) -> Prim {
-                match self { $( Prim::$V(_) => Prim::$V(Arc::new(it.map(|k| k as $t).collect())), )+ }
-            }
-            /// stable per-element hash: each element WIDENED to u64 (zero-extend) and mixed (splitmix64
-            /// finalizer). The leaf of [`crate::hash::hash`]; reads the stored bytes only, so it is
-            /// KIND-BLIND and — for the raw/unsigned reading — WIDTH-BLIND: `u8` 5 and `u64` 5 both
-            /// hash `mix64(5)`, since the widen collapses them (so a narrowing/widening for storage is
-            /// id-preserving). Signed/float store a WIDTH-DEPENDENT order-preserving encoding, so
-            /// cross-width identity is NOT promised for those kinds; see [`crate::hash`].
-            pub(crate) fn hashes(&self) -> Vec<u64> {
-                match self {
-                    $( Prim::$V(v) => v.iter().map(|&x| crate::hash::mix64(x as u64)).collect(), )+
-                }
-            }
-
-            /// Fold leaf hashes into an existing structural accumulator without materializing
-            /// a temporary hash column. The leaf encoding and hash are identical to `hashes`.
-            pub(crate) fn fold_hashes(&self, acc: &mut [u64], mut fold: impl FnMut(u64, u64) -> u64) {
-                match self {
-                    $( Prim::$V(v) => {
-                        for (a, &x) in acc.iter_mut().zip(v.iter()) {
-                            *a = fold(*a, crate::hash::mix64(x as u64));
-                        }
-                    } )+
+                    _ => panic!("scatter_into: an integer meets a float"),
                 }
             }
 
             /// structural order of paired records: `out[k]` = sign of `self[ia[k]]` vs `other[ib[k]]`
-            /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and scalar
-            /// on NEON; the dense column-vs-column compare is [`Prim::rel`].
+            /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and
+            /// scalar on NEON; the dense column-vs-column compare is [`Prim::rel`].
             pub(crate) fn cmp_idx(&self, ia: &[usize], ib: &[usize], other: &Prim) -> Vec<i8> {
-                match (self, other) {
+                let (a, b) = Prim::meet_ref(self, other);
+                match (&*a, &*b) {
                     $( (Prim::$V(a), Prim::$V(b)) =>
                         ia.iter().zip(ib).map(|(&i, &j)| (a[i] > b[j]) as i8 - (a[i] < b[j]) as i8).collect(), )+
-                    _ => panic!("cmp_idx: prim width mismatch"),
+                    _ => unreachable!("meet brings both to one storage"),
                 }
             }
 
@@ -678,72 +695,81 @@ macro_rules! prim {
             /// row i) and `skew` 1 the adjacent (row k vs row k+1). Both sides are read
             /// sequentially, so this vectorizes where [`Prim::cmp_idx`] is two gathers per lane.
             pub(crate) fn cmp_dense(&self, other: &Prim, n: usize, skew: usize) -> Vec<i8> {
-                match (self, other) {
+                let (a, b) = Prim::meet_ref(self, other);
+                match (&*a, &*b) {
                     $( (Prim::$V(a), Prim::$V(b)) => (0..n)
                         .map(|k| {
                             let (x, y) = (a[k], b[k + skew]);
                             (x > y) as i8 - (x < y) as i8
                         })
                         .collect(), )+
-                    _ => panic!("cmp_dense: prim width mismatch"),
+                    _ => unreachable!("meet brings both to one storage"),
                 }
             }
 
-            /// `rel` against the constant `c` (stored bits that fit this width): the mask of rows
-            /// whose comparison with `c` lands in the chosen order flags.
-            #[allow(clippy::unnecessary_cast)]
-            pub(crate) fn rel_imm(&self, c: u64, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
+            /// lane-wise relational compare of two columns → a 0/1 byte mask. The three order-flags
+            /// arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
+            pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
+                let (a, b) = Prim::meet_ref(self, other);
+                match (&*a, &*b) {
+                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
+                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u8)
+                        .collect(), )+
+                    _ => unreachable!("meet brings both to one storage"),
+                }
+            }
+        }
+
+        /// the immediate kernels: a leaf against a constant of its kind. A byte leaf whose constant
+        /// is not a byte works at `i64`.
+        impl Prim {
+            /// `rel` against the constant `c`: the mask of rows whose comparison with `c` lands in
+            /// the chosen order flags.
+            pub(crate) fn rel_imm(&self, c: Scalar, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
+                if let (Prim::U8(_), Scalar::Int(x)) = (self, c) {
+                    if !(0..=255).contains(&x) {
+                        return self.widen().rel_imm(c, lt, eq, gt);
+                    }
+                }
                 match self {
                     // one loop per predicate: a single compare per lane, where folding the three
                     // order flags into the body measured ~20% slower on a `gt` filter.
                     $( Prim::$V(a) => {
-                        let y = c as $t;
+                        let y: $t = c.elem();
                         match (lt, eq, gt) {
-                            (true, false, false) => a.iter().map(|&x| (x < y) as u64).collect(),
-                            (true, true, false) => a.iter().map(|&x| (x <= y) as u64).collect(),
-                            (false, true, false) => a.iter().map(|&x| (x == y) as u64).collect(),
-                            (true, false, true) => a.iter().map(|&x| (x != y) as u64).collect(),
-                            (false, false, true) => a.iter().map(|&x| (x > y) as u64).collect(),
-                            (false, true, true) => a.iter().map(|&x| (x >= y) as u64).collect(),
+                            (true, false, false) => a.iter().map(|&x| (x < y) as u8).collect(),
+                            (true, true, false) => a.iter().map(|&x| (x <= y) as u8).collect(),
+                            (false, true, false) => a.iter().map(|&x| (x == y) as u8).collect(),
+                            (true, false, true) => a.iter().map(|&x| (x != y) as u8).collect(),
+                            (false, false, true) => a.iter().map(|&x| (x > y) as u8).collect(),
+                            (false, true, true) => a.iter().map(|&x| (x >= y) as u8).collect(),
                             // no flag or every flag: the predicate is constant
-                            (all, _, _) => vec![all as u64; a.len()],
+                            (all, _, _) => vec![all as u8; a.len()],
                         }
                     } )+
                 }
             }
 
-            /// lane-wise relational compare of two same-width columns → a 0/1 mask. Kind-blind: reads the
-            /// stored bytes, correct for unsigned and order-preserving swizzled signed alike. The three
-            /// order-flags arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
-            pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u64> {
-                match (self, other) {
-                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
-                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u64)
-                        .collect(), )+
-                    _ => panic!("rel: prim width mismatch"),
+            /// lane-wise min (or max, with `take_max`) against the constant `c`; in place when
+            /// uniquely owned.
+            pub(crate) fn pick_imm(self, c: Scalar, take_max: bool) -> Prim {
+                if let (Prim::U8(_), Scalar::Int(x)) = (&self, c) {
+                    if !(0..=255).contains(&x) {
+                        return self.widen().pick_imm(c, take_max);
+                    }
                 }
-            }
-
-            /// append same-width leaves end to end. Test-only: the leaf of `engine::concat`, the
-            /// `gather_lanes` reference oracle (no production path concatenates leaves).
-            #[cfg(test)]
-            pub(crate) fn concat(parts: &[&Prim]) -> Prim {
-                match parts[0] {
-                    $( Prim::$V(_) => {
-                        let mut o = Vec::new();
-                        for &p in parts {
-                            match p {
-                                Prim::$V(x) => o.extend_from_slice(x),
-                                _ => panic!("concat: prim width mismatch"),
-                            }
-                        }
-                        Prim::$V(Arc::new(o))
+                match self {
+                    $( Prim::$V(mut a) => {
+                        let c: $t = c.elem();
+                        let pick = |x: $t| if take_max { x.max(c) } else { x.min(c) };
+                        Prim::$V(if let Some(dst) = Arc::get_mut(&mut a) {
+                            for x in dst.iter_mut() { *x = pick(*x); }
+                            a
+                        } else {
+                            Arc::new(a.iter().map(|&x| pick(x)).collect())
+                        })
                     } )+
                 }
-            }
-
-            fn show(&self) -> String {
-                match self { $( Prim::$V(xs) => format!("{xs:?}"), )+ }
             }
         }
     };
@@ -751,9 +777,129 @@ macro_rules! prim {
 
 prim! {
     U8 => u8,
-    U16 => u16,
-    U32 => u32,
-    U64 => u64,
+    I64 => i64,
+    F64 => u64,
+}
+
+impl Prim {
+    /// does this leaf hold integers (rather than floats)?
+    pub(crate) fn is_int(&self) -> bool {
+        !matches!(self, Prim::F64(_))
+    }
+
+    /// the leaf with integers at `i64`: a byte leaf widens (one pass), any other is itself.
+    pub(crate) fn widen(&self) -> Prim {
+        match self {
+            Prim::U8(v) => Prim::I64(Arc::new(v.iter().map(|&x| x as i64).collect())),
+            other => other.clone(),
+        }
+    }
+
+    /// two leaves at one storage, to be combined lane by lane: two integer leaves at different
+    /// storages meet at `i64`. A leaf already there is returned as it was. An integer and a float
+    /// never meet; the typer keeps them apart, so meeting them is a bug.
+    pub(crate) fn meet(a: Prim, b: Prim) -> (Prim, Prim) {
+        assert_eq!(a.is_int(), b.is_int(), "an integer leaf meets a float leaf");
+        if a.bits() == b.bits() {
+            (a, b)
+        } else {
+            (a.widen(), b.widen())
+        }
+    }
+
+    /// [`Prim::meet`], borrowing where nothing needs to widen.
+    pub(crate) fn meet_ref<'a>(a: &'a Prim, b: &'a Prim) -> (std::borrow::Cow<'a, Prim>, std::borrow::Cow<'a, Prim>) {
+        use std::borrow::Cow;
+        assert_eq!(a.is_int(), b.is_int(), "an integer leaf meets a float leaf");
+        if a.bits() == b.bits() {
+            (Cow::Borrowed(a), Cow::Borrowed(b))
+        } else {
+            (Cow::Owned(a.widen()), Cow::Owned(b.widen()))
+        }
+    }
+
+    /// an empty (zero-row) leaf: an integer one is `i64`, a float one is `F64`. Used to fill the
+    /// unselected variants of an `Inject`.
+    pub(crate) fn empty(int: bool) -> Prim {
+        if int { Prim::I64(Arc::new(Vec::new())) } else { Prim::F64(Arc::new(Vec::new())) }
+    }
+
+    /// A leaf whose positions are the owned `idx` (each a word: a negative position is past every
+    /// row). An `i64` haystack rewrites that buffer in place into the result; other storages
+    /// allocate their own. The raw caller deliberately materializes even an identity gather
+    /// rather than adding an identity-detection scan to its single indexing pass. An index past
+    /// the leaf reads zero. (A clamped read and a select, with no branch, measured 10–18% slower
+    /// on pointer chasing than this bounds test, whose branch is predicted when indices are in
+    /// range.)
+    pub(crate) fn gather_words_owned(&self, mut idx: Vec<u64>) -> Prim {
+        if let Prim::I64(v) = self {
+            for x in idx.iter_mut() {
+                *x = v.get(*x as usize).copied().unwrap_or(0) as u64;
+            }
+            Prim::I64(Arc::new(i64s_of_words(idx)))
+        } else {
+            let idx: Vec<usize> = idx.into_iter().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).collect();
+            self.gather_or_zero(&idx)
+        }
+    }
+
+    /// Validate one row of positions and gather it. Exact identity indices reuse the haystack
+    /// leaf; an `i64` haystack otherwise validates and rewrites the owned index buffer in one
+    /// pass, while other storages keep an all-or-nothing validation pass.
+    pub(crate) fn gather_words_checked_owned(&self, mut idx: Vec<u64>, rowlen: usize) -> Option<Prim> {
+        // A List invariant guarantees the flattened one-row leaf has exactly `rowlen`
+        // elements. Identity reuse and checked indexing both rely on that correspondence.
+        debug_assert_eq!(self.len(), rowlen, "gather: bounds/leaf length mismatch");
+        let identity = idx.len() == rowlen
+            && (rowlen == 0 || (idx[0] == 0 && idx.iter().enumerate().all(|(i, &x)| x == i as u64)));
+        if identity {
+            return Some(self.clone());
+        }
+        if let Prim::I64(v) = self {
+            for x in idx.iter_mut() {
+                if *x >= rowlen as u64 {
+                    return None;
+                }
+                *x = v[*x as usize] as u64;
+            }
+            return Some(Prim::I64(Arc::new(i64s_of_words(idx))));
+        }
+        (!idx.iter().any(|&x| x >= rowlen as u64)).then(|| self.gather_words_owned(idx))
+    }
+
+    fn show(&self) -> String {
+        match self {
+            Prim::U8(xs) => format!("{xs:?}"),
+            Prim::I64(xs) => format!("{xs:?}"),
+            Prim::F64(xs) => format!("{:?}", xs.iter().map(|&k| f64_of_key(k)).collect::<Vec<_>>()),
+        }
+    }
+}
+
+// equality and hashing go by VALUE: an integer is the same whatever storage holds it, so a byte
+// leaf and an `i64` leaf of the same integers are equal and hash alike.
+impl PartialEq for Prim {
+    fn eq(&self, other: &Prim) -> bool {
+        match (self, other) {
+            (Prim::U8(a), Prim::U8(b)) => a == b,
+            (Prim::I64(a), Prim::I64(b)) => a == b,
+            (Prim::F64(a), Prim::F64(b)) => a == b,
+            (Prim::U8(a), Prim::I64(b)) | (Prim::I64(b), Prim::U8(a)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(&x, &y)| x as i64 == y)
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for Prim {}
+impl std::hash::Hash for Prim {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.is_int().hash(state);
+        self.len().hash(state);
+        for i in 0..self.len() {
+            self.word_at(i).hash(state);
+        }
+    }
 }
 
 /// within-variant offset of each row: `out[i]` = the index of row `i` inside `variants[tags[i]]`, in
@@ -765,10 +911,12 @@ fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
 
 impl Value {
     /// leaf-column constructors — the funnel results pass through, so the representation lives in one place.
-    pub fn  u8(xs: Vec<u8 >) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
-    pub fn u16(xs: Vec<u16>) -> Value { Value::Prim(Prim::U16(Arc::new(xs))) }
-    pub fn u32(xs: Vec<u32>) -> Value { Value::Prim(Prim::U32(Arc::new(xs))) }
-    pub fn u64(xs: Vec<u64>) -> Value { Value::Prim(Prim::U64(Arc::new(xs))) }
+    /// Integers held as bytes (each from 0 to 255): text, masks, tags.
+    pub fn u8(xs: Vec<u8>) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
+    /// Integers held as `i64`s.
+    pub fn i64(xs: Vec<i64>) -> Value { Value::Prim(Prim::I64(Arc::new(xs))) }
+    /// Floats.
+    pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(Arc::new(xs.into_iter().map(f64_key).collect()))) }
 
     /// a Sum from its discriminant `tags` (stored as a u8 leaf column — ≤256 variants) and the
     /// per-variant columns (every lane present; a variant no row carries is an empty column). The
@@ -790,7 +938,8 @@ impl Value {
     /// fills the lanes it does not carry with this; the recursion mirrors `shape_of_value` inverted.
     pub fn empty(shape: &Shape) -> Value {
         match shape {
-            Shape::Prim(w) => Value::Prim(Prim::empty(*w)),
+            Shape::Int => Value::Prim(Prim::empty(true)),
+            Shape::Float => Value::Prim(Prim::empty(false)),
             Shape::Prod(ss) => Value::Prod(ss.iter().map(Value::empty).collect()),
             Shape::Sum(ss) => {
                 Value::Sum(Tags::Const(0, 0), ss.iter().map(Value::empty).collect())
@@ -872,36 +1021,73 @@ impl Value {
         }
     }
 
-    /// borrow the leaf as a `u64` slice — for an op that only READS its operand.
+    /// borrow an integer leaf as `i64`s — for an op that only READS its operand. A byte leaf
+    /// widens (a copy); an `i64` leaf is borrowed.
     ///
-    /// `into_u64` forces ownership, and ownership is a full column COPY whenever anyone else still
+    /// `into_i64` forces ownership, and ownership is a full column COPY whenever anyone else still
     /// holds the buffer: a graph node with fan-out 2, or a caller that keeps its input. Measured on
     /// a one-pass `fold_add` at 1M rows, that copy was 7.9x the whole operation. Reading needs none
-    /// of it; only an op that rewrites its operand in place (`Shr`, `And`, `Scan`) has to
-    /// consume it.
-    pub fn as_u64(&self, who: &str) -> Result<&[u64], String> {
+    /// of it; only an op that rewrites its operand in place has to consume it.
+    pub fn as_i64(&self, who: &str) -> Result<std::borrow::Cow<'_, [i64]>, String> {
+        use std::borrow::Cow;
         match self {
-            Value::Prim(Prim::U64(xs)) => Ok(&xs[..]),
-            other => Err(format!("{who}: expected U64, got {}", shape_of_value(other))),
+            Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(&xs[..])),
+            Value::Prim(Prim::U8(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| x as i64).collect())),
+            other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
         }
     }
 
-    /// borrow the leaf as a `u8` slice — the byte-column sibling of [`Value::as_u64`].
-    pub fn as_u8(&self, who: &str) -> Result<&[u8], String> {
+    /// take an integer leaf as an owned `i64` buffer — for an op that REWRITES its operand in
+    /// place. Moves the buffer out at refcount 1, and copies it when shared or held as bytes.
+    pub fn into_i64(self, who: &str) -> Result<Vec<i64>, String> {
+        match self {
+            Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
+            Value::Prim(Prim::U8(xs)) => Ok(xs.iter().map(|&x| x as i64).collect()),
+            other => Err(format!("{who}: expected Int, got {}", shape_of_value(&other))),
+        }
+    }
+
+    /// an integer leaf as 64-bit words (two's complement) — how positions, counts and tags are
+    /// read, so a negative one is past every row. Borrowed from an `i64` leaf.
+    pub(crate) fn as_words(&self, who: &str) -> Result<std::borrow::Cow<'_, [u64]>, String> {
+        use std::borrow::Cow;
+        match self {
+            Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(words_of(xs))),
+            Value::Prim(Prim::U8(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| x as u64).collect())),
+            other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
+        }
+    }
+
+    /// [`Value::as_words`], owned: the `i64` buffer itself when uniquely held.
+    pub(crate) fn into_words(self, who: &str) -> Result<Vec<u64>, String> {
+        Ok(words_of_i64s(self.into_i64(who)?))
+    }
+
+    /// an integer leaf as a mask: a byte per row, nonzero where the row is. A byte leaf (what
+    /// every comparison writes) is borrowed as it is.
+    pub(crate) fn as_mask(&self, who: &str) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+        use std::borrow::Cow;
+        match self {
+            Value::Prim(Prim::U8(xs)) => Ok(Cow::Borrowed(&xs[..])),
+            Value::Prim(Prim::I64(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| (x != 0) as u8).collect())),
+            other => Err(format!("{who}: expected an Int mask, got {}", shape_of_value(other))),
+        }
+    }
+
+    /// borrow a byte leaf — text, which is a list of integers held as bytes. Crate-private: a host
+    /// reads integers by shape (`as_i64`), never by storage.
+    pub(crate) fn as_u8(&self, who: &str) -> Result<&[u8], String> {
         match self {
             Value::Prim(Prim::U8(xs)) => Ok(&xs[..]),
-            other => Err(format!("{who}: expected U8, got {}", shape_of_value(other))),
+            other => Err(format!("{who}: expected Int bytes, got {}", shape_of_value(other))),
         }
     }
 
-    /// take the leaf's `u64` buffer — for an op that REWRITES its operand in place. Moves the
-    /// buffer out at refcount 1, and copies it when shared; see [`Value::as_u64`], which most
-    /// callers want instead.
-    pub fn into_u64(self, who: &str) -> Result<Vec<u64>, String> {
+    /// a float leaf's values.
+    pub fn as_f64(&self, who: &str) -> Result<Vec<f64>, String> {
         match self {
-            // move the buffer out if this is the last holder, else clone (shared leaf).
-            Value::Prim(Prim::U64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
-            other => Err(format!("{who}: expected U64, got {}", shape_of_value(&other))),
+            Value::Prim(Prim::F64(ks)) => Ok(ks.iter().map(|&k| f64_of_key(k)).collect()),
+            other => Err(format!("{who}: expected Float, got {}", shape_of_value(other))),
         }
     }
 

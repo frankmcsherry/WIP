@@ -5,4 +5,4 @@
 # n = 8
 # = List ends=[8] <[0, 1, 2, 3, 3, 3, 3, 3]>
 let xs = input iota map (x -> x and 3) in
-(0u64, xs) scan ((a, x) -> (a, x) max)
+(0, xs) scan ((a, x) -> (a, x) max)

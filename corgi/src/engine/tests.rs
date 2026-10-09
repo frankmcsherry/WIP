@@ -1,8 +1,9 @@
 use super::*;
 use crate::value::Value;
 
+/// integers from their 64-bit words (so the full range, negatives included, is easy to write).
 fn u(xs: &[u64]) -> Value {
-    Value::u64(xs.to_vec())
+    Value::i64(xs.iter().map(|&x| x as i64).collect())
 }
 
 /// reference for `gather_lanes`: index into `concat(variants)` by lane-start + offset.
@@ -30,12 +31,12 @@ fn check(tags: &[usize], variants: Vec<Value>) {
 #[test]
 fn blend_matches_the_gather_lanes_path() {
     // the general path, written out: row i from lane `mask[i] != 0`, at its own position.
-    fn oracle(mask: &[u64], then: &Value, els: &Value) -> Value {
+    fn oracle(mask: &[u8], then: &Value, els: &Value) -> Value {
         let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();
         let off: Vec<usize> = (0..tags.len()).collect();
         gather_lanes(&[Some(els), Some(then)], &tags, &off)
     }
-    let mask = [1u64, 0, 0, 1];
+    let mask = [1u8, 0, 0, 1];
     let list = |ends: Vec<usize>, xs: &[u64]| Value::List(ends.into(), Box::new(u(xs)));
 
     // leaf, product of leaves, unit — the lane-wise path.
@@ -119,27 +120,27 @@ fn gather_lanes_matches_concat_gather() {
 /// a unit, lane 0 holding its own zero; in range it reads as `gather`. A sum of no lanes has no zero.
 #[test]
 fn gather_or_zero_reads_the_shapes_zero() {
-    let leaf = Value::u64(vec![7, 8]);
-    assert_eq!(gather_or_zero(&leaf, &[1, 5]).unwrap(), Value::u64(vec![8, 0]));
-    let pair = Value::Prod(vec![Value::u64(vec![1, 2]), Value::u8(vec![3, 4])]);
-    assert_eq!(gather_or_zero(&pair, &[9, 0]).unwrap(), Value::Prod(vec![Value::u64(vec![0, 1]), Value::u8(vec![0, 3])]));
-    let lists = Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7])));
-    assert_eq!(gather_or_zero(&lists, &[1, 4, 0]).unwrap(), Value::List(vec![1, 1, 3].into(), Box::new(Value::u64(vec![7, 5, 6]))));
-    let sum = Value::sum(vec![1, 0], vec![Value::u64(vec![40]), Value::u64(vec![30])]);
+    let leaf = Value::i64(vec![7, 8]);
+    assert_eq!(gather_or_zero(&leaf, &[1, 5]).unwrap(), Value::i64(vec![8, 0]));
+    let pair = Value::Prod(vec![Value::i64(vec![1, 2]), Value::u8(vec![3, 4])]);
+    assert_eq!(gather_or_zero(&pair, &[9, 0]).unwrap(), Value::Prod(vec![Value::i64(vec![0, 1]), Value::u8(vec![0, 3])]));
+    let lists = Value::List(vec![2, 3].into(), Box::new(Value::i64(vec![5, 6, 7])));
+    assert_eq!(gather_or_zero(&lists, &[1, 4, 0]).unwrap(), Value::List(vec![1, 1, 3].into(), Box::new(Value::i64(vec![7, 5, 6]))));
+    let sum = Value::sum(vec![1, 0], vec![Value::i64(vec![40]), Value::i64(vec![30])]);
     let got = gather_or_zero(&sum, &[0, 2, 1]).unwrap();
-    assert_eq!(got, Value::sum(vec![1, 0, 0], vec![Value::u64(vec![0, 40]), Value::u64(vec![30])]));
+    assert_eq!(got, Value::sum(vec![1, 0, 0], vec![Value::i64(vec![0, 40]), Value::i64(vec![30])]));
     let none = Value::Sum(crate::value::Tags::Const(0, 0), Vec::new());
     assert!(gather_or_zero(&none, &[0]).is_err());
     // a reference's zero is an empty row of its arena: in range, the arena is the one shared; out of
     // range, a new arena with one more, empty row (or the last row, when that is empty already)
-    let arena = std::sync::Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7]))));
+    let arena = std::sync::Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::i64(vec![5, 6, 7]))));
     let refs = Value::Ref(arena.clone(), std::sync::Arc::new(vec![1, 0]));
     let Value::Ref(same, _) = gather_or_zero(&refs, &[1, 0]).unwrap() else { panic!() };
     assert!(std::sync::Arc::ptr_eq(&same, &arena));
     let missed = gather_or_zero(&refs, &[0, 9]).unwrap();
     let Value::Ref(grown, rows) = &missed else { panic!() };
     assert_eq!((grown.len(), rows.to_vec()), (3, vec![1, 2]));
-    assert_eq!(clone_ref(missed.clone()), Value::List(vec![1, 1].into(), Box::new(Value::u64(vec![7]))));
+    assert_eq!(clone_ref(missed.clone()), Value::List(vec![1, 1].into(), Box::new(Value::i64(vec![7]))));
     let Value::Ref(again, rows) = gather_or_zero(&missed, &[5]).unwrap() else { panic!() };
     assert!(std::sync::Arc::ptr_eq(&again, grown) && rows.to_vec() == vec![2], "an empty last row is reused");
 }

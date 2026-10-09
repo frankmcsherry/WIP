@@ -3,16 +3,16 @@
 use crate::common::{bytes_col, run_case, Cfg, Rng};
 use corgi::Value;
 
-fn reference(s: &[u8]) -> u64 {
+fn reference(s: &[u8]) -> i64 {
     if s.is_empty() {
         return 0;
     }
-    let sum: u64 = s
+    let sum: i64 = s
         .iter()
         .rev()
         .enumerate()
         .map(|(i, &c)| {
-            let d = (c - b'0') as u64;
+            let d = (c - b'0') as i64;
             if i % 2 == 1 {
                 let t = 2 * d;
                 if t > 9 { t - 9 } else { t }
@@ -21,7 +21,7 @@ fn reference(s: &[u8]) -> u64 {
             }
         })
         .sum();
-    sum.is_multiple_of(10) as u64
+    (sum % 10 == 0) as i64
 }
 
 pub fn run(cfg: &Cfg) {
@@ -43,7 +43,7 @@ pub fn run(cfg: &Cfg) {
         numbers.push(s);
     }
     let input = bytes_col(&numbers);
-    let expected = Value::u64(numbers.iter().map(|s| reference(s)).collect());
-    let rust = || numbers.iter().map(|s| reference(s)).collect::<Vec<u64>>();
+    let expected = Value::i64(numbers.iter().map(|s| reference(s)).collect());
+    let rust = || numbers.iter().map(|s| reference(s)).collect::<Vec<i64>>();
     run_case(cfg, "luhn", "digit strings of 12-19 digits, half valid", include_str!("../../algorithms/luhn.col"), input, expected, rust);
 }

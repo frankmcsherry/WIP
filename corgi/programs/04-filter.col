@@ -1,3 +1,3 @@
 # n = 5
 # = List ends=[2] <[3, 4]>
-input iota map (x -> ((x, 2u64) gt, x)) filter
+input iota map (x -> ((x, 2) gt, x)) filter

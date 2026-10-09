@@ -2,7 +2,7 @@
 # sql: SELECT AdvEngineID, COUNT(*) AS c FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY c DESC, AdvEngineID
 # columns: AdvEngineID
 # output: [u,u]
-# Most frequent first: sort on (MAX - count, key).
-input map (a -> ((a, 0u64) ne, (a, 1u64))) filter group
-    map ((a, ones) -> ((18446744073709551615u64, ones len) sub, a)) sort
-    map ((d, a) -> (a, (18446744073709551615u64, d) sub))
+# Most frequent first: sort on (-count, key).
+input map (a -> ((a, 0) ne, (a, 1))) filter group
+    map ((a, ones) -> (ones len neg, a)) sort
+    map ((d, a) -> (a, d neg))

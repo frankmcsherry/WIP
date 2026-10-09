@@ -4,8 +4,8 @@ use crate::common::{run_case, Cfg, Rng};
 use crate::common_data::tuple_lists;
 use std::collections::BTreeMap;
 
-fn reference(kvs: &[[u64; 2]]) -> Vec<[u64; 4]> {
-    let mut groups: BTreeMap<u64, [u64; 3]> = BTreeMap::new();
+fn reference(kvs: &[[i64; 2]]) -> Vec<[i64; 4]> {
+    let mut groups: BTreeMap<i64, [i64; 3]> = BTreeMap::new();
     for &[k, v] in kvs {
         let g = groups.entry(k).or_insert([0, 0, 0]);
         g[0] += 1;
@@ -17,7 +17,7 @@ fn reference(kvs: &[[u64; 2]]) -> Vec<[u64; 4]> {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(18);
-    let rows: Vec<Vec<[u64; 2]>> = (0..cfg.list_rows())
+    let rows: Vec<Vec<[i64; 2]>> = (0..cfg.list_rows())
         .map(|_| (0..cfg.list_len(&mut rng, 33)).map(|_| [rng.below(8), rng.below(1000)]).collect())
         .collect();
     let input = tuple_lists(&rows);

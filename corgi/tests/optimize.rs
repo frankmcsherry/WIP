@@ -7,8 +7,8 @@ use corgi::{
     Program, Value,
 };
 
-fn u64(xs: &[u64]) -> Value {
-    Value::u64(xs.to_vec())
+fn int(xs: &[i64]) -> Value {
+    Value::i64(xs.to_vec())
 }
 
 fn eval_str(g: &Graph<NumOp>, arg: &Value) -> String {
@@ -18,12 +18,12 @@ fn eval_str(g: &Graph<NumOp>, arg: &Value) -> String {
 
 fn sample() -> Value {
     Value::Prod(vec![
-        u64(&[10, 20, 30]),
+        int(&[10, 20, 30]),
         Value::List(
             vec![2, 3, 6].into(),
-            Box::new(Value::Prod(vec![u64(&[1, 2, 3, 4, 5, 6]), u64(&[100, 200, 300, 400, 500, 600])])),
+            Box::new(Value::Prod(vec![int(&[1, 2, 3, 4, 5, 6]), int(&[100, 200, 300, 400, 500, 600])])),
         ),
-        Value::sum(vec![0, 1, 0], vec![u64(&[1111, 3333]), u64(&[2222])]),
+        Value::sum(vec![0, 1, 0], vec![int(&[1111, 3333]), int(&[2222])]),
     ])
 }
 
@@ -31,9 +31,9 @@ fn join_input() -> Value {
     Value::Prod(vec![
         Value::List(
             vec![6].into(),
-            Box::new(Value::Prod(vec![u64(&[1, 1, 2, 3, 3, 3]), u64(&[10, 11, 20, 30, 31, 32])])),
+            Box::new(Value::Prod(vec![int(&[1, 1, 2, 3, 3, 3]), int(&[10, 11, 20, 30, 31, 32])])),
         ),
-        Value::List(vec![4].into(), Box::new(u64(&[2, 3, 5, 1]))),
+        Value::List(vec![4].into(), Box::new(int(&[2, 3, 5, 1]))),
     ])
 }
 
@@ -78,9 +78,9 @@ fn optimize_preserves_eval_everywhere() {
     let cases: &[Case] = &[
         ("input.1 transpose .1 fold_add", sample),
         ("(input.0, input.1 transpose .1) cap_list map (p -> p add)", sample),
-        ("input.2 map_variant 1 (h -> (h, 1000000u64) add) unwrap", sample),
+        ("input.2 map_variant 1 (h -> (h, 1000000) add) unwrap", sample),
         // map fusion: a three-deep MapList chain must collapse without changing the result.
-        ("input.1 transpose .1 map (x -> (x, 1u64) add) map (x -> x shr 1) map (x -> (x, 5u64) add)", sample),
+        ("input.1 transpose .1 map (x -> (x, 1) add) map (x -> (x, 2) div) map (x -> (x, 5) add)", sample),
         // iso cancellation under composition with a real op between the pair.
         ("input.1 transpose zip map (p -> p.0)", sample),
         (INLINED_JOIN, join_input),
@@ -96,7 +96,7 @@ fn optimize_preserves_eval_everywhere() {
 fn fuse_maps_collapses_adjacent_passes() {
     // two passes over the same list become one. The fused graph has fewer nodes (one MapList, one
     // composed body) and the same result.
-    let g = parse_ml("input.1 transpose .1 map (x -> (x, 1u64) add) map (x -> (x, 10u64) add)").unwrap();
+    let g = parse_ml("input.1 transpose .1 map (x -> (x, 1) add) map (x -> (x, 10) add)").unwrap();
     let fused = dce(&fuse_maps(&g)); // fusion orphans the producer MapList; dce sweeps it
     assert!(fused.node_count() < g.node_count(), "fusion should drop the intermediate MapList node");
     assert_eq!(eval_str(&fused, &sample()), eval_str(&g, &sample()));
@@ -129,7 +129,7 @@ fn optimize_preserves_every_corpus_program() {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
-        let (mut n, mut prog) = (8u64, String::new());
+        let (mut n, mut prog) = (8i64, String::new());
         for line in text.lines() {
             if let Some(r) = line.strip_prefix("# n =") {
                 n = r.trim().parse().unwrap();
@@ -140,7 +140,7 @@ fn optimize_preserves_every_corpus_program() {
         }
         let who = path.file_name().unwrap().to_string_lossy().into_owned();
         let g = parse_ml(prog.trim()).unwrap_or_else(|e| panic!("{who}: {e}"));
-        let arg = u64(&[n]);
+        let arg = int(&[n]);
         assert_eq!(eval_str(&optimize(&g), &arg), eval_str(&g, &arg), "optimize drifted on {who}");
     }
 }

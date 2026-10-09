@@ -6,9 +6,9 @@
 # n = 6
 # = ([1], [1], [1])
 let xs = input iota in
-let as_fold = ((0u64, xs) foldscan ((a, x) -> ((a, x) add, x unit))) .0 in
-let as_scan = ((0u64, xs) foldscan ((a, x) -> let a2 = (a, x) add in (a2, a2))) .1 in
-let idx     = ((0u64, xs) foldscan ((i, x) -> ((i, 1u64) add, i))) .1 in
-((as_fold, (0u64, xs) fold ((a, x) -> (a, x) add)) eq,
- (as_scan, (0u64, xs) scan ((a, x) -> (a, x) add)) eq,
+let as_fold = ((0, xs) foldscan ((a, x) -> ((a, x) add, x unit))) .0 in
+let as_scan = ((0, xs) foldscan ((a, x) -> let a2 = (a, x) add in (a2, a2))) .1 in
+let idx     = ((0, xs) foldscan ((i, x) -> ((i, 1) add, i))) .1 in
+((as_fold, (0, xs) fold ((a, x) -> (a, x) add)) eq,
+ (as_scan, (0, xs) scan ((a, x) -> (a, x) add)) eq,
  (idx, xs) eq)

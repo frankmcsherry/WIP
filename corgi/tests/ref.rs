@@ -13,13 +13,13 @@ fn run(src: &str, input: Value) -> Value {
     eval_graph(&g, input)
 }
 
-fn seed(n: u64) -> Value {
-    Value::u64(vec![n])
+fn seed(n: i64) -> Value {
+    Value::i64(vec![n])
 }
 
 /// a 3-row list over a 6-element payload
 fn haystack() -> Value {
-    Value::List(vec![2, 5, 6].into(), Box::new(Value::u64(vec![10, 11, 20, 21, 22, 30])))
+    Value::List(vec![2, 5, 6].into(), Box::new(Value::i64(vec![10, 11, 20, 21, 22, 30])))
 }
 
 #[test]
@@ -29,8 +29,8 @@ fn ref_clone_round_trips_and_shows_as_the_rows() {
     assert_eq!(show(&referenced), format!("Ref <{}>", show(&h)));
     assert_eq!(run("input ref clone", h.clone()), h);
     // `ref` passes through a product: the list field is referenced, the scalar stays by value
-    let p = Value::Prod(vec![Value::u64(vec![1, 2, 3]), h.clone()]);
-    assert_eq!(shape_of_value(&run("input ref", p.clone())).to_string(), "(U64, Ref<List<U64>>)");
+    let p = Value::Prod(vec![Value::i64(vec![1, 2, 3]), h.clone()]);
+    assert_eq!(shape_of_value(&run("input ref", p.clone())).to_string(), "(Int, Ref<List<Int>>)");
     assert_eq!(run("input ref clone", p.clone()), p);
     // and `clone` of a value with no references is the value
     assert_eq!(run("input clone", p.clone()), p);
@@ -41,12 +41,12 @@ fn ref_clone_round_trips_and_shows_as_the_rows() {
 /// more than once, and the lists those references name, copied out.
 fn sub_list_references() -> (Value, Value) {
     use std::sync::Arc;
-    let arena = Arc::new(Value::List(vec![1, 2, 4].into(), Box::new(Value::u64(vec![3, 7, 3, 1]))));
+    let arena = Arc::new(Value::List(vec![1, 2, 4].into(), Box::new(Value::i64(vec![3, 7, 3, 1]))));
     let rows = Arc::new(vec![0, 1, 0, 2, 0]);
     let by_ref = Value::List(vec![3, 5].into(), Box::new(Value::Ref(arena, rows)));
     let by_val = Value::List(
         vec![3, 5].into(),
-        Box::new(Value::List(vec![1, 2, 3, 5, 6].into(), Box::new(Value::u64(vec![3, 7, 3, 3, 1, 3])))),
+        Box::new(Value::List(vec![1, 2, 3, 5, 6].into(), Box::new(Value::i64(vec![3, 7, 3, 3, 1, 3])))),
     );
     (by_ref, by_val)
 }
@@ -82,7 +82,7 @@ fn merges_keep_references() {
     use corgi::arrange::gather_lanes;
     use std::sync::Arc;
     // rows [1], [2, 3], [4]
-    let arena = Arc::new(Value::List(vec![1, 3, 4].into(), Box::new(Value::u64(vec![1, 2, 3, 4]))));
+    let arena = Arc::new(Value::List(vec![1, 3, 4].into(), Box::new(Value::i64(vec![1, 2, 3, 4]))));
     let a = Value::Ref(arena.clone(), Arc::new(vec![0, 1]));
     let b = Value::Ref(arena.clone(), Arc::new(vec![2]));
     let (tags, off) = ([1, 0, 0], [0, 1, 0]);
@@ -92,13 +92,13 @@ fn merges_keep_references() {
     assert_eq!(**rows, vec![2, 1, 0]);
 
     // rows [9, 8], [7], [6, 5]
-    let other = Arc::new(Value::List(vec![2, 3, 5].into(), Box::new(Value::u64(vec![9, 8, 7, 6, 5]))));
+    let other = Arc::new(Value::List(vec![2, 3, 5].into(), Box::new(Value::i64(vec![9, 8, 7, 6, 5]))));
     let c = Value::Ref(other, Arc::new(vec![0, 0, 1]));
     let merged = gather_lanes(&[Some(&a), Some(&c)], &[1, 0, 1, 0, 1], &[0, 0, 1, 1, 2]);
     let Value::Ref(p, _) = &merged else { panic!() };
     let Value::List(_, held) = &**p else { panic!("an arena is a list") };
     assert_eq!((p.len(), held.len()), (4, 6), "a's two rows and c's two, each once; c's unnamed [6, 5] left behind");
-    let expect = Value::List(vec![2, 3, 5, 7, 8].into(), Box::new(Value::u64(vec![9, 8, 1, 9, 8, 2, 3, 7])));
+    let expect = Value::List(vec![2, 3, 5, 7, 8].into(), Box::new(Value::i64(vec![9, 8, 1, 9, 8, 2, 3, 7])));
     assert_eq!(run("input clone", merged), expect);
 }
 
@@ -107,9 +107,9 @@ fn merges_keep_references() {
 #[test]
 fn fold_state_stays_a_reference() {
     use std::sync::Arc;
-    let arena = Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::u64(vec![5, 6, 7]))));
+    let arena = Arc::new(Value::List(vec![2, 3].into(), Box::new(Value::i64(vec![5, 6, 7]))));
     let seed = Value::Ref(arena.clone(), Arc::new(vec![0, 1]));
-    let xs = Value::List(vec![3, 4].into(), Box::new(Value::u64(vec![0, 1, 0, 1])));
+    let xs = Value::List(vec![3, 4].into(), Box::new(Value::i64(vec![0, 1, 0, 1])));
     let out = run(
         "let (s, xs) = input in (s, xs) fold ((acc, x) -> (x, acc, acc) select)",
         Value::Prod(vec![seed.clone(), xs]),
@@ -124,8 +124,8 @@ fn fold_state_stays_a_reference() {
 #[test]
 fn bytes_round_trip_a_reference() {
     use std::sync::Arc;
-    let arena = Arc::new(Value::List(vec![2, 3, 3].into(), Box::new(Value::u64(vec![10, 11, 12]))));
-    let r = Value::Prod(vec![Value::u64(vec![1, 2, 3]), Value::Ref(arena.clone(), Arc::new(vec![1, 0, 2]))]);
+    let arena = Arc::new(Value::List(vec![2, 3, 3].into(), Box::new(Value::i64(vec![10, 11, 12]))));
+    let r = Value::Prod(vec![Value::i64(vec![1, 2, 3]), Value::Ref(arena.clone(), Arc::new(vec![1, 0, 2]))]);
     let mut buf = Vec::new();
     corgi::bytes::write_to(&r, &mut buf).unwrap();
     assert_eq!(buf.len(), corgi::bytes::length_in_bytes(&r));
@@ -134,7 +134,7 @@ fn bytes_round_trip_a_reference() {
     // a row past its arena, or an arena that is not a list, is refused, not trusted
     for bad in [
         Value::Ref(arena, Arc::new(vec![3])),
-        Value::Ref(Arc::new(Value::u64(vec![10])), Arc::new(vec![0])),
+        Value::Ref(Arc::new(Value::i64(vec![10])), Arc::new(vec![0])),
     ] {
         let mut buf = Vec::new();
         corgi::bytes::write_to(&bad, &mut buf).unwrap();
@@ -146,12 +146,12 @@ fn bytes_round_trip_a_reference() {
 #[test]
 fn readers_agree_through_a_box() {
     let h = haystack();
-    let idx = Value::u64(vec![1, 2, 0]);
-    let lists = Value::List(vec![1, 3, 4].into(), Box::new(Value::u64(vec![1, 2, 0, 0])));
-    let needles = Value::List(vec![1, 2, 3].into(), Box::new(Value::u64(vec![11, 21, 22, 5])));
+    let idx = Value::i64(vec![1, 2, 0]);
+    let lists = Value::List(vec![1, 3, 4].into(), Box::new(Value::i64(vec![1, 2, 0, 0])));
+    let needles = Value::List(vec![1, 2, 3].into(), Box::new(Value::i64(vec![11, 21, 22, 5])));
     let ranges = Value::List(
         vec![1, 3, 4].into(),
-        Box::new(Value::Prod(vec![Value::u64(vec![0, 0, 2, 0]), Value::u64(vec![2, 1, 3, 1])])),
+        Box::new(Value::Prod(vec![Value::i64(vec![0, 0, 2, 0]), Value::i64(vec![2, 1, 3, 1])])),
     );
     for (name, lhs, by_value, by_ref) in [
         ("get", Some(idx), "let (i, h) = input in (i, h) get", "let (i, h) = input in (i, h ref) get"),
@@ -173,17 +173,17 @@ fn readers_agree_through_a_box() {
 #[test]
 fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
     let by_ref = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in \
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in \
          (xs ref, ys) cap_list map ((c, y) -> (y, c) get)",
         seed(6),
     );
     let by_value = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in \
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in \
          (xs, ys) cap_list map ((c, y) -> (y, c) get)",
         seed(6),
     );
     let via_gather = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in (ys, xs) gather",
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in (ys, xs) gather",
         seed(6),
     );
     assert_eq!(by_ref, by_value);
@@ -196,18 +196,18 @@ fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
 #[test]
 fn field_of_a_referenced_product() {
     let out = run(
-        "let xs = input iota in let p = (xs, xs map (y -> y shr 1)) in let b = p ref in (b.1 clone, b.0 clone)",
+        "let xs = input iota in let p = (xs, xs map (y -> (y, 2) div)) in let b = p ref in (b.1 clone, b.0 clone)",
         seed(6),
     );
-    let expect = run("let xs = input iota in (xs map (y -> y shr 1), xs)", seed(6));
+    let expect = run("let xs = input iota in (xs map (y -> (y, 2) div), xs)", seed(6));
     assert_eq!(out, expect);
     // and a list field of a referenced product comes back as a referenced LIST (spans), readable by `gather`
     let by_ref = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in let b = (xs, xs) ref in (ys, b.1) gather",
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in let b = (xs, xs) ref in (ys, b.1) gather",
         seed(6),
     );
     let by_value = run(
-        "let xs = input iota in let ys = xs map (y -> y shr 1) in (ys, xs) gather",
+        "let xs = input iota in let ys = xs map (y -> (y, 2) div) in (ys, xs) gather",
         seed(6),
     );
     assert_eq!(by_ref, by_value);
@@ -218,7 +218,7 @@ fn field_of_a_referenced_product() {
 #[test]
 fn a_box_is_not_silently_materialized() {
     let g = parse_ml("input ref map (x -> x)").unwrap();
-    let err = corgi::shape_of(&g, &corgi::Shape::List(Box::new(corgi::Shape::Prim(64))));
+    let err = corgi::shape_of(&g, &corgi::Shape::List(Box::new(corgi::Shape::Int)));
     assert!(err.is_err(), "map over a Box must be a shape error");
     let msg = err.unwrap_err();
     assert!(msg.contains("expected a list") && msg.contains("Ref<"), "{msg}");
@@ -230,17 +230,17 @@ fn a_box_is_not_silently_materialized() {
 fn wco_step_searches_through_references() {
     use std::sync::Arc;
     let anchors = 4;
-    let adj_vals: Vec<u64> = (0..40).collect();
-    let adj = Value::List(vec![adj_vals.len()].into(), Box::new(Value::u64(adj_vals)));
+    let adj_vals: Vec<i64> = (0..40).collect();
+    let adj = Value::List(vec![adj_vals.len()].into(), Box::new(Value::i64(adj_vals)));
     let by_ref = Value::Ref(Arc::new(adj), Arc::new(vec![0; anchors]));
     let ranges = Value::List(
         vec![1, 2, 3, 4].into(),
-        Box::new(Value::Prod(vec![Value::u64(vec![0, 10, 20, 30]), Value::u64(vec![10, 20, 30, 40])])),
+        Box::new(Value::Prod(vec![Value::i64(vec![0, 10, 20, 30]), Value::i64(vec![10, 20, 30, 40])])),
     );
-    let small = Value::List(vec![2, 4, 6, 8].into(), Box::new(Value::u64(vec![3, 9, 10, 15, 25, 29, 30, 99])));
+    let small = Value::List(vec![2, 4, 6, 8].into(), Box::new(Value::i64(vec![3, 9, 10, 15, 25, 29, 30, 99])));
     let prog = |adj: &str| {
         format!(
-            "let (small, ranges, adj) = input in let hay = ((ranges len, 1u64) sub, (ranges, {adj}) slices) get in (small, hay) find"
+            "let (small, ranges, adj) = input in let hay = ((ranges len, 1) sub, (ranges, {adj}) slices) get in (small, hay) find"
         )
     };
     let arg = Value::Prod(vec![small, ranges, by_ref]);
@@ -262,8 +262,8 @@ fn wco_step_searches_through_references() {
 #[test]
 fn fold_state_across_arenas_holds_only_live_rows() {
     let n = 2000;
-    let seed = Value::List(vec![1, 2].into(), Box::new(Value::u64(vec![0, 0])));
-    let xs = Value::List(vec![1, 1 + n].into(), Box::new(Value::u64(vec![3; 1 + n])));
+    let seed = Value::List(vec![1, 2].into(), Box::new(Value::i64(vec![0, 0])));
+    let xs = Value::List(vec![1, 1 + n].into(), Box::new(Value::i64(vec![3; 1 + n])));
     let out = run(
         "let (s, xs) = input in (s ref, xs) fold ((acc, x) -> x iota ref)",
         Value::Prod(vec![seed, xs]),

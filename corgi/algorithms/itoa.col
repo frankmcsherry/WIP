@@ -1,11 +1,12 @@
-# A u64 as its decimal digits (ASCII), the way `to_string` writes it. Input `U64`. Output
-# `List<U8>`. Twenty rounds of divide by ten give the digits least significant first; the rounds
-# past the number's top digit are dropped, and the rest reversed.
+# A non-negative Int as its decimal digits (ASCII), the way `to_string` writes it. Input an `Int`.
+# Output a `List<Int>` of bytes. Nineteen rounds of divide by ten (the most digits an Int has) give
+# the digits least significant first; the rounds past the number's top digit are dropped, and the
+# rest reversed.
 let x = input in
-let (_, ds) = (x, 20u64 iota) foldscan ((v, k) ->
-    let keep = ((v, 0u64) gt, (k, 0u64) eq) max in
-    ((v, 10u64) div_u64, (keep, ((v, 10u64) rem, 48u64) add))) in
+let (_, ds) = (x, 19 iota) foldscan ((v, k) ->
+    let keep = ((v, 0) gt, (k, 0) eq) max in
+    ((v, 10) div, (keep, ((v, 10) rem, 48) add))) in
 let digits = ds filter in
 let n = digits len in
-let back = (n, n iota) cap_list map ((n, i) -> (((n, 1u64) sub, i) sub)) in
-(back, digits) gather try match (0 (s -> s map (c -> c cast 8)), 1 (_ -> "")) 
+let back = (n, n iota) cap_list map ((n, i) -> (((n, 1) sub, i) sub)) in
+(back, digits) gather try match (0 (s -> s), 1 (_ -> ""))

@@ -1,4 +1,4 @@
 # n = 5
 # = Sum tags=[1] [[], [5], []]
-enum Three = A u64 | B u64 | C u64 in
+enum Three = A int | B int | C int in
 input inject B

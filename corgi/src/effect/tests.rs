@@ -8,15 +8,15 @@ fn run(src: &str, n: u64) -> String {
     let g = parse_ml(src).unwrap();
     let lowered = lower_effects(&g);
     // the lowered program is well-typed in the pure vocabulary.
-    shape_of(&lowered, &Shape::Prim(64)).unwrap_or_else(|e| panic!("{src}: {e}"));
-    show(&eval_graph(&lowered, Value::u64(vec![n])))
+    shape_of(&lowered, &Shape::Int).unwrap_or_else(|e| panic!("{src}: {e}"));
+    show(&eval_graph(&lowered, Value::i64(vec![n as i64])))
 }
 
 #[test]
 fn get_then_lifted_add() {
     // `head` fails on the empty row; the `add` downstream runs on the Ok lane only.
-    assert_eq!(run("(input iota head, 10u64) add", 3), "Sum tags=[0] [[10], ()x0]");
-    assert_eq!(run("(input iota head, 10u64) add", 0), "Sum tags=[1] [[], ()x1]");
+    assert_eq!(run("(input iota head, 10) add", 3), "Sum tags=[0] [[10], ()x0]");
+    assert_eq!(run("(input iota head, 10) add", 0), "Sum tags=[1] [[], ()x1]");
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn maplist_hoists_a_fallible_body() {
     let src = "input iota map (x -> x iota head)";
     assert_eq!(run(src, 0), "Sum tags=[0] [List ends=[0] <[]>, ()x0]"); // no elements: Ok
     assert_eq!(run(src, 3), "Sum tags=[1] [List ends=[] <[]>, ()x1]"); // element 0 errs
-    let src = "(input, 1u64) add iota map (x -> (x, 1u64) add iota head)";
+    let src = "(input, 1) add iota map (x -> (x, 1) add iota head)";
     assert_eq!(run(src, 2), "Sum tags=[0] [List ends=[3] <[0, 0, 0]>, ()x0]");
 }
 
@@ -41,7 +41,7 @@ fn maplist_hoists_a_fallible_body() {
 fn try_erases_and_discharges() {
     assert_eq!(run("input iota head try", 0), "Sum tags=[1] [[], ()x1]");
     // matching on the revealed sum is ordinary pure code again.
-    let src = "input iota head try match (0 (x -> (x, 100u64) add), 1 (u -> 7u64))";
+    let src = "input iota head try match (0 (x -> (x, 100) add), 1 (u -> 7))";
     assert_eq!(run(src, 0), "[7]");
     assert_eq!(run(src, 5), "[100]");
 }
@@ -49,7 +49,7 @@ fn try_erases_and_discharges() {
 #[test]
 fn fold_with_a_fallible_body_errs_the_row() {
     // fold over [0..n): the body reads element `x` of a length-3 list, so x >= 3 errs the row.
-    let src = "(0u64, input iota) fold ((acc, x) -> ((x, 3u64 iota) get, acc) add)";
+    let src = "(0, input iota) fold ((acc, x) -> ((x, 3 iota) get, acc) add)";
     assert_eq!(run(src, 3), "Sum tags=[0] [[3], ()x0]"); // 0+1+2
     assert_eq!(run(src, 4), "Sum tags=[1] [[], ()x1]"); // x=3 out of range
 }
@@ -60,8 +60,8 @@ fn nested_fallible_ops_squash_flat() {
     let src = "input iota head iota head";
     let g = parse_ml(src).unwrap();
     let lowered = lower_effects(&g);
-    let s = shape_of(&lowered, &Shape::Prim(64)).unwrap();
-    assert_eq!(s.to_string(), "{U64 | ()}");
+    let s = shape_of(&lowered, &Shape::Int).unwrap();
+    assert_eq!(s.to_string(), "{Int | ()}");
     assert_eq!(run(src, 0), "Sum tags=[1] [[], ()x1]");
     assert_eq!(run(src, 1), "Sum tags=[1] [[], ()x1]"); // head of [0] is 0; [0..0) is empty
     assert_eq!(run(src, 2), "Sum tags=[1] [[], ()x1]"); // head of [0,1] is 0 again

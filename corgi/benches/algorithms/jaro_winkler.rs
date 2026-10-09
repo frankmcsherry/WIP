@@ -1,7 +1,7 @@
 //! Jaro-Winkler similarity of two byte strings, as `strsim::jaro_winkler` computes it on ASCII.
 //! Two programs: `direct` follows the textbook loop, `by_byte` reformulates the match per byte value.
 
-use crate::common::{bytes_col, enc_f64, run_case, Cfg, Rng};
+use crate::common::{bytes_col, run_case, Cfg, Rng};
 use corgi::Value;
 
 fn reference(a: &[u8], b: &[u8]) -> f64 {
@@ -51,7 +51,7 @@ pub fn run(cfg: &Cfg) {
         bytes_col(&pairs.iter().map(|p| &p.0).collect::<Vec<_>>()),
         bytes_col(&pairs.iter().map(|p| &p.1).collect::<Vec<_>>()),
     ]);
-    let expected = Value::u64(pairs.iter().map(|(a, b)| enc_f64(reference(a, b))).collect());
+    let expected = Value::f64(pairs.iter().map(|(a, b)| reference(a, b)).collect());
     let rust = || pairs.iter().map(|(a, b)| reference(a, b)).collect::<Vec<f64>>();
     let what = "two strings of 0-15 bytes over 5 letters";
     run_case(cfg, "jaro_winkler_direct", what, include_str!("../../algorithms/jaro_winkler_direct.col"), input.clone(), expected.clone(), rust);

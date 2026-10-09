@@ -4,6 +4,6 @@
 # columns: ClientIP
 # output: [i,i,i,i,u]
 # Written as the SQL is: grouped on all four expressions.
-let ranked = input map (i -> ((i, (i, 1i64) sub_i64, (i, 2i64) sub_i64, (i, 3i64) sub_i64), 1u64)) group
-    map (((a, b, c, d), ones) -> ((18446744073709551615u64, ones len) sub, a, b, c, d)) sort_limit 10 in
-ranked map ((x, a, b, c, d) -> (a, b, c, d, (18446744073709551615u64, x) sub))
+let ranked = input map (i -> ((i, (i, 1) sub, (i, 2) sub, (i, 3) sub), 1)) group
+    map (((a, b, c, d), ones) -> (ones len neg, a, b, c, d)) sort_limit 10 in
+ranked map ((x, a, b, c, d) -> (a, b, c, d, x neg))

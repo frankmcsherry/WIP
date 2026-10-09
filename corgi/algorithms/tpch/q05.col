@@ -20,7 +20,7 @@ let cfound = (cnat, akeys) find in
 let custs = (cfound, (ckey, cnat) zip) zip map (((lo, hi), c) -> ((hi, lo) gt, c)) filter sort in
 # Orders from 1994 by those customers, each with its customer's nation, sorted by order key.
 let eorders = ((okey, ocust) zip, odate) zip
-    map (((k, c), dt) -> (((dt, 8766u64) ge, (dt, 9131u64) lt) mul, (c, k))) filter in
+    map (((k, c), dt) -> (((dt, 8766) ge, (dt, 9131) lt) min, (c, k))) filter in
 let ofound = (eorders map ((c, _) -> c), custs map ((k, _) -> k)) find in
 let omatch = (ofound, eorders) zip map (((lo, hi), (_, k)) -> ((hi, lo) gt, (lo, k))) filter in
 let onat = (omatch map ((lo, _) -> lo), custs) gather map ((_, n) -> n) in
@@ -28,7 +28,7 @@ let orders = (omatch map ((_, k) -> k), onat) zip sort in
 # Suppliers (key, nation) sorted by key.
 let supps = (skey, snat) zip sort in
 # Line items of those orders: the order's nation and the supplier's nation must agree.
-let lines = ((lkey, lsupp) zip, (price, disc) zip) zip map (((k, s), (p, d)) -> (k, s, (p, (100u64, d) sub) mul)) in
+let lines = ((lkey, lsupp) zip, (price, disc) zip) zip map (((k, s), (p, d)) -> (k, s, (p, (100, d) sub) mul)) in
 let at = (lines map ((k, _, _) -> k), orders map ((k, _) -> k)) find in
 let lmatch = (at, lines) zip map (((lo, hi), (_, s, r)) -> ((hi, lo) gt, (lo, s, r))) filter in
 let lnat = (lmatch map ((lo, _, _) -> lo), orders) gather map ((_, n) -> n) in
@@ -39,5 +39,5 @@ let same = ((lnat, snats) zip, lmatch map ((_, _, r) -> r)) zip map (((a, b), r)
 let per = same group map ((n, rs) -> (n, rs fold_add)) in
 let nat = (per map ((n, _) -> n), akeys) find in
 let names = (nat map ((lo, _) -> lo), anations) gather map ((_, name) -> name) in
-(names, per map ((_, r) -> r)) zip map ((name, r) -> ((18446744073709551615u64, r) sub, name, r)) sort map ((_, name, r) -> (name, r))
-    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> ("", z))))
+(names, per map ((_, r) -> r)) zip map ((name, r) -> (r neg, name, r)) sort map ((_, name, r) -> (name, r))
+    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> ("", z))))

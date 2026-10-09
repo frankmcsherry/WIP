@@ -12,7 +12,7 @@
 //!
 //!   expr   = 'let' pat '=' expr 'in' expr
 //!          | 'enum' IDENT '=' IDENT shape? ('|' IDENT shape?)* 'in' expr  -- a compile-time table; names ERASE here
-//!   shape  = 'u8'|'u16'|'u32'|'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
+//!   shape  = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
 //!   pat    = IDENT | '_' | '(' pat (',' pat)* ')'      -- irrefutable: names, wildcards, tuples
 //!   pipe   = atom apply*                               -- juxtaposition; chain ends before `in`
@@ -28,32 +28,28 @@
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
 //!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root
-//!   LIT    = '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)? SUFFIX
-//!   SUFFIX = ('u'|'i') ('8'|'16'|'32'|'64') | 'f' ('32'|'64')   -- required: kind and width
+//!   LIT    = '-'? DIGITS                                        -- an Int
+//!          | '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)?  -- a Float, with a fraction or exponent
 //!
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
-//! the scope. A bare NUM is an op's parameter (`shr 3`, `branch 2`), never a value. `#` starts a
-//! comment to the end of the line. (What runs is not always what is written here: `Program` turns a
-//! binary op on a pair holding a literal, `(x, 1u64) sub`, into one op that carries the constant, so
-//! no column of the constant is built; see `corgi::immediates`.)
+//! the scope. A NUM after an op that takes one is its parameter (`chunk 3`, `branch 2`); anywhere
+//! else it is an Int, as `-3` is. `#` starts a comment to the end of the line. (What runs is not
+//! always what is written here: `Program` turns a binary op on a pair holding a literal,
+//! `(x, 1) sub`, into one op that carries the constant, so no column of the constant is built; see
+//! `corgi::immediates`.)
 //!
-//! A literal's suffix chooses how its bits are laid down: `u` as the value, `i` in the
-//! order-preserving signed encoding, `f` in the total-order float encoding. The encodings keep
-//! order, so sorting, comparison, `min`/`max` and `find` are right for every kind. Nothing tracks
-//! a kind past the literal: arithmetic takes its kind from the op's name (`add` is unsigned,
-//! `add_f64` is float), so `(1.5f64, 1.5f64) add` type-checks and adds the encodings. Checking
-//! kinds belongs to a language that lowers to this one.
+//! An Int literal is an integer and a Float literal an `f64`; arithmetic takes its kind from its
+//! operands, so `(1.5, 2.5) add` is a float add and `(1, 2.5) add` a shape error.
 //!
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
-//!       e match (0 (lo -> lo), 1 (hi -> (hi, 100u64) add))   -- exhaustive ⇒ Unwrap types it
-//!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100u64) add))
-//!       enum Opt = None () | Some u64 in xs inject Some  -- tag xs into Some; None is an empty unit lane
+//!       e match (0 (lo -> lo), 1 (hi -> (hi, 100) add))   -- exhaustive ⇒ Unwrap types it
+//!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100) add))
+//!       enum Opt = None () | Some int in xs inject Some  -- tag xs into Some; None is an empty unit lane
 
-use super::{parse_kw, resolve, str_value, takes_num};
+use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::numeric::{enc_f32, enc_f64};
-use crate::ops::{lit_value, Kind, NumOp, Op};
+use crate::ops::{NumOp, Op};
 use crate::shape::Shape;
 use crate::value::Value;
 use std::collections::HashMap;
@@ -70,8 +66,8 @@ enum Tok {
     Eq,
     Bar, // | — the variant separator in an `enum` declaration
     Ident(String),
-    Num(u64),   // an op's numeric parameter: `shr 3`, `branch 2`
-    Lit(Value), // a typed constant: `5u64`, `-3i64`, `0.7f64`
+    Num(u64),   // a non-negative integer: an op's parameter (`chunk 3`, `branch 2`), or an Int
+    Lit(Value), // a constant no parameter can be: a negative Int (`-3`) or a Float (`0.7`)
     Str(Vec<u8>),
 }
 
@@ -83,30 +79,12 @@ fn position(cs: &[char], at: usize) -> String {
     format!("{line}:{col}")
 }
 
-/// a typed constant from its text: `digits` (with an optional leading `-`, and for floats a
-/// fraction or exponent) and a suffix naming its kind and width. The suffix is required and says
-/// how the bits are laid down: `u` as the value, `i` in the order-preserving signed encoding, `f`
-/// in the total-order float encoding.
-fn typed_lit(digits: &str, suffix: &str) -> Result<Value, String> {
-    let (kind, width) = parse_kw(suffix).ok_or_else(|| format!("unknown literal suffix '{suffix}'"))?;
-    let bad = || format!("'{digits}{suffix}' is not a {suffix}");
-    match kind {
-        Kind::F => {
-            let x: f64 = digits.parse().map_err(|_| bad())?;
-            Ok(if width == 32 { Value::u32(vec![enc_f32(x as f32)]) } else { Value::u64(vec![enc_f64(x)]) })
-        }
-        Kind::U | Kind::I => {
-            let v: i128 = digits.parse().map_err(|_| bad())?;
-            let (lo, hi) = match kind {
-                Kind::U => (0i128, (1i128 << width) - 1),
-                _ => (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1),
-            };
-            if v < lo || v > hi {
-                return Err(format!("{v} does not fit in {suffix}"));
-            }
-            // two's complement truncated to the width; `lit_value` applies the kind's encoding.
-            Ok(lit_value(kind, width, v as u64))
-        }
+/// an Int constant, held as a byte when it is one (so a byte column meeting it stays bytes, as text
+/// meeting `40` does) and as an `i64` otherwise.
+fn int_lit(n: i64) -> Value {
+    match u8::try_from(n) {
+        Ok(b) => Value::u8(vec![b]),
+        Err(_) => Value::i64(vec![n]),
     }
 }
 
@@ -184,58 +162,53 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
                     text.push(cs[i]);
                     i += 1;
                 }
-                // A fraction or exponent makes a float, and only counts when an `f` suffix follows:
-                // otherwise `x.0.1` would read `0.1` as a number rather than two projections.
-                let mut j = i;
-                let mut float = String::new();
-                if cs.get(j) == Some(&'.') && digit(j + 1) {
-                    float.push('.');
-                    j += 1;
-                    while digit(j) {
-                        float.push(cs[j]);
-                        j += 1;
-                    }
-                }
-                if matches!(cs.get(j), Some('e') | Some('E'))
-                    && (digit(j + 1) || (matches!(cs.get(j + 1), Some('+') | Some('-')) && digit(j + 2)))
-                {
-                    float.push('e');
-                    j += 1;
-                    if !digit(j) {
-                        float.push(cs[j]);
-                        j += 1;
-                    }
-                    while digit(j) {
-                        float.push(cs[j]);
-                        j += 1;
-                    }
-                }
-                if !float.is_empty() {
-                    match cs.get(j) {
-                        Some('f') => {
-                            text.push_str(&float);
-                            i = j;
-                        }
-                        Some(c) if c.is_ascii_alphabetic() => {
-                            let at = position(&cs, start);
-                            return Err(format!("{at}: '{text}{float}' has a fraction, so needs an f32 or f64 suffix"));
-                        }
-                        _ => {}
-                    }
-                }
-                let mut suffix = String::new();
-                while i < cs.len() && cs[i].is_ascii_alphanumeric() {
-                    suffix.push(cs[i]);
+                // A fraction or exponent makes a float, but not right after a `.`: there a number
+                // is a projection, and `x.0.1` is two of them.
+                let projecting = toks.last() == Some(&Tok::Dot);
+                let mut float = false;
+                if !projecting && cs.get(i) == Some(&'.') && digit(i + 1) {
+                    float = true;
+                    text.push('.');
                     i += 1;
+                    while digit(i) {
+                        text.push(cs[i]);
+                        i += 1;
+                    }
+                }
+                if !projecting
+                    && matches!(cs.get(i), Some('e') | Some('E'))
+                    && (digit(i + 1) || (matches!(cs.get(i + 1), Some('+') | Some('-')) && digit(i + 2)))
+                {
+                    float = true;
+                    text.push('e');
+                    i += 1;
+                    if !digit(i) {
+                        text.push(cs[i]);
+                        i += 1;
+                    }
+                    while digit(i) {
+                        text.push(cs[i]);
+                        i += 1;
+                    }
                 }
                 let at = position(&cs, start);
-                if suffix.is_empty() {
-                    let n: u64 = text
-                        .parse()
-                        .map_err(|_| format!("{at}: '{text}' needs a type suffix, such as {text}i64"))?;
-                    Tok::Num(n)
+                if i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                    let mut suffix = String::new();
+                    while i < cs.len() && cs[i].is_ascii_alphanumeric() {
+                        suffix.push(cs[i]);
+                        i += 1;
+                    }
+                    return Err(format!("{at}: '{text}{suffix}': a literal takes no suffix (integers have no width), so write {text}"));
+                }
+                if float {
+                    let x: f64 = text.parse().map_err(|_| format!("{at}: '{text}' is not a float"))?;
+                    Tok::Lit(Value::f64(vec![x]))
+                } else if text.starts_with('-') {
+                    let n: i64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
+                    Tok::Lit(int_lit(n))
                 } else {
-                    Tok::Lit(typed_lit(&text, &suffix).map_err(|e| format!("{at}: {e}"))?)
+                    let n: u64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
+                    Tok::Num(n)
                 }
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
@@ -274,7 +247,7 @@ enum Apply {
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, Vec<Shape>),    // tag + the declared sum's lane shapes -> Op::Inject
-    Head, // `head`: sugar for `(0u64, list) get` — the first element (an empty row errs)
+    Head, // `head`: sugar for `(0, list) get` — the first element (an empty row errs)
 }
 
 enum E {
@@ -417,7 +390,7 @@ impl P {
     }
 
     /// a payload shape in an `enum` declaration:
-    ///   shape = 'u8' | 'u16' | 'u32' | 'u64' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
+    ///   shape = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
     /// where ENUM names an earlier, fully-shaped enum (so sums nest, but never recursively).
     fn shape(&mut self) -> Result<Shape, String> {
         match self.bump() {
@@ -435,10 +408,11 @@ impl P {
                 Ok(Shape::Prod(fields))
             }
             Some(Tok::Ident(k)) => match k.as_str() {
-                "u8" => Ok(Shape::Prim(8)),
-                "u16" => Ok(Shape::Prim(16)),
-                "u32" => Ok(Shape::Prim(32)),
-                "u64" => Ok(Shape::Prim(64)),
+                "int" => Ok(Shape::Int),
+                "float" => Ok(Shape::Float),
+                "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
+                    Err(format!("'{k}' is retired: an integer is `int` (its width is storage), a float `float`"))
+                }
                 "List" => {
                     self.eat(&Tok::LParen)?;
                     let inner = self.shape()?;
@@ -585,12 +559,16 @@ impl P {
                 Ok(Apply::Op(name, Some(lanes)))
             }
             _ if takes_num(&name) => Ok(Apply::Op(name, Some(self.num()?))),
+            // a retired spelling points at its replacement, whatever follows it (`cast 32`)
+            _ if retired(&name).is_some() => Err(retired(&name).unwrap_or_default()),
+            // `and` takes its mask optionally: `x and 255`, or the pair form `(x, y) and`.
+            "and" if matches!(self.peek(), Some(Tok::Num(_))) => Ok(Apply::Op(name, Some(self.num()?))),
             "field" => Err("projection is `.N`, as in x .1".into()),
             _ if name == "lit" || name.starts_with("lit_") => {
-                Err("a constant is a typed literal, as in 5u64 or -3i64".into())
+                Err("a constant is a literal, as in 5, -3 or 0.5".into())
             }
             _ if matches!(self.peek(), Some(Tok::Num(_))) => {
-                Err(format!("'{name}' takes no number; a constant operand is a typed literal, as in (x, 1u64) {name}"))
+                Err(format!("'{name}' takes no number; a constant operand goes in the pair, as in (x, 1) {name}"))
             }
             _ => Ok(Apply::Op(name, None)),
         }
@@ -629,7 +607,11 @@ impl P {
                 let Some(Tok::Str(bytes)) = self.bump() else { unreachable!() };
                 Ok(E::Lit(str_value(bytes)))
             }
-            Some(Tok::Num(n)) => Err(format!("a constant needs a type suffix, as in {n}u64")),
+            Some(&Tok::Num(n)) => {
+                self.bump();
+                let n = i64::try_from(n).map_err(|_| format!("{n} does not fit in an Int (an i64)"))?;
+                Ok(E::Lit(int_lit(n)))
+            }
             other => Err(format!("expected an expression, found {other:?}")),
         }
     }
@@ -730,7 +712,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
                 // row errs (carried in the err-mask, observed by a downstream TRY), not a panic.
                 Apply::Head => {
-                    let zero = b.add(Op::Lit(Value::u64(vec![0])), vec![id]);
+                    let zero = b.add(Op::Lit(int_lit(0)), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
                     Ok(b.add(Op::TryGather, vec![pair]))
                 }

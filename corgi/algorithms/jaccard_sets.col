@@ -1,5 +1,5 @@
-# Jaccard similarity of two sets: |A ∩ B| / |A ∪ B|. Input `(a, b)`, two `List<U64>` that may hold
-# duplicates. Output an `f64` (corgi's total-order encoding); two empty sets are identical, 1.0.
+# Jaccard similarity of two sets: |A ∩ B| / |A ∪ B|. Input `(a, b)`, two `List<Int>` that may hold
+# duplicates. Output a `Float`; two empty sets are identical, 1.0.
 #
 # Deduplicate both, count the elements of A that B contains (an equal range of length one), and
 # the union is what is left of both.
@@ -8,4 +8,4 @@ let sa = a dedup in
 let sb = b dedup in
 let inter = (sa, sb) find map ((lo, hi) -> (hi, lo) sub) fold_add in
 let union = ((sa len, sb len) add, inter) sub in
-((union, 0u64) eq, 1f64, (inter to_f64, union to_f64) div_f64) select
+((union, 0) eq, 1.0, (inter to_float, union to_float) div) select

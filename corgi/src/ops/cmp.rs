@@ -15,7 +15,7 @@ use crate::engine::gather;
 use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
 use sort::{sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Scalar, Value};
 use search::find_leaf;
 use std::hint::select_unpredictable;
 
@@ -46,18 +46,18 @@ impl Pred {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
-    Rel(Pred), // (X, X) -> U64 mask   compare row by row in structural order: leaves lane-wise
-               // (kind-blind), lists/products/sums as `sort` orders them
-    RelImm(Pred, u32, u64), // X -> U64 mask   `x pred c`, `c` a constant's stored bits at width w
-    Min,       // (X, X) -> X   lane-wise minimum (kind-blind byte min; order op, no deswizzle)
+    Rel(Pred), // (X, X) -> Int mask   compare row by row in structural order: leaves lane-wise by
+               // value, lists/products/sums as `sort` orders them. The mask is 0/1, held as bytes.
+    RelImm(Pred, Scalar), // X -> Int mask   `x pred c`, `c` a constant of x's kind
+    Min,       // (X, X) -> X   lane-wise minimum, by value
     Max,       // (X, X) -> X   lane-wise maximum
-    MinImm(u32, u64), // X -> X   lane-wise min with a constant (stored bits at width w), in place
-    MaxImm(u32, u64), // X -> X   lane-wise max with a constant
-    SortBy,    // List<(K,V)> -> List<(K,V,U64)>   stable order by K alone, V carried along (a Unit
+    MinImm(Scalar), // X -> X   lane-wise min with a constant, in place
+    MaxImm(Scalar), // X -> X   lane-wise max with a constant
+    SortBy,    // List<(K,V)> -> List<(K,V,Int)>   stable order by K alone, V carried along (a Unit
                // V carries nothing), and each element's run of equal keys (numbered densely)
     SortLimit(usize), // List<X> -> List<X>   the first k of each row in structural order (`sort`,
                // then take k), sorting only what can reach the first k: see `sort_limit`
-    Adjacent,  // List<X> -> List<U64>   1 where an element differs from the one before it in its
+    Adjacent,  // List<X> -> List<Int>   1 where an element differs from the one before it in its
                // row, and at each row's first element: where runs of equal elements start
     Find,      // (needle:List<X>, haystack:List<X>) -> List<(lo,hi)>  equal_range / needle elem
 }
@@ -77,35 +77,33 @@ impl CmpOp {
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
                     // equality needs no order: lists of different lengths differ unread.
-                    _ if matches!(pred, Pred::Eq | Pred::Ne) => equal_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
-                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
+                    _ if matches!(pred, Pred::Eq | Pred::Ne) => equal_cols(&a, &b).iter().map(|&o| pred.test(o) as u8).collect(),
+                    _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u8).collect(),
                 };
-                Value::u64(mask)
+                Value::u8(mask)
             }
 
             CmpOp::Min | CmpOp::Max => {
                 let take_max = matches!(self, CmpOp::Max);
                 let (a, b) = input.into_pair("min/max")?;
+                same(&shape_of_value(&a), &shape_of_value(&b)).map_err(|e| format!("min/max: {e}"))?;
                 let (pa, pb) = (a.into_prim("min/max lhs")?, b.into_prim("min/max rhs")?);
-                if pa.bits() != pb.bits() {
-                    return Err(format!("min/max expects two equal-width leaves, got U{} and U{}", pa.bits(), pb.bits()));
-                }
                 assert_eq!(pa.len(), pb.len(), "min/max: operands at different strata");
                 Value::Prim(pa.lane_pick(pb, take_max))
             }
 
-            CmpOp::RelImm(pred, w, c) => {
+            CmpOp::RelImm(pred, c) => {
                 let p = input.into_prim("compare with a constant")?;
-                if p.bits() != *w {
-                    return Err(format!("compare with a U{w} constant expects U{w}, got U{}", p.bits()));
+                if !c.kind_of(&p) {
+                    return Err(format!("compare with a constant: {} against {c:?}", shape_of_value(&Value::Prim(p))));
                 }
-                Value::u64(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
+                Value::u8(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
-            CmpOp::MinImm(w, c) | CmpOp::MaxImm(w, c) => {
+            CmpOp::MinImm(c) | CmpOp::MaxImm(c) => {
                 let p = input.into_prim("min/max with a constant")?;
-                if p.bits() != *w {
-                    return Err(format!("min/max with a U{w} constant expects U{w}, got U{}", p.bits()));
+                if !c.kind_of(&p) {
+                    return Err(format!("min/max with a constant: {} against {c:?}", shape_of_value(&Value::Prim(p))));
                 }
                 Value::Prim(p.pick_imm(*c, matches!(self, CmpOp::MaxImm(..))))
             }
@@ -124,7 +122,7 @@ impl CmpOp {
                 };
                 // the runs the sort found, as it found them: each element's run, numbered densely
                 // over the whole column (a run never spans two rows)
-                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::u64(refined)])))
+                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::i64(refined.into_iter().map(|r| r as i64).collect())])))
             }
 
             CmpOp::SortLimit(k) => {
@@ -136,9 +134,9 @@ impl CmpOp {
             // first element starts a run whatever it follows.
             CmpOp::Adjacent => {
                 let (bounds, vals) = input.into_list("Adjacent")?;
-                let mut mask = vec![1u64; vals.len()];
+                let mut mask = vec![1u8; vals.len()];
                 for (k, s) in compare_adjacent(&vals).into_iter().enumerate() {
-                    mask[k + 1] = (s != 0) as u64;
+                    mask[k + 1] = (s != 0) as u8;
                 }
                 for r in 0..bounds.len() {
                     let (s, e) = bounds.span(r);
@@ -146,7 +144,7 @@ impl CmpOp {
                         mask[s] = 1;
                     }
                 }
-                Value::List(bounds, Box::new(Value::u64(mask)))
+                Value::List(bounds, Box::new(Value::u8(mask)))
             }
 
             // for each needle element, equal_range it in the matching haystack row: leaves by a
@@ -163,7 +161,7 @@ impl CmpOp {
                 // Leaves: a search per needle (a walk for a dense row of needles in order; a
                 // branch-free binary search, sixteen needles at a time, otherwise). See `search`.
                 if let Some((lo_c, hi_c)) = find_leaf(&nb, &nvals, hb, hvals) {
-                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)]))));
+                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)]))));
                 }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
@@ -190,11 +188,11 @@ impl CmpOp {
                     let (ns, ne) = nb.span(r);
                     let (hs, _) = hb.span(r);
                     for k in ns..ne {
-                        lo_c.push((lower.0[k] - hs) as u64);
-                        hi_c.push((upper.0[k] - hs) as u64);
+                        lo_c.push((lower.0[k] - hs) as i64);
+                        hi_c.push((upper.0[k] - hs) as i64);
                     }
                 }
-                Value::List(nb, Box::new(Value::Prod(vec![Value::u64(lo_c), Value::u64(hi_c)])))
+                Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])))
             }
         })
     }
@@ -218,9 +216,9 @@ fn order_levels(v: &Value, out: &mut Vec<Level>) {
             // the elements by position, a row past its end reading zero (the least value of any
             // shape), then the length: a proper prefix ties its padded rows and comes first.
             out.push(Level::Elems(v.clone()));
-            out.push(Level::Col(Value::u64((0..inner.len()).map(|i| {
+            out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
                 let (s, e) = inner.span(i);
-                (e - s) as u64
+                (e - s) as i64
             }).collect())));
         }
         other => out.push(Level::Col(other.clone())),
@@ -311,7 +309,8 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                         }
                         let splits = (1..col.len()).any(|p| play.tied(p) && col[p] != col[p - 1]);
                         if splits {
-                            play.level(&Value::u64(col), k);
+                            // the words order unsigned: as `i64`s, each with its top bit flipped
+                            play.level(&Value::i64(col.iter().map(|&w| (w ^ (1 << 63)) as i64).collect()), k);
                         }
                     }
                     continue;
@@ -320,15 +319,24 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                     if play.settled() {
                         break;
                     }
-                    // element j of each row in play; a row without one reads zero, the least
-                    // value, and the length level after breaks the ties that leaves.
-                    let mut any = false;
-                    let at: Vec<usize> = play.idx.iter().map(|&r| {
+                    // element j of each row in play. A row that has ended comes first (a proper
+                    // prefix), so whether a row has element j is a level of its own, made when some
+                    // row in play has ended; under it, an ended row's zero ties only with its kind.
+                    let (mut any, mut ended) = (false, false);
+                    let mut at: Vec<usize> = play.idx.iter().map(|&r| {
                         let (s, e) = inner.span(r);
-                        if s + j < e { any = true; s + j } else { usize::MAX }
+                        if s + j < e { any = true; s + j } else { ended = true; usize::MAX }
                     }).collect();
                     if !any {
                         break;
+                    }
+                    if ended {
+                        play.level(&Value::u8(at.iter().map(|&p| (p != usize::MAX) as u8).collect()), k);
+                        // that level reordered (and may have cut) the rows in play: read them again
+                        at = play.idx.iter().map(|&r| {
+                            let (s, e) = inner.span(r);
+                            if s + j < e { s + j } else { usize::MAX }
+                        }).collect();
                     }
                     let col = crate::engine::gather_or_zero(elems, &at).expect("a list's elements have a zero");
                     play.level(&col, k);

@@ -6,7 +6,7 @@
 let (date, disc, qty, price) = input in
 ((date, disc) zip, (qty, price) zip) zip
     map (((d, k), (q, p)) ->
-        let keep = ((((d, 8766u64) ge, (d, 9131u64) lt) mul, ((k, 5u64) ge, (k, 7u64) le) mul) mul, (q, 24u64) lt) mul in
+        let keep = ((((d, 8766) ge, (d, 9131) lt) min, ((k, 5) ge, (k, 7) le) min) min, (q, 24) lt) min in
         (keep, (p, k) mul))
     filter fold_add
-    try match (0 (s -> s), 1 (_ -> 0u64))
+    try match (0 (s -> s), 1 (_ -> 0))

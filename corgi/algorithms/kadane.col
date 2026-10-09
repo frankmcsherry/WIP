@@ -1,8 +1,8 @@
 # Kadane's maximum subarray sum over signed values: the largest sum of a non-empty run of
-# consecutive values. Input a `List<I64>`. Output an `I64`; an empty row gives 0.
+# consecutive values. Input a `List<Int>`. Output an `Int`; an empty row gives 0.
 let xs = input in
 # Per value: the best sum of a run ending here, and the best seen so far.
-let (_, best) = ((0i64, -9223372036854775808i64), xs) fold (((cur, best), x) ->
-    let cur = (x, (cur, x) add_i64) max in
+let (_, best) = ((0, -9223372036854775808), xs) fold (((cur, best), x) ->
+    let cur = (x, (cur, x) add) max in
     (cur, (best, cur) max)) in
-((xs len, 0u64) eq, 0i64, best) select
+((xs len, 0) eq, 0, best) select

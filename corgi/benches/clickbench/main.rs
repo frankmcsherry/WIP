@@ -5,11 +5,11 @@
 //!
 //! Each query is `algorithms/clickbench/NAME.col`, whose header names the SQL it answers (`# sql:`), the
 //! columns it reads (`# columns:`, the program's input in that order) and its output's kinds
-//! (`# output:`: `u` unsigned, `i` signed, `f` float to four decimals, `g` float to twelve significant
-//! digits, `s` string; `[..]` for a list of rows). The whole table is one row: each column is a
+//! (`# output:`: `u` or `i` an Int, `f` a Float to four decimals, `g` a Float to twelve significant
+//! digits, `s` a string; `[..]` for a list of rows). The whole table is one row: each column is a
 //! one-row `List`. `--profile` (with `--features profile`) prints each query's time per op.
 
-use corgi::{dec_i64, Bounds, Program, Value};
+use corgi::{Bounds, Program, Value};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -45,44 +45,46 @@ fn read_u64s(path: &Path) -> Vec<u64> {
     bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
-/// a column as a one-row list: numbers as `List<U64>`, strings as `List<List<U8>>`.
+/// the columns `prepare.py` stores with the sign bit flipped (its kind `i`), so their words sort in
+/// signed order; flipping it back gives the `i64`.
+const SIGN_FLIPPED: [&str; 6] = ["WatchID", "ClientIP", "UserID", "TraficSourceID", "URLHash", "RefererHash"];
+
+/// a column as a one-row list: numbers as `List<Int>`, strings as `List<List<Int>>` (held as bytes).
 fn column(dir: &Path, name: &str) -> Value {
     let one_row = |v: Value| Value::List(Bounds::offsets(vec![v.len()]), Box::new(v));
     let numbers = dir.join(format!("{name}.u64"));
     if numbers.exists() {
-        return one_row(Value::u64(read_u64s(&numbers)));
+        let flip = if SIGN_FLIPPED.contains(&name) { 1 << 63 } else { 0 };
+        return one_row(Value::i64(read_u64s(&numbers).into_iter().map(|x| (x ^ flip) as i64).collect()));
     }
     let ends: Vec<usize> = read_u64s(&dir.join(format!("{name}.ends"))).into_iter().map(|e| e as usize).collect();
     let bytes = std::fs::read(dir.join(format!("{name}.bytes"))).unwrap();
     one_row(Value::List(Bounds::offsets(ends), Box::new(Value::u8(bytes))))
 }
 
-fn dec_f64(u: u64) -> f64 {
-    f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u })
-}
-
-/// field `j` of a column, in the canonical text form `prepare.py` writes DuckDB's answers in.
-fn field(kind: &str, col: &Value, j: usize) -> String {
-    if kind == "s" {
-        let Value::List(bounds, bytes) = col else { panic!("a string column is a List<U8>") };
-        let ends = bounds.to_vec();
-        let (s, e) = (if j == 0 { 0 } else { ends[j - 1] }, ends[j]);
-        return bytes.as_u8("string")
-            .map(|b| b[s..e].iter().map(|x| format!("{x:02x}")).collect())
-            .unwrap_or_else(|_| panic!("a string is a List<U8>"));
-    }
-    let x = col.as_u64("number").unwrap_or_else(|e| panic!("{e}"))[j];
+/// a column's fields, in the canonical text form `prepare.py` writes DuckDB's answers in.
+fn fields(kind: &str, col: &Value) -> Vec<String> {
+    let floats = || col.as_f64("number").unwrap_or_else(|e| panic!("{e}"));
     match kind {
-        "u" => x.to_string(),
-        "i" => dec_i64(x).to_string(),
-        "f" => format!("{:.4}", dec_f64(x)),
+        "s" => {
+            let Value::List(bounds, bytes) = col else { panic!("a string column is a List<Int>") };
+            let bytes = bytes.as_i64("string").unwrap_or_else(|e| panic!("{e}"));
+            let mut start = 0;
+            bounds.to_vec().into_iter().map(|end| {
+                let s = bytes[start..end].iter().map(|&b| format!("{:02x}", u8::try_from(b).expect("a string byte"))).collect();
+                start = end;
+                s
+            }).collect()
+        }
+        "u" | "i" => col.as_i64("number").unwrap_or_else(|e| panic!("{e}")).iter().map(|x| x.to_string()).collect(),
+        "f" => floats().iter().map(|x| format!("{x:.4}")).collect(),
         // as Python's `{:.11e}`: a signed, at least two-digit exponent
-        "g" => {
-            let s = format!("{:.11e}", dec_f64(x));
+        "g" => floats().iter().map(|x| {
+            let s = format!("{x:.11e}");
             let (m, e) = s.split_once('e').unwrap();
             let e: i32 = e.parse().unwrap();
             format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
-        }
+        }).collect(),
         other => panic!("unknown output kind {other}"),
     }
 }
@@ -102,10 +104,11 @@ fn canonical(output: &str, v: Value) -> String {
         (v.len(), v)
     };
     let cols = if kinds.len() == 1 { vec![v] } else { v.into_prod("query output").unwrap() };
+    let cols: Vec<Vec<String>> = kinds.iter().zip(&cols).map(|(k, c)| fields(k, c)).collect();
     let mut out = String::new();
     for j in 0..rows {
-        let fields: Vec<String> = kinds.iter().zip(&cols).map(|(k, c)| field(k, c, j)).collect();
-        out.push_str(&fields.join("\t"));
+        let row: Vec<&str> = cols.iter().map(|c| c[j].as_str()).collect();
+        out.push_str(&row.join("\t"));
         out.push('\n');
     }
     out

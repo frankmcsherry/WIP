@@ -2,5 +2,5 @@
 # sql: SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10
 # columns: SearchPhrase
 # output: [s]
-let sorted = input map (s -> ((s len, 0u64) gt, s)) filter sort_limit 10 in
+let sorted = input map (s -> ((s len, 0) gt, s)) filter sort_limit 10 in
 sorted map (s -> s)

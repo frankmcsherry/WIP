@@ -1,18 +1,19 @@
 # Levenshtein edit distance between two byte strings: the textbook dynamic program, one row of
-# the table per byte of s1. Input `(s1, s2)`, two `List<U8>`. Output the distance, `U64`.
+# the table per byte of s1. Input `(s1, s2)`, two `List<Int>` of bytes. Output the distance, an
+# `Int`.
 let (s1, s2) = input in
-let row0 = ((s2 len, 1u64) add) iota in
-let last = ((s2, 0u64, row0), s1) fold (((s2, i, prev), c) ->
+let row0 = ((s2 len, 1) add) iota in
+let last = ((s2, 0, row0), s1) fold (((s2, i, prev), c) ->
     let n = s2 len in
     # prev[j] (the diagonal) and prev[j + 1] (the cell above), beside s2[j].
-    let diag = ((0u64, n) range, prev) gather in
-    let up = ((1u64, (n, 1u64) add) range, prev) gather in
+    let diag = ((0, n) range, prev) gather in
+    let up = ((1, (n, 1) add) range, prev) gather in
     let cells = (c, ((diag, up) zip, s2) zip) cap_list in
-    let i1 = (i, 1u64) add in
+    let i1 = (i, 1) add in
     # left to right: cur[j + 1] = min(up + 1, left + 1, diag + (c != s2[j])).
     let row = (i1, cells) foldscan ((left, (c, ((d, u), ch))) ->
-        let v = (((u, 1u64) add, (left, 1u64) add) min, (d, (c, ch) ne) add) min in
+        let v = (((u, 1) add, (left, 1) add) min, (d, (c, ch) ne) add) min in
         (v, v)) in
     (s2, i1, (i1 enlist, row.1) append)) in
 let (s2, _, row) = last in
-(s2 len, row) get try match (0 (d -> d), 1 (_ -> 0u64))
+(s2 len, row) get try match (0 (d -> d), 1 (_ -> 0))

@@ -3,6 +3,6 @@
 # sql:   ORDER BY c DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase
 # output: [s,u]
-let ranked = input map (s -> ((s len, 0u64) gt, (s, 1u64))) filter group
-    map ((s, ones) -> ((18446744073709551615u64, ones len) sub, s)) sort_limit 10 in
-ranked map ((d, s) -> (s, (18446744073709551615u64, d) sub))
+let ranked = input map (s -> ((s len, 0) gt, (s, 1))) filter group
+    map ((s, ones) -> (ones len neg, s)) sort_limit 10 in
+ranked map ((d, s) -> (s, d neg))

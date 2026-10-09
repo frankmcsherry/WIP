@@ -1,8 +1,8 @@
 use super::*;
 use crate::value::Bounds;
 
-fn u(xs: &[u64]) -> Value {
-    Value::u64(xs.to_vec())
+fn u(xs: &[i64]) -> Value {
+    Value::i64(xs.to_vec())
 }
 fn h(v: &Value) -> Vec<u64> {
     hash(v)
@@ -24,14 +24,12 @@ fn equal_rows_hash_equal() {
 }
 
 #[test]
-fn width_invariant_for_unsigned() {
-    // the id addresses the value, not its storage width: the same unsigned value at any leaf width
-    // hashes identically (the fold widens every leaf to u64). Lets a narrowing/widening be
-    // id-preserving and a two-input join match keys carried at different widths. (Signed/float
-    // store a width-dependent encoding and are NOT promised this — see the module doc.)
-    assert_eq!(h(&Value::u8(vec![5])), h(&Value::u64(vec![5]))); // u8 5 == u64 5
-    assert_eq!(h(&Value::u16(vec![5, 300])), h(&Value::u64(vec![5, 300])));
-    assert_eq!(h(&Value::u32(vec![5, 300, 70000])), h(&Value::u64(vec![5, 300, 70000])));
+fn storage_invariant() {
+    // the id addresses the value, not its storage: the same integers held as bytes or as i64s
+    // hash identically (the fold reads every integer's word). Lets a two-input join match keys
+    // carried at different storages.
+    assert_eq!(h(&Value::u8(vec![5])), h(&Value::i64(vec![5])));
+    assert_eq!(h(&Value::u8(vec![0, 200, 255])), h(&Value::i64(vec![0, 200, 255])));
 }
 
 #[test]
@@ -81,8 +79,8 @@ fn sum_tag_and_payload() {
 fn ignores_arc_identity_and_capacity() {
     let a = u(&[7, 8, 9]);
     let mut backing = Vec::with_capacity(64);
-    backing.extend_from_slice(&[7u64, 8, 9]);
-    let b = Value::Prim(crate::value::Prim::U64(std::sync::Arc::new(backing)));
+    backing.extend_from_slice(&[7i64, 8, 9]);
+    let b = Value::Prim(crate::value::Prim::I64(std::sync::Arc::new(backing)));
     assert_eq!(h(&a), h(&b));
 }
 
@@ -92,8 +90,8 @@ fn ignores_arc_identity_and_capacity() {
 #[test]
 fn permutation_is_position_independent() {
     let v = Value::Prod(vec![
-        Value::u32(vec![3, 1, 4, 1, 5, 9]),
-        Value::u16(vec![30, 10, 40, 10, 50, 90]),
+        Value::i64(vec![3, 1, 4, 1, 5, 9]),
+        Value::u8(vec![30, 10, 40, 10, 50, 90]),
     ]);
     let perm = vec![5usize, 0, 3, 2, 1, 4];
     let base = h(&v);
@@ -109,7 +107,7 @@ fn permutation_is_position_independent() {
 fn covers_prim_prod_sum_list_unit() {
     let prod = Value::Prod(vec![
         Value::u8(vec![1, 2, 3]),
-        Value::Prod(vec![Value::u16(vec![10, 20, 30]), Value::u32(vec![100, 200, 300])]),
+        Value::Prod(vec![Value::i64(vec![10, 20, 30]), Value::i64(vec![-100, 200, 300])]),
     ]);
     let hp = h(&prod);
     assert_eq!(hp.len(), 3);
@@ -118,7 +116,7 @@ fn covers_prim_prod_sum_list_unit() {
     // rows 0 and 2 both land in lane 1, with different payloads.
     let s = Value::sum(
         vec![1, 2, 1, 2],
-        vec![Value::u8(vec![]), Value::u16(vec![5, 7]), Value::u32(vec![9, 11])],
+        vec![Value::u8(vec![]), Value::i64(vec![5, 7]), Value::i64(vec![9, 11])],
     );
     let hs = h(&s);
     assert_eq!(hs.len(), 4);
@@ -154,9 +152,8 @@ fn fused_product_hashes_match_scalar_rows() {
         match v {
             Value::Prim(p) => mix64(match p {
                 Prim::U8(v) => v[r] as u64,
-                Prim::U16(v) => v[r] as u64,
-                Prim::U32(v) => v[r] as u64,
-                Prim::U64(v) => v[r],
+                Prim::I64(v) => v[r] as u64,
+                Prim::F64(v) => v[r],
             }),
             Value::Prod(cols) => cols.iter().fold(PROD, |a, c| combine(a, row(c, r))),
             Value::Unit(_) => UNIT,
@@ -183,11 +180,11 @@ fn fused_product_hashes_match_scalar_rows() {
         for i in 0..n {
             tags.push(i % 2);
             if i % 2 == 0 {
-                a.push(i as u16);
+                a.push(i as u8);
             } else {
-                b.push(u64::MAX - i as u64);
+                b.push(-(i as i64));
             }
-            vals.extend((0..i % 4).map(|j| (i + j) as u64));
+            vals.extend((0..i % 4).map(|j| (i + j) as i64));
             ends.push(vals.len());
         }
         let nested = Value::Prod(vec![
@@ -196,13 +193,12 @@ fn fused_product_hashes_match_scalar_rows() {
                 Bounds::offsets(ends),
                 Box::new(Value::Prod(vec![Value::Unit(vals.len()), u(&vals)])),
             ),
-            Value::sum(tags, vec![Value::u16(a), u(&b), Value::Unit(0)]),
+            Value::sum(tags, vec![Value::u8(a), u(&b), Value::Unit(0)]),
         ]);
         let v = Value::Prod(vec![
             Value::u8((0..n).map(|i| i as u8).collect()),
-            Value::u16((0..n).map(|i| (i * 257) as u16).collect()),
-            Value::u32((0..n).map(|i| u32::MAX - i as u32).collect()),
-            u(&(0..n).map(|i| u64::MAX - i as u64).collect::<Vec<_>>()),
+            Value::f64((0..n).map(|i| i as f64 * 0.5).collect()),
+            u(&(0..n).map(|i| i64::MIN + i as i64).collect::<Vec<_>>()),
             nested,
         ]);
         assert_eq!(hash(&v), (0..n).map(|r| row(&v, r)).collect::<Vec<_>>());

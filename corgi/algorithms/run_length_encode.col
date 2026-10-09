@@ -1,11 +1,11 @@
-# Run-length encoding: each maximal run of one byte becomes (byte, run length). Input `List<U8>`.
-# Output `List<(U8, U64)>`, the runs in order. Written as "gaps and islands": mark where a run
-# starts (the first byte, or one that differs from the byte before), number the runs with a
-# running sum of the marks, and group the bytes by run number.
+# Run-length encoding: each maximal run of one byte becomes (byte, run length). Input a `List<Int>`
+# of bytes. Output a `List<(Int, Int)>`, the runs in order. Written as "gaps and islands": mark
+# where a run starts (the first byte, or one that differs from the byte before), number the runs
+# with a running sum of the marks, and group the bytes by run number.
 let s = input in
 let idx = s len iota in
-let prev = (idx map (i -> ((i, 1u64) max, 1u64) sub), s) gather in
-let starts = (idx, (s, prev) zip) zip map ((i, (c, p)) -> ((i, 0u64) eq, (c, p) ne) max) in
+let prev = (idx map (i -> ((i, 1) max, 1) sub), s) gather in
+let starts = (idx, (s, prev) zip) zip map ((i, (c, p)) -> ((i, 0) eq, (c, p) ne) max) in
 let run = starts scan_add in
-(run, s) zip group map ((_, bs) -> ((0u64, bs) get, bs len))
-    try match (0 (runs -> runs), 1 (_ -> 0u64 iota map (z -> (z cast 8, z))))
+(run, s) zip group map ((_, bs) -> ((0, bs) get, bs len))
+    try match (0 (runs -> runs), 1 (_ -> 0 iota map (z -> (z, z))))

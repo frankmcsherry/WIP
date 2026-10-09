@@ -3,46 +3,25 @@
 //! and adds arithmetic via `Arith`. The same `Graph`/`eval_graph`/`shape_of`
 //! machinery runs it unchanged; the core never learns arithmetic.
 //!
-//! Arithmetic is the (op × kind × width) GRID — `Bin(op, kind, bits)` / `Neg(kind, bits)`,
-//! macro-generated over the widths. A leaf is always `Prim::Uw`; `Kind::U` reads the bytes
-//! as the value (native wrapping ops), `Kind::I` reads them as an order-preserving *swizzled*
-//! signed value (XOR the top bit — `enc_i64` generalized per width). All interpretation lives
-//! here; the shape-checker sees plain leaf ops, never the kinds.
+//! Two leaves carry numbers. `Int` is an integer: arithmetic on it means integer arithmetic, and
+//! it is exact within `i64` (past that it wraps, the one documented edge for now; truncating
+//! division, `x / 0 = 0` and `x % 0 = x`, so nothing fails on data). `Float` is an `f64`, with IEEE
+//! arithmetic. The plain ops (`add`, `mul`, ..) take either, two of one kind; a mix is a shape
+//! error. Integers a program wants to treat as 64-bit words (hashing, bit banging) use the `_b64`
+//! verbs, the shifts and the bitwise ops ([`BitOp`], [`ShiftOp`]): each takes the low 64 bits of
+//! its operands, does the `u64` operation, and reads the result back as an `i64`.
 
 use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
-
-use crate::value::{Prim, Value};
+use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value};
 use std::sync::Arc;
 
-/// order-preserving encode/decode for signed 64-bit integers.
-pub fn enc_i64(x: i64) -> u64 {
-    (x as u64) ^ (1 << 63)
-}
-pub fn dec_i64(u: u64) -> i64 {
-    (u ^ (1 << 63)) as i64
-}
-
-/// a typed scalar literal: the value `n` encoded for `kind` at `width` — raw for `U`, sign-swizzled
-/// for `I` (the order-preserving form the leaf stores). The surface `lit_<k><w> N` lowers to
-/// `Op::Lit` of this.
-pub(crate) fn lit_value(kind: Kind, width: u32, n: u64) -> Value {
-    let raw = match width {
-        8 => Prim::U8(Arc::new(vec![n as u8])),
-        16 => Prim::U16(Arc::new(vec![n as u16])),
-        32 => Prim::U32(Arc::new(vec![n as u32])),
-        64 => Prim::U64(Arc::new(vec![n])),
-        _ => panic!("lit: unsupported width {width}"),
-    };
-    Value::Prim(if matches!(kind, Kind::I) { raw.xor_signbit() } else { raw })
-}
-
-/// the named monoid reductions — `List<U64> -> U64` per row, each a one-pass SIMD-friendly horizontal
-/// fold (the fast paths a general `fold` over the same monoid would be ~20x slower than). `Min`/`Max`
-/// are kind-blind (the order-preserving bytes make them correct for signed/float too); `Sum`/`Prod`
-/// are unsigned; `All`/`Any` are the 0/1-mask AND/OR.
+/// the named monoid reductions — `List<Int> -> Int` per row, each a one-pass SIMD-friendly
+/// horizontal fold (the fast paths a general `fold` over the same monoid would be ~20x slower than).
+/// `Min`/`Max` go by value, and an empty row's is 0, the zero of an integer (a program that wants
+/// another default tests `len` and `select`s it); `All`/`Any` are the mask AND/OR, written as bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Red {
     Add, // `fold_add` (sum) / `scan_add` (prefix sum)
@@ -58,70 +37,55 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
-    Div, // Integer: truncating, x/0 = 0, signed MIN/-1 wraps. Float: IEEE division.
+    Div, // Int: truncating, x/0 = 0, MIN/-1 wraps. Float: IEEE division.
     Rem, // INTEGER-ONLY (the float remainder has no caller). `x % 0 = x`: a total definition, so the
          // lane body needs no branch out and callers that guard the divisor pay nothing. It is the
          // "no reduction" reading of a zero modulus, which is what DDIR's `hash(0, ..)` means.
-    // NB: lane-wise min/max are NOT here — they're kind-blind order ops (byte min/max on the
-    // order-preserving leaf needs no deswizzle), so they live in `cmp` as `CmpOp::Min`/`Max`.
+    // NB: lane-wise min/max are NOT here — they're order ops, so they live in `cmp` as
+    // `CmpOp::Min`/`Max`.
 }
 
+/// integers as 64-bit words: `add_b64`, `sub_b64`, `mul_b64` are the low 64 bits of the sum,
+/// difference and product (read back as an `i64`), and `and`, `or`, `xor` are two's complement
+/// bitwise, which keeps every result in the `i64` range. Two byte leaves `and`, `or` and `xor` to a
+/// byte leaf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Kind {
-    U, // unsigned: the bytes ARE the value
-    I, // signed: the bytes are an order-preserving swizzle of the value
-    F, // float (32/64 only): the bytes are the IEEE bits under the TOTAL-order swizzle. Arithmetic is
-       // IEEE (NaN/inf propagate, div-by-zero -> inf/NaN, no panic); ordering/equality is total, NOT
-       // IEEE — NaN is orderable (sorts to the top) and equals itself bit-for-bit, -0 != +0. (See NOTES.)
+pub enum BitOp {
+    AddB64,
+    SubB64,
+    MulB64,
+    And,
+    Or,
+    Xor,
 }
 
-/// IEEE-bits <-> total-order encoding for f32 (and f64 below): negatives flip all bits, non-negatives
-/// flip just the sign bit, so the unsigned byte order is the float total order (`f64::total_cmp`). The
-/// kind-blind comparator then sorts/compares floats correctly with no special case.
-pub(crate) fn enc_f32(f: f32) -> u32 {
-    let b = f.to_bits();
-    if b >> 31 == 1 { !b } else { b ^ (1 << 31) }
-}
-fn dec_f32(u: u32) -> f32 {
-    f32::from_bits(if u >> 31 == 1 { u ^ (1 << 31) } else { !u })
-}
-pub(crate) fn enc_f64(f: f64) -> u64 {
-    let b = f.to_bits();
-    if b >> 63 == 1 { !b } else { b ^ (1 << 63) }
-}
-fn dec_f64(u: u64) -> f64 {
-    f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u })
+/// shifts by a constant, each on the integer as its 64-bit word: `ShlB64` drops the bits shifted
+/// past 64, `ShrB64` fills with zeros (a logical shift), and the rotates move bits around the
+/// word. A shift by 64 or more leaves no bits; a rotate turns by `k mod 64`. (There is no
+/// integer shift: dividing by a power of two is `div`, which runs as a shift.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShiftOp {
+    ShlB64,
+    ShrB64,
+    RotlB64,
+    RotrB64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ArithOp {
-    Bin(BinOp, Kind, u32), // binary leaf arithmetic at a bit-width
-    BinImm(BinOp, Kind, u32, u64), // the same with a constant right operand: `x op c`, where `c` is the
-                           // constant's stored bits at that width (its kind's encoding). One pass over
-                           // `x`, in place when it is uniquely owned; no column of `c` is built.
-    Neg(Kind, u32),        // unary negate
-    ToSigned,              // leaf -> leaf  XOR the sign bit (any width): unsigned <-> signed encoding,
-                           // the kind-conversion `signed` (an involution; how a column enters Kind::I)
-    ToFloat(u32),          // U-int leaf -> float leaf (w in {32,64}): each unsigned int -> the float of
-                           // the same width, total-order encoded. `to_f32`/`to_f64`: how iota becomes floats.
-    Shr(u32),              // U64 -> U64   x >> k  (= ÷ 2^k; the SIMD-vectorizable divide, USHR)
-    And(u64),              // U64 -> U64   x & m   (= mod 2^k with m = 2^k-1; the SIMD modulo, AND)
-    Reduce(Red),           // List<U64> -> U64      per-row monoid reduction (sum/prod/min/max/all/any)
-    Scan(Red),             // List<U64> -> List<U64>  per-row inclusive monoid PREFIX scan. The monoid
+    Bin(BinOp),            // (X, X) -> X   two Ints or two Floats
+    BinImm(BinOp, Scalar), // X -> X   `x op c` with a constant `c` of x's kind. One pass over `x`,
+                           // in place when it is uniquely owned; no column of `c` is built.
+    Bits(BitOp),           // (Int, Int) -> Int
+    BitsImm(BitOp, i64),   // Int -> Int   `x op c`
+    Shift(ShiftOp, u32),   // Int -> Int
+    Neg,                   // X -> X   negate an Int (wrapping at the edge) or a Float
+    ToFloat,               // Int -> Float   the nearest `f64`
+    Reduce(Red),           // List<Int> -> Int      per-row monoid reduction (sum/prod/min/max/all/any)
+    Scan(Red),             // List<Int> -> List<Int>  per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
                            // general `FoldScan` re-evals the body per element (catastrophic on one long
                            // row — see performance.md). `Reduce` is its drop-the-prefix sibling.
-}
-
-// deswizzle the order-preserving signed encoding (XOR the top bit `m`), apply a native wrapping op,
-// reswizzle. `m` is a per-width constant. This is the `Kind::I` lane body, factored so the grid's
-// six (kind × op) arms each stay a one-line lane map. `wrapping_*` are inherent on every uN/iN, so
-// no `num_traits` dependency.
-macro_rules! swiz {
-    ($u:ty, $i:ty, $x:ident, $y:ident, $op:ident) => {{
-        let m = !(<$u>::MAX >> 1);
-        ((($x ^ m) as $i).$op(($y ^ m) as $i) as $u) ^ m
-    }};
 }
 
 /// apply a binary lane op `f` in place, writing into whichever operand buffer we uniquely own.
@@ -140,49 +104,9 @@ fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) ->
     }
 }
 
-/// apply a binary lane op `f` against the constant `c`, in place when `a` is uniquely owned, else
-/// fresh. The immediate sibling of `bin_into`: `f(x, c)` is exactly what `bin_into` computes when
-/// every row of the right operand is `c`.
-fn imm_into<T: Copy>(mut a: Arc<Vec<T>>, c: T, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
-    if let Some(dst) = Arc::get_mut(&mut a) {
-        for x in dst.iter_mut() { *x = f(*x, c); }
-        a
-    } else {
-        Arc::new(a.iter().map(|&x| f(x, c)).collect())
-    }
-}
-
-/// the integer (kind × op) lane bodies, written once: `$apply($($arg),*, body)` for the body of the
-/// cell `($kind, $op)` at unsigned type `$u` and signed type `$i`. `int_bin` applies them to two
-/// columns and `int_imm` to a column and a constant, so the two can't disagree.
-macro_rules! int_arms {
-    ($u:ty, $i:ty, $kind:expr, $op:expr, $apply:ident($($arg:expr),*)) => {
-        match ($kind, $op) {
-            (Kind::U, BinOp::Add) => $apply($($arg,)* |x: $u, y: $u| x.wrapping_add(y)),
-            (Kind::U, BinOp::Sub) => $apply($($arg,)* |x: $u, y: $u| x.wrapping_sub(y)),
-            (Kind::U, BinOp::Mul) => $apply($($arg,)* |x: $u, y: $u| x.wrapping_mul(y)),
-            (Kind::I, BinOp::Add) => $apply($($arg,)* |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_add)),
-            (Kind::I, BinOp::Sub) => $apply($($arg,)* |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_sub)),
-            (Kind::I, BinOp::Mul) => $apply($($arg,)* |x: $u, y: $u| swiz!($u, $i, x, y, wrapping_mul)),
-            (Kind::U, BinOp::Rem) => $apply($($arg,)* |x: $u, y: $u| if y == 0 { x } else { x % y }),
-            // `wrapping_rem` for the MIN % -1 overflow; the zero divisor is the total `x % 0 = x`.
-            (Kind::I, BinOp::Rem) => $apply($($arg,)* |x: $u, y: $u| {
-                let m = !(<$u>::MAX >> 1);
-                if (y ^ m) as $i == 0 { x } else { swiz!($u, $i, x, y, wrapping_rem) }
-            }),
-            (Kind::U, BinOp::Div) => $apply($($arg,)* |x: $u, y: $u| if y == 0 { 0 } else { x / y }),
-            (Kind::I, BinOp::Div) => $apply($($arg,)* |x: $u, y: $u| {
-                let m = !(<$u>::MAX >> 1);
-                if (y ^ m) as $i == 0 { m } else { swiz!($u, $i, x, y, wrapping_div) }
-            }),
-            // float is dispatched by `bin_eval`/`imm_eval` before reaching here.
-            (Kind::F, _) => unreachable!("int arithmetic: float dispatched by bin_eval/imm_eval"),
-        }
-    };
-}
-
-/// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh.
-fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
+/// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh. (A binary op
+/// against a constant is this with the constant captured.)
+fn map_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for x in dst.iter_mut() { *x = f(*x); }
         a
@@ -191,188 +115,235 @@ fn neg_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     }
 }
 
-// list the widths ONCE; generate the per-width binary/unary leaf arithmetic. Mirrors `prim!`.
-// The (kind × op) dispatch is HOISTED ABOVE the lane loop: each arm matches once, picks ONE concrete
-// closure, then makes a single tight pass — no per-element branch to keep the vectorizer out.
-// `Kind::U` is native wrapping; `Kind::I` deswizzles/reswizzles via `swiz!`.
-macro_rules! grid {
-    ($($V:ident => $u:ty : $i:ty),+ $(,)?) => {
-        fn int_bin(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
-            match (a, b) {
-                $( (Prim::$V(av), Prim::$V(bv)) => Prim::$V(int_arms!($u, $i, kind, op, bin_into(av, bv))), )+
-                _ => panic!("arith: operand width mismatch"),
-            }
-        }
+/// `f(own, other)` lane by lane, into `own`'s buffer when it is uniquely held, else fresh.
+fn zip_into<T: Copy, U: Copy>(mut own: Arc<Vec<T>>, other: &[U], f: impl Fn(T, U) -> T) -> Arc<Vec<T>> {
+    if let Some(dst) = Arc::get_mut(&mut own) {
+        for (x, &y) in dst.iter_mut().zip(other) { *x = f(*x, y); }
+        own
+    } else {
+        Arc::new(own.iter().zip(other).map(|(&x, &y)| f(x, y)).collect())
+    }
+}
 
-        // `c` is the constant's stored bits; at a narrow width they fit (the front end checks).
-        #[allow(clippy::unnecessary_cast)]
-        fn int_imm(op: BinOp, kind: Kind, a: Prim, c: u64) -> Prim {
-            match a {
-                $( Prim::$V(av) => Prim::$V(int_arms!($u, $i, kind, op, imm_into(av, c as $u))), )+
-            }
+/// a binary integer kernel: `f` on each pair, written as `i64`s — into an `i64` operand's buffer
+/// when one is uniquely held. A byte operand is read where it lies, each element widened as it is
+/// read, never as a column of its own.
+fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
+    match (a, b) {
+        (Prim::I64(x), Prim::I64(y)) => Prim::I64(bin_into(x, y, f)),
+        (Prim::I64(x), Prim::U8(y)) => Prim::I64(zip_into(x, &y, |p, q: u8| f(p, q as i64))),
+        (Prim::U8(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: u8| f(p as i64, q))),
+        (Prim::U8(x), Prim::U8(y)) => {
+            Prim::I64(Arc::new(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)).collect()))
         }
+        _ => unreachable!("int_pairs: integer leaves, checked by the caller"),
+    }
+}
 
-        fn int_neg(kind: Kind, a: Prim) -> Prim {
-            match a {
-                $( Prim::$V(av) => Prim::$V(match kind {
-                    Kind::U => neg_into(av, |x: $u| x.wrapping_neg()),
-                    Kind::I => neg_into(av, |x: $u| {
-                        let m = !(<$u>::MAX >> 1);
-                        (((x ^ m) as $i).wrapping_neg() as $u) ^ m
-                    }),
-                    Kind::F => unreachable!("int_neg: float dispatched by neg_eval"),
-                }), )+
-            }
+/// a unary integer kernel: `f` on each element, written as `i64`s — in place in a uniquely held
+/// `i64` leaf; a byte leaf is read where it lies.
+fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
+    match a {
+        Prim::I64(x) => Prim::I64(map_into(x, f)),
+        Prim::U8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
+        Prim::F64(_) => unreachable!("int_map: an integer leaf, checked by the caller"),
+    }
+}
+
+/// `$apply(args.., body)` with the integer lane body of the `BinOp` `$op`: exact within `i64`,
+/// wrapping past it; truncating division with `x / 0 = 0` and `x % 0 = x`. The op is matched
+/// ONCE, above the loop, so each arm is one concrete closure the loop inlines and vectorizes.
+macro_rules! int_body {
+    ($op:expr, $apply:ident($($arg:expr),*)) => {
+        match $op {
+            BinOp::Add => $apply($($arg,)* |x: i64, y: i64| x.wrapping_add(y)),
+            BinOp::Sub => $apply($($arg,)* |x: i64, y: i64| x.wrapping_sub(y)),
+            BinOp::Mul => $apply($($arg,)* |x: i64, y: i64| x.wrapping_mul(y)),
+            BinOp::Div => $apply($($arg,)* |x: i64, y: i64| if y == 0 { 0 } else { x.wrapping_div(y) }),
+            BinOp::Rem => $apply($($arg,)* |x: i64, y: i64| if y == 0 { x } else { x.wrapping_rem(y) }),
         }
     };
 }
-grid! { U8 => u8:i8, U16 => u16:i16, U32 => u32:i32, U64 => u64:i64 }
 
-/// the binary leaf op, dispatching `Kind::F` to the float path (32/64 only) and `U`/`I` to the macro
-/// grid. `eval` has already rejected float at widths 8/16, so the fallthroughs panic.
-fn bin_eval(op: BinOp, kind: Kind, a: Prim, b: Prim) -> Prim {
-    match kind {
-        Kind::F => float_bin(op, a, b),
-        _ => int_bin(op, kind, a, b),
+/// `$apply(args.., body)` with the float lane body of `$op`, on total-order keys (decode, IEEE op,
+/// encode); `rem` is integer-only. Matched once, as `int_body`.
+macro_rules! float_body {
+    ($op:expr, $apply:ident($($arg:expr),*)) => {
+        match $op {
+            BinOp::Add => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) + f64_of_key(y))),
+            BinOp::Sub => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) - f64_of_key(y))),
+            BinOp::Mul => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) * f64_of_key(y))),
+            BinOp::Div => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) / f64_of_key(y))),
+            BinOp::Rem => return Err("rem is integer-only".into()),
+        }
+    };
+}
+
+/// `$apply(args.., body)` with the lane body of the bitwise op `$op` on two `i64`s.
+macro_rules! bit_body {
+    ($op:expr, $apply:ident($($arg:expr),*)) => {
+        match $op {
+            BitOp::AddB64 => $apply($($arg,)* |x: i64, y: i64| x.wrapping_add(y)),
+            BitOp::SubB64 => $apply($($arg,)* |x: i64, y: i64| x.wrapping_sub(y)),
+            BitOp::MulB64 => $apply($($arg,)* |x: i64, y: i64| x.wrapping_mul(y)),
+            BitOp::And => $apply($($arg,)* |x: i64, y: i64| x & y),
+            BitOp::Or => $apply($($arg,)* |x: i64, y: i64| x | y),
+            BitOp::Xor => $apply($($arg,)* |x: i64, y: i64| x ^ y),
+        }
+    };
+}
+
+/// the bitwise ops that keep two bytes a byte, as a byte lane body, or `None`.
+fn byte_bits(op: BitOp) -> Option<fn(u8, u8) -> u8> {
+    match op {
+        BitOp::And => Some(|x, y| x & y),
+        BitOp::Or => Some(|x, y| x | y),
+        BitOp::Xor => Some(|x, y| x ^ y),
+        _ => None,
     }
 }
 
-/// `x op c` with `c` the constant's stored bits, dispatching float to `float_imm`.
-fn imm_eval(op: BinOp, kind: Kind, a: Prim, c: u64) -> Prim {
-    match kind {
-        Kind::F => float_imm(op, a, c),
-        _ => int_imm(op, kind, a, c),
-    }
+/// the error for two leaves of different kinds.
+fn mixed(op: impl std::fmt::Debug, a: &Prim, b: &Prim) -> String {
+    let kind = |p: &Prim| if p.is_int() { "Int" } else { "Float" };
+    format!("{op:?}: an {} and a {}", kind(a), kind(b))
 }
 
-fn neg_eval(kind: Kind, a: Prim) -> Prim {
-    match kind {
-        Kind::F => match a {
-            Prim::U32(v) => Prim::U32(neg_into(v, |u| enc_f32(-dec_f32(u)))),
-            Prim::U64(v) => Prim::U64(neg_into(v, |u| enc_f64(-dec_f64(u)))),
-            _ => panic!("float neg expects f32/f64"),
-        },
-        _ => int_neg(kind, a),
-    }
+/// a binary op on two leaves of one kind.
+fn bin_eval(op: BinOp, a: Prim, b: Prim) -> Result<Prim, String> {
+    Ok(match (a, b) {
+        (Prim::F64(x), Prim::F64(y)) => Prim::F64(float_body!(op, bin_into(x, y))),
+        (a, b) if a.is_int() && b.is_int() => int_body!(op, int_pairs(a, b)),
+        (a, b) => return Err(mixed(op, &a, &b)),
+    })
 }
 
-/// IEEE float arithmetic on the total-order-encoded leaf: deswizzle both operands, apply the native
-/// op (NaN/inf propagate, div-by-zero -> inf/NaN — no panic), re-encode. `min`/`max` use IEEE's
-/// (NaN-skipping) float min/max; the *ordering* used by sort/`Rel` is the total order, separately.
-fn float_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
-    macro_rules! f { ($V:ident, $dec:ident, $enc:ident, $av:ident, $bv:ident) => {
-        Prim::$V(bin_into($av, $bv, |x, y| { let (x, y) = ($dec(x), $dec(y)); $enc(match op {
-            BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
-            BinOp::Rem => unreachable!("float Rem is rejected before dispatch"),
-        })}))
-    }}
-    match (a, b) {
-        (Prim::U32(av), Prim::U32(bv)) => f!(U32, dec_f32, enc_f32, av, bv),
-        (Prim::U64(av), Prim::U64(bv)) => f!(U64, dec_f64, enc_f64, av, bv),
-        _ => panic!("float arith expects f32/f64 (width 32/64)"),
+/// `x op c` for a constant `c` of `x`'s kind.
+fn imm_eval(op: BinOp, a: Prim, c: Scalar) -> Result<Prim, String> {
+    fn with<T: Copy>(f: impl Fn(T, T) -> T, c: T) -> impl Fn(T) -> T {
+        move |x| f(x, c)
     }
+    fn int_imm(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+        int_map(a, with(f, c))
+    }
+    fn float_imm(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
+        Prim::F64(map_into(a, with(f, k)))
+    }
+    Ok(match (a, c) {
+        (Prim::F64(x), Scalar::Float(k)) => float_body!(op, float_imm(x, k)),
+        // by a power of two, `div` and `rem` are shifts: a negative dividend is biased by `c - 1`
+        // first, so the quotient still rounds toward zero (and the remainder takes its sign).
+        (a, Scalar::Int(c)) if a.is_int() && c > 1 && c.count_ones() == 1 && matches!(op, BinOp::Div | BinOp::Rem) => {
+            let k = c.trailing_zeros();
+            match op {
+                BinOp::Div => int_map(a, move |x| (x + ((x >> 63) & (c - 1))) >> k),
+                _ => int_map(a, move |x| x - (((x + ((x >> 63) & (c - 1))) >> k) << k)),
+            }
+        }
+        (a, Scalar::Int(c)) if a.is_int() => int_body!(op, int_imm(a, c)),
+        (a, c) => return Err(format!("{op:?}: {} with the constant {c:?}", if a.is_int() { "an Int" } else { "a Float" })),
+    })
 }
 
-/// float `x op c` on the encoded leaf: the constant decodes once, each lane as in `float_bin`.
-fn float_imm(op: BinOp, a: Prim, c: u64) -> Prim {
-    macro_rules! f { ($V:ident, $dec:ident, $enc:ident, $av:ident, $c:expr) => {{
-        let y = $dec($c);
-        Prim::$V(imm_into($av, $c, |x, _| { let x = $dec(x); $enc(match op {
-            BinOp::Add => x + y, BinOp::Sub => x - y, BinOp::Mul => x * y, BinOp::Div => x / y,
-            BinOp::Rem => unreachable!("float Rem is rejected before dispatch"),
-        })}))
-    }}}
-    match a {
-        Prim::U32(av) => f!(U32, dec_f32, enc_f32, av, c as u32),
-        Prim::U64(av) => f!(U64, dec_f64, enc_f64, av, c),
-        _ => panic!("float arith expects f32/f64 (width 32/64)"),
+/// a bitwise op on two integer leaves. Two byte leaves `and`, `or` and `xor` to bytes.
+fn bits_eval(op: BitOp, a: Prim, b: Prim) -> Result<Prim, String> {
+    if !(a.is_int() && b.is_int()) {
+        return Err(mixed(op, &a, &b));
+    }
+    if let (Prim::U8(x), Prim::U8(y), Some(f)) = (&a, &b, byte_bits(op)) {
+        return Ok(Prim::U8(bin_into(x.clone(), y.clone(), f)));
+    }
+    Ok(bit_body!(op, int_pairs(a, b)))
+}
+
+/// `x op c`, bitwise, for an integer leaf. A byte leaf against a byte constant `and`s, `or`s and
+/// `xor`s to bytes (`c and 223`, the case fold of text).
+fn bits_imm(op: BitOp, a: Prim, c: i64) -> Result<Prim, String> {
+    fn int_imm(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+        int_map(a, move |x| f(x, c))
+    }
+    if !a.is_int() {
+        return Err(format!("{op:?}: a Float"));
+    }
+    if let (Prim::U8(x), Some(f), 0..=255) = (&a, byte_bits(op), c) {
+        let c = c as u8;
+        return Ok(Prim::U8(map_into(x.clone(), move |x| f(x, c))));
+    }
+    Ok(bit_body!(op, int_imm(a, c)))
+}
+
+/// a shift by `k` of an integer leaf, the op matched once above the loop.
+fn shift_eval(op: ShiftOp, a: Prim, k: u32) -> Result<Prim, String> {
+    if !a.is_int() {
+        return Err(format!("{op:?}: a Float"));
+    }
+    Ok(match op {
+        ShiftOp::ShlB64 if k >= 64 => int_map(a, |_| 0),
+        ShiftOp::ShrB64 if k >= 64 => int_map(a, |_| 0),
+        ShiftOp::ShlB64 => int_map(a, move |x| ((x as u64) << k) as i64),
+        ShiftOp::ShrB64 => int_map(a, move |x| ((x as u64) >> k) as i64),
+        ShiftOp::RotlB64 => int_map(a, move |x| (x as u64).rotate_left(k % 64) as i64),
+        ShiftOp::RotrB64 => int_map(a, move |x| (x as u64).rotate_right(k % 64) as i64),
+    })
+}
+
+/// each row's reduction, reading the values at their storage (a byte leaf is not widened first).
+/// Sums and products wrap at the `i64` edge, as `add` and `mul` do. An empty row's sum is 0, its
+/// product 1, its minimum and maximum 0.
+fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: Red) -> Value {
+    let mut start = 0;
+    let rows = bounds.ends().map(|end| {
+        let row = &xs[start..end];
+        start = end;
+        row
+    });
+    match r {
+        Red::Add => Value::i64(rows.map(|s| s.iter().fold(0i64, |a, &x| a.wrapping_add(x.into()))).collect()),
+        Red::Mul => Value::i64(rows.map(|s| s.iter().fold(1i64, |a, &x| a.wrapping_mul(x.into()))).collect()),
+        Red::Min => Value::i64(rows.map(|s| s.iter().map(|&x| x.into()).min().unwrap_or(0)).collect()),
+        Red::Max => Value::i64(rows.map(|s| s.iter().map(|&x| x.into()).max().unwrap_or(0)).collect()),
+        Red::All => Value::u8(rows.map(|s| s.iter().all(|&x| x.into() != 0) as u8).collect()),
+        Red::Any => Value::u8(rows.map(|s| s.iter().any(|&x| x.into() != 0) as u8).collect()),
     }
 }
 
 impl ArithOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
         Ok(match self {
-            ArithOp::Bin(op, kind, w) => {
-                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
-                    return Err(format!("float arith only at width 32/64, got {w}"));
-                }
-                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
-                    return Err("rem is integer-only".into());
-                }
+            ArithOp::Bin(op) => {
                 let (a, b) = input.into_pair("binary arith")?;
                 let (pa, pb) = (a.into_prim("binary arith lhs")?, b.into_prim("binary arith rhs")?);
-                if pa.bits() != *w || pb.bits() != *w {
-                    return Err(format!("binary arith expects (U{w}, U{w}), got (U{}, U{})", pa.bits(), pb.bits()));
-                }
                 assert_eq!(pa.len(), pb.len(), "binary arith: operands at different strata");
-                Value::Prim(bin_eval(*op, *kind, pa, pb))
+                Value::Prim(bin_eval(*op, pa, pb)?)
             }
-            ArithOp::BinImm(op, kind, w, c) => {
-                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
-                    return Err(format!("float arith only at width 32/64, got {w}"));
-                }
-                if matches!(op, BinOp::Rem) && matches!(kind, Kind::F) {
-                    return Err("rem is integer-only".into());
-                }
-                let p = input.into_prim("arith with a constant")?;
-                if p.bits() != *w {
-                    return Err(format!("arith with a U{w} constant expects U{w}, got U{}", p.bits()));
-                }
-                Value::Prim(imm_eval(*op, *kind, p, *c))
+            ArithOp::BinImm(op, c) => Value::Prim(imm_eval(*op, input.into_prim("arith with a constant")?, *c)?),
+            ArithOp::Bits(op) => {
+                let (a, b) = input.into_pair("bitwise")?;
+                let (pa, pb) = (a.into_prim("bitwise lhs")?, b.into_prim("bitwise rhs")?);
+                assert_eq!(pa.len(), pb.len(), "bitwise: operands at different strata");
+                Value::Prim(bits_eval(*op, pa, pb)?)
             }
-            ArithOp::Neg(kind, w) => {
-                if matches!(kind, Kind::F) && !matches!(w, 32 | 64) {
-                    return Err(format!("float neg only at width 32/64, got {w}"));
-                }
-                let p = input.into_prim("Neg")?;
-                if p.bits() != *w {
-                    return Err(format!("Neg expects U{w}, got U{}", p.bits()));
-                }
-                Value::Prim(neg_eval(*kind, p))
-            }
-            ArithOp::ToSigned => Value::Prim(input.into_prim("signed")?.xor_signbit()),
-            ArithOp::ToFloat(w) => Value::Prim(match (w, input.into_prim("to_float")?) {
-                (32, Prim::U32(v)) => Prim::U32(neg_into(v, |x| enc_f32(x as f32))),
-                (64, Prim::U64(v)) => Prim::U64(neg_into(v, |x| enc_f64(x as f64))),
-                (w, p) => return Err(format!("to_float expects a U{w} leaf (w in 32/64), got U{}", p.bits())),
+            ArithOp::BitsImm(op, c) => Value::Prim(bits_imm(*op, input.into_prim("bitwise with a constant")?, *c)?),
+            ArithOp::Shift(op, k) => Value::Prim(shift_eval(*op, input.into_prim("shift")?, *k)?),
+            ArithOp::Neg => Value::Prim(match input.into_prim("neg")? {
+                Prim::F64(v) => Prim::F64(map_into(v, |k| f64_key(-f64_of_key(k)))),
+                p => int_map(p, |x: i64| x.wrapping_neg()),
             }),
-            // in place when uniquely owned. Both vectorize (vector shift / vector AND) — the SIMD forms of
-            // divide / modulo by a power of two, which general integer div/mod lack on NEON.
-            ArithOp::Shr(k) => {
-                let mut xs = input.into_u64("Shr")?;
-                xs.iter_mut().for_each(|x| *x >>= *k);
-                Value::u64(xs)
-            }
-            ArithOp::And(m) => {
-                let mut xs = input.into_u64("And")?;
-                xs.iter_mut().for_each(|x| *x &= *m);
-                Value::u64(xs)
+            ArithOp::ToFloat => {
+                let xs = input.as_i64("to_float")?;
+                Value::f64(xs.iter().map(|&x| x as f64).collect())
             }
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
-                let xs = vals.as_u64("reduce values")?;
-                let mut out = Vec::with_capacity(bounds.len());
-                let mut start = 0;
-                for end in bounds.ends() {
-                    let s = &xs[start..end]; // empty row -> the monoid identity
-                    out.push(match r {
-                        // Wrapping, to match the Scan sibling (prefix!) and the Kind::U BinOp add — so
-                        // reducing raw two's-complement diffs (a negative diff is a large u64) yields
-                        // the correct i64 sum instead of a checked-overflow panic in debug.
-                        Red::Add => s.iter().fold(0u64, |a, &x| a.wrapping_add(x)),
-                        Red::Mul => s.iter().fold(1u64, |a, &x| a.wrapping_mul(x)),
-                        Red::Min => s.iter().copied().min().unwrap_or(u64::MAX),
-                        Red::Max => s.iter().copied().max().unwrap_or(0),
-                        Red::All => s.iter().all(|&x| x != 0) as u64,
-                        Red::Any => s.iter().any(|&x| x != 0) as u64,
-                    });
-                    start = end;
+                match vals.into_prim("reduce values")? {
+                    Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::F64(_) => return Err("reduce: expected Int values, got Float".into()),
                 }
-                Value::u64(out)
             }
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
-                let mut xs = vals.into_u64("scan values")?; // owned -> inclusive prefix written in place
+                let mut xs = vals.into_i64("scan values")?; // owned -> inclusive prefix written in place
                 // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
                 // sequential within a row, so this is a single memory pass, not a vectorizable one.
                 macro_rules! prefix {
@@ -390,19 +361,18 @@ impl ArithOp {
                     }};
                 }
                 match r {
-                    // integer Add/Mul wrap (the totality invariant); identities seed each row.
-                    Red::Add => prefix!(0u64, a, x => a.wrapping_add(x)),
-                    Red::Mul => prefix!(1u64, a, x => a.wrapping_mul(x)),
-                    Red::Min => prefix!(u64::MAX, a, x => a.min(x)),
-                    Red::Max => prefix!(0u64, a, x => a.max(x)),
-                    Red::All => prefix!(1u64, a, x => a & (x != 0) as u64), // running "all nonzero so far"
-                    Red::Any => prefix!(0u64, a, x => a | (x != 0) as u64), // running "any nonzero so far"
+                    Red::Add => prefix!(0i64, a, x => a.wrapping_add(x)),
+                    Red::Mul => prefix!(1i64, a, x => a.wrapping_mul(x)),
+                    Red::Min => prefix!(i64::MAX, a, x => a.min(x)),
+                    Red::Max => prefix!(i64::MIN, a, x => a.max(x)),
+                    Red::All => prefix!(1i64, a, x => a & (x != 0) as i64), // running "all nonzero so far"
+                    Red::Any => prefix!(0i64, a, x => a | (x != 0) as i64), // running "any nonzero so far"
                 }
-                Value::List(bounds, Box::new(Value::u64(xs)))
+                let out = if matches!(r, Red::All | Red::Any) { Value::u8(xs.iter().map(|&x| x as u8).collect()) } else { Value::i64(xs) };
+                Value::List(bounds, Box::new(out))
             }
         })
     }
-
 }
 
 /// the standard vocabulary: the core (structural) ops plus the `cmp` (comparison/order),

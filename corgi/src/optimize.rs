@@ -3,8 +3,8 @@
 //! matches core `Field`/`Tuple`, so it reaches through `NumOp::Core`.
 
 use crate::graph::{Graph, Node, NodeKind};
-use crate::ops::{ArithOp, BinOp, CmpOp, Kind, NumOp, Op, Pred};
-use crate::value::Value;
+use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred};
+use crate::value::{Scalar, Value};
 use std::collections::HashMap;
 
 /// recurse a body-bearing core op's sub-graphs through a pass.
@@ -197,15 +197,16 @@ pub fn cancel_isos(g: &Graph<NumOp>) -> Graph<NumOp> {
 }
 
 /// constant operands become immediates: a binary op whose input is a pair with a one-row leaf
-/// literal in it runs as one op carrying the constant (`ArithOp::BinImm`, `CmpOp::RelImm`,
-/// `CmpOp::MinImm`/`MaxImm`) on the other side, so `(x, 4u64) add` builds no column of 4s. Exact,
-/// because the immediate kernels share the pair kernels' lane bodies and take the literal's stored
-/// bits. A literal on the left converts where the order of operands doesn't matter (integer
-/// `add`/`mul`, `eq`, `ne`, `min`, `max`) and for the other comparisons, which flip; `(c, x) sub`,
-/// `div` and `rem`, and float `(c, x) add`/`mul` (whose NaN payloads can depend on the order), stay
-/// pairs. A width that disagrees with the op stays a pair too, so it fails where it did. The pair and
-/// the literal remain while anything else reads them; [`dce`] sweeps them otherwise. `Program` runs
-/// this, then `dce`, on every program; the ML notation has no spelling of its own for these ops.
+/// literal in it runs as one op carrying the constant (`ArithOp::BinImm`, `ArithOp::BitsImm`,
+/// `CmpOp::RelImm`, `CmpOp::MinImm`/`MaxImm`) on the other side, so `(x, 4) add` builds no column
+/// of 4s. Exact, because the immediate kernels share the pair kernels' lane bodies. A literal on
+/// the left converts where the order of operands doesn't matter (integer `add`/`mul`, the bitwise
+/// ops but `sub_b64`, `eq`, `ne`, `min`, `max`) and for the other comparisons, which flip;
+/// `(c, x) sub`, `div` and `rem`, and float `(c, x) add`/`mul` (whose NaN payloads can depend on the
+/// order), stay pairs. A constant whose kind disagrees with the op stays a pair too, so it fails
+/// where it did. The pair and the literal remain while anything else reads them; [`dce`] sweeps
+/// them otherwise. `Program` runs this, then `dce`, on every program; the ML notation has no
+/// spelling of its own for these ops.
 pub fn immediates(g: &Graph<NumOp>) -> Graph<NumOp> {
     rewrite_graph(g, immediates, |kind, inputs, built, _| {
         let NodeKind::Op(op) = kind else { return None };
@@ -214,10 +215,10 @@ pub fn immediates(g: &Graph<NumOp>) -> Graph<NumOp> {
             return None;
         }
         let literal = |i: usize| match &built[pair.inputs[i]].kind {
-            NodeKind::Op(NumOp::Core(Op::Lit(Value::Prim(p)))) if p.len() == 1 => Some((p.bits(), p.u64_at(0))),
+            NodeKind::Op(NumOp::Core(Op::Lit(Value::Prim(p)))) if p.len() == 1 => Some(Scalar::of(p, 0)),
             _ => None,
         };
-        let (x, (w, c), left) = match (literal(1), literal(0)) {
+        let (x, c, left) = match (literal(1), literal(0)) {
             (Some(l), _) => (pair.inputs[0], l, false),
             (None, Some(l)) => (pair.inputs[1], l, true),
             (None, None) => return None,
@@ -230,16 +231,23 @@ pub fn immediates(g: &Graph<NumOp>) -> Graph<NumOp> {
             same => same,
         };
         let imm = match op {
-            NumOp::Arith(ArithOp::Bin(b, k, bw)) => {
-                let either_side = matches!(b, BinOp::Add | BinOp::Mul) && !matches!(k, Kind::F);
-                if *bw != w || (left && !either_side) {
+            NumOp::Arith(ArithOp::Bin(b)) => {
+                let either_side = matches!(b, BinOp::Add | BinOp::Mul) && matches!(c, Scalar::Int(_));
+                if left && !either_side {
                     return None;
                 }
-                NumOp::Arith(ArithOp::BinImm(*b, *k, *bw, c))
+                NumOp::Arith(ArithOp::BinImm(*b, c))
             }
-            NumOp::Cmp(CmpOp::Rel(p)) => NumOp::Cmp(CmpOp::RelImm(if left { flip(*p) } else { *p }, w, c)),
-            NumOp::Cmp(CmpOp::Min) => NumOp::Cmp(CmpOp::MinImm(w, c)),
-            NumOp::Cmp(CmpOp::Max) => NumOp::Cmp(CmpOp::MaxImm(w, c)),
+            NumOp::Arith(ArithOp::Bits(b)) => {
+                let Scalar::Int(c) = c else { return None };
+                if left && matches!(b, BitOp::SubB64) {
+                    return None;
+                }
+                NumOp::Arith(ArithOp::BitsImm(*b, c))
+            }
+            NumOp::Cmp(CmpOp::Rel(p)) => NumOp::Cmp(CmpOp::RelImm(if left { flip(*p) } else { *p }, c)),
+            NumOp::Cmp(CmpOp::Min) => NumOp::Cmp(CmpOp::MinImm(c)),
+            NumOp::Cmp(CmpOp::Max) => NumOp::Cmp(CmpOp::MaxImm(c)),
             _ => return None,
         };
         Some(Rewrite::Replace(Node { kind: NodeKind::Op(imm), inputs: vec![x] }))

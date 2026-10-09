@@ -11,6 +11,5 @@ pub(crate) mod text;
 
 pub use self::cmp::{CmpOp, Pred};
 pub use self::core::Op;
-pub use self::numeric::{dec_i64, enc_i64, ArithOp, BinOp, Kind, NumOp, Red};
-pub(crate) use self::numeric::lit_value;
+pub use self::numeric::{ArithOp, BinOp, BitOp, NumOp, Red, ShiftOp};
 pub use self::text::TextOp;

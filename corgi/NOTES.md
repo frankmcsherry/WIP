@@ -12,7 +12,7 @@ Every core operation is total, and takes and returns its natural data: a sort re
 Layers above add opinions:
 
 - words written in Corgi over the core, which expand into the graph so the optimizer sees through them;
-- the representations the engine chooses (integer widths, list bounds, tags);
+- the representations the engine chooses (an integer's storage, list bounds, tags);
 - and languages that check what the core leaves unchecked (types, totality, unwrapping).
 
 **Goals:**
@@ -57,15 +57,17 @@ language; `cargo bench --bench eval` measures throughput.
 
 ```
 src/
-  value.rs     Value (columnar data) + show. Leaf = Prim, a width-tagged Arc<Vec<uN>>
-               (u8/u16/u32/u64) via the `prim!` macro. Sum = (Tags, variants), where Tags is the
-               lane assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
+  value.rs     Value (columnar data) + show. Leaf = Prim, an Arc<Vec<_>> per storage via the
+               `prim!` macro: U8 and I64 hold integers (the same value at either; equality and hash
+               go by value, and two integer leaves at different storages meet at I64), F64 floats
+               (as their total-order keys). Sum = (Tags, variants), where Tags is the lane
+               assignment: Const(tag, rows) or Column(u8 tags, within-lane offsets).
   engine.rs    row-movement primitives: gather, concat, fill + index generators
                (filter_mask / owner_ids / index_plan / expand_ranges).
   lib.rs       re-exports, plus `arrange`: the sort/survey/gather surface DDIR's backend calls.
   bytes.rs     the byte codec: a column to and from a self-describing, 8-byte-aligned byte string,
                for shipping columns between processes.
-  hash.rs      structural hashing, one stable u64 per row, over the same structure the comparator reads.
+  hash.rs      structural hashing, one stable 64-bit word per row, over the same structure the comparator reads.
   graph.rs     OpLike, NodeKind{Input,Tuple,Op(O)}, Graph<O>, Builder<O>, eval_graph / try_eval_graph,
                shape_of (= try_eval_graph on `Value::empty(shape)`), check. eval_graph CONSUMES its arg and MOVES values to last use (enables in-place).
                Value::Ref(Arc<list>, Arc<rows>) = referenced LIST ROWS (shape Ref<List<T>>, Rust's &[T]):
@@ -77,7 +79,7 @@ src/
                never once per reference).
                `Rows` = the reader's borrowed view (List or Ref) via `rows_of`; `into_list` takes only a
                List, so a Ref elsewhere is the shape error "clone first". Compare/sort read through refs.
-  shape.rs     Shape (Prim(width) | Prod | Sum | List | Ref) + shape_of_value + Display.
+  shape.rs     Shape (Int | Float | Prod | Sum | List | Ref) + shape_of_value + Display.
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
                passes are latent, not dead.
@@ -98,15 +100,15 @@ src/
                FoldScan with body (a,x)->(b,b), field 1). Gather (positions per row, nested or flat;
                the result keeps their structure) is the one fetch kernel, with a checked per-row form and
                `gather_try` (per element, Sum{Found|Missing}); `slices` = map(range); gather. Plus Unit
-               (X -> Unit) and the typed numeric grid + named reductions in `numeric`.
+               (X -> Unit) and the arithmetic + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
                List⊗List (Flatten / the word `slices`), List⊗Sum (Unweave/Weave) — and the fused forms/producers
-               (Lit/Cast/Filter/Gather/Iota/Range), each reducible to kernel+isos (the `law` corpus
+               (Lit/Filter/Gather/Iota/Range), each reducible to kernel+isos (the `law` corpus
                programs witness it), kept for the execution strategy the expansion loses. The
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
-               eval/children; NOT OpLike. (Iota: U64->List<U64> data gen; MapSum: variadic match,
+               eval/children; NOT OpLike. (Iota: Int->List<Int> data gen; MapSum: variadic match,
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
-    cmp.rs     CmpOp: Rel(Pred) + SortBy/SortLimit/Find/Adjacent. Kind-blind comparisons. SortBy is
+    cmp.rs     CmpOp: Rel(Pred) + SortBy/SortLimit/Find/Adjacent. Comparisons by value. SortBy is
                the sort's own output (stable by key, payload carried, runs numbered;
                dev/indexed-sort.md); `sort`/`dedup`/`group` are words over it (ml.rs::sort_word).
                SortLimit sorts the order's levels one at a time, keeping per row the first k and the
@@ -122,14 +124,15 @@ src/
                sort.rs: the indexed discrimination sort (dev/indexed-sort.md). survey.rs: the merge
                kernel, rank at a time (dev/lane-survey.md).
     host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi.
-    numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp = the
-               (op × kind × width) grid + ReduceSum + Shr/And (SIMD ÷2^k / mod 2^k). enc_i64/dec_i64.
+    numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp =
+               arithmetic on two Ints or two Floats (the kind from the operands) + the `_b64` and
+               bitwise ops (an Int as its 64-bit word) + shifts + the named reductions and scans.
     fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` checked
                producers (gather/zip/chunk), `Lift`/`Squash`, and the
                three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
                functor). The evals live here; `Op::eval` dispatches to them first.
-    text.rs    TextOp: Split(u8) + ParseU64. Byte-leaf interpretations (a string is List<U8>); both
-               total — ParseU64 returns Sum{Err: bytes | Ok: U64}, no data-dependent panic.
+    text.rs    TextOp: Split(u8) + ParseInt. A string is a List<Int> of its bytes (held as bytes); both
+               total — ParseInt returns Sum{Ok: Int | Err: ()}, no data-dependent panic.
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
@@ -185,8 +188,8 @@ reasons. Adding a structural op means either filling a hole (and writing its law
 
 - **Every semantic op is a unary `T0 -> T1`** (the 1:1 map), run by `eval`. `Input`/`Tuple` are the
   only non-ops — they're `graph::NodeKind`.
-- **Shape = structure + leaf width, kind-blind.** Numeric kinds (signed/float) are an interpretation
-  a layer encodes, never a Shape. `shape_of` is LITERALLY `eval` on a zero-row column: every op is
+- **Shape = structure over two leaves, `Int` and `Float`.** An integer's storage (a byte, an `i64`)
+  is the engine's choice and never part of its shape or its value. `shape_of` is LITERALLY `eval` on a zero-row column: every op is
   total on zero rows, reports a mismatched operand as `Err` (the accessors `into_pair`/`into_list`/…
   carry the message), and builds an output of the shape it would at any length — so there is one
   vocabulary, one evaluator, and no type-level shadow of it to keep in sync. `eval_graph` unwraps
@@ -194,20 +197,29 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   body-bearing ops use.
 - **Layering = enum embedding via `OpLike` + body-generic `Op<L>`.** A layer is `{ Core(Op<Self>),
   <buckets> }` impl'ing `OpLike` by delegating; the graph machinery is unchanged across layers.
-- **The core is numeric-blind.** Arithmetic is `ops/numeric`; comparison is `ops/cmp`. The leaf is
-  stored order-preserving (signed = top-bit swizzle), so ONE kind-blind comparator serves `sort`,
-  `find`, and `Rel` alike.
-- **Float semantics are TOTAL-ORDER, not IEEE (deliberate).** `Kind::F` (widths 32/64) stores the
-  IEEE bits under the total-order swizzle (`f64::total_cmp`: negatives flip all bits, others flip the
-  sign bit). The kind-blind comparator then orders floats correctly with NO special case — *the
-  swizzle never mis-orders two values IEEE orders; it only supplies a definite position where IEEE
-  declines.* The deviations, all on the "naughty" sort/eq path: NaN is orderable (sorts to the top)
+- **The core is numeric-blind.** Arithmetic is `ops/numeric`; comparison is `ops/cmp`. Every leaf
+  orders by value (an integer as a signed number, a float by its total order), so ONE comparator
+  serves `sort`, `find`, and `Rel` alike; the sort radixes each storage's order keys.
+- **One integer type.** `Int` is an integer, exact within `i64` and wrapping past it (the one
+  documented edge, until exact wide integers). Integer `div` truncates and is total: `x/0 = 0`,
+  `x%0 = x`, and `MIN/-1` wraps. Code that treats an integer as a 64-bit word (hashing, bit banging)
+  says so with the `_b64` verbs (`add_b64`, `mul_b64`, `shr_b64` the logical shift, rotates) and the
+  bitwise ops, each defined on the integer's low 64 bits read back as an `i64`; they will keep their
+  meaning when plain arithmetic becomes exact. There is no integer shift: dividing by a power of
+  two is `div` (run as a shift), so the word's logical shift and integer division can't be
+  mistaken for each other. Text, masks and sum tags are held as bytes, every
+  other integer as `i64`. A reduction of an empty row reads the zero of an integer: `fold_min` and
+  `fold_max` give 0 (not an identity, which unbounded integers would not have), and a program that
+  wants another default tests `len` and `select`s it.
+- **Float semantics are TOTAL-ORDER, not IEEE (deliberate).** A `Float` is an `f64`, stored as its
+  total-order key (`f64::total_cmp`: negatives flip all bits, others flip the sign bit), so the
+  comparator orders floats with NO special case — *the key never mis-orders two values IEEE orders;
+  it only supplies a definite position where IEEE declines.* The deviations, all on the "naughty" sort/eq path: NaN is orderable (sorts to the top)
   and equals itself bit-for-bit; `-0 != +0` (distinct bits — no canonicalization, by choice). The
   win: no NaN-poisons-comparison surprise. *Arithmetic stays IEEE* (NaN/inf propagate; `x/0 -> ±inf`,
-  `0/0 -> NaN` — total, no panic). A future `fXY_eq` can offer IEEE equality if needed. Floats enter
-  via `to_f32`/`to_f64` or a float literal (`1.5f64`, the same encoding); the typed grid is reached by
-  suffix (`add_i32`, `div_f64`, `signed`), and literals carry kind and width (`-3i16`, `7u8`). Integer `div` truncates and is total:
-  `x/0 = 0`, and signed `MIN/-1` wraps.
+  `0/0 -> NaN` — total, no panic). A future IEEE `eq` can be offered if needed. Floats enter via
+  `to_float` or a float literal (`1.5`, `1e3`: a fraction or exponent); an Int literal is `5` or
+  `-3`. Arithmetic takes its kind from its operands, and an Int meeting a Float is a shape error.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
   level is always 1:1.
 - **List rows carry a stride-aware `Bounds`.** `Value::List` holds `Bounds { Stride(stride, rows) |
@@ -240,13 +252,13 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
   *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
-  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (`Shr` does).
+  sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (the shifts do).
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
-  *Reuse policy:* an op that is elementwise AND same-width (`Shr`/`And`, `bin_into`, `neg_into`,
-  `lane_pick`, `xor_signbit`, the in-place fold scatter) consumes its operand and rewrites it under
+  *Reuse policy:* an op that is elementwise AND same-storage (shifts, `bin_into`, `map_into`,
+  `lane_pick`, the in-place fold scatter) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
-  fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, `cast` = re-width, `rel`/`cmp_idx`/
+  fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, a byte leaf widening, `rel`/`cmp_idx`/
   the sort's pulled keys = a differently-typed result) allocate *by necessity*, not oversight — the access pattern
   or output type rules reuse out. (Cross-op intermediate elimination is the separate DPS backlog item.)
 - **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
@@ -296,7 +308,7 @@ shortest column; the raw `Chunk` drops a row's remainder. Their `Try` forms, the
 those rows as errors instead. `Branch` is total (a tag of n-1 or
 more goes to the last lane) and is the surface `branch`. `gather_try` is distinct: the per-ELEMENT
 `List<Sum{Found | Missing}>`, a value the program handles itself, not a per-row effect. Every "maybe"
-result has this one shape: Ok first, the failures only counted (`Fail<T>`, `gather_try`, `parse_u64`).
+result has this one shape: Ok first, the failures only counted (`Fail<T>`, `gather_try`, `parse_int`).
 
 **Audit rule, kept from the old gates:** an analysis threaded through a fixpoint (`Fold`/`FoldScan`'s
 accumulator back-edge) must treat the fed-back value as unknown; the lowering does this by making the
@@ -335,6 +347,13 @@ gives a scalar element, so `get` is `gather` on one position per row (no enlist,
 `get 0`, and `slices` is the word `map(range); gather` (`Range` is iota with a start). Fewer kernels
 was the reason: `Get`, `Slices` and their `Try` forms leave the core, and sub-list references (a
 `slices` view of a referenced list) go with `Slices`.
+
+Then one integer type (2026-10): the leaf types are `Int` and `Float`, and an integer's width is
+its storage (bytes or `i64`), never its value or shape. The typed grid (`add_i64`, `div_f64`), the
+literal suffixes, `cast`, `signed` and the sign-flip encoding are gone; arithmetic takes its kind
+from its operands; the `_b64` verbs and the bitwise ops are how a program asks for 64-bit word
+arithmetic. Unsigned 64-bit values above 2^63 have no storage of their own: a hash is the full
+64-bit word read as an `i64`, and exact wide integers are the backlog item that will hold the rest.
 
 ## Live work — the DDIR consumer
 
@@ -414,21 +433,23 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   Arrow-validity-bitmap is the representation reconcile point.
 - **Recursion / μ-types** — arbitrary-depth JSON; needs a recursive-column construct, and a
   length-carrying `Unit` for `null` / `Option` None.
-- **JSONL / Extern** — `split`/`parse_u64` landed as the `text` bucket (typed, not `Op::Extern`); `parse_json` remains open and still wants `Extern` or recursion (μ-types below).
+- **JSONL / Extern** — `split`/`parse_int` landed as the `text` bucket (typed, not `Op::Extern`); `parse_json` remains open and still wants `Extern` or recursion (μ-types below).
 - **Named declarations — enum half DONE; struct half deliberately skipped.**
   `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
   Use sites: `inject V` (the tag AND the whole sum's lane shapes off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
-  Payload shapes: `enum Node = Lit u64 | Add (u64, u64) | Str List(u8) | Wrap Other in …` — a variant may omit its shape unless the
+  Payload shapes: `enum Node = Lit int | Add (int, int) | Str List(int) | Wrap Other in …` — a variant may omit its shape unless the
   enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
   naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
-  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are typed literals (`(x, 1u64) sub`; the core's `And`/`Shr`/`AddU64`/`Gt` immediate kernels are ops with a parameter, `x shr 3`).
+  Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are literals (`(x, 1) sub`; the core's `And`/`Shr`/`Gt` immediate kernels are ops with a parameter, `x shr 3`; `shr` later retired for `shr_b64` and `div`).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).
 
-- **Kind-checking numeric front-end** — where `i32` / `f32` live; type-checks kinds, inserts
-  swizzles, lowers to `NumOp`. Today's surface is kind-blind (emits `add` / `gt` / `lt` / …).
+- **Exact wide integers** — `Int` wraps at the `i64` edge for now. Next: an `i128` storage (holds
+  any `i64` or `u64`, and the sums that leave 64 bits, e.g. ClickBench q03's AVG of ids), then
+  arbitrary precision held apart as a sum. Narrower storages (`i8` for DD diffs, 32-bit for offsets
+  and ids) come in behind the same `Int`, each measured as it lands.
 - **Length / stratum checker** — the one judgment `shape_of` skips (Tuple/Add same length; map body
   one stratum deeper). A pass beside `check`.
 - **Sum random-access cost — RESOLVED (via representation).** A `Value::Sum` carries each row's

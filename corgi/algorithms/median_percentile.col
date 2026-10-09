@@ -1,10 +1,10 @@
 # The median (the lower one for an even count) and the 90th percentile (nearest rank) of each row's
-# values. Input a `List<U64>`. Output `(median, p90)`, two `U64`; an empty row gives `(0, 0)`.
+# values. Input a `List<Int>`. Output `(median, p90)`, two `Int`s; an empty row gives `(0, 0)`.
 let s = input sort in
 let n = s len in
 # The lower median is at (n - 1) / 2; nearest rank puts p90 at ceil(9n / 10) - 1.
-let mid = ((n, 1u64) sub, 2u64) div_u64 in
-let rank = ((((n, 9u64) mul, 9u64) add, 10u64) div_u64, 1u64) sub in
-let median = (mid, s) get try match (0 (v -> v), 1 (_ -> 0u64)) in
-let p90 = (rank, s) get try match (0 (v -> v), 1 (_ -> 0u64)) in
+let mid = ((n, 1) sub, 2) div in
+let rank = ((((n, 9) mul, 9) add, 10) div, 1) sub in
+let median = (mid, s) get try match (0 (v -> v), 1 (_ -> 0)) in
+let p90 = (rank, s) get try match (0 (v -> v), 1 (_ -> 0)) in
 (median, p90)

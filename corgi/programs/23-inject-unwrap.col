@@ -1,4 +1,4 @@
 # n = 5
 # = [5]
-enum Two = First u64 | Second u64 in
+enum Two = First int | Second int in
 input inject Second unwrap

@@ -2,4 +2,4 @@
 # sql: SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
 # columns: AdvEngineID
 # output: u
-input map (a -> (a, 0u64) ne) fold_add
+input map (a -> (a, 0) ne) fold_add
