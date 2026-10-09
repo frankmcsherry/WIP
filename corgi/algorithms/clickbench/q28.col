@@ -1,7 +1,7 @@
 # Q28: SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25
 # sql: SELECT regexp_replace(decode(Referer), '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(octet_length(Referer)) AS l,
 # sql:   COUNT(*) AS c, min(Referer) FROM hits WHERE Referer <> ''
-# sql:   GROUP BY k HAVING COUNT(*) > 1000 ORDER BY l DESC, strlen(k), k LIMIT 25
+# sql:   GROUP BY k HAVING COUNT(*) > 1000 ORDER BY l DESC, k LIMIT 25
 # columns: Referer
 # output: [s,f,u,s]
 # corgi has no regular expressions; this is the regexp as byte logic. A referer matches when it starts
