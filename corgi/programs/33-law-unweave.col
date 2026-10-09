@@ -8,4 +8,4 @@
 # = [1]
 let xs = input iota in
 let sums = xs map (x -> (x, x and 1) branch 2 map_variant 1 (o -> o iota)) in
-(sums unweave .0, xs map (x -> x and 1 cast 8)) eq
+(sums unweave .0, xs map (x -> x and 1)) eq

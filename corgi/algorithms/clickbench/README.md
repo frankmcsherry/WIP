@@ -15,7 +15,8 @@ checks corgi's answers against DuckDB's, then times both.
 
 - **Written as the SQL is:** 35 queries.
 - **A different method, because corgi lacks the operation:**
-  - q03 (AVG of a signed column): sums of 32-bit halves, since there is no signed-to-float.
+  - q03 (AVG of a 64-bit id): sums of 32-bit halves, since the ids sum to about 2^80 and an Int
+    sum wraps at the i64 edge.
   - q20–q22 (LIKE): split and compare.
   - q28 (REGEXP_REPLACE): the equivalent byte logic.
 - **Cut down:** q23 returns three columns for `SELECT *`.
@@ -39,7 +40,7 @@ from one `--profile` run, taken while `sort`, `dedup` and `group` were the kerne
 | q00 | 0.00 | 0.09 | 0 | Nothing to do: the row count is in the bounds. |
 | q01 | 0.45 | 0.40 | 1.12 | At parity: one compare pass and a sum. |
 | q02 | 0.16 | 0.40 | 0.40 | Ahead: two SIMD sums; DuckDB pays its per-query overhead (~0.1 ms) at this size. |
-| q03 | 0.90 | 0.74 | 1.22 | Approximated in method: corgi has no signed-to-float and no float sum. Two extra passes (shr, and). |
+| q03 | 0.90 | 0.74 | 1.22 | Approximated in method: corgi has no integer wider than i64. Two extra passes (shr, and). |
 | q04 | 15.57 | 3.65 | 4.27 | Sort-based distinct (DedupList 21 ms) against DuckDB's hash set. |
 | q05 | 45.60 | 5.70 | 8.00 | Structural sort of 1M byte strings (47 ms) against a hash set. |
 | q06 | 0.22 | 0.63 | 0.35 | Ahead: two SIMD passes. |
@@ -102,7 +103,7 @@ takes 9.8 s and DuckDB 0.9 s.
 1. **Grouping, dedup and count-distinct on byte strings.** Today these sort the strings
    structurally. That is about 7 of corgi's 10 s: q33's `group` of 1M URLs takes 1.6 s, while
    DuckDB answers the whole query in 29 ms. Either of these would avoid it:
-   - group on a u64 hash, and compare bytes only within equal hashes;
+   - group on a 64-bit hash, and compare bytes only within equal hashes;
    - dictionary codes: a reference column over a distinct list of strings is already a dictionary.
 
    Order is only needed for the final top ten.
@@ -113,7 +114,7 @@ takes 9.8 s and DuckDB 0.9 s.
 3. **Missing words: substring search and string min/max.**
    - q20–q23 spend 9–60× on split-and-compare.
    - MIN(Referer) by sorting each group is 1.4 s of q28.
-4. **COUNT(\*) without value lists.** `(k, 1u64) group … ones len` builds lists only to count
+4. **COUNT(\*) without value lists.** `(k, 1) group … ones len` builds lists only to count
    them. Run lengths (`adjacent`, `cut`) or a bincount for a small key domain would not.
 5. **Predicate chains.** Each comparison, and each `mul` used as AND, is its own pass. DuckDB
    fuses them, evaluates the cheap ones first (q21's LIKE runs only on survivors), and skips blocks

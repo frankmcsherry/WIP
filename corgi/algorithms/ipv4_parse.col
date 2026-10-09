@@ -1,11 +1,11 @@
 # Parse a dotted-quad IPv4 address, "a.b.c.d", into its 32-bit value. Valid: exactly four parts,
 # each of one to three decimal digits with value at most 255 (leading zeros are allowed and read as
-# decimal: "010" is 10). Input `List<U8>`. Output `Sum{U64 address | () invalid}`.
+# decimal: "010" is 10). Input a `List<Int>` of bytes. Output `Sum{Int address | () invalid}`.
 let parts = input split "." in
 # Each part: whether it is valid, and its value.
 let fields = parts map (p ->
-    let (ok, v) = p parse_u64 match (0 (v -> ((v, 255u64) le, v)), 1 (_ -> (0u64, 0u64))) in
-    ((ok, (p len, 3u64) le) mul, v)) in
-let valid = ((parts len, 4u64) eq, fields map ((ok, _) -> ok) fold_all) mul in
-let addr = (0u64, fields) fold ((acc, (_, v)) -> ((acc, 256u64) mul, v) add) in
-(addr, (valid, 0u64) eq) branch 2 map_variant 1 (x -> x unit)
+    let (ok, v) = p parse_int match (0 (v -> ((v, 255) le, v)), 1 (_ -> (0, 0))) in
+    ((ok, (p len, 3) le) mul, v)) in
+let valid = ((parts len, 4) eq, fields map ((ok, _) -> ok) fold_all) mul in
+let addr = (0, fields) fold ((acc, (_, v)) -> ((acc, 256) mul, v) add) in
+(addr, (valid, 0) eq) branch 2 map_variant 1 (x -> x unit)

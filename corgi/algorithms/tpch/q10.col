@@ -9,15 +9,15 @@
 let (ckey, cnat, nkey, nname, okey, ocust, odate, lkey, lrf, price, disc) = input in
 # Orders from 1993-Q4 (key, customer), sorted by key.
 let orders = ((okey, ocust) zip, odate) zip
-    map (((k, c), dt) -> (((dt, 8674u64) ge, (dt, 8766u64) lt) mul, (k, c))) filter sort in
+    map (((k, c), dt) -> (((dt, 8674) ge, (dt, 8766) lt) mul, (k, c))) filter sort in
 # Returned line items, each looked up in those orders: revenue per customer.
 let lines = ((lkey, lrf) zip, (price, disc) zip) zip
-    map (((k, f), (p, d)) -> ((f, "R") eq, (k, (p, (100u64, d) sub) mul))) filter in
+    map (((k, f), (p, d)) -> ((f, "R") eq, (k, (p, (100, d) sub) mul))) filter in
 let at = (lines map ((k, _) -> k), orders map ((k, _) -> k)) find in
 let matched = (at, lines) zip map (((lo, hi), (_, r)) -> ((hi, lo) gt, (lo, r))) filter in
 let custs = (matched map ((lo, _) -> lo), orders) gather map ((_, c) -> c) in
 let per = (custs, matched map ((_, r) -> r)) zip group
-    map ((c, rs) -> let r = rs fold_add in ((18446744073709551615u64, r) sub, c, r)) sort_limit 20 in
+    map ((c, rs) -> let r = rs fold_add in (r neg, c, r)) sort_limit 20 in
 let top = per in
 # The top customers' nation names: customer -> nation key -> name.
 let cs = (ckey, cnat) zip sort in
@@ -27,4 +27,4 @@ let natk = (cat map ((lo, _) -> lo), cs) gather map ((_, n) -> n) in
 let nat = (natk, ns map ((k, _) -> k)) find in
 let names = (nat map ((lo, _) -> lo), ns) gather map ((_, name) -> name) in
 (top, names) zip map (((_, c, r), name) -> (c, r, name))
-    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, ""))))
+    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, ""))))

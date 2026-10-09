@@ -4,4 +4,4 @@
 # output: u,u,f
 let (adv, width) = input in
 let n = adv len in
-(adv fold_add, n, (width fold_add to_f64, n to_f64) div_f64)
+(adv fold_add, n, (width fold_add to_float, n to_float) div)

@@ -5,8 +5,8 @@
 # output: [i,i,u,u,f]
 let (watchid, ip, refresh, width, phrase) = input in
 let rows = (watchid, (ip, (refresh, (width, phrase) zip) zip) zip) zip
-    map ((e, (i, (r, (w, s)))) -> ((s len, 0u64) gt, ((e, i), (r, w)))) filter in
+    map ((e, (i, (r, (w, s)))) -> ((s len, 0) gt, ((e, i), (r, w)))) filter in
 let ranked = rows group map (((e, i), vs) -> let n = vs len in
-    ((18446744073709551615u64, n) sub, e, i, n, vs map ((r, _) -> r) fold_add, (vs map ((_, w) -> w) fold_add to_f64, n to_f64) div_f64)) sort_limit 10 in
+    (n neg, e, i, n, vs map ((r, _) -> r) fold_add, (vs map ((_, w) -> w) fold_add to_float, n to_float) div)) sort_limit 10 in
 ranked map ((_, e, i, n, r, w) -> (e, i, n, r, w))
-    try match (0 (x -> x), 1 (_ -> 0u64 iota map (z -> (z, z, z, z, 0f64))))
+    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, z, z, 0.0))))

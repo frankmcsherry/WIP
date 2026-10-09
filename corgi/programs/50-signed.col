@@ -4,6 +4,6 @@
 # reads the swizzled bytes, so `eq` works across kinds.
 # n = 1
 # = [1]
-let a = 3i32 in
-let b = 7i32 in
-(((a, b) sub_i32, (b, a) sub_i32 neg_i32) eq, (a neg_i32 neg_i32, a) eq) mul
+let a = 3 in
+let b = 7 in
+(((a, b) sub, (b, a) sub neg) eq, (a neg neg, a) eq) mul

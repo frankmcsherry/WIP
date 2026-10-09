@@ -4,4 +4,4 @@ let s = input in
 let starts = s adjacent in
 let bytes = (starts, s) zip filter in
 let lens = (starts, s) zip cut map (r -> r len) in
-(bytes, lens) zip try match (0 (runs -> runs), 1 (_ -> 0u64 iota map (z -> (z cast 8, z))))
+(bytes, lens) zip try match (0 (runs -> runs), 1 (_ -> 0 iota map (z -> (z, z))))

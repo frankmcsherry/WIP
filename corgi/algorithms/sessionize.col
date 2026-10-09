@@ -1,19 +1,19 @@
 # Split each row's events into sessions: a new session starts when the gap since the previous
-# event exceeds 30. Input a sorted `List<U64>` of timestamps per row. Output `(sessions, longest)`:
+# event exceeds 30. Input a sorted `List<Int>` of timestamps per row. Output `(sessions, longest)`:
 # the number of sessions and the length, in events, of the longest one (both 0 for no events).
 #
 # Pair each event with the one before it, mark the gaps over 30, and the sessions are the stretches
 # between marks: they start at 0 and at each marked position, and end where the next one starts.
 let ts = input in
 let n = ts len in
-let at = (1u64, n) range in
+let at = (1, n) range in
 let cur = (at, ts) gather in
-let prev = (at map (i -> (i, 1u64) sub), ts) gather in
-let breaks = (prev, cur) zip map ((p, c) -> ((c, p) sub, 30u64) gt) in
-let sessions = ((n, 0u64) eq, 0u64, (breaks fold_add, 1u64) add) select in
+let prev = (at map (i -> (i, 1) sub), ts) gather in
+let breaks = (prev, cur) zip map ((p, c) -> ((c, p) sub, 30) gt) in
+let sessions = ((n, 0) eq, 0, (breaks fold_add, 1) add) select in
 # where each session starts, and where it ends
 let marked = (breaks, at) zip filter in
-let starts = (0u64 enlist, marked) append in
+let starts = (0 enlist, marked) append in
 let ends = (marked, n enlist) append in
 let longest = (ends, starts) zip map ((e, s) -> (e, s) sub) fold_max in
-(sessions, ((n, 0u64) eq, 0u64, longest) select) try match (0 (r -> r), 1 (_ -> (0u64, 0u64)))
+(sessions, ((n, 0) eq, 0, longest) select) try match (0 (r -> r), 1 (_ -> (0, 0)))

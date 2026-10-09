@@ -18,18 +18,18 @@ fn run(src: &str, input: Value) -> Value {
 
 /// a sum of `lanes` lanes over `rows` rows; lane `l` holds (row index, row index * 10 + l), as a
 /// product when `prod`, else just the row index. Returns the sum and each row's (tag, payload).
-fn sum(rows: usize, lanes: usize, prod: bool, rng: &mut Rng) -> (Value, Vec<(usize, u64)>) {
+fn sum(rows: usize, lanes: usize, prod: bool, rng: &mut Rng) -> (Value, Vec<(usize, i64)>) {
     let tags: Vec<usize> = (0..rows).map(|_| (rng.next() % lanes as u64) as usize).collect();
-    let mut cols: Vec<(Vec<u64>, Vec<u64>)> = vec![(Vec::new(), Vec::new()); lanes];
+    let mut cols: Vec<(Vec<i64>, Vec<i64>)> = vec![(Vec::new(), Vec::new()); lanes];
     for (r, &t) in tags.iter().enumerate() {
-        cols[t].0.push(r as u64);
-        cols[t].1.push(r as u64 * 10 + t as u64);
+        cols[t].0.push(r as i64);
+        cols[t].1.push(r as i64 * 10 + t as i64);
     }
     let variants = cols
         .into_iter()
-        .map(|(a, b)| if prod { Value::Prod(vec![Value::u64(a), Value::u64(b)]) } else { Value::u64(a) })
+        .map(|(a, b)| if prod { Value::Prod(vec![Value::i64(a), Value::i64(b)]) } else { Value::i64(a) })
         .collect();
-    let rows_out = tags.iter().enumerate().map(|(r, &t)| (t, r as u64)).collect();
+    let rows_out = tags.iter().enumerate().map(|(r, &t)| (t, r as i64)).collect();
     (Value::sum(tags, variants), rows_out)
 }
 
@@ -41,12 +41,12 @@ fn unwrap_reads_each_row_from_its_lane() {
             for prod in [false, true] {
                 let (v, want) = sum(rows, lanes, prod, &mut rng);
                 let got = run("input unwrap", v);
-                let firsts: Vec<u64> = want.iter().map(|&(_, r)| r).collect();
+                let firsts: Vec<i64> = want.iter().map(|&(_, r)| r).collect();
                 let expect = if prod {
-                    let seconds: Vec<u64> = want.iter().map(|&(t, r)| r * 10 + t as u64).collect();
-                    Value::Prod(vec![Value::u64(firsts), Value::u64(seconds)])
+                    let seconds: Vec<i64> = want.iter().map(|&(t, r)| r * 10 + t as i64).collect();
+                    Value::Prod(vec![Value::i64(firsts), Value::i64(seconds)])
                 } else {
-                    Value::u64(firsts)
+                    Value::i64(firsts)
                 };
                 assert_eq!(got, expect, "lanes {lanes}, rows {rows}, prod {prod}");
             }
@@ -79,7 +79,7 @@ fn unweave_counts_each_rows_elements_per_lane() {
                     lb.push(vals.len());
                     start = end;
                 }
-                expect.push(Value::List(Bounds::offsets(lb), Box::new(Value::u64(vals))));
+                expect.push(Value::List(Bounds::offsets(lb), Box::new(Value::i64(vals))));
             }
             assert_eq!(got, Value::Prod(expect), "lanes {lanes}, rows {rows}");
         }

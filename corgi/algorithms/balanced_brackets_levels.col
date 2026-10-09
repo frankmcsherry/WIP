@@ -4,19 +4,19 @@
 # never outnumber openers, and the whole is balanced (ignoring kinds) when the totals agree. Then
 # each bracket has a nesting level, and once brackets are sorted by (level, position) an opener
 # and the closer that matches it sit side by side; pair them up and check the kinds agree.
-let bs = input map (c -> ((((((c, 40u8) eq, (c, 41u8) eq) max, (c, 91u8) eq) max, (c, 93u8) eq) max,
-    ((c, 123u8) eq, (c, 125u8) eq) max) max, c)) filter in
-let closer = bs map (c -> (((c, 41u8) eq, (c, 93u8) eq) max, (c, 125u8) eq) max) in
+let bs = input map (c -> ((((((c, 40) eq, (c, 41) eq) max, (c, 91) eq) max, (c, 93) eq) max,
+    ((c, 123) eq, (c, 125) eq) max) max, c)) filter in
+let closer = bs map (c -> (((c, 41) eq, (c, 93) eq) max, (c, 125) eq) max) in
 let closes = closer scan_add in
-let opens = (bs len iota, closes) zip map ((i, c) -> (((i, 1u64) add, c) sub)) in
+let opens = (bs len iota, closes) zip map ((i, c) -> (((i, 1) add, c) sub)) in
 let prefix_ok = (closes, opens) zip map ((c, o) -> (c, o) le) fold_all in
 let totals_ok = (opens fold_max, closes fold_max) eq in
 # an opener's level counts itself; a closer's is the level it closes
 let level = ((opens, closes) zip, closer) zip map (((o, c), k) -> ((o, c) sub, k) add) in
-let kind = bs map (c -> ((c, 91u8) ge, (c, 123u8) ge) add) in
+let kind = bs map (c -> ((c, 91) ge, (c, 123) ge) add) in
 let items = ((level, bs len iota) zip, (closer, kind) zip) zip sort in
 let kinds_ok = items chunk 2 map (pair ->
-    let ((_, (c0, k0)), (_, (c1, k1))) = ((0u64, pair) get, (1u64, pair) get) in
-    (((c0, 0u64) eq, (c1, 1u64) eq) mul, (k0, k1) eq) mul) fold_all
-    try match (0 (k -> k), 1 (_ -> 0u64)) in
-((prefix_ok, totals_ok) mul, kinds_ok) mul try match (0 (r -> r), 1 (_ -> 0u64))
+    let ((_, (c0, k0)), (_, (c1, k1))) = ((0, pair) get, (1, pair) get) in
+    (((c0, 0) eq, (c1, 1) eq) mul, (k0, k1) eq) mul) fold_all
+    try match (0 (k -> k), 1 (_ -> 0)) in
+((prefix_ok, totals_ok) mul, kinds_ok) mul try match (0 (r -> r), 1 (_ -> 0))

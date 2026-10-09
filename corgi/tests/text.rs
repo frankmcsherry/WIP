@@ -1,5 +1,5 @@
 //! Text bucket tests: the awkward rows the corpus programs don't dwell on — empty rows,
-//! adjacent delimiters, overflow — since `Split` and `ParseU64` claim totality over every
+//! adjacent delimiters, overflow — since `Split` and `ParseInt` claim totality over every
 //! well-typed input, not over the happy corpus.
 
 use corgi::{shape_of_value, show, Program, Shape, Value};
@@ -12,7 +12,7 @@ fn run(src: &str, arg: &Value) -> String {
     show(&out)
 }
 
-/// a column of strings: one `List<U8>` row per `&str`.
+/// a column of strings: one row of bytes per `&str`.
 fn strings(rows: &[&str]) -> Value {
     let mut ends = Vec::new();
     let mut bytes = Vec::new();
@@ -35,31 +35,31 @@ fn split_keeps_empty_pieces() {
 }
 
 #[test]
-fn parse_u64_is_total() {
-    // malformed rows (empty, non-digit) land in the Err lane, which counts them; u64::MAX is
-    // well-formed. Nothing panics.
-    let arg = strings(&["42", "", "9x", "18446744073709551615"]);
+fn parse_int_is_total() {
+    // malformed rows (empty, non-digit, a sign) land in the Err lane, which counts them; i64::MAX
+    // is well-formed. Nothing panics.
+    let arg = strings(&["42", "", "9x", "-7", "9223372036854775807"]);
     assert_eq!(
-        run("input parse_u64", &arg),
-        "Sum tags=[0, 1, 1, 0] [[42, 18446744073709551615], ()x2]"
+        run("input parse_int", &arg),
+        "Sum tags=[0, 1, 1, 1, 0] [[42, 9223372036854775807], ()x3]"
     );
 }
 
 #[test]
-fn parse_u64_overflow_is_err_not_wrap() {
-    // u64::MAX + 1: the checked accumulate rejects it — an Err row, not a wrapped value.
-    let arg = strings(&["18446744073709551616"]);
-    let out = run("input parse_u64", &arg);
+fn parse_int_overflow_is_err_not_wrap() {
+    // i64::MAX + 1: the checked accumulate rejects it — an Err row, not a wrapped value.
+    let arg = strings(&["9223372036854775808"]);
+    let out = run("input parse_int", &arg);
     assert!(out.starts_with("Sum tags=[1]"), "expected an Err row, got {out}");
 }
 
 #[test]
 fn text_ops_reject_non_strings() {
-    // the judge wants List<U8>; a bare U64 column is a located type error, not an eval panic.
-    let p = Program::compile_ml("input parse_u64").unwrap();
-    assert!(p.shape(&Shape::Prim(64)).is_err());
+    // the judge wants List<Int>; a bare Int column is a located type error, not an eval panic.
+    let p = Program::compile_ml("input parse_int").unwrap();
+    assert!(p.shape(&Shape::Int).is_err());
     let p = Program::compile_ml("input split \",\"").unwrap();
-    assert!(p.shape(&Shape::Prim(64)).is_err());
+    assert!(p.shape(&Shape::Int).is_err());
     // and the delimiter must be one byte.
     assert!(Program::compile_ml("input split \",,\"").is_err());
 }

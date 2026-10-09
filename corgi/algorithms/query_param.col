@@ -1,9 +1,9 @@
 # Look up one parameter of a URL query string: in "a=1&b=two&c" the key "b" has the value "two".
 # Pairs are separated by '&', a pair's key from its value by '='; a pair without '=' has an empty
-# value; the first pair with the key wins. Input `(query, key)`, two `List<U8>`. Output
-# `Sum{List<U8> | ()}`: the value, or () when no pair has the key.
+# value; the first pair with the key wins. Input `(query, key)`, two `List<Int>` of bytes. Output
+# `Sum{List<Int> | ()}`: the value, or () when no pair has the key.
 let (q, key) = input in
 let pairs = q split "&" map (p ->
     let parts = p split "=" in
-    ((0u64, parts) get, (1u64, parts) get try match (0 (v -> v), 1 (_ -> "")))) in
+    ((0, parts) get, (1, parts) get try match (0 (v -> v), 1 (_ -> "")))) in
 (key, pairs) cap_list map ((key, (k, v)) -> ((k, key) eq, v)) filter head try

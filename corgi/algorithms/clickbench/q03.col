@@ -2,11 +2,13 @@
 # sql: SELECT AVG(UserID) FROM hits
 # columns: UserID
 # output: g
-# UserID is signed and stored sign-flipped; corgi's sums are unsigned and there is no float sum or
-# signed-to-float conversion. So: sum the stored values in two 32-bit halves (neither overflows),
-# average them as floats, and undo the flip (subtract 2^63).
+# The ids spread over all of i64 and sum to about 2^80, past where an Int's sum is exact (it wraps
+# at the i64 edge). So: split each id into 32-bit halves, x = hi * 2^32 + lo exactly, with
+# hi = x shr 32 (floor division, so signed) and lo = x and 4294967295; sum each half (neither sum
+# leaves i64 below 2^31 rows), and put them together as floats. With an exact wide integer this
+# would be `(u fold_add to_float, n) div`.
 let u = input in
-let n = u len to_f64 in
-let hi = u map (x -> x shr 32) fold_add to_f64 in
-let lo = u map (x -> x and 4294967295) fold_add to_f64 in
-((((hi, 4294967296f64) mul_f64, lo) add_f64, n) div_f64, 9223372036854775808f64) sub_f64
+let n = u len to_float in
+let hi = u map (x -> x shr 32) fold_add to_float in
+let lo = u map (x -> x and 4294967295) fold_add to_float in
+(((hi, 4294967296.0) mul, lo) add, n) div

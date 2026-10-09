@@ -1,4 +1,4 @@
 # n = 5
 # = List ends=[5] <[0, 1, 2, 103, 104]>
 enum Size = Lo | Hi in
-input iota map (x -> (x, (x, 2u64) gt) branch Size map_variant Hi (h -> (h, 100u64) add) unwrap)
+input iota map (x -> (x, (x, 2) gt) branch Size map_variant Hi (h -> (h, 100) add) unwrap)

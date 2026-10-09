@@ -1,8 +1,8 @@
 # The three largest values of each row, largest first (fewer when the row is shorter).
-# Input a `List<U64>` per row. Output a `List<U64>` of up to three values.
+# Input a `List<Int>` per row. Output a `List<Int>` of up to three values.
 #
 # Sort ascending, then read positions n-1, n-2, n-3 (as many as there are).
 let sorted = input sort in
 let n = sorted len in
-let picks = (n, (0u64, (n, 3u64) min) range) cap_list map ((n, k) -> ((n, 1u64) sub, k) sub) in
-(picks, sorted) gather try match (0 (top -> top), 1 (_ -> 0u64 iota))
+let picks = (n, (0, (n, 3) min) range) cap_list map ((n, k) -> ((n, 1) sub, k) sub) in
+(picks, sorted) gather try match (0 (top -> top), 1 (_ -> 0 iota))

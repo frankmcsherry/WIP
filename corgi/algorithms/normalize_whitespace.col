@@ -1,15 +1,15 @@
 # Normalize a text field the way a cleaning step does: lowercase ASCII letters, turn each run of
 # spaces and tabs into one space, and drop the spaces at both ends ("  Hello \t World " ->
-# "hello world"). Input `List<U8>`. Output `List<U8>`.
-let s = input map (c -> ((c, 9u8) eq, 32u8, (((c, 65u8) ge, (c, 90u8) le) mul, (c, 32u8) add_u8, c) select) select) in
-let word = s map (c -> (c, 32u8) ne) in
+# "hello world"). Input and output a `List<Int>` of bytes.
+let s = input map (c -> ((c, 9) eq, 32, (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select) select) in
+let word = s map (c -> (c, 32) ne) in
 # Non-space bytes up to and including each position, and in the whole string.
 let before = word scan_add in
 let total = word fold_add in
 let idx = s len iota in
 # Whether the byte before is a non-space (the first byte looks at itself).
-let prev = (idx map (i -> ((i, 1u64) max, 1u64) sub), word) gather in
+let prev = (idx map (i -> ((i, 1) max, 1) sub), word) gather in
 # Keep every non-space, and a space that follows a non-space when another non-space comes later.
 let keep = (total, (idx, (word, (before, prev) zip) zip) zip) cap_list map ((total, (i, (w, (b, p)))) ->
-    (w, (((i, 0u64) gt, p) mul, (total, b) gt) mul) max) in
+    (w, (((i, 0) gt, p) mul, (total, b) gt) mul) max) in
 (keep, s) zip filter try match (0 (t -> t), 1 (_ -> ""))

@@ -10,9 +10,9 @@ input map (u ->
     let n = pieces len in
     let ends = pieces map (p ->
         let m = p len in
-        let long = (m, 5u64) ge in
-        let lo = (long, (m, 5u64) sub, 0u64) select in
-        let tail = ((lo, (lo, 5u64) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0u8))) in
+        let long = (m, 5) ge in
+        let lo = (long, (m, 5) sub, 0) select in
+        let tail = ((lo, (lo, 5) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))) in
         (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
-    (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1u64) add, n) lt, e) mul) fold_any) fold_add
-    try match (0 (n -> n), 1 (_ -> 0u64))
+    (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1) add, n) lt, e) mul) fold_any) fold_add
+    try match (0 (n -> n), 1 (_ -> 0))

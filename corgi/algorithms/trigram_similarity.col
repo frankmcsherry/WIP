@@ -1,18 +1,18 @@
 # Trigram similarity, as PostgreSQL's pg_trgm computes it for one word: lowercase the string, pad it
 # with two spaces in front and one behind, take the SET of its three-byte grams, and divide the
-# number of grams the two strings share by the number in either. Input `(s1, s2)`, two `List<U8>`.
-# Output the similarity as an `f64`. An empty string has the one gram "   ", so two empty strings
-# are identical (1.0).
+# number of grams the two strings share by the number in either. Input `(s1, s2)`, two `List<Int>`
+# of bytes. Output the similarity as a `Float`. An empty string has the one gram "   ", so two empty
+# strings are identical (1.0).
 let (s1, s2) = input in
 # The first string's grams: lowercase, pad, then each position with the two after it.
-let p1 = (("  ", s1 map (c -> (((c, 65u8) ge, (c, 90u8) le) mul, (c, 32u8) add_u8, c) select)) append, " ") append in
+let p1 = (("  ", s1 map (c -> (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select)) append, " ") append in
 let n1 = p1 len in
-let g1 = (((0u64, (n1, 2u64) sub) range, p1) gather, (((1u64, (n1, 1u64) sub) range, p1) gather, ((2u64, n1) range, p1) gather) zip) zip dedup in
+let g1 = (((0, (n1, 2) sub) range, p1) gather, (((1, (n1, 1) sub) range, p1) gather, ((2, n1) range, p1) gather) zip) zip dedup in
 # The same for the second string.
-let p2 = (("  ", s2 map (c -> (((c, 65u8) ge, (c, 90u8) le) mul, (c, 32u8) add_u8, c) select)) append, " ") append in
+let p2 = (("  ", s2 map (c -> (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select)) append, " ") append in
 let n2 = p2 len in
-let g2 = (((0u64, (n2, 2u64) sub) range, p2) gather, (((1u64, (n2, 1u64) sub) range, p2) gather, ((2u64, n2) range, p2) gather) zip) zip dedup in
+let g2 = (((0, (n2, 2) sub) range, p2) gather, (((1, (n2, 1) sub) range, p2) gather, ((2, n2) range, p2) gather) zip) zip dedup in
 # Shared grams: those of the first set found in the second.
 let shared = (g1, g2) find map ((lo, hi) -> (hi, lo) gt) fold_add in
 let either = ((g1 len, g2 len) add, shared) sub in
-(shared to_f64, either to_f64) div_f64 try match (0 (x -> x), 1 (_ -> 0f64))
+(shared to_float, either to_float) div try match (0 (x -> x), 1 (_ -> 0.0))

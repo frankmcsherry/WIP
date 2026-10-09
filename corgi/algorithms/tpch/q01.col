@@ -9,12 +9,12 @@
 let (rf, ls, qty, price, disc, tax, date) = input in
 let rows = (((rf, ls) zip, (qty, price) zip) zip, ((disc, tax) zip, date) zip) zip
     map ((((f, s), (q, p)), ((d, t), dt)) ->
-        let dp = (p, (100u64, d) sub) mul in
-        ((dt, 10471u64) le, ((f, s), (q, p, dp, (dp, (100u64, t) add) mul))))
+        let dp = (p, (100, d) sub) mul in
+        ((dt, 10471) le, ((f, s), (q, p, dp, (dp, (100, t) add) mul))))
     filter in
 rows group map (((f, s), vs) ->
     let n = vs len in
     let sq = vs map ((q, _, _, _) -> q) fold_add in
     (f, s, sq, vs map ((_, p, _, _) -> p) fold_add, vs map ((_, _, dp, _) -> dp) fold_add,
-        vs map ((_, _, _, c) -> c) fold_add, (sq to_f64, n to_f64) div_f64, n))
-    try match (0 (r -> r), 1 (_ -> 0u64 iota map (z -> ("", "", z, z, z, z, 0f64, z))))
+        vs map ((_, _, _, c) -> c) fold_add, (sq to_float, n to_float) div, n))
+    try match (0 (r -> r), 1 (_ -> 0 iota map (z -> ("", "", z, z, z, z, 0.0, z))))

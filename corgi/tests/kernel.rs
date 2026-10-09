@@ -9,9 +9,9 @@ use corgi::{eval_graph, Builder, NumOp, Value};
 
 #[test]
 fn weave_unweaves_round_trip() {
-    // a heterogeneous sum column in one list row: tags [0,1,0,1], lane 0 and lane 1 each U64.
+    // a heterogeneous sum column in one list row: tags [0,1,0,1], lane 0 and lane 1 each Int.
     let inner =
-        Value::sum(vec![0, 1, 0, 1], vec![Value::u64(vec![10, 30]), Value::u64(vec![20, 40])]);
+        Value::sum(vec![0, 1, 0, 1], vec![Value::i64(vec![10, 30]), Value::i64(vec![20, 40])]);
     let x = Value::List(vec![4].into(), Box::new(inner));
 
     // Input -> Unweave -> Weave reconstructs the input exactly (the List⊗Sum iso, kernel side).
@@ -60,13 +60,13 @@ fn raw_zip_and_chunk_are_total() {
         let o = b.add(op, vec![i]);
         b.finish(o)
     };
-    let a = Value::List(vec![2, 5].into(), Box::new(Value::u64(vec![1, 2, 3, 4, 5])));
-    let b = Value::List(vec![1, 4].into(), Box::new(Value::u64(vec![10, 20, 30, 40])));
+    let a = Value::List(vec![2, 5].into(), Box::new(Value::i64(vec![1, 2, 3, 4, 5])));
+    let b = Value::List(vec![1, 4].into(), Box::new(Value::i64(vec![10, 20, 30, 40])));
     let zipped = eval_graph(&one(Zip), Value::Prod(vec![a, b]));
-    let expect = Value::List(vec![1, 4].into(), Box::new(Value::Prod(vec![Value::u64(vec![1, 3, 4, 5]), Value::u64(vec![10, 20, 30, 40])])));
+    let expect = Value::List(vec![1, 4].into(), Box::new(Value::Prod(vec![Value::i64(vec![1, 3, 4, 5]), Value::i64(vec![10, 20, 30, 40])])));
     assert_eq!(zipped, expect);
-    let rows = Value::List(vec![5, 9].into(), Box::new(Value::u64((0..9).collect())));
+    let rows = Value::List(vec![5, 9].into(), Box::new(Value::i64((0..9).collect())));
     let chunked = eval_graph(&one(Chunk(2)), rows);
-    let expect = Value::List(vec![2, 4].into(), Box::new(Value::List(corgi::Bounds::Stride(2, 4), Box::new(Value::u64(vec![0, 1, 2, 3, 5, 6, 7, 8])))));
+    let expect = Value::List(vec![2, 4].into(), Box::new(Value::List(corgi::Bounds::Stride(2, 4), Box::new(Value::i64(vec![0, 1, 2, 3, 5, 6, 7, 8])))));
     assert_eq!(chunked, expect);
 }

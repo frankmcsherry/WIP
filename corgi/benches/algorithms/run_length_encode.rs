@@ -3,8 +3,8 @@
 use crate::common::{bytes_col, run_case, Cfg, Rng};
 use corgi::{Bounds, Value};
 
-fn reference(s: &[u8]) -> Vec<(u8, u64)> {
-    let mut runs: Vec<(u8, u64)> = Vec::new();
+fn reference(s: &[u8]) -> Vec<(u8, i64)> {
+    let mut runs: Vec<(u8, i64)> = Vec::new();
     for &c in s {
         match runs.last_mut() {
             Some((b, k)) if *b == c => *k += 1,
@@ -30,7 +30,7 @@ pub fn run(cfg: &Cfg) {
             s
         })
         .collect();
-    let encoded: Vec<Vec<(u8, u64)>> = inputs.iter().map(|s| reference(s)).collect();
+    let encoded: Vec<Vec<(u8, i64)>> = inputs.iter().map(|s| reference(s)).collect();
     let mut ends = Vec::new();
     let (mut bytes, mut counts) = (Vec::new(), Vec::new());
     for r in &encoded {
@@ -38,7 +38,7 @@ pub fn run(cfg: &Cfg) {
         counts.extend(r.iter().map(|x| x.1));
         ends.push(bytes.len());
     }
-    let expected = Value::List(Bounds::offsets(ends), Box::new(Value::Prod(vec![Value::u8(bytes), Value::u64(counts)])));
+    let expected = Value::List(Bounds::offsets(ends), Box::new(Value::Prod(vec![Value::u8(bytes), Value::i64(counts)])));
     let rust = || inputs.iter().map(|s| reference(s)).collect::<Vec<_>>();
     let what = "strings of 0-24 bytes in runs of 1-4";
     run_case(cfg, "run_length_encode", what, include_str!("../../algorithms/run_length_encode.col"), bytes_col(&inputs), expected.clone(), rust);

@@ -1,19 +1,20 @@
 # American Soundex: the first letter, then the digits of the following consonants, with vowels
 # dropped and adjacent equal digits written once (also across `h` and `w`, which are transparent);
-# padded with zeros, or cut, to four bytes. Input `List<U8>` of ASCII letters. Output `List<U8>`
-# of four bytes, e.g. "Robert" -> "R163", "Ashcraft" -> "A261". An empty word gives "0000".
-let w = input map (c -> (((c, 65u8) ge, (c, 90u8) le) mul, (c, 32u8) add_u8, c) select) in
+# padded with zeros, or cut, to four bytes. Input a `List<Int>` of ASCII letters. Output a
+# `List<Int>` of four bytes, e.g. "Robert" -> "R163", "Ashcraft" -> "A261". An empty word gives
+# "0000".
+let w = input map (c -> (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select) in
 # The digit of each letter, from a table indexed by letter ('0' for vowels, h, w and y).
-let codes = w map (c -> (((c, 97u8) sub_u8) cast 64, "01230120022455012623010202") get) in
+let codes = w map (c -> ((c, 97) sub, "01230120022455012623010202") get) in
 # Left to right, remembering the last digit written: a letter writes its digit when it is not '0'
 # and differs from the last one. A vowel resets the last digit; `h` and `w` leave it alone.
-let steps = (0u8, (w, codes) zip) foldscan ((last, (c, d)) ->
-    let keep = ((d, 48u8) ne, (d, last) ne) mul in
-    let hw = ((c, 104u8) eq, (c, 119u8) eq) max in
+let steps = (0, (w, codes) zip) foldscan ((last, (c, d)) ->
+    let keep = ((d, 48) ne, (d, last) ne) mul in
+    let hw = ((c, 104) eq, (c, 119) eq) max in
     ((hw, last, d) select, (keep, d))) in
 # The first letter is written as itself, so its digit is dropped (but it still counts as last).
-let kept = ((w len) iota, steps.1) zip map ((i, (keep, d)) -> (((i, 0u64) gt, keep) mul, d)) filter in
-let first = (0u64, w) get in
-let upper = (((first, 97u8) ge, (first, 32u8) sub_u8, first) select) enlist in
+let kept = ((w len) iota, steps.1) zip map ((i, (keep, d)) -> (((i, 0) gt, keep) mul, d)) filter in
+let first = (0, w) get in
+let upper = (((first, 97) ge, (first, 32) sub, first) select) enlist in
 let padded = ((upper, kept) append, "000") append in
-((0u64, 4u64) range, padded) gather try match (0 (code -> code), 1 (_ -> "0000"))
+((0, 4) range, padded) gather try match (0 (code -> code), 1 (_ -> "0000"))

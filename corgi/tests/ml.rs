@@ -3,8 +3,8 @@
 
 use corgi::{parse_ml, show, Program, Value};
 
-fn u64(xs: &[u64]) -> Value {
-    Value::u64(xs.to_vec())
+fn int(xs: &[i64]) -> Value {
+    Value::i64(xs.to_vec())
 }
 
 /// run through the effect layer and render: a failure no `try` takes up shows in the output as the
@@ -16,12 +16,12 @@ fn run_ml(src: &str, arg: &Value) -> String {
 
 fn sample() -> Value {
     Value::Prod(vec![
-        u64(&[10, 20, 30]),
+        int(&[10, 20, 30]),
         Value::List(
             vec![2, 3, 6].into(),
-            Box::new(Value::Prod(vec![u64(&[1, 2, 3, 4, 5, 6]), u64(&[100, 200, 300, 400, 500, 600])])),
+            Box::new(Value::Prod(vec![int(&[1, 2, 3, 4, 5, 6]), int(&[100, 200, 300, 400, 500, 600])])),
         ),
-        Value::sum(vec![0, 1, 0], vec![u64(&[1111, 3333]), u64(&[2222])]),
+        Value::sum(vec![0, 1, 0], vec![int(&[1111, 3333]), int(&[2222])]),
     ])
 }
 
@@ -33,14 +33,14 @@ fn sum_scores_with_destructure() {
 
 #[test]
 fn match_contact() {
-    let src = "input.2 map_variant 1 (p -> (p, 1000000u64) add) unwrap";
+    let src = "input.2 map_variant 1 (p -> (p, 1000000) add) unwrap";
     assert_eq!(run_ml(src, &sample()), "[1111, 1002222, 3333]");
 }
 
 #[test]
 fn const_in_lambda() {
     let src = "let (subj, vals) = input.1 transpose in \
-               vals map (v -> (v, 1000u64) add)";
+               vals map (v -> (v, 1000) add)";
     assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[1100, 1200, 1300, 1400, 1500, 1600]>");
 }
 
@@ -48,7 +48,7 @@ fn const_in_lambda() {
 fn juxtaposition_stops_at_let_in() {
     // the juxtaposed chain `input.1 transpose` must terminate at the `let` body's `in`, not read it
     // as an op; then a bare lambda maps over the result.
-    let src = "let (subj, vals) = input.1 transpose in subj map (v -> (v, 1u64) add)";
+    let src = "let (subj, vals) = input.1 transpose in subj map (v -> (v, 1) add)";
     assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[2, 3, 4, 5, 6, 7]>");
 }
 
@@ -69,16 +69,16 @@ fn let_sharing_beats_fanout_recompute() {
 #[test]
 fn workhorse_products_sums_lists() {
     // ONE program that walks the whole data model on the `sample()` record-batch
-    //   ( id:U64, scores:List<(subj,val)>, contact:Sum{Email|Phone} ):
+    //   ( id:Int, scores:List<(subj,val)>, contact:Sum{Email|Phone} ):
     //   input.1 transpose        List<(subj,val)> -> (List<subj>, List<val>)   [list <-> product]
-    //   scores.1 fold_add       List<val> -> one U64 per record (sum each row) [list -> scalar]
+    //   scores.1 fold_add       List<val> -> one Int per record (sum each row) [list -> scalar]
     //   (input.0, totals) add     pair the id column with the totals, add them   [product + arith]
     //   map_variant 0 (..) unwrap bump the Email variant, then flatten the sum    [sum navigation]
     //   (id_plus, contact)           bundle the two results into a product           [product build]
     let src = "let scores = input.1 transpose in \
                let totals = scores.1 fold_add in \
                let id_plus = (input.0, totals) add in \
-               let contact = input.2 map_variant 0 (e -> (e, 1000000u64) add) unwrap in \
+               let contact = input.2 map_variant 0 (e -> (e, 1000000) add) unwrap in \
                (id_plus, contact)";
     assert_eq!(run_ml(src, &sample()), "([310, 320, 1530], [1001111, 2222, 1003333])");
 }
@@ -88,30 +88,30 @@ fn enum_names_resolve_and_erase() {
     // the declaration is a compile-time table: `Phone` resolves to tag 1 and erases, so this is
     // the same graph as `match_contact`.
     let src = "enum Contact = Email | Phone in \
-               input.2 map_variant Phone (p -> (p, 1000000u64) add) unwrap";
+               input.2 map_variant Phone (p -> (p, 1000000) add) unwrap";
     assert_eq!(run_ml(src, &sample()), "[1111, 1002222, 3333]");
 }
 
 #[test]
 fn inject_by_name_carries_the_sum_shape() {
     // `inject Email` reads the tag AND the whole sum's lane shapes off the declaration, so the
-    // Phone lane is built as an empty u64 column and `unwrap` typechecks.
-    let src = "enum Contact = Email u64 | Phone u64 in input.0 inject Email unwrap";
+    // Phone lane is built as an empty Int column and `unwrap` typechecks.
+    let src = "enum Contact = Email int | Phone int in input.0 inject Email unwrap";
     assert_eq!(run_ml(src, &sample()), "[10, 20, 30]");
     // a lane without a declared payload shape cannot be built empty.
-    assert!(parse_ml("enum Contact = Email u64 | Phone in input.0 inject Email").is_err());
+    assert!(parse_ml("enum Contact = Email int | Phone in input.0 inject Email").is_err());
     // shapes nest: an enum names an earlier fully-shaped enum.
-    let src = "enum Contact = Email u64 | Phone u64 in enum Card = Anon () | Known Contact in \
+    let src = "enum Contact = Email int | Phone int in enum Card = Anon () | Known Contact in \
                input.0 inject Email inject Known";
     let p = Program::compile_ml(src).unwrap();
-    assert_eq!(p.shape(&corgi::Shape::Prod(vec![corgi::Shape::Prim(64)])).unwrap().to_string(), "{() | {U64 | U64}}");
+    assert_eq!(p.shape(&corgi::Shape::Prod(vec![corgi::Shape::Int])).unwrap().to_string(), "{() | {Int | Int}}");
 }
 
 #[test]
 fn branch_by_enum_and_named_match_arms() {
     let src = "enum Size = Lo | Hi in \
                let (subj, vals) = input.1 transpose in \
-               vals map (v -> (v, (v, 300u64) gt) branch Size match (Lo (l -> l), Hi (h -> (h, 1u64) add)))";
+               vals map (v -> (v, (v, 300) gt) branch Size match (Lo (l -> l), Hi (h -> (h, 1) add)))";
     // `branch` is total (the demux Sum{Lo|Hi}), and the match arms align: Hi (>300) gets +1.
     assert_eq!(run_ml(src, &sample()), "List ends=[2, 3, 6] <[100, 200, 300, 401, 501, 601]>");
 }
@@ -136,71 +136,94 @@ fn errors_are_reported() {
 
 #[test]
 fn string_literal_broadcasts() {
-    // a string literal is a constant List<U8>, one per row of its scope's input.
-    assert_eq!(run_ml("\"hi\"", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
+    // a string literal is a constant List<Int> of bytes, one per row of its scope's input.
+    assert_eq!(run_ml("\"hi\"", &int(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
 }
 
 #[test]
 fn head_sugar_is_a_failop() {
     // `head` is the get FailOp: a non-empty row -> Found(first), an EMPTY row -> Oob — both carried in
-    // the err-mask, shown TRY'd as Sum{T | Unit}. No panic, no total/unchecked split. (`(input, 1u64) add
+    // the err-mask, shown TRY'd as Sum{T | Unit}. No panic, no total/unchecked split. (`(input, 1) add
     // iota` is [0..n+1); `input iota` at n=0 is the empty row.)
-    assert_eq!(run_ml("(input, 1u64) add iota head", &u64(&[3])), "Sum tags=[0] [[0], ()x0]");
-    assert_eq!(run_ml("input iota head", &u64(&[0])), "Sum tags=[1] [[], ()x1]");
+    assert_eq!(run_ml("(input, 1) add iota head", &int(&[3])), "Sum tags=[0] [[0], ()x0]");
+    assert_eq!(run_ml("input iota head", &int(&[0])), "Sum tags=[1] [[], ()x1]");
 }
 
 #[test]
-fn typed_literals_are_expressions() {
-    // A suffixed constant is an expression, filled to the length of its scope's input: here the
-    // map body's, so it needs no anchor.
-    assert_eq!(run_ml("input iota map (x -> (x, 100u64) add)", &u64(&[3])), "List ends=[3] <[100, 101, 102]>");
-    // The suffix picks the encoding, so signed and float constants compare and compute correctly.
-    assert_eq!(run_ml("((-3i64, 5i64) lt, (5i64, -3i64) lt)", &u64(&[0])), "([1], [0])");
-    assert_eq!(run_ml("((-3i64, 5i64) add_i64, 2i64) eq", &u64(&[0])), "[1]");
-    assert_eq!(run_ml("((0.5f64, 0.25f64) add_f64, 0.75f64) eq", &u64(&[0])), "[1]");
-    assert_eq!(run_ml("((1.5e2f32, 2f32) div_f32, 75f32) eq", &u64(&[0])), "[1]");
-    assert_eq!(run_ml("(255u8, 65535u16, 7u32)", &u64(&[0])), "([255], [65535], [7])");
+fn literals_are_expressions() {
+    // A constant is an expression, filled to the length of its scope's input: here the map body's,
+    // so it needs no anchor.
+    assert_eq!(run_ml("input iota map (x -> (x, 100) add)", &int(&[3])), "List ends=[3] <[100, 101, 102]>");
+    // Negative and float constants compare and compute by value.
+    assert_eq!(run_ml("((-3, 5) lt, (5, -3) lt)", &int(&[0])), "([1], [0])");
+    assert_eq!(run_ml("((-3, 5) add, 2) eq", &int(&[0])), "[1]");
+    assert_eq!(run_ml("((0.5, 0.25) add, 0.75) eq", &int(&[0])), "[1]");
+    assert_eq!(run_ml("((1.5e2, 2.0) div, 75.0) eq", &int(&[0])), "[1]");
+    assert_eq!(run_ml("(255, -65535, 0.5)", &int(&[0])), "([255], [-65535], [0.5])");
     // A string is an expression too.
-    assert_eq!(run_ml("(\"hi\", input) .0", &u64(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
+    assert_eq!(run_ml("(\"hi\", input) .0", &int(&[0, 0])), "List ends=[2, 4] <[104, 105, 104, 105]>");
 }
 
 #[test]
-fn typed_literals_are_checked() {
+fn literals_are_checked() {
     let err = |src: &str| parse_ml(src).err().unwrap_or_else(|| panic!("{src} parsed"));
-    assert!(err("(input, 256u8) add").contains("does not fit"), "{}", err("256u8"));
-    assert!(err("(input, -1u64) add").contains("does not fit"));
-    assert!(err("(input, 128i8) add").contains("does not fit"));
-    assert!(err("(input, -3) add").contains("needs a type suffix"));
-    assert!(err("(input, 1.5u64) add").contains("needs an f32 or f64 suffix"));
-    assert!(err("(input, 5q8) add").contains("unknown literal suffix"));
-    // The spellings typed literals and `.N` replaced are gone, each with a pointer to its replacement.
-    assert!(err("input lit 5").contains("typed literal"));
-    assert!(err("input lit_i64 5").contains("typed literal"));
-    assert!(err("input sub 1").contains("(x, 1u64) sub"));
+    // A literal takes no suffix; the old typed literals point at the bare spelling.
+    assert!(err("(input, 256u8) add").contains("takes no suffix"), "{}", err("256u8"));
+    assert!(err("(input, 5u64) add").contains("so write 5"));
+    assert!(err("(input, -3i64) add").contains("so write -3"));
+    assert!(err("(input, 1.5f64) add").contains("so write 1.5"));
+    assert!(err("(input, 5q8) add").contains("takes no suffix"));
+    // An Int is an i64: a literal past either end does not fit.
+    assert!(err("(input, 9223372036854775808) add").contains("does not fit"));
+    assert!(err("(input, -9223372036854775809) add").contains("does not fit"));
+    // The spellings literals and `.N` replaced are gone, each with a pointer to its replacement.
+    assert!(err("input lit 5").contains("a constant is a literal"));
+    assert!(err("input lit_i64 5").contains("a constant is a literal"));
+    assert!(err("input sub 1").contains("(x, 1) sub"));
     assert!(err("input field 1").contains(".N"));
     assert!(err("input \"hi\"").contains("unexpected"));
-    // Without a float suffix, `x.0.1` is still two projections.
-    assert_eq!(run_ml("((input, (input, 7u64)), input).0.1.1", &u64(&[0])), "[7]");
+    // A number right after a `.` is a projection, never a float: `x.0.1` is two of them.
+    assert_eq!(run_ml("((input, (input, 7)), input).0.1.1", &int(&[0])), "[7]");
+}
+
+#[test]
+fn retired_spellings_point_to_their_replacements() {
+    let err = |src: &str| parse_ml(src).err().unwrap_or_else(|| panic!("{src} parsed"));
+    // a typed op: integers have no width, and the plain op takes its kind from its operands.
+    for op in ["add_u64", "sub_i32", "mul_u8", "div_f64", "rem_i64", "neg_i16"] {
+        let e = err(&format!("input {op}"));
+        assert!(e.contains("is retired") && e.contains("takes its kind from its operands"), "{op}: {e}");
+    }
+    assert!(err("input add_u64").contains("add_b64"));
+    // the conversions that existed only because integers had widths and signs.
+    assert!(err("input cast").contains("width is its storage"));
+    assert!(err("input signed").contains("signed values already"));
+    assert!(err("input to_f64").contains("use to_float"));
+    assert!(err("input to_f32").contains("use to_float"));
+    assert!(err("input parse_u64").contains("use parse_int"));
+    // shape names: an integer is `int`, a float `float`.
+    assert!(err("enum E = A u64 | B () in input inject A").contains("is retired: an integer is `int`"));
+    assert!(err("enum E = A f64 | B () in input inject A").contains("a float `float`"));
 }
 
 #[test]
 fn nested_patterns_and_wildcards() {
-    let src = "let ((a, _), b) = ((input, (input, 1u64) add), (input, 10u64) add) in (a, b) add";
-    assert_eq!(run_ml(src, &u64(&[5])), "[20]");
+    let src = "let ((a, _), b) = ((input, (input, 1) add), (input, 10) add) in (a, b) add";
+    assert_eq!(run_ml(src, &int(&[5])), "[20]");
     let src = "input iota map (x -> ((x, x), x)) map (((a, _), c) -> (a, c) mul)";
-    assert_eq!(run_ml(src, &u64(&[4])), "List ends=[4] <[0, 1, 4, 9]>");
+    assert_eq!(run_ml(src, &int(&[4])), "List ends=[4] <[0, 1, 4, 9]>");
 }
 
 #[test]
 fn projection_after_any_stage() {
     // `flatten` returns (ranges, values); `.1` after the stage takes the values.
-    assert_eq!(run_ml("input iota map (x -> x iota) flatten .1", &u64(&[4])), "List ends=[6] <[0, 0, 1, 0, 1, 2]>");
+    assert_eq!(run_ml("input iota map (x -> x iota) flatten .1", &int(&[4])), "List ends=[6] <[0, 0, 1, 0, 1, 2]>");
 }
 
 #[test]
 fn comments_and_error_positions() {
     let src = "# the identity\ninput # stays as it is\n";
-    assert_eq!(run_ml(src, &u64(&[3])), "[3]");
+    assert_eq!(run_ml(src, &int(&[3])), "[3]");
     let err = parse_ml("let x = input in\n  (x, y) add").err().unwrap();
     assert!(err.starts_with("2:7: unbound variable 'y'"), "{err}");
     let err = parse_ml("input\n  map (x ->").err().unwrap();
@@ -267,12 +290,11 @@ fn jaro_winkler_examples_match_the_reference() {
         Value::List(ends.into(), Box::new(Value::u8(xs.into_iter().flatten().copied().collect())))
     };
     let input = Value::Prod(vec![column(pairs.iter().map(|p| &p.0).collect()), column(pairs.iter().map(|p| &p.1).collect())]);
-    let decode = |u: u64| f64::from_bits(if u >> 63 == 1 { u ^ (1 << 63) } else { !u });
     for src in [include_str!("../algorithms/jaro_winkler_direct.col"), include_str!("../algorithms/jaro_winkler_by_byte.col")] {
         let p = Program::compile_ml(src).expect("parse error");
-        let out = p.run(input.clone()).into_u64("similarity").unwrap();
-        for ((a, b), u) in pairs.iter().zip(out) {
-            assert_eq!(decode(u).to_bits(), jaro_winkler_reference(a, b).to_bits(), "{a:?} {b:?}");
+        let out = p.run(input.clone()).as_f64("similarity").unwrap();
+        for ((a, b), x) in pairs.iter().zip(out) {
+            assert_eq!(x.to_bits(), jaro_winkler_reference(a, b).to_bits(), "{a:?} {b:?}");
         }
     }
 }

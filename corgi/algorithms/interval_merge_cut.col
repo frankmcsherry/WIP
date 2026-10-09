@@ -1,10 +1,10 @@
 # interval_merge with the merged intervals cut out at their marks, instead of numbered and grouped.
 let sorted = input sort in
-let marks = ((0u64, 0u64), sorted) foldscan (((seen, reach), (lo, hi)) ->
-    let start = ((seen, 0u64) eq, (lo, reach) gt) max in
-    ((1u64, (reach, hi) max), (start, (lo, hi)))) .1 in
+let marks = ((0, 0), sorted) foldscan (((seen, reach), (lo, hi)) ->
+    let start = ((seen, 0) eq, (lo, reach) gt) max in
+    ((1, (reach, hi) max), (start, (lo, hi)))) .1 in
 # Each merged interval is a run of the sorted intervals that starts at a mark: cut there.
 let starts = marks map ((start, _) -> start) in
 let ivs = marks map ((_, iv) -> iv) in
 (starts, ivs) zip cut map (g -> (g map ((lo, _) -> lo) fold_min, g map ((_, hi) -> hi) fold_max))
-    try match (0 (m -> m), 1 (_ -> 0u64 iota map (z -> (z, z))))
+    try match (0 (m -> m), 1 (_ -> 0 iota map (z -> (z, z))))

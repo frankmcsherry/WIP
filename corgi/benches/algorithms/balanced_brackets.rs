@@ -3,7 +3,7 @@
 use crate::common::{bytes_col, run_case, Cfg, Rng};
 use corgi::Value;
 
-fn reference(s: &[u8]) -> u64 {
+fn reference(s: &[u8]) -> i64 {
     let mut stack = Vec::new();
     for &c in s {
         match c {
@@ -17,7 +17,7 @@ fn reference(s: &[u8]) -> u64 {
             _ => {}
         }
     }
-    stack.is_empty() as u64
+    stack.is_empty() as i64
 }
 
 /// a random string that is balanced about half the time: a balanced nest, sometimes broken.
@@ -34,7 +34,7 @@ fn gen(rng: &mut Rng) -> Vec<u8> {
     }
     while let Some(c) = open.pop() { s.push(c); }
     if rng.below(2) == 0 && !s.is_empty() {
-        let at = rng.below(s.len() as u64) as usize;
+        let at = rng.below(s.len() as i64) as usize;
         s[at] = b"()[]{}x"[rng.below(7) as usize];
     }
     s
@@ -44,7 +44,7 @@ pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(14);
     let rows: Vec<Vec<u8>> = (0..cfg.rows).map(|_| gen(&mut rng)).collect();
     let input = bytes_col(&rows);
-    let expected = Value::u64(rows.iter().map(|r| reference(r)).collect());
+    let expected = Value::i64(rows.iter().map(|r| reference(r)).collect());
     let rust = || rows.iter().map(|r| reference(r)).collect::<Vec<_>>();
     let what = "0-50 bytes, nested ([{ with letters, half broken";
     run_case(cfg, "balanced_brackets", what, include_str!("../../algorithms/balanced_brackets.col"), input.clone(), expected.clone(), rust);

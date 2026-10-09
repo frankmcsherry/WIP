@@ -4,4 +4,4 @@
 # n = 4
 # = [1]
 let g = input iota map (x -> x iota) in
-((g map (r -> (0u64, r) scan ((a, x) -> x))), g) eq
+((g map (r -> (0, r) scan ((a, x) -> x))), g) eq

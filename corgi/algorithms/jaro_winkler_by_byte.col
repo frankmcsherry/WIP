@@ -3,41 +3,41 @@
 # compete for a position, so the match splits into one two-pointer merge per byte value.
 let (s1, s2) = input in
 let (l1, l2) = (s1 len, s2 len) in
-let d = ((((l1, l2) max shr 1), 1u64) max, 1u64) sub in
+let d = ((((l1, l2) max shr 1), 1) max, 1) sub in
 # Positions grouped by byte: List<(byte, List<position>)>.
-let g1 = ((0u64, s1) foldscan ((i, c) -> ((i, 1u64) add, (c, i)))) .1 group in
-let g2 = ((0u64, s2) foldscan ((j, c) -> ((j, 1u64) add, (c, j)))) .1 group in
+let g1 = ((0, s1) foldscan ((i, c) -> ((i, 1) add, (c, i)))) .1 group in
+let g2 = ((0, s2) foldscan ((j, c) -> ((j, 1) add, (c, j)))) .1 group in
 # For each byte of s1, the s2 positions holding it (empty if none).
 let bs = ((g1 map ((c, _) -> c), g2 map ((c, _) -> c)) find, g2 map ((_, js) -> js)) slices try
-    match (0 (ok -> ok map (x -> x flatten .1)), 1 (_ -> 0u64 iota map (z -> z iota))) in
-let ab = (g1, bs) zip try match (0 (ok -> ok), 1 (_ -> 0u64 iota map (z -> ((z cast 8, z iota), z iota)))) in
+    match (0 (ok -> ok map (x -> x flatten .1)), 1 (_ -> 0 iota map (z -> z iota))) in
+let ab = (g1, bs) zip try match (0 (ok -> ok), 1 (_ -> 0 iota map (z -> ((z, z iota), z iota)))) in
 let per = (d, ab) cap_list map ((d, ((c, al), bl)) ->
     # Every window at once: L = first b >= a - d, U = past the last b <= a + d.
     let (lows, highs) = (d, al) cap_list map ((d, a) -> (((a, d) max, d) sub, (a, d) add)) transpose in
     let lo = (lows, bl) find map ((l, _) -> l) in
     let hi = (highs, bl) find map ((_, h) -> h) in
-    let lu = (lo, hi) zip try match (0 (ok -> ok), 1 (_ -> 0u64 iota map (z -> (z, z)))) in
+    let lu = (lo, hi) zip try match (0 (ok -> ok), 1 (_ -> 0 iota map (z -> (z, z)))) in
     # The two-pointer merge with scalar state: p = max(p + hit, L), hit = p < U.
-    let sc = (((0u64, 0u64), lu) foldscan (((p, m), (l, u)) ->
+    let sc = (((0, 0), lu) foldscan (((p, m), (l, u)) ->
         let q = ((p, m) add, l) max in
         let hit = (q, u) lt in
         ((q, hit), ((q, (q, hit) add), hit)))) .1 in
-    let mb = (sc map ((r, _) -> r), bl) slices try match (0 (ok -> ok flatten .1), 1 (_ -> 0u64 iota)) in
-    let ma = (sc map ((_, h) -> h), al) zip filter try match (0 (ok -> ok), 1 (_ -> 0u64 iota)) in
+    let mb = (sc map ((r, _) -> r), bl) slices try match (0 (ok -> ok flatten .1), 1 (_ -> 0 iota)) in
+    let ma = (sc map ((_, h) -> h), al) zip filter try match (0 (ok -> ok), 1 (_ -> 0 iota)) in
     ((c, ma) cap_list map ((c, a) -> (a, c)), (c, mb) cap_list map ((c, b) -> (b, c)), sc map ((_, h) -> h) fold_add)) in
 let m = per map ((_, _, n) -> n) fold_add in
 # Transpositions: the matched bytes of each string in position order, compared rank by rank.
 let c1 = per map ((x, _, _) -> x) flatten .1 sort map ((_, c) -> c) in
 let c2 = per map ((_, x, _) -> x) flatten .1 sort map ((_, c) -> c) in
-let t = (c1, c2) zip try match (0 (z -> z map ((a, b) -> (a, b) ne) fold_add), 1 (_ -> 0u64)) shr 1 in
+let t = (c1, c2) zip try match (0 (z -> z map ((a, b) -> (a, b) ne) fold_add), 1 (_ -> 0)) shr 1 in
 # The common prefix, up to four bytes.
-let n4 = ((l1, l2) min, 4u64) min in
-let pr1 = ((0u64, n4) enlist, s1) slices try match (0 (ok -> ok flatten .1), 1 (_ -> "")) in
-let pr2 = ((0u64, n4) enlist, s2) slices try match (0 (ok -> ok flatten .1), 1 (_ -> "")) in
-let prefix = (pr1, pr2) zip try match (0 (z -> z map ((a, b) -> (a, b) eq) scan_min fold_add), 1 (_ -> 0u64)) in
-let fm = m to_f64 in
-let jaro = ((((fm, l1 to_f64) div_f64, (fm, l2 to_f64) div_f64) add_f64, ((fm, t to_f64) sub_f64, fm) div_f64) add_f64, 3f64) div_f64 in
-let jaro = ((m, 0u64) eq, 0f64, jaro) select in
-let sim = (((l1, l2) add, 0u64) eq, 1f64, jaro) select in
-let jw = (sim, ((0.1f64, prefix to_f64) mul_f64, (1f64, sim) sub_f64) mul_f64) add_f64 in
-((0.7f64, sim) lt, jw, sim) select
+let n4 = ((l1, l2) min, 4) min in
+let pr1 = ((0, n4) enlist, s1) slices try match (0 (ok -> ok flatten .1), 1 (_ -> "")) in
+let pr2 = ((0, n4) enlist, s2) slices try match (0 (ok -> ok flatten .1), 1 (_ -> "")) in
+let prefix = (pr1, pr2) zip try match (0 (z -> z map ((a, b) -> (a, b) eq) scan_min fold_add), 1 (_ -> 0)) in
+let fm = m to_float in
+let jaro = ((((fm, l1 to_float) div, (fm, l2 to_float) div) add, ((fm, t to_float) sub, fm) div) add, 3.0) div in
+let jaro = ((m, 0) eq, 0.0, jaro) select in
+let sim = (((l1, l2) add, 0) eq, 1.0, jaro) select in
+let jw = (sim, ((0.1, prefix to_float) mul, (1.0, sim) sub) mul) add in
+((0.7, sim) lt, jw, sim) select

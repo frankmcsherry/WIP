@@ -1,18 +1,18 @@
 # Days since 1970-01-01 of a proleptic Gregorian date, by Howard Hinnant's `days_from_civil`, and
-# its weekday (0 = Sunday). Input `(year, month, day)`, three `U64` columns (years 1900-2100).
-# Output `(days, weekday)`: days an `I64` (negative before 1970), weekday a `U64`.
+# its weekday (0 = Sunday). Input `(year, month, day)`, three `Int` columns (years 1900-2100).
+# Output `(days, weekday)`, two `Int`s; days are negative before 1970.
 let (y, m, d) = input in
 # The year starts in March, so January and February belong to the year before.
-let y = (y, (m, 2u64) le) sub in
-let era = (y, 400u64) div_u64 in
-let yoe = (y, (era, 400u64) mul) sub in
+let y = (y, (m, 2) le) sub in
+let era = (y, 400) div in
+let yoe = (y, (era, 400) mul) sub in
 # Months from March: March is 0, February is 11.
-let mp = ((m, 2u64) gt, (m, 3u64) sub, (m, 9u64) add) select in
-let doy = ((((153u64, mp) mul, 2u64) add, 5u64) div_u64, (d, 1u64) sub) add in
-let doe = ((((yoe, 365u64) mul, (yoe, 4u64) div_u64) add, (yoe, 100u64) div_u64) sub, doy) add in
+let mp = ((m, 2) gt, (m, 3) sub, (m, 9) add) select in
+let doy = ((((153, mp) mul, 2) add, 5) div, (d, 1) sub) add in
+let doe = ((((yoe, 365) mul, (yoe, 4) div) add, (yoe, 100) div) sub, doy) add in
 # Days since 0000-03-01, never negative for these years; 1970-01-01 is day 719468.
-let n = ((era, 146097u64) mul, doe) add in
-let days = (n signed, 719468i64) sub_i64 in
+let n = ((era, 146097) mul, doe) add in
+let days = (n, 719468) sub in
 # 0000-03-01 was a Wednesday, so day n is weekday (n + 3) mod 7.
-let weekday = ((n, 3u64) add, 7u64) rem in
+let weekday = ((n, 3) add, 7) rem in
 (days, weekday)

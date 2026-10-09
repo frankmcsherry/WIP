@@ -16,7 +16,7 @@ impl Rng {
     }
 }
 
-/// one row holding all of `strs`, as `List<List<U8>>`.
+/// one row holding all of `strs`, as `List<List<Int>>` held as bytes.
 fn one_row(strs: &[Vec<u8>]) -> Value {
     let mut ends = Vec::new();
     let mut bytes = Vec::new();
@@ -61,13 +61,13 @@ fn strings_sort_lexicographically() {
     }
 }
 
-/// rows of `List<U64>` lists, several rows: the general (non-byte) path, per-row blocks.
+/// rows of `List<Int>` lists held as `i64`s, several rows: the general (non-byte) path, per-row blocks.
 #[test]
 fn number_lists_sort_lexicographically_per_row() {
     let mut rng = Rng(11);
     for trial in 0..40 {
-        let rows: Vec<Vec<Vec<u64>>> = (0..1 + rng.below(5))
-            .map(|_| (0..rng.below(80)).map(|_| (0..rng.below(6)).map(|_| rng.below(3)).collect()).collect())
+        let rows: Vec<Vec<Vec<i64>>> = (0..1 + rng.below(5))
+            .map(|_| (0..rng.below(80)).map(|_| (0..rng.below(6)).map(|_| rng.below(3) as i64 - 1).collect()).collect())
             .collect();
         let (mut outer, mut inner, mut vals) = (Vec::new(), Vec::new(), Vec::new());
         for row in &rows {
@@ -77,11 +77,11 @@ fn number_lists_sort_lexicographically_per_row() {
             }
             outer.push(inner.len());
         }
-        let arg = Value::List(Bounds::offsets(outer), Box::new(Value::List(inner.into(), Box::new(Value::u64(vals)))));
-        let flat = |v: &Value| -> Vec<Vec<u64>> {
+        let arg = Value::List(Bounds::offsets(outer), Box::new(Value::List(inner.into(), Box::new(Value::i64(vals)))));
+        let flat = |v: &Value| -> Vec<Vec<i64>> {
             let Value::List(_, inner) = v else { panic!("a list") };
             let Value::List(b, xs) = &**inner else { panic!("lists") };
-            let p = xs.as_u64("numbers").unwrap();
+            let p = xs.as_i64("numbers").unwrap();
             let ends = b.to_vec();
             (0..ends.len()).map(|i| (if i == 0 { 0 } else { ends[i - 1] }..ends[i]).map(|j| p[j]).collect()).collect()
         };

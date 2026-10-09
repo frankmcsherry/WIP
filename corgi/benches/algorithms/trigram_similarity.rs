@@ -1,6 +1,6 @@
 //! pg_trgm-style trigram similarity of two strings.
 
-use crate::common::{bytes_col, enc_f64, run_case, Cfg, Rng};
+use crate::common::{bytes_col, run_case, Cfg, Rng};
 use corgi::Value;
 
 fn grams(s: &[u8]) -> Vec<[u8; 3]> {
@@ -31,7 +31,7 @@ pub fn run(cfg: &Cfg) {
         bytes_col(&pairs.iter().map(|p| &p.0).collect::<Vec<_>>()),
         bytes_col(&pairs.iter().map(|p| &p.1).collect::<Vec<_>>()),
     ]);
-    let expected = Value::u64(pairs.iter().map(|(a, b)| enc_f64(reference(a, b))).collect());
+    let expected = Value::f64(pairs.iter().map(|(a, b)| reference(a, b)).collect());
     let rust = || pairs.iter().map(|(a, b)| reference(a, b)).collect::<Vec<f64>>();
     run_case(cfg, "trigram_similarity", "two strings of 0-16 bytes over 5 letters, mixed case", include_str!("../../algorithms/trigram_similarity.col"), input, expected, rust);
 }

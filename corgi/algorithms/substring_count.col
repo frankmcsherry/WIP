@@ -1,10 +1,11 @@
 # Count the (possibly overlapping) occurrences of a pattern in a text, by comparing the pattern
-# against the window at every start. Input `(text, pattern)`, two `List<U8>`. Output `U64`.
+# against the window at every start. Input `(text, pattern)`, two `List<Int>` of bytes. Output an
+# `Int`.
 let (text, pat) = input in
 let (n, m) = (text len, pat len) in
 # every start i with i + m <= n.
-let starts = ((((n, 1u64) add, m) max, m) sub) iota in
+let starts = ((((n, 1) add, m) max, m) sub) iota in
 ((text, pat), starts) cap_list map (((text, pat), i) ->
     let w = ((i, (i, pat len) add) range, text) gather in
     (w, pat) zip map ((a, b) -> (a, b) eq) fold_all) fold_add
-    try match (0 (c -> c), 1 (_ -> 0u64))
+    try match (0 (c -> c), 1 (_ -> 0))

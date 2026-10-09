@@ -3,10 +3,10 @@
 use crate::common::{run_case, Cfg, Rng};
 use crate::common_data::tuple_lists;
 
-fn reference(ivs: &[[u64; 2]]) -> Vec<[u64; 2]> {
+fn reference(ivs: &[[i64; 2]]) -> Vec<[i64; 2]> {
     let mut ivs = ivs.to_vec();
     ivs.sort_unstable();
-    let mut out: Vec<[u64; 2]> = Vec::new();
+    let mut out: Vec<[i64; 2]> = Vec::new();
     for [lo, hi] in ivs {
         match out.last_mut() {
             Some(last) if lo <= last[1] => last[1] = last[1].max(hi),
@@ -18,7 +18,7 @@ fn reference(ivs: &[[u64; 2]]) -> Vec<[u64; 2]> {
 
 pub fn run(cfg: &Cfg) {
     let mut rng = Rng::new(11);
-    let rows: Vec<Vec<[u64; 2]>> = (0..cfg.rows)
+    let rows: Vec<Vec<[i64; 2]>> = (0..cfg.rows)
         .map(|_| {
             let n = rng.below(17) as usize;
             (0..n).map(|_| { let lo = rng.below(200); [lo, lo + 1 + rng.below(20)] }).collect()

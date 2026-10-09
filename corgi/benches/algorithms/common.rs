@@ -26,8 +26,8 @@ impl Cfg {
         (self.rows / self.scale).max(1)
     }
     /// a list length below `n` scaled: `0..n * scale`.
-    pub fn list_len(&self, rng: &mut Rng, n: u64) -> usize {
-        rng.below(n * self.scale as u64) as usize
+    pub fn list_len(&self, rng: &mut Rng, n: i64) -> usize {
+        rng.below(n * self.scale as i64) as usize
     }
 }
 
@@ -45,23 +45,23 @@ impl Rng {
         self.0
     }
     /// uniform in `0..n` (`n > 0`).
-    pub fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+    pub fn below(&mut self, n: i64) -> i64 {
+        (self.next() % n as u64) as i64
     }
     /// `len` bytes drawn from `alphabet`.
     pub fn string(&mut self, len: usize, alphabet: &[u8]) -> Vec<u8> {
-        (0..len).map(|_| alphabet[self.below(alphabet.len() as u64) as usize]).collect()
+        (0..len).map(|_| alphabet[self.below(alphabet.len() as i64) as usize]).collect()
     }
 }
 
-/// a `List<U8>` column, one row per string.
+/// a text column, one row per string: a `List<Int>` of its bytes, held as bytes.
 pub fn bytes_col<B: AsRef<[u8]>>(rows: &[B]) -> Value {
     list_col(rows, |xs| Value::u8(xs.iter().flat_map(|r| r.as_ref().iter().copied()).collect()))
 }
 
-/// a `List<U64>` column.
-pub fn u64_lists<B: AsRef<[u64]>>(rows: &[B]) -> Value {
-    list_col(rows, |xs| Value::u64(xs.iter().flat_map(|r| r.as_ref().iter().copied()).collect()))
+/// a `List<Int>` column.
+pub fn int_lists<B: AsRef<[i64]>>(rows: &[B]) -> Value {
+    list_col(rows, |xs| Value::i64(xs.iter().flat_map(|r| r.as_ref().iter().copied()).collect()))
 }
 
 fn list_col<B, T: AsRef<[B]>>(rows: &[T], values: impl FnOnce(&[T]) -> Value) -> Value {
@@ -135,10 +135,4 @@ pub fn run_case<R>(cfg: &Cfg, name: &str, what: &str, src: &str, input: Value, e
     let r = best(|| { black_box(rust()); });
     let per = |d: Duration| d.as_nanos() as f64 / rows as f64;
     println!("{name:<20} {rows:>8}  corgi {:>8.1}  rust {:>7.1} ns/row  {:>6.2}x  {what}", per(c), per(r), per(c) / per(r));
-}
-
-/// an `f64` in corgi's total-order encoding (how `to_f64` and the `_f64` ops store it).
-pub fn enc_f64(x: f64) -> u64 {
-    let b = x.to_bits();
-    if b >> 63 == 0 { b ^ (1 << 63) } else { !b }
 }

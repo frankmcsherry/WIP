@@ -5,6 +5,6 @@
 # never a panic. Float order/equality is total, NOT IEEE (NaN orderable, -0 != +0) — see NOTES.
 # n = 1
 # = [1]
-let half3 = (3u32 to_f32, 2u32 to_f32) div_f32 in
-let half6 = (6u32 to_f32, 4u32 to_f32) div_f32 in
-((half3, half6) eq, (1u32 to_f32 neg_f32, 1u32 to_f32) lt) mul
+let half3 = (3 to_float, 2 to_float) div in
+let half6 = (6 to_float, 4 to_float) div in
+((half3, half6) eq, (1 to_float neg, 1 to_float) lt) mul
