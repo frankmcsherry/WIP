@@ -11,7 +11,7 @@ let parts = (pkey, ptype) zip
     map ((k, t) -> (k, (((0, 5) range, t) gather, "PROMO") eq)) sort in
 # Line items shipped in September 1995, each looked up by part key.
 let lines = ((lpart, lship) zip, (price, disc) zip) zip
-    map (((k, s), (p, d)) -> (((s, 9374) ge, (s, 9404) lt) mul, (k, (p, (100, d) sub) mul))) filter in
+    map (((k, s), (p, d)) -> (((s, 9374) ge, (s, 9404) lt) min, (k, (p, (100, d) sub) mul))) filter in
 let at = (lines map ((k, _) -> k), parts map ((k, _) -> k)) find in
 let promo = (at map ((lo, _) -> lo), parts) gather map ((_, f) -> f) in
 let revs = lines map ((_, r) -> r) in

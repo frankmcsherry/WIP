@@ -10,4 +10,4 @@ let sum = (n, ((ds len) iota, ds) zip) cap_list map ((n, (i, d)) ->
     let twice = (d, 2) mul in
     let twice = ((twice, 9) gt, (twice, 9) sub, twice) select in
     (second, twice, d) select) fold_add in
-(((sum, 10) rem, 0) eq, (n, 0) gt) mul try match (0 (v -> v), 1 (_ -> 0))
+(((sum, 10) rem, 0) eq, (n, 0) gt) min try match (0 (v -> v), 1 (_ -> 0))

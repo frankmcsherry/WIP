@@ -9,7 +9,7 @@
 let (ckey, cnat, nkey, nname, okey, ocust, odate, lkey, lrf, price, disc) = input in
 # Orders from 1993-Q4 (key, customer), sorted by key.
 let orders = ((okey, ocust) zip, odate) zip
-    map (((k, c), dt) -> (((dt, 8674) ge, (dt, 8766) lt) mul, (k, c))) filter sort in
+    map (((k, c), dt) -> (((dt, 8674) ge, (dt, 8766) lt) min, (k, c))) filter sort in
 # Returned line items, each looked up in those orders: revenue per customer.
 let lines = ((lkey, lrf) zip, (price, disc) zip) zip
     map (((k, f), (p, d)) -> ((f, "R") eq, (k, (p, (100, d) sub) mul))) filter in

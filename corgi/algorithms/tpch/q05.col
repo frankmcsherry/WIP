@@ -20,7 +20,7 @@ let cfound = (cnat, akeys) find in
 let custs = (cfound, (ckey, cnat) zip) zip map (((lo, hi), c) -> ((hi, lo) gt, c)) filter sort in
 # Orders from 1994 by those customers, each with its customer's nation, sorted by order key.
 let eorders = ((okey, ocust) zip, odate) zip
-    map (((k, c), dt) -> (((dt, 8766) ge, (dt, 9131) lt) mul, (c, k))) filter in
+    map (((k, c), dt) -> (((dt, 8766) ge, (dt, 9131) lt) min, (c, k))) filter in
 let ofound = (eorders map ((c, _) -> c), custs map ((k, _) -> k)) find in
 let omatch = (ofound, eorders) zip map (((lo, hi), (_, k)) -> ((hi, lo) gt, (lo, k))) filter in
 let onat = (omatch map ((lo, _) -> lo), custs) gather map ((_, n) -> n) in

@@ -5,7 +5,7 @@ let parts = input split "." in
 # Each part: whether it is valid, and its value.
 let fields = parts map (p ->
     let (ok, v) = p parse_int match (0 (v -> ((v, 255) le, v)), 1 (_ -> (0, 0))) in
-    ((ok, (p len, 3) le) mul, v)) in
-let valid = ((parts len, 4) eq, fields map ((ok, _) -> ok) fold_all) mul in
+    ((ok, (p len, 3) le) min, v)) in
+let valid = ((parts len, 4) eq, fields map ((ok, _) -> ok) fold_all) min in
 let addr = (0, fields) fold ((acc, (_, v)) -> ((acc, 256) mul, v) add) in
 (addr, (valid, 0) eq) branch 2 map_variant 1 (x -> x unit)

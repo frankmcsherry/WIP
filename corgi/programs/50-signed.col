@@ -6,4 +6,4 @@
 # = [1]
 let a = 3 in
 let b = 7 in
-(((a, b) sub, (b, a) sub neg) eq, (a neg neg, a) eq) mul
+(((a, b) sub, (b, a) sub neg) eq, (a neg neg, a) eq) min

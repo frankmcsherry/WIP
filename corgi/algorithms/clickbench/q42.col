@@ -7,7 +7,7 @@
 let (counter, date, refresh, dont, time) = input in
 let minutes = (counter, (date, (refresh, (dont, time) zip) zip) zip) zip
     map ((c, (d, (r, (x, t)))) ->
-        ((((c, 62) eq, ((d, 15900) ge, (d, 15901) le) mul) mul, ((r, 0) eq, (x, 0) eq) mul) mul,
+        ((((c, 62) eq, ((d, 15900) ge, (d, 15901) le) min) min, ((r, 0) eq, (x, 0) eq) min) min,
          (((t, 60) div, 60) mul, 1))) filter in
 let counts = minutes group map ((m, ones) -> (m, ones len)) in
 ((1000, ((counts len, 1010) min)) range, counts) gather

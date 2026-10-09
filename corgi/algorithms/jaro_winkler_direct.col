@@ -10,11 +10,11 @@ let s2x = ((0, s2) foldscan ((j, c) -> ((j, 1) add, (j, c, 0)))) .1 in
 # The greedy match: for each byte of s1, take the first unmatched equal byte of s2 in the window.
 let matching = ((d, s2x), s1x) foldscan (((d, st), (i, c)) ->
     let cand = ((d, i, c), st) cap_list map (((d, i, c), (j, ch, m)) ->
-        let ok = (((ch, c) eq, (m, 0) eq) mul, ((i, (j, d) add) le, (j, (i, d) add) le) mul) mul in
+        let ok = (((ch, c) eq, (m, 0) eq) min, ((i, (j, d) add) le, (j, (i, d) add) le) min) min in
         (ok, j, 1000000000) select) in
     let jm = ((cand len, 0) eq, 1000000000, cand fold_min) select in
     let st2 = (jm, st) cap_list map ((jm, (j, ch, m)) -> (j, ch, (m, (j, jm) eq) max)) in
-    let same = ((i, c), st) cap_list map (((i, c), (j, ch, _)) -> ((i, j) eq, (c, ch) eq) mul) fold_any in
+    let same = ((i, c), st) cap_list map (((i, c), (j, ch, _)) -> ((i, j) eq, (c, ch) eq) min) fold_any in
     ((d, st2), ((jm, 1000000000) lt, same, (i, 4) lt, c))) in
 let ((_, s2m), per1) = matching in
 let m = per1 map ((hit, _, _, _) -> hit) fold_add in
@@ -22,12 +22,12 @@ let m = per1 map ((hit, _, _, _) -> hit) fold_add in
 let rank2 = ((0, s2m) foldscan ((k, (_, ch, mm)) -> let k2 = (k, mm) add in (k2, (ch, mm, k2)))) .1 in
 let rank1 = ((0, per1) foldscan ((k, (hit, _, _, c)) -> let k2 = (k, hit) add in (k2, (c, hit, k2)))) .1 in
 let t2 = (rank2, rank1) cap_list map ((rank2, (c, hit, k)) ->
-    let mis = ((c, k), rank2) cap_list map (((c, k), (ch, mm, k2)) -> ((mm, (k2, k) eq) mul, (ch, c) ne) mul) fold_any in
-    (mis, hit) mul) fold_add in
+    let mis = ((c, k), rank2) cap_list map (((c, k), (ch, mm, k2)) -> ((mm, (k2, k) eq) min, (ch, c) ne) min) fold_any in
+    (mis, hit) min) fold_add in
 let t = t2 shr 1 in
 # The common prefix, up to four bytes.
 let prefix = (((0, 1), per1) fold (((p, alive), (_, same, lt4, _)) ->
-    let a2 = ((alive, same) mul, lt4) mul in
+    let a2 = ((alive, same) min, lt4) min in
     ((p, a2) add, a2))) .0 in
 let fm = m to_float in
 let jaro = ((((fm, l1 to_float) div, (fm, l2 to_float) div) add, ((fm, t to_float) sub, fm) div) add, 3.0) div in

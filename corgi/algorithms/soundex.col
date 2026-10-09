@@ -3,17 +3,17 @@
 # padded with zeros, or cut, to four bytes. Input a `List<Int>` of ASCII letters. Output a
 # `List<Int>` of four bytes, e.g. "Robert" -> "R163", "Ashcraft" -> "A261". An empty word gives
 # "0000".
-let w = input map (c -> (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select) in
+let w = input map (c -> (((c, 65) ge, (c, 90) le) min, (c, 32) add, c) select) in
 # The digit of each letter, from a table indexed by letter ('0' for vowels, h, w and y).
 let codes = w map (c -> ((c, 97) sub, "01230120022455012623010202") get) in
 # Left to right, remembering the last digit written: a letter writes its digit when it is not '0'
 # and differs from the last one. A vowel resets the last digit; `h` and `w` leave it alone.
 let steps = (0, (w, codes) zip) foldscan ((last, (c, d)) ->
-    let keep = ((d, 48) ne, (d, last) ne) mul in
+    let keep = ((d, 48) ne, (d, last) ne) min in
     let hw = ((c, 104) eq, (c, 119) eq) max in
     ((hw, last, d) select, (keep, d))) in
 # The first letter is written as itself, so its digit is dropped (but it still counts as last).
-let kept = ((w len) iota, steps.1) zip map ((i, (keep, d)) -> (((i, 0) gt, keep) mul, d)) filter in
+let kept = ((w len) iota, steps.1) zip map ((i, (keep, d)) -> (((i, 0) gt, keep) min, d)) filter in
 let first = (0, w) get in
 let upper = (((first, 97) ge, (first, 32) sub, first) select) enlist in
 let padded = ((upper, kept) append, "000") append in

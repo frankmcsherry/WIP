@@ -5,11 +5,11 @@
 # strings are identical (1.0).
 let (s1, s2) = input in
 # The first string's grams: lowercase, pad, then each position with the two after it.
-let p1 = (("  ", s1 map (c -> (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select)) append, " ") append in
+let p1 = (("  ", s1 map (c -> (((c, 65) ge, (c, 90) le) min, (c, 32) add, c) select)) append, " ") append in
 let n1 = p1 len in
 let g1 = (((0, (n1, 2) sub) range, p1) gather, (((1, (n1, 1) sub) range, p1) gather, ((2, n1) range, p1) gather) zip) zip dedup in
 # The same for the second string.
-let p2 = (("  ", s2 map (c -> (((c, 65) ge, (c, 90) le) mul, (c, 32) add, c) select)) append, " ") append in
+let p2 = (("  ", s2 map (c -> (((c, 65) ge, (c, 90) le) min, (c, 32) add, c) select)) append, " ") append in
 let n2 = p2 len in
 let g2 = (((0, (n2, 2) sub) range, p2) gather, (((1, (n2, 1) sub) range, p2) gather, ((2, n2) range, p2) gather) zip) zip dedup in
 # Shared grams: those of the first set found in the second.

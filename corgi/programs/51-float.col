@@ -7,4 +7,4 @@
 # = [1]
 let half3 = (3 to_float, 2 to_float) div in
 let half6 = (6 to_float, 4 to_float) div in
-((half3, half6) eq, (1 to_float neg, 1 to_float) lt) mul
+((half3, half6) eq, (1 to_float neg, 1 to_float) lt) min

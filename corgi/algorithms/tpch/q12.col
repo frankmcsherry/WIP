@@ -16,7 +16,7 @@ let orders = (okey, oprio) zip
 let lines = ((lkey, lmode) zip, ((lcommit, lreceipt) zip, lship) zip) zip
     map (((k, m), ((c, r), s)) ->
         let mode = ((m, "MAIL") eq, (m, "SHIP") eq) max in
-        let keep = (((mode, (c, r) lt) mul, (s, c) lt) mul, ((r, 8766) ge, (r, 9131) lt) mul) mul in
+        let keep = (((mode, (c, r) lt) min, (s, c) lt) min, ((r, 8766) ge, (r, 9131) lt) min) min in
         (keep, (k, m)))
     filter in
 # Each line item's order priority, by looking its order up.

@@ -14,15 +14,15 @@ let google = title map (u ->
     let starts = pieces map (p ->
         let head = ((0, 5) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))) in
         (head, "oogle") zip map ((a, c) -> (a, c) eq) fold_all) in
-    (pieces len iota, starts) zip map ((i, s) -> ((i, 0) gt, s) mul) fold_any) in
+    (pieces len iota, starts) zip map ((i, s) -> ((i, 0) gt, s) min) fold_any) in
 let dotted = url map (u ->
     let pieces = u split "." in
     let n = pieces len in
     let google = pieces map (p ->
         let head = ((0, 6) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))) in
-        ((p len, 6) eq, (head, "google") zip map ((a, c) -> (a, c) eq) fold_all) mul) in
-    (n, (n iota, google) zip) cap_list map ((n, (i, g)) -> (((i, 0) gt, ((i, 1) add, n) lt) mul, g) mul) fold_any) in
-let keep = (phrase, (google, dotted) zip) zip map ((s, (g, d)) -> (((s len, 0) gt, g) mul, (d, 0) eq) mul) in
+        ((p len, 6) eq, (head, "google") zip map ((a, c) -> (a, c) eq) fold_all) min) in
+    (n, (n iota, google) zip) cap_list map ((n, (i, g)) -> (((i, 0) gt, ((i, 1) add, n) lt) min, g) min) fold_any) in
+let keep = (phrase, (google, dotted) zip) zip map ((s, (g, d)) -> (((s len, 0) gt, g) min, (d, 0) eq) min) in
 let ranked = (keep, (phrase, (url, (title, user) zip) zip) zip) zip filter group
     map ((s, rows) ->
         (rows len neg, s, rows map ((u, _) -> u) sort head, rows map ((_, (t, _)) -> t) sort head,

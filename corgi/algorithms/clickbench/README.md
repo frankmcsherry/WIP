@@ -77,7 +77,7 @@ from one `--profile` run, taken while `sort`, `dedup` and `group` were the kerne
 | q37 | 429.10 | 8.41 | 51.02 | GroupKey on Titles 0.38 s. |
 | q38 | 22.78 | 2.71 | 8.41 | Fewer rows survive; GroupKey 16 ms. |
 | q39 | 1118.17 | 32.35 | 34.56 | GroupKey on 5-tuples with two strings 0.8 s; `select` blending byte lists 0.2 s. |
-| q40 | 6.23 | 1.55 | 4.02 | Predicate chain: one pass per predicate and per `mul`; nothing survives. |
+| q40 | 6.23 | 1.55 | 4.02 | Predicate chain: one pass per predicate and per AND (`min`); nothing survives. |
 | q41 | 5.37 | 2.51 | 2.14 | As q40. |
 | q42 | 7.86 | 2.97 | 2.65 | Predicate chain, then a small group. |
 
@@ -116,7 +116,7 @@ takes 9.8 s and DuckDB 0.9 s.
    - MIN(Referer) by sorting each group is 1.4 s of q28.
 4. **COUNT(\*) without value lists.** `(k, 1) group … ones len` builds lists only to count
    them. Run lengths (`adjacent`, `cut`) or a bincount for a small key domain would not.
-5. **Predicate chains.** Each comparison, and each `mul` used as AND, is its own pass. DuckDB
+5. **Predicate chains.** Each comparison, and each AND (`min` of two masks), is its own pass. DuckDB
    fuses them, evaluates the cheap ones first (q21's LIKE runs only on survivors), and skips blocks
    by min/max (q19).
 

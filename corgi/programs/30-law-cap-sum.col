@@ -15,4 +15,4 @@ let used = xs map (x ->
     match (0 (p -> (p.0, p.1) add), 1 (p -> p.1))) in
 let direct = xs map (x ->
     (x, ((1, x and 1) sub, (x, 100) add) mul) add) in
-((strip, sums) eq, (used, direct) eq) mul
+((strip, sums) eq, (used, direct) eq) min

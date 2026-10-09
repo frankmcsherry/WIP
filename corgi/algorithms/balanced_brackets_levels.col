@@ -17,6 +17,6 @@ let kind = bs map (c -> ((c, 91) ge, (c, 123) ge) add) in
 let items = ((level, bs len iota) zip, (closer, kind) zip) zip sort in
 let kinds_ok = items chunk 2 map (pair ->
     let ((_, (c0, k0)), (_, (c1, k1))) = ((0, pair) get, (1, pair) get) in
-    (((c0, 0) eq, (c1, 1) eq) mul, (k0, k1) eq) mul) fold_all
+    (((c0, 0) eq, (c1, 1) eq) min, (k0, k1) eq) min) fold_all
     try match (0 (k -> k), 1 (_ -> 0)) in
-((prefix_ok, totals_ok) mul, kinds_ok) mul try match (0 (r -> r), 1 (_ -> 0))
+((prefix_ok, totals_ok) min, kinds_ok) min try match (0 (r -> r), 1 (_ -> 0))

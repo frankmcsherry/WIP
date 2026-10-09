@@ -14,24 +14,24 @@ let (pkey, brand, cont, size, lpart, qty, mode, instr, price, disc) = input in
 # Each part's group: 1, 2 or 3 when its brand, container and size fit one, else 0; sorted by key.
 let parts = ((pkey, brand) zip, (cont, size) zip) zip map (((k, b), (c, s)) ->
     let g1 = (((b, "Brand#12") eq, (((c, "SM CASE") eq, (c, "SM BOX") eq) max,
-        ((c, "SM PACK") eq, (c, "SM PKG") eq) max) max) mul, ((s, 1) ge, (s, 5) le) mul) mul in
+        ((c, "SM PACK") eq, (c, "SM PKG") eq) max) max) min, ((s, 1) ge, (s, 5) le) min) min in
     let g2 = (((b, "Brand#23") eq, (((c, "MED BAG") eq, (c, "MED BOX") eq) max,
-        ((c, "MED PKG") eq, (c, "MED PACK") eq) max) max) mul, ((s, 1) ge, (s, 10) le) mul) mul in
+        ((c, "MED PKG") eq, (c, "MED PACK") eq) max) max) min, ((s, 1) ge, (s, 10) le) min) min in
     let g3 = (((b, "Brand#34") eq, (((c, "LG CASE") eq, (c, "LG BOX") eq) max,
-        ((c, "LG PACK") eq, (c, "LG PKG") eq) max) max) mul, ((s, 1) ge, (s, 15) le) mul) mul in
+        ((c, "LG PACK") eq, (c, "LG PKG") eq) max) max) min, ((s, 1) ge, (s, 15) le) min) min in
     (k, ((g1, (2, g2) mul) add, (3, g3) mul) add)) sort in
 # Line items shipped by air and delivered in person: (part key, quantity, revenue).
 let lines = (((lpart, qty) zip, (mode, instr) zip) zip, (price, disc) zip) zip
     map ((((k, q), (m, i)), (p, d)) ->
         let air = ((m, "AIR") eq, (m, "AIR REG") eq) max in
-        ((air, (i, "DELIVER IN PERSON") eq) mul, (k, q, (p, (100, d) sub) mul)))
+        ((air, (i, "DELIVER IN PERSON") eq) min, (k, q, (p, (100, d) sub) mul)))
     filter in
 # Each line item's part group, by looking its part up; the quantity must fit the group.
 let at = (lines map ((k, _, _) -> k), parts map ((k, _) -> k)) find in
 let group = (at map ((lo, _) -> lo), parts) gather map ((_, g) -> g) in
 (group, lines) zip map ((g, (_, q, r)) ->
-    let in1 = ((g, 1) eq, ((q, 1) ge, (q, 11) le) mul) mul in
-    let in2 = ((g, 2) eq, ((q, 10) ge, (q, 20) le) mul) mul in
-    let in3 = ((g, 3) eq, ((q, 20) ge, (q, 30) le) mul) mul in
+    let in1 = ((g, 1) eq, ((q, 1) ge, (q, 11) le) min) min in
+    let in2 = ((g, 2) eq, ((q, 10) ge, (q, 20) le) min) min in
+    let in3 = ((g, 3) eq, ((q, 20) ge, (q, 30) le) min) min in
     (((in1, in2) max, in3) max, r) mul) fold_add
     try match (0 (x -> x), 1 (_ -> 0))
