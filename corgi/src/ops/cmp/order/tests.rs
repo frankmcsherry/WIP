@@ -12,7 +12,7 @@ fn sort_perm(v: &Value) -> Vec<usize> {
 }
 
 /// the obviously-correct scalar reference: structural order of row `i` of `a` vs row `j` of `b`,
-/// recursing through the type (leaf, Prod field-by-field, List length-first, Sum tag-then-payload).
+/// recursing through the type (leaf, Prod field-by-field, List lexicographic, Sum tag-then-payload).
 /// The Sum arm recovers each row's within-variant offset by a prefix scan — O(i), so this is the
 /// O(n²) standard the bulk `compare_idx` is checked against, and the order `sort` must materialise.
 fn compare2(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
@@ -32,19 +32,14 @@ fn compare2(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
             let (si, ei) = crate::engine::row_span(ab, i);
             let (sj, ej) = crate::engine::row_span(bb, j);
             let (li, lj) = (ei - si, ej - sj);
-            // length-first: shorter list sorts first; equal lengths compare element-wise.
-            match li.cmp(&lj) {
-                Ordering::Equal => {
-                    for k in 0..li {
-                        match compare2(av, si + k, bv, sj + k) {
-                            Ordering::Equal => continue,
-                            o => return o,
-                        }
-                    }
-                    Ordering::Equal
+            // lexicographic: the first differing element decides; a proper prefix sorts first.
+            for k in 0..li.min(lj) {
+                match compare2(av, si + k, bv, sj + k) {
+                    Ordering::Equal => continue,
+                    o => return o,
                 }
-                o => o,
             }
+            li.cmp(&lj)
         }
         (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
             let (tav, tbv): (Vec<usize>, Vec<usize>) =
@@ -68,6 +63,9 @@ fn agree_cmp(a: &Value, b: &Value) {
     let got = compare_cols(a, b);
     let want: Vec<i8> = (0..a.len()).map(|i| compare2(a, i, b, i) as i8).collect();
     assert_eq!(got, want);
+    // asked only for equality, the same pairs are equal
+    let eq: Vec<bool> = equal_cols(a, b).iter().map(|&o| o == 0).collect();
+    assert_eq!(eq, want.iter().map(|&o| o == 0).collect::<Vec<_>>(), "equal_cols");
 }
 
 /// The implicit pair forms must answer exactly what the same pairs written out do — they are a
@@ -86,9 +84,11 @@ fn implicit_pairs_match_explicit_ones() {
         let n = v.len();
         let id: Vec<usize> = (0..n).collect();
         assert_eq!(compare_cols(&v, &v), compare_idx(&v, &v, &id, &id), "diagonal");
+        // adjacent pairs are asked only whether they are equal
+        let zero = |o: Vec<i8>| o.into_iter().map(|s| s == 0).collect::<Vec<_>>();
         assert_eq!(
-            compare_adjacent(&v),
-            compare_idx(&v, &v, &id[..n - 1], &id[1..]),
+            zero(compare_adjacent(&v)),
+            zero(compare_idx(&v, &v, &id[..n - 1], &id[1..])),
             "adjacent"
         );
     }
@@ -111,7 +111,7 @@ fn compare_cols_matches_scalar() {
         &Value::sum(vec![0, 1, 0, 1, 0], vec![u(&[5, 7, 9]), u(&[2, 4])]),
         &Value::sum(vec![0, 1, 1, 1, 0], vec![u(&[5, 8]), u(&[2, 3, 1])]),
     );
-    // list: length-first, then position-wise first difference over ragged rows
+    // list: position-wise first difference over ragged rows, then a proper prefix first
     agree_cmp(
         &Value::List(vec![2, 2, 5, 6].into(), Box::new(u(&[3, 1, 4, 5, 9, 0]))),
         &Value::List(vec![2, 3, 6, 7].into(), Box::new(u(&[3, 2, 7, 4, 5, 1, 0]))),
@@ -203,8 +203,8 @@ fn sum_by_tag_then_payload() {
 }
 
 #[test]
-fn list_length_first() {
-    // rows [3,1,2], [], [5], [9,0] — sorted length-first, then element-wise
+fn list_lexicographic() {
+    // rows [3,1,2], [], [5], [9,0] — sorted element-wise, a proper prefix first
     agree(&Value::List(vec![3, 3, 4, 6].into(), Box::new(u(&[3, 1, 2, 5, 9, 0]))));
 }
 
@@ -223,8 +223,8 @@ fn list_of_sum_fully_discriminated() {
 
 #[test]
 fn variable_length_lists_at_scale() {
-    // many u64-list rows of differing length — exercises the length-first arm and its position recursion;
-    // must agree with the (length-first) compare2 reference.
+    // many u64-list rows of differing length — exercises the list arm and its position recursion, rows
+    // ending at every position; must agree with the compare2 reference.
     let m = 200u64;
     let mut bounds = Vec::new();
     let mut vals = Vec::new();

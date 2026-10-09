@@ -1,4 +1,4 @@
-# The three most frequent words of a text (ties: the shorter word, then the smaller), with their
+# The three most frequent words of a text (ties: the smaller word), with their
 # counts.
 # Input `List<U8>`, words separated by single spaces. Output `List<(List<U8>, U64)>`.
 let words = input split " " map (w -> (((w len, 0u64) gt), w)) filter in

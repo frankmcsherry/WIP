@@ -3,7 +3,7 @@
 //! which `Rel` and `find` reduce to), `mod labels` (the block-label vocabulary the sort speaks and
 //! `dedup`/`group` read), and `group_bounds`; the merge kernel is `super::survey`.
 
-use crate::value::{Bounds, Value};
+use crate::value::{Bounds, Prim, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
@@ -43,7 +43,7 @@ pub fn group_bounds(keys: &Value) -> Vec<usize> {
 
 mod compare {
     //! The bulk structural comparator: a total structural order on rows, recursing through the type —
-    //! leaf value, then Prod field-by-field, List LENGTH-FIRST (shorter first; equal lengths element-wise),
+    //! leaf value, then Prod field-by-field, List LEXICOGRAPHIC (first differing element; a proper prefix first),
     //! Sum tag-then-payload. The discrimination sort matches this order, so `find` stays consistent with `sort`.
     //!
     //! `compare_idx` is the kernel: it compares an explicit list of `(i, j)` index pairs in one descent per
@@ -107,6 +107,12 @@ mod compare {
 
     /// [`compare_idx`] over any [`Pairs`] — the kernel proper.
     pub(crate) fn compare_pairs(a: &Value, b: &Value, pairs: Pairs) -> Vec<i8> {
+        compare_in(a, b, pairs, false)
+    }
+
+    /// With `eq`, only whether each pair is equal: zero or not, the sign meaningless. Equality
+    /// needs no order, so lists of different lengths are unequal without reading an element.
+    fn compare_in(a: &Value, b: &Value, pairs: Pairs, eq: bool) -> Vec<i8> {
         let m = pairs.len();
         match (a, b) {
             // leaf: read all pairs in one width-dispatched pass. An implicit form reads BOTH sides
@@ -120,7 +126,7 @@ mod compare {
 
             // single-field product: the field's order IS the order — skip the fold + tie vec.
             (Value::Prod(ca), Value::Prod(cb)) if ca.len() == 1 && cb.len() == 1 => {
-                compare_pairs(&ca[0], &cb[0], pairs)
+                compare_in(&ca[0], &cb[0], pairs, eq)
             }
 
             // product = lexicographic: field 0 over all pairs, then each later field over the
@@ -128,7 +134,7 @@ mod compare {
             // case), later fields cost proportionally to the ties, not to m.
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
-                let mut ord = compare_pairs(&ca[0], &cb[0], pairs);
+                let mut ord = compare_in(&ca[0], &cb[0], pairs, eq);
                 if ca.len() > 1 {
                     let mut tie_k: Vec<usize> = (0..m).filter(|&k| ord[k] == 0).collect();
                     let mut tia: Vec<usize> = tie_k.iter().map(|&k| pairs.left(k)).collect();
@@ -137,7 +143,7 @@ mod compare {
                         if tie_k.is_empty() {
                             break;
                         }
-                        let sub = compare_pairs(x, y, Pairs::Explicit(&tia, &tib));
+                        let sub = compare_in(x, y, Pairs::Explicit(&tia, &tib), eq);
                         let mut w = 0usize;
                         for t in 0..tie_k.len() {
                             let k = tie_k[t];
@@ -167,7 +173,7 @@ mod compare {
                 // the identity, so the comparison IS the lane's, at the pairs we were handed.
                 if let (Some(t), Some(u)) = (ta.const_tag(), tb.const_tag()) {
                     if t == u {
-                        return compare_pairs(&va[t], &vb[t], pairs);
+                        return compare_in(&va[t], &vb[t], pairs, eq);
                     }
                 }
                 // Read the discriminants in place. Decoding a whole tag column per call made a
@@ -186,20 +192,38 @@ mod compare {
                     // the carried within-lane offsets — read, not recomputed.
                     let sia: Vec<usize> = ks.iter().map(|&k| ta.offset_at(pairs.left(k))).collect();
                     let sib: Vec<usize> = ks.iter().map(|&k| tb.offset_at(pairs.right(k))).collect();
-                    let sub = compare_pairs(&va[t], &vb[t], Pairs::Explicit(&sia, &sib));
+                    let sub = compare_in(&va[t], &vb[t], Pairs::Explicit(&sia, &sib), eq);
                     // tag was Equal on these pairs, so the payload order IS the order.
                     for (&k, o) in ks.iter().zip(sub) { ord[k] = o; }
                 }
                 ord
             }
 
-            // list = length-first: unequal-length pairs decided by length. Equal-length pairs expand
-            // to their element index pairs, recurse ONCE (no per-position loop — `sort` needs that
-            // refinement, `cmp` doesn't), then read each pair's first difference off its segment.
+            // list = lexicographic: each pair expands to its element index pairs up to the shorter
+            // length, recurse ONCE (no per-position loop — `sort` needs that refinement, `cmp`
+            // doesn't), then read each pair's first difference off its segment; a pair with none
+            // is decided by length, a proper prefix first.
             // A referenced list compares as the rows it names, read through its arena.
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
+                // leaf elements of one width: each pair is one slice compare (a memcmp on bytes),
+                // with no element pairs built.
+                macro_rules! slices {
+                    ($($V:ident),*) => {
+                        match (va, vb) {
+                            $( (Value::Prim(Prim::$V(x)), Value::Prim(Prim::$V(y))) => {
+                                return (0..m).map(|k| {
+                                    let ((s_a, e_a), (s_b, e_b)) = (ba.span(pairs.left(k)), bb.span(pairs.right(k)));
+                                    let (x, y) = (&x[s_a..e_a], &y[s_b..e_b]);
+                                    if eq { (x != y) as i8 } else { x.cmp(y) as i8 }
+                                }).collect();
+                            } )*
+                            _ => {}
+                        }
+                    };
+                }
+                slices!(U8, U16, U32, U64);
                 let mut ord = vec![0i8; m];
                 let (mut sia, mut sib) = (Vec::new(), Vec::new());
                 let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)
@@ -207,16 +231,17 @@ mod compare {
                     let (i, j) = (pairs.left(k), pairs.right(k));
                     let ((s_a, e_a), (s_b, e_b)) = (ba.span(i), bb.span(j));
                     let (la, lb) = (e_a - s_a, e_b - s_b);
-                    match la.cmp(&lb) {
-                        Ordering::Equal if la > 0 => {
-                            seg.push((k, sia.len(), la));
-                            for p in 0..la { sia.push(s_a + p); sib.push(s_b + p); }
-                        }
-                        Ordering::Equal => {}    // equal length 0 — stays Equal (0)
-                        ow => *o = ow as i8,     // length decides
+                    *o = la.cmp(&lb) as i8;
+                    if eq && la != lb {
+                        continue;
+                    }
+                    let common = la.min(lb);
+                    if common > 0 {
+                        seg.push((k, sia.len(), common));
+                        for p in 0..common { sia.push(s_a + p); sib.push(s_b + p); }
                     }
                 }
-                let cmp = compare_pairs(va, vb, Pairs::Explicit(&sia, &sib));
+                let cmp = compare_in(va, vb, Pairs::Explicit(&sia, &sib), eq);
                 for (k, start, len) in seg {
                     if let Some(o) = cmp[start..start + len].iter().copied().find(|&o| o != 0) {
                         ord[k] = o;
@@ -238,10 +263,17 @@ mod compare {
         compare_pairs(a, b, Pairs::Diagonal(a.len()))
     }
 
-    /// the adjacent case: `out[k]` = the order of row `k` of `v` vs row `k+1` — the run boundaries
-    /// of a sorted column ([`super::group_bounds`]), and the shape a `windows(2)` scan has.
+    /// the diagonal case asked only for equality: `out[i]` is zero exactly when row `i` of `a`
+    /// equals row `i` of `b` — `Rel`'s `eq` and `ne`.
+    pub fn equal_cols(a: &Value, b: &Value) -> Vec<i8> {
+        compare_in(a, b, Pairs::Diagonal(a.len()), true)
+    }
+
+    /// the adjacent case, asked only for equality: `out[k]` is zero exactly when row `k` of `v`
+    /// equals row `k+1` — the run boundaries of a sorted column ([`super::group_bounds`]), and the
+    /// shape a `windows(2)` scan has.
     pub fn compare_adjacent(v: &Value) -> Vec<i8> {
-        compare_pairs(v, v, Pairs::Adjacent(v.len().saturating_sub(1)))
+        compare_in(v, v, Pairs::Adjacent(v.len().saturating_sub(1)), true)
     }
 }
 

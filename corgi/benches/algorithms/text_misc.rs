@@ -17,8 +17,7 @@ fn word_topk(text: &[u8]) -> Vec<(Vec<u8>, u64)> {
         *counts.entry(w).or_default() += 1;
     }
     let mut v: Vec<(&[u8], u64)> = counts.into_iter().collect();
-    // corgi orders lists shorter-first, then by bytes; the reference ties the same way.
-    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.len().cmp(&b.0.len())).then(a.0.cmp(b.0)));
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     v.into_iter().take(3).map(|(w, c)| (w.to_vec(), c)).collect()
 }
 

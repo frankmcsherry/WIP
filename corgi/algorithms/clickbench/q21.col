@@ -1,11 +1,9 @@
 # Q21: SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
-# sql: SELECT SearchPhrase, arg_min(URL, {'l': octet_length(URL), 'u': URL}), COUNT(*) AS c FROM hits
+# sql: SELECT SearchPhrase, min(URL), COUNT(*) AS c FROM hits
 # sql:   WHERE decode(URL) LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase
-# sql:   ORDER BY c DESC, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql:   ORDER BY c DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase URL
 # output: [s,s,u]
-# MIN(URL) is the first in corgi's string order (shorter first, then bytes), so the SQL takes the
-# same minimum.
 # corgi has no substring search: a string contains "google" when, split at "e" (its last byte, which
 # occurs once in it), some piece other than the last ends with "googl" (its last bytes read with
 # gather_try, since a piece may be shorter).

@@ -12,7 +12,7 @@ pub(crate) mod sort;
 pub(crate) mod survey;
 
 use crate::engine::gather;
-use order::{compare_adjacent, compare_cols, compare_idx, segment_labels};
+use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
 use sort::{sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
@@ -76,6 +76,8 @@ impl CmpOp {
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
+                    // equality needs no order: lists of different lengths differ unread.
+                    _ if matches!(pred, Pred::Eq | Pred::Ne) => equal_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                 };
                 Value::u64(mask)
@@ -207,17 +209,19 @@ enum Level {
 }
 
 /// the levels whose lexicographic order is the structural order of `v`'s rows, most significant
-/// first: a product's fields' in turn, a list's length and then its elements by position (lists
-/// order shorter first), anything else itself.
+/// first: a product's fields' in turn, a list's elements by position and then its length (lists
+/// order lexicographically), anything else itself.
 fn order_levels(v: &Value, out: &mut Vec<Level>) {
     match v {
         Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
         Value::List(inner, _) => {
+            // the elements by position, a row past its end reading zero (the least value of any
+            // shape), then the length: a proper prefix ties its padded rows and comes first.
+            out.push(Level::Elems(v.clone()));
             out.push(Level::Col(Value::u64((0..inner.len()).map(|i| {
                 let (s, e) = inner.span(i);
                 (e - s) as u64
             }).collect())));
-            out.push(Level::Elems(v.clone()));
         }
         other => out.push(Level::Col(other.clone())),
     }
@@ -253,7 +257,14 @@ impl InPlay {
     }
     /// no ties left: later levels cannot change the order.
     fn settled(&self) -> bool {
+        if self.labels.is_empty() {
+            return self.idx.len() <= 1; // no labels: one block
+        }
         self.labels.windows(2).all(|w| w[0] != w[1])
+    }
+    /// positions `p - 1` and `p` are in one block.
+    fn tied(&self, p: usize) -> bool {
+        self.labels.is_empty() || self.labels[p] == self.labels[p - 1]
     }
 }
 
@@ -277,8 +288,8 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
             Level::Col(c) => play.level(&gather(c, &play.idx), k),
             Level::Elems(list) => {
                 let Value::List(inner, elems) = list else { unreachable!("a list level is a List") };
-                // bytes go eight at a time, packed big-endian into one u64 level; rows in play tie on
-                // their length, so a short row's zero padding is compared only with its own length's.
+                // bytes go eight at a time, packed big-endian into one u64 level; a short row pads
+                // with zeros, and ties the padding leaves are the length level's to break.
                 // Eight bytes every tied run agrees on (a shared prefix) change nothing: no sort.
                 if let Ok(bytes) = elems.as_u8("bytes") {
                     for j in (0..).step_by(8) {
@@ -298,7 +309,7 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                         if !any {
                             break;
                         }
-                        let splits = (1..col.len()).any(|p| play.labels[p] == play.labels[p - 1] && col[p] != col[p - 1]);
+                        let splits = (1..col.len()).any(|p| play.tied(p) && col[p] != col[p - 1]);
                         if splits {
                             play.level(&Value::u64(col), k);
                         }
@@ -309,8 +320,8 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                     if play.settled() {
                         break;
                     }
-                    // element j of each row in play; a row without one reads zero, and sorts only
-                    // among rows of its own length, so the zero is never compared.
+                    // element j of each row in play; a row without one reads zero, the least
+                    // value, and the length level after breaks the ties that leaves.
                     let mut any = false;
                     let at: Vec<usize> = play.idx.iter().map(|&r| {
                         let (s, e) = inner.span(r);

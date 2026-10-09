@@ -2,7 +2,7 @@
 # sql: SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE ''::BLOB END AS Src,
 # sql:   URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0
 # sql:   GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst
-# sql:   ORDER BY PageViews DESC, TraficSourceID, SearchEngineID, AdvEngineID, octet_length(Src), Src, octet_length(Dst), Dst LIMIT 10 OFFSET 1000
+# sql:   ORDER BY PageViews DESC, TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst LIMIT 10 OFFSET 1000
 # columns: CounterID EventDate IsRefresh TraficSourceID SearchEngineID AdvEngineID Referer URL
 # output: [i,u,u,s,s,u]
 let (counter, date, refresh, source, engine, adv, referer, url) = input in

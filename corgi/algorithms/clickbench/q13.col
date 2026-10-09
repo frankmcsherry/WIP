@@ -1,6 +1,6 @@
 # Q13: SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10
 # sql: SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase
-# sql:   ORDER BY u DESC, octet_length(SearchPhrase), SearchPhrase LIMIT 10
+# sql:   ORDER BY u DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase UserID
 # output: [s,u]
 let (key, user) = input in

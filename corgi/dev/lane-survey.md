@@ -31,9 +31,10 @@ and the excess joins the run that follows, which is what a two-pointer walk repo
   in `survey` takes the old pairwise walk directly and costs what it did.
 - **Every level below refines all its classes at once.** A product's next field re-merges the
   classes the field before left equal, at the same rows. A sum merges on the tag as a virtual
-  leaf, then each lane merges its classes at the carried within-lane offsets. A list merges on
-  the length, then element by element over the classes still that long, each position as one
-  level over index lists into the elements; a class at its length is equal throughout.
+  leaf, then each lane merges its classes at the carried within-lane offsets. A list merges
+  element by element, each position as one level over index lists into the elements; at each
+  position a class first splits into the rows that end there, which come first and are equal
+  throughout, and the rows that go on.
 - **Reports are a tree.** An equal class holds its refinement as children, `None` until a level
   has refined it, which is what marks it equal throughout. A level's work is proportional to the
   rows of the classes it refines, since each level copies the row lists of every class still
