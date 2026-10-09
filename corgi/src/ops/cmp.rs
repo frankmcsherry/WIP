@@ -12,7 +12,7 @@ pub(crate) mod sort;
 pub(crate) mod survey;
 
 use crate::engine::gather;
-use order::{compare_adjacent, compare_cols, compare_idx, segment_labels};
+use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
 use sort::{sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Value};
@@ -76,6 +76,8 @@ impl CmpOp {
                         pa.rel(pb, pred.test(-1), pred.test(0), pred.test(1)),
                     // any other shape: the bulk structural comparator — one descent per type level,
                     // linear (the Sum arm computes within-offsets in bulk, not a per-lane rescan).
+                    // equality needs no order: lists of different lengths differ unread.
+                    _ if matches!(pred, Pred::Eq | Pred::Ne) => equal_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                     _ => compare_cols(&a, &b).iter().map(|&o| pred.test(o) as u64).collect(),
                 };
                 Value::u64(mask)
