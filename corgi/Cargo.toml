@@ -20,6 +20,10 @@ name = "gaps"
 harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see benches/gaps.rs
 
 [[bench]]
+name = "fold"
+harness = false   # Fold and FoldScan across row-length regimes and state shapes
+
+[[bench]]
 name = "idioms"
 harness = false   # idiomatic corgi against idiomatic Rust; the rows of performance.md gaps.rs does not measure
 

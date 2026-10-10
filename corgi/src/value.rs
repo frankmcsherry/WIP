@@ -435,6 +435,11 @@ macro_rules! prim {
                 match self { $( Prim::$V(v) => v.len(), )+ }
             }
 
+            /// keep the first `n` rows.
+            pub(crate) fn truncate(&mut self, n: usize) {
+                match self { $( Prim::$V(v) => truncate_arc(v, n), )+ }
+            }
+
             /// the storage width in bits.
             pub(crate) fn bits(&self) -> u32 {
                 match self { $( Prim::$V(_) => <$t as Elem>::BITS, )+ }
@@ -650,24 +655,6 @@ macro_rules! prim {
                         })
                     } )+
                     _ => unreachable!("meet brings both to one storage"),
-                }
-            }
-
-            /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives
-            /// the buffer mutably when uniquely owned (the common case), or clones it once if shared.
-            /// Touches only the `active` rows. A byte leaf receiving `i64` rows widens first. The
-            /// leaf of [`scatter`].
-            pub(crate) fn scatter_into(&mut self, active: &[usize], src: &Prim) {
-                if self.bits() < src.bits() {
-                    *self = self.widen();
-                }
-                let src = if src.bits() < self.bits() { std::borrow::Cow::Owned(src.widen()) } else { std::borrow::Cow::Borrowed(src) };
-                match (self, &*src) {
-                    $( (Prim::$V(dst), Prim::$V(s)) => {
-                        let dst = Arc::make_mut(dst);
-                        for (p, &r) in active.iter().enumerate() { dst[r] = s[p]; }
-                    } )+
-                    _ => panic!("scatter_into: an integer meets a float"),
                 }
             }
 
@@ -935,6 +922,54 @@ impl Value {
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// keep the first `n` rows, through every shape. A prefix of rows is a prefix of each witness
+    /// column (a list's ends, a sum's tags and offsets), so nothing is rebased: each buffer is cut
+    /// where it is when uniquely held, and copied up to the cut when shared. A sum's lanes keep
+    /// their rows among the first `n`, which are counted from the rows cut off.
+    pub(crate) fn truncate(&mut self, n: usize) {
+        match self {
+            Value::Prim(p) => p.truncate(n),
+            Value::Prod(fields) => fields.iter_mut().for_each(|f| f.truncate(n)),
+            Value::Unit(rows) => *rows = n,
+            Value::Ref(_, rows) => truncate_arc(rows, n),
+            Value::List(bounds, vals) => {
+                let end = if n == 0 { 0 } else { bounds.end(n - 1) };
+                match bounds {
+                    Bounds::Offsets(ends) => truncate_arc(ends, n),
+                    Bounds::Stride(_, rows) => *rows = n,
+                }
+                vals.truncate(end);
+            }
+            Value::Sum(tags, lanes) => {
+                let mut keep: Vec<usize> = lanes.iter().map(Value::len).collect();
+                match tags {
+                    Tags::Const(t, rows) => {
+                        keep[*t] = n;
+                        *rows = n;
+                    }
+                    Tags::Column(ts, offsets) => {
+                        for i in n..ts.len() {
+                            keep[ts.usize_at(i)] -= 1;
+                        }
+                        ts.truncate(n);
+                        truncate_arc(offsets, n);
+                    }
+                }
+                for (lane, k) in lanes.iter_mut().zip(keep) {
+                    lane.truncate(k);
+                }
+            }
+        }
+    }
+}
+
+/// keep the first `n` entries: in place when uniquely held, else a copy of them.
+fn truncate_arc<T: Clone>(v: &mut Arc<Vec<T>>, n: usize) {
+    match Arc::get_mut(v) {
+        Some(owned) => owned.truncate(n),
+        None => *v = Arc::new(v[..n.min(v.len())].to_vec()),
+    }
 }
 
 /// a `Sum` taken apart: its lane assignment and its lanes.
