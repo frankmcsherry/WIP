@@ -24,6 +24,23 @@ fn weave_unweaves_round_trip() {
     assert_eq!(eval_graph(&g, x.clone()), x);
 }
 
+/// `Weave` reads its tags by value: tags held as `i64`s (as `iota` writes them) weave as the same
+/// tags held as bytes do.
+#[test]
+fn weave_reads_tags_at_any_storage() {
+    let weave = |tags: Value| {
+        let lane = |xs: Vec<i64>| Value::List(vec![2].into(), Box::new(Value::i64(xs)));
+        let mut b = Builder::<NumOp>::default();
+        let i = b.input();
+        let w = b.add(Weave, vec![i]);
+        let g = b.finish(w);
+        eval_graph(&g, Value::Prod(vec![Value::List(vec![4].into(), Box::new(tags)), lane(vec![10, 30]), lane(vec![20, 40])]))
+    };
+    let expect = Value::List(vec![4].into(), Box::new(Value::sum(vec![0, 1, 0, 1], vec![Value::i64(vec![10, 30]), Value::i64(vec![20, 40])])));
+    assert_eq!(weave(Value::u8(vec![0, 1, 0, 1])), expect);
+    assert_eq!(weave(Value::i64(vec![0, 1, 0, 1])), expect);
+}
+
 /// The stride fast path in the indexed sort's `List` arm must produce the SAME sort as the general structural
 /// path. Build `n` equal-width byte records two ways — the inner list as a `Stride` (which diverts to
 /// the packed-u64 leaf radix) vs the equivalent `Offsets` (the position-by-position structural sort) —

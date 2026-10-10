@@ -348,7 +348,16 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("Weave expects 1..=256 lanes, got {}", rest.len()));
                 }
                 let (tb, tv) = cols.pop().ok_or("Weave expects (List<U8> tags, List<A>, ..)")?.into_list("Weave tags")?;
-                let tags = tv.as_u8("Weave tags")?;
+                // tags are integers at any storage: bytes, the usual one, are read in place, and
+                // any other is read by value (a tag past a byte names no lane; there are at most 256)
+                let tags: std::borrow::Cow<[u8]> = match tv.as_u8("Weave tags") {
+                    Ok(t) => t.into(),
+                    Err(_) => tv
+                        .as_i64("Weave tags")?
+                        .iter()
+                        .map(|&t| u8::try_from(t).map_err(|_| format!("Weave: tag {t} out of range")))
+                        .collect::<Result<_, _>>()?,
+                };
                 let mut lanes = Vec::with_capacity(rest.len());
                 let mut lane_bounds = Vec::with_capacity(rest.len());
                 for l in rest {
