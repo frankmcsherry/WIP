@@ -355,6 +355,11 @@ from its operands; the `_b64` verbs and the bitwise ops are how a program asks f
 arithmetic. Unsigned 64-bit values above 2^63 have no storage of their own: a hash is the full
 64-bit word read as an `i64`, and exact wide integers are the backlog item that will hold the rest.
 
+Then the signed widths (2026-10): `i8`, `i16` and `i32` join bytes and `i64` as storages (unsigned
+only at a byte). Two storages meet at the narrowest that holds both (a byte and an `i8` meet at
+`i16`); movement ops keep their input's storage, and arithmetic still computes and writes `i64`.
+Nothing yet narrows; narrow columns come only from hosts.
+
 ## Live work — the DDIR consumer
 
 The real consumer is **DDIR** (`../../differential-dataflow/interactive/`): DD hosts opaque `Value`

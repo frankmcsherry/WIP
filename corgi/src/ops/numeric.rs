@@ -115,39 +115,25 @@ fn map_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     }
 }
 
-/// `f(own, other)` lane by lane, into `own`'s buffer when it is uniquely held, else fresh.
-fn zip_into<T: Copy, U: Copy>(mut own: Arc<Vec<T>>, other: &[U], f: impl Fn(T, U) -> T) -> Arc<Vec<T>> {
-    if let Some(dst) = Arc::get_mut(&mut own) {
-        for (x, &y) in dst.iter_mut().zip(other) { *x = f(*x, y); }
-        own
-    } else {
-        Arc::new(own.iter().zip(other).map(|(&x, &y)| f(x, y)).collect())
+/// an integer leaf's values as `i64`s behind an `Arc`, for the kernels that write in place: an
+/// `i64` leaf is its own buffer (a refcount bump), a narrower one converts (one pass).
+fn int_arc(p: Prim) -> Arc<Vec<i64>> {
+    match p {
+        Prim::I64(v) => v,
+        p => Arc::new(p.ints()),
     }
 }
 
-/// a binary integer kernel: `f` on each pair, written as `i64`s — into an `i64` operand's buffer
-/// when one is uniquely held. A byte operand is read where it lies, each element widened as it is
-/// read, never as a column of its own.
+/// a binary integer kernel: `f` on each pair, written as `i64`s — into an operand's buffer when
+/// one is uniquely held. Operands held narrower convert to `i64`s first.
 fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
-    match (a, b) {
-        (Prim::I64(x), Prim::I64(y)) => Prim::I64(bin_into(x, y, f)),
-        (Prim::I64(x), Prim::U8(y)) => Prim::I64(zip_into(x, &y, |p, q: u8| f(p, q as i64))),
-        (Prim::U8(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: u8| f(p as i64, q))),
-        (Prim::U8(x), Prim::U8(y)) => {
-            Prim::I64(Arc::new(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)).collect()))
-        }
-        _ => unreachable!("int_pairs: integer leaves, checked by the caller"),
-    }
+    Prim::I64(bin_into(int_arc(a), int_arc(b), f))
 }
 
 /// a unary integer kernel: `f` on each element, written as `i64`s — in place in a uniquely held
-/// `i64` leaf; a byte leaf is read where it lies.
+/// `i64` leaf; a leaf held narrower converts to `i64`s first.
 fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
-    match a {
-        Prim::I64(x) => Prim::I64(map_into(x, f)),
-        Prim::U8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
-        Prim::F64(_) => unreachable!("int_map: an integer leaf, checked by the caller"),
-    }
+    Prim::I64(map_into(int_arc(a), f))
 }
 
 /// `$apply(args.., body)` with the integer lane body of the `BinOp` `$op`: exact within `i64`,
@@ -337,6 +323,9 @@ impl ArithOp {
                 let (bounds, vals) = input.into_list("reduce")?;
                 match vals.into_prim("reduce values")? {
                     Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I8(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I16(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I32(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::F64(_) => return Err("reduce: expected Int values, got Float".into()),
                 }

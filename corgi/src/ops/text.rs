@@ -6,7 +6,7 @@
 //! well-typed program, so it must be a value, not a crash.
 
 
-use crate::value::{Bounds, Prim, Tags, Value};
+use crate::value::{Bounds, Prim, Scalar, Tags, Value};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,18 +61,16 @@ impl TextOp {
         Ok(match self {
             TextOp::Split(d) => {
                 let (ends, vals) = input.into_list("Split")?;
-                let (out, piece_ends, outer_ends) = match &vals {
-                    Value::Prim(Prim::U8(bytes)) => {
-                        let (o, p, e) = split(&ends, bytes, *d);
-                        (Value::u8(o), p, e)
-                    }
-                    _ => {
-                        let xs = vals.as_i64("Split bytes")?;
-                        let (o, p, e) = split(&ends, &xs, *d as i64);
-                        (Value::i64(o), p, e)
-                    }
-                };
-                Value::List(outer_ends.into(), Box::new(Value::List(piece_ends.into(), Box::new(out))))
+                // the pieces keep the text's storage, widened first if it can't hold the delimiter
+                let d = Scalar::Int(*d as i64);
+                let p = vals.into_prim("Split bytes")?;
+                let p = p.to_hold(d).unwrap_or(p);
+                macro_rules! go { ($($s:ident),*) => { match &p {
+                    $( Prim::$s(xs) => { let (o, pe, oe) = split(&ends, xs, d.elem()); (Prim::$s(Arc::new(o)), pe, oe) } )*
+                    Prim::F64(_) => return Err("Split bytes: expected Int, got Float".into()),
+                } } }
+                let (out, piece_ends, outer_ends) = go!(U8, I8, I16, I32, I64);
+                Value::List(outer_ends.into(), Box::new(Value::List(piece_ends.into(), Box::new(Value::Prim(out)))))
             }
             TextOp::ParseInt => {
                 let (ends, vals) = input.into_list("ParseInt")?;

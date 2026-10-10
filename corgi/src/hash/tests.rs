@@ -152,6 +152,9 @@ fn fused_product_hashes_match_scalar_rows() {
         match v {
             Value::Prim(p) => mix64(match p {
                 Prim::U8(v) => v[r] as u64,
+                Prim::I8(v) => v[r] as i64 as u64,
+                Prim::I16(v) => v[r] as i64 as u64,
+                Prim::I32(v) => v[r] as i64 as u64,
                 Prim::I64(v) => v[r] as u64,
                 Prim::F64(v) => v[r],
             }),

@@ -325,19 +325,22 @@ impl std::hash::Hash for Tags {
     }
 }
 
-/// a leaf's element type: how it orders, and what an integer it holds is. The three storages are
-/// `u8` (an integer from 0 to 255: bytes, masks, tags), `i64` (an integer, two's complement) and a
-/// float's total-order key (`u64`).
+/// a leaf's element type: how it orders, and what an integer it holds is. The integer storages are
+/// `u8` (an integer from 0 to 255: bytes, masks, tags) and `i8`, `i16`, `i32`, `i64` (two's
+/// complement); a float is held as its total-order key (`u64`).
 pub(crate) trait Elem: Copy + Ord + Default + std::fmt::Debug {
     /// the storage width in bits.
     const BITS: u32;
-    /// an unsigned key in the element's order: the sort radixes these, and packs them.
+    /// an unsigned key in the element's order, of the storage's width: the sort radixes these,
+    /// and packs them `BITS` at a time.
     fn key(self) -> u64;
     /// the element whose key is `k`.
     fn from_key(k: u64) -> Self;
-    /// the element's 64-bit word: an integer's two's complement, a float's key. Positions, tags
-    /// and hashes read this, so a byte 5 and an `i64` 5 read alike.
+    /// the element's 64-bit word: an integer's two's complement (sign-extended), a float's key.
+    /// Positions, tags and hashes read this, so a byte 5 and an `i64` 5 read alike.
     fn word(self) -> u64;
+    /// the element holding the constant `s` (an integer that fits the storage, or a float).
+    fn of_scalar(s: Scalar) -> Self;
 }
 
 const SIGN: u64 = 1 << 63;
@@ -347,18 +350,72 @@ impl Elem for u8 {
     #[inline] fn key(self) -> u64 { self as u64 }
     #[inline] fn from_key(k: u64) -> Self { k as u8 }
     #[inline] fn word(self) -> u64 { self as u64 }
+    #[inline] fn of_scalar(s: Scalar) -> Self { s.int() as u8 }
 }
-impl Elem for i64 {
-    const BITS: u32 = 64;
-    #[inline] fn key(self) -> u64 { (self as u64) ^ SIGN }
-    #[inline] fn from_key(k: u64) -> Self { (k ^ SIGN) as i64 }
-    #[inline] fn word(self) -> u64 { self as u64 }
+/// the signed storages: a key is the value with its sign bit flipped, at the storage's width.
+macro_rules! signed_elem {
+    ($($t:ty => $u:ty),+) => { $(
+        impl Elem for $t {
+            const BITS: u32 = <$t>::BITS;
+            #[inline] fn key(self) -> u64 { ((self as $u) ^ (1 << (<$t>::BITS - 1))) as u64 }
+            #[inline] fn from_key(k: u64) -> Self { ((k as $u) ^ (1 << (<$t>::BITS - 1))) as $t }
+            #[inline] fn word(self) -> u64 { self as i64 as u64 }
+            #[inline] fn of_scalar(s: Scalar) -> Self { s.int() as $t }
+        }
+    )+ };
 }
+signed_elem!(i8 => u8, i16 => u16, i32 => u32, i64 => u64);
 impl Elem for u64 {
     const BITS: u32 = 64;
     #[inline] fn key(self) -> u64 { self }
     #[inline] fn from_key(k: u64) -> Self { k }
     #[inline] fn word(self) -> u64 { self }
+    #[inline] fn of_scalar(s: Scalar) -> Self {
+        match s {
+            Scalar::Float(k) => k,
+            Scalar::Int(x) => x as u64,
+        }
+    }
+}
+
+/// the storages an integer leaf can be held at, narrowest first. Unsigned only at a byte; each
+/// signed width widens to the next, and a byte to `i16`. Two storages meet at the narrowest that
+/// holds both ([`Storage::join`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Storage {
+    U8,
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+impl Storage {
+    /// the least and greatest values the storage holds.
+    pub(crate) fn range(self) -> (i64, i64) {
+        match self {
+            Storage::U8 => (0, u8::MAX as i64),
+            Storage::I8 => (i8::MIN as i64, i8::MAX as i64),
+            Storage::I16 => (i16::MIN as i64, i16::MAX as i64),
+            Storage::I32 => (i32::MIN as i64, i32::MAX as i64),
+            Storage::I64 => (i64::MIN, i64::MAX),
+        }
+    }
+    /// the narrowest storage holding every value from `lo` to `hi`.
+    pub(crate) fn holding(lo: i64, hi: i64) -> Storage {
+        [Storage::U8, Storage::I8, Storage::I16, Storage::I32]
+            .into_iter()
+            .find(|s| { let (a, b) = s.range(); a <= lo && hi <= b })
+            .unwrap_or(Storage::I64)
+    }
+    /// the narrowest storage holding everything either does: `u8` with `i8` is `i16`.
+    pub(crate) fn join(a: Storage, b: Storage) -> Storage {
+        if a == b {
+            return a;
+        }
+        let ((a0, a1), (b0, b1)) = (a.range(), b.range());
+        Storage::holding(a0.min(b0), a1.max(b1))
+    }
 }
 
 /// the order-preserving key of an `f64`: negatives flip every bit, the rest flip the sign bit, so
@@ -405,30 +462,47 @@ impl Scalar {
     /// row `i` of a leaf, as a constant.
     pub(crate) fn of(p: &Prim, i: usize) -> Scalar {
         match p {
-            Prim::U8(v) => Scalar::Int(v[i] as i64),
-            Prim::I64(v) => Scalar::Int(v[i]),
             Prim::F64(v) => Scalar::Float(v[i]),
+            p => Scalar::Int(p.int_at(i)),
         }
     }
-    /// the constant as an element of a leaf of its kind (a byte one only when it fits a byte):
-    /// its key read back at that storage.
+    /// the constant as an element of a leaf of its kind, at a storage that holds it.
     pub(crate) fn elem<T: Elem>(self) -> T {
-        T::from_key(match self {
-            Scalar::Int(x) => x.key(),
-            Scalar::Float(k) => k,
-        })
+        T::of_scalar(self)
+    }
+    /// the integer this constant is (a float's key, read as one, for a float).
+    fn int(self) -> i64 {
+        match self {
+            Scalar::Int(x) => x,
+            Scalar::Float(k) => k as i64,
+        }
     }
     /// does this constant agree in kind with the leaf (an integer for an integer, a float for a float)?
     pub(crate) fn kind_of(&self, p: &Prim) -> bool {
-        matches!((self, p), (Scalar::Int(_), Prim::U8(_) | Prim::I64(_)) | (Scalar::Float(_), Prim::F64(_)))
+        matches!((self, p), (Scalar::Float(_), Prim::F64(_))) || (matches!(self, Scalar::Int(_)) && p.is_int())
+    }
+}
+
+/// the integers `xs` held at storage `s` (which must hold them): one loop per (source, target).
+fn convert<S: Elem>(xs: &[S], s: Storage) -> Prim {
+    fn collect<S: Elem, T>(xs: &[S], f: impl Fn(i64) -> T) -> Arc<Vec<T>> {
+        Arc::new(xs.iter().map(|&x| f(x.word() as i64)).collect())
+    }
+    match s {
+        Storage::U8 => Prim::U8(collect(xs, |x| x as u8)),
+        Storage::I8 => Prim::I8(collect(xs, |x| x as i8)),
+        Storage::I16 => Prim::I16(collect(xs, |x| x as i16)),
+        Storage::I32 => Prim::I32(collect(xs, |x| x as i32)),
+        Storage::I64 => Prim::I64(collect(xs, |x| x)),
     }
 }
 
 /// a leaf column: one storage per variant, each a naturally aligned `Vec` behind an `Arc` (leaves
 /// are write-once read-many; `eval` clones freely for shared edges, so a leaf clone must be a
-/// refcount bump, not a buffer copy). `U8` and `I64` both hold integers, the same values at two
-/// widths: a kernel reading two integer leaves at different storages widens the byte one first
-/// ([`Prim::meet`]). `F64` holds floats, as their total-order keys. The `prim!` macro lists the
+/// refcount bump, not a buffer copy). `U8`, `I8`, `I16`, `I32` and `I64` all hold integers, the same
+/// values at several widths: a kernel reading two integer leaves at different storages brings them
+/// to the narrowest that holds both first ([`Prim::meet`]). `F64` holds floats, as their
+/// total-order keys. The `prim!` macro lists the
 /// storages ONCE and generates the enum and every per-storage method.
 macro_rules! prim {
     ($($V:ident => $t:ty),+ $(,)?) => {
@@ -460,6 +534,44 @@ macro_rules! prim {
             #[inline]
             pub(crate) fn word_at(&self, i: usize) -> u64 {
                 match self { $( Prim::$V(v) => v[i].word(), )+ }
+            }
+
+            /// every element as an `i64` (an integer leaf's values), one loop per storage.
+            pub(crate) fn ints(&self) -> Vec<i64> {
+                match self { $( Prim::$V(v) => v.iter().map(|&x| x.word() as i64).collect(), )+ }
+            }
+
+            /// every element's word, one loop per storage.
+            pub(crate) fn words(&self) -> Vec<u64> {
+                match self { $( Prim::$V(v) => v.iter().map(|&x| x.word()).collect(), )+ }
+            }
+
+            /// every element as a mask byte: 1 where it is nonzero.
+            pub(crate) fn mask(&self) -> Vec<u8> {
+                match self { $( Prim::$V(v) => v.iter().map(|&x| (x.word() != 0) as u8).collect(), )+ }
+            }
+
+            /// an integer leaf's least and greatest values (`None` for no rows, or a float leaf).
+            pub(crate) fn int_range(&self) -> Option<(i64, i64)> {
+                if !self.is_int() {
+                    return None;
+                }
+                match self {
+                    $( Prim::$V(v) => v.iter().map(|&x| x.word() as i64).fold(None, |r, x| match r {
+                        None => Some((x, x)),
+                        Some((lo, hi)) => Some((x.min(lo), x.max(hi))),
+                    }), )+
+                }
+            }
+
+            /// the same integers held at storage `s`, which must hold them all: the leaf itself
+            /// when it is held there already, otherwise one pass.
+            pub(crate) fn to_storage(&self, s: Storage) -> Prim {
+                if self.storage() == Some(s) {
+                    return self.clone();
+                }
+                debug_assert!(self.int_range().is_none_or(|(lo, hi)| { let (a, b) = s.range(); a <= lo && hi <= b }), "to_storage: {s:?} can't hold the values");
+                match self { $( Prim::$V(v) => convert(v, s), )+ }
             }
 
             /// row `i`'s order key (see [`Elem::key`]).
@@ -519,9 +631,9 @@ macro_rules! prim {
             where
                 usize: From<T>,
             {
-                if srcs.iter().any(|s| s.bits() != srcs[0].bits()) {
-                    let wide: Vec<Prim> = srcs.iter().map(|s| s.widen()).collect();
-                    let refs: Vec<&Prim> = wide.iter().collect();
+                if srcs.iter().any(|s| s.storage() != srcs[0].storage()) {
+                    let met = Prim::meet_all(srcs);
+                    let refs: Vec<&Prim> = met.iter().collect();
                     return Prim::gather_lanes(&refs, tags, off);
                 }
                 match srcs[0] {
@@ -588,9 +700,9 @@ macro_rules! prim {
             /// `gather_lanes` reference oracle (no production path concatenates leaves).
             #[cfg(test)]
             pub(crate) fn concat(parts: &[&Prim]) -> Prim {
-                if parts.iter().any(|s| s.bits() != parts[0].bits()) {
-                    let wide: Vec<Prim> = parts.iter().map(|s| s.widen()).collect();
-                    return Prim::concat(&wide.iter().collect::<Vec<_>>());
+                if parts.iter().any(|s| s.storage() != parts[0].storage()) {
+                    let met = Prim::meet_all(parts);
+                    return Prim::concat(&met.iter().collect::<Vec<_>>());
                 }
                 match parts[0] {
                     $( Prim::$V(_) => {
@@ -662,13 +774,17 @@ macro_rules! prim {
 
             /// overwrite rows `active[p]` of `self` with `src`'s row `p`, IN PLACE — `make_mut` gives
             /// the buffer mutably when uniquely owned (the common case), or clones it once if shared.
-            /// Touches only the `active` rows. A byte leaf receiving `i64` rows widens first. The
-            /// leaf of [`scatter`].
+            /// Touches only the `active` rows. A leaf receiving rows its storage can't hold widens
+            /// first. The leaf of [`scatter`].
             pub(crate) fn scatter_into(&mut self, active: &[usize], src: &Prim) {
-                if self.bits() < src.bits() {
-                    *self = self.widen();
+                let (mine, theirs) = (self.storage(), src.storage());
+                if mine != theirs {
+                    let j = Storage::join(mine.expect("an integer leaf"), theirs.expect("an integer leaf"));
+                    if mine != Some(j) {
+                        *self = self.to_storage(j);
+                    }
                 }
-                let src = if src.bits() < self.bits() { std::borrow::Cow::Owned(src.widen()) } else { std::borrow::Cow::Borrowed(src) };
+                let src = if src.storage() != self.storage() { std::borrow::Cow::Owned(src.to_storage(self.storage().expect("an integer leaf"))) } else { std::borrow::Cow::Borrowed(src) };
                 match (self, &*src) {
                     $( (Prim::$V(dst), Prim::$V(s)) => {
                         let dst = Arc::make_mut(dst);
@@ -720,16 +836,14 @@ macro_rules! prim {
             }
         }
 
-        /// the immediate kernels: a leaf against a constant of its kind. A byte leaf whose constant
-        /// is not a byte works at `i64`.
+        /// the immediate kernels: a leaf against a constant of its kind. An integer leaf whose
+        /// storage can't hold the constant works at the narrowest storage that holds both.
         impl Prim {
             /// `rel` against the constant `c`: the mask of rows whose comparison with `c` lands in
             /// the chosen order flags.
             pub(crate) fn rel_imm(&self, c: Scalar, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
-                if let (Prim::U8(_), Scalar::Int(x)) = (self, c) {
-                    if !(0..=255).contains(&x) {
-                        return self.widen().rel_imm(c, lt, eq, gt);
-                    }
+                if let Some(wider) = self.to_hold(c) {
+                    return wider.rel_imm(c, lt, eq, gt);
                 }
                 match self {
                     // one loop per predicate: a single compare per lane, where folding the three
@@ -753,10 +867,8 @@ macro_rules! prim {
             /// lane-wise min (or max, with `take_max`) against the constant `c`; in place when
             /// uniquely owned.
             pub(crate) fn pick_imm(self, c: Scalar, take_max: bool) -> Prim {
-                if let (Prim::U8(_), Scalar::Int(x)) = (&self, c) {
-                    if !(0..=255).contains(&x) {
-                        return self.widen().pick_imm(c, take_max);
-                    }
+                if let Some(wider) = self.to_hold(c) {
+                    return wider.pick_imm(c, take_max);
                 }
                 match self {
                     $( Prim::$V(mut a) => {
@@ -777,6 +889,9 @@ macro_rules! prim {
 
 prim! {
     U8 => u8,
+    I8 => i8,
+    I16 => i16,
+    I32 => i32,
     I64 => i64,
     F64 => u64,
 }
@@ -787,35 +902,65 @@ impl Prim {
         !matches!(self, Prim::F64(_))
     }
 
-    /// the leaf with integers at `i64`: a byte leaf widens (one pass), any other is itself.
-    pub(crate) fn widen(&self) -> Prim {
+    /// the storage an integer leaf is held at (`None` for a float leaf).
+    pub(crate) fn storage(&self) -> Option<Storage> {
         match self {
-            Prim::U8(v) => Prim::I64(Arc::new(v.iter().map(|&x| x as i64).collect())),
-            other => other.clone(),
+            Prim::U8(_) => Some(Storage::U8),
+            Prim::I8(_) => Some(Storage::I8),
+            Prim::I16(_) => Some(Storage::I16),
+            Prim::I32(_) => Some(Storage::I32),
+            Prim::I64(_) => Some(Storage::I64),
+            Prim::F64(_) => None,
         }
+    }
+
+    /// row `i` of an integer leaf, as an `i64`.
+    #[inline]
+    pub(crate) fn int_at(&self, i: usize) -> i64 {
+        self.word_at(i) as i64
+    }
+
+    /// the leaf at a storage that also holds the constant `c`, when its own can't (`None` when it
+    /// can, or for a float).
+    pub(crate) fn to_hold(&self, c: Scalar) -> Option<Prim> {
+        let (Some(mine), Scalar::Int(x)) = (self.storage(), c) else { return None };
+        let (lo, hi) = mine.range();
+        (x < lo || x > hi).then(|| self.to_storage(Storage::join(mine, Storage::holding(x, x))))
     }
 
     /// two leaves at one storage, to be combined lane by lane: two integer leaves at different
-    /// storages meet at `i64`. A leaf already there is returned as it was. An integer and a float
-    /// never meet; the typer keeps them apart, so meeting them is a bug.
+    /// storages meet at the narrowest storage that holds both. A leaf already there is returned as
+    /// it was. An integer and a float never meet; the typer keeps them apart, so meeting them is a
+    /// bug.
     pub(crate) fn meet(a: Prim, b: Prim) -> (Prim, Prim) {
         assert_eq!(a.is_int(), b.is_int(), "an integer leaf meets a float leaf");
-        if a.bits() == b.bits() {
-            (a, b)
-        } else {
-            (a.widen(), b.widen())
+        match (a.storage(), b.storage()) {
+            (Some(x), Some(y)) if x != y => {
+                let j = Storage::join(x, y);
+                (a.to_storage(j), b.to_storage(j))
+            }
+            _ => (a, b),
         }
     }
 
-    /// [`Prim::meet`], borrowing where nothing needs to widen.
+    /// [`Prim::meet`], borrowing where nothing needs to convert.
     pub(crate) fn meet_ref<'a>(a: &'a Prim, b: &'a Prim) -> (std::borrow::Cow<'a, Prim>, std::borrow::Cow<'a, Prim>) {
         use std::borrow::Cow;
         assert_eq!(a.is_int(), b.is_int(), "an integer leaf meets a float leaf");
-        if a.bits() == b.bits() {
-            (Cow::Borrowed(a), Cow::Borrowed(b))
-        } else {
-            (Cow::Owned(a.widen()), Cow::Owned(b.widen()))
+        match (a.storage(), b.storage()) {
+            (Some(x), Some(y)) if x != y => {
+                let j = Storage::join(x, y);
+                let conv = |p: &'a Prim| if p.storage() == Some(j) { Cow::Borrowed(p) } else { Cow::Owned(p.to_storage(j)) };
+                (conv(a), conv(b))
+            }
+            _ => (Cow::Borrowed(a), Cow::Borrowed(b)),
         }
+    }
+
+    /// leaves at one storage: the narrowest that holds every one of them.
+    fn meet_all(parts: &[&Prim]) -> Vec<Prim> {
+        let j = parts.iter().filter_map(|p| p.storage()).reduce(Storage::join);
+        parts.iter().map(|p| j.map_or_else(|| (*p).clone(), |j| p.to_storage(j))).collect()
     }
 
     /// an empty (zero-row) leaf: an integer one is `i64`, a float one is `F64`. Used to fill the
@@ -870,6 +1015,9 @@ impl Prim {
     fn show(&self) -> String {
         match self {
             Prim::U8(xs) => format!("{xs:?}"),
+            Prim::I8(xs) => format!("{xs:?}"),
+            Prim::I16(xs) => format!("{xs:?}"),
+            Prim::I32(xs) => format!("{xs:?}"),
             Prim::I64(xs) => format!("{xs:?}"),
             Prim::F64(xs) => format!("{:?}", xs.iter().map(|&k| f64_of_key(k)).collect::<Vec<_>>()),
         }
@@ -884,8 +1032,8 @@ impl PartialEq for Prim {
             (Prim::U8(a), Prim::U8(b)) => a == b,
             (Prim::I64(a), Prim::I64(b)) => a == b,
             (Prim::F64(a), Prim::F64(b)) => a == b,
-            (Prim::U8(a), Prim::I64(b)) | (Prim::I64(b), Prim::U8(a)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(&x, &y)| x as i64 == y)
+            (a, b) if a.is_int() && b.is_int() => {
+                a.len() == b.len() && (0..a.len()).all(|i| a.int_at(i) == b.int_at(i))
             }
             _ => false,
         }
@@ -913,7 +1061,10 @@ impl Value {
     /// leaf-column constructors — the funnel results pass through, so the representation lives in one place.
     /// Integers held as bytes (each from 0 to 255): text, masks, tags.
     pub fn u8(xs: Vec<u8>) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
-    /// Integers held as `i64`s.
+    /// Integers held as `i8`s, `i16`s, `i32`s or `i64`s.
+    pub fn i8(xs: Vec<i8>) -> Value { Value::Prim(Prim::I8(Arc::new(xs))) }
+    pub fn i16(xs: Vec<i16>) -> Value { Value::Prim(Prim::I16(Arc::new(xs))) }
+    pub fn i32(xs: Vec<i32>) -> Value { Value::Prim(Prim::I32(Arc::new(xs))) }
     pub fn i64(xs: Vec<i64>) -> Value { Value::Prim(Prim::I64(Arc::new(xs))) }
     /// Floats.
     pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(Arc::new(xs.into_iter().map(f64_key).collect()))) }
@@ -1032,7 +1183,7 @@ impl Value {
         use std::borrow::Cow;
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(&xs[..])),
-            Value::Prim(Prim::U8(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| x as i64).collect())),
+            Value::Prim(p) if p.is_int() => Ok(Cow::Owned(p.ints())),
             other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
         }
     }
@@ -1042,7 +1193,7 @@ impl Value {
     pub fn into_i64(self, who: &str) -> Result<Vec<i64>, String> {
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
-            Value::Prim(Prim::U8(xs)) => Ok(xs.iter().map(|&x| x as i64).collect()),
+            Value::Prim(p) if p.is_int() => Ok(p.ints()),
             other => Err(format!("{who}: expected Int, got {}", shape_of_value(&other))),
         }
     }
@@ -1053,7 +1204,7 @@ impl Value {
         use std::borrow::Cow;
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(words_of(xs))),
-            Value::Prim(Prim::U8(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| x as u64).collect())),
+            Value::Prim(p) if p.is_int() => Ok(Cow::Owned(p.words())),
             other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
         }
     }
@@ -1069,7 +1220,7 @@ impl Value {
         use std::borrow::Cow;
         match self {
             Value::Prim(Prim::U8(xs)) => Ok(Cow::Borrowed(&xs[..])),
-            Value::Prim(Prim::I64(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| (x != 0) as u8).collect())),
+            Value::Prim(p) if p.is_int() => Ok(Cow::Owned(p.mask())),
             other => Err(format!("{who}: expected an Int mask, got {}", shape_of_value(other))),
         }
     }

@@ -42,6 +42,9 @@ pub(crate) fn find_leaf(nb: &Bounds, needles: &Value, hb: Rows, hay: &Value) -> 
     let (np, hp) = Prim::meet_ref(np, hp);
     match (&*np, &*hp) {
         (Prim::U8(nv), Prim::U8(hv)) => Some(find_rows(nb, hb, nv, hv)),
+        (Prim::I8(nv), Prim::I8(hv)) => Some(find_rows(nb, hb, nv, hv)),
+        (Prim::I16(nv), Prim::I16(hv)) => Some(find_rows(nb, hb, nv, hv)),
+        (Prim::I32(nv), Prim::I32(hv)) => Some(find_rows(nb, hb, nv, hv)),
         (Prim::I64(nv), Prim::I64(hv)) => Some(find_rows(nb, hb, nv, hv)),
         (Prim::F64(nv), Prim::F64(hv)) => Some(find_rows(nb, hb, nv, hv)),
         _ => unreachable!("meet brings both to one storage"),

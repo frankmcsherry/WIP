@@ -223,7 +223,7 @@ mod compare {
                         }
                     };
                 }
-                slices!(U8, I64, F64);
+                slices!(U8, I8, I16, I32, I64, F64);
                 let mut ord = vec![0i8; m];
                 let (mut sia, mut sib) = (Vec::new(), Vec::new());
                 let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)
