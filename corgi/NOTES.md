@@ -264,7 +264,9 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
-  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. The
+  paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Over
+  Floats a sum or product runs in row order, so it is the `fold` of `add` or `mul` bit for bit
+  (`all`/`any` read masks, which are Ints). The
   all-active fast path (move `acc` through the body, skip the identity acc-gather + scatter) is built,
   but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
   all ragged input, take the general per-round gather and scatter.
