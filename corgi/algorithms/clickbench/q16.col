@@ -4,6 +4,6 @@
 # columns: UserID SearchPhrase
 # output: [i,s,u]
 let (user, phrase) = input in
-let ranked = (user, phrase) zip map ((u, s) -> ((u, s), 1)) group
-    map (((u, s), ones) -> (ones len neg, u, s)) sort_limit 10 in
+let ranked = (user, phrase) zip map ((u, s) -> ((u, s), ())) group
+    map (((u, s), rows) -> (rows len neg, u, s)) sort_limit 10 in
 ranked map ((d, u, s) -> (u, s, d neg))

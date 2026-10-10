@@ -6,5 +6,5 @@
 # Without ORDER BY the SQL's ten rows are any ten; corgi's groups come out in key order, so the
 # deterministic version takes the first ten keys.
 let (user, phrase) = input in
-let groups = (user, phrase) zip map ((u, s) -> ((u, s), 1)) group map (((u, s), ones) -> (u, s, ones len)) in
+let groups = (user, phrase) zip map ((u, s) -> ((u, s), ())) group map (((u, s), rows) -> (u, s, rows len)) in
 ((0, (groups len, 10) min) range, groups) gather

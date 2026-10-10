@@ -2,5 +2,5 @@
 # sql: SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC, URL LIMIT 10
 # columns: URL
 # output: [u,s,u]
-let ranked = input map (u -> ((1, u), 1)) group map (((one, u), ones) -> (ones len neg, one, u)) sort_limit 10 in
+let ranked = input map (u -> ((1, u), ())) group map (((one, u), rows) -> (rows len neg, one, u)) sort_limit 10 in
 ranked map ((d, one, u) -> (one, u, d neg))
