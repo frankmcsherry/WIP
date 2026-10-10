@@ -467,7 +467,12 @@ impl<L: OpLike> Op<L> {
                         lens
                     }
                     Rows::Part(Bounds::Stride(k, n)) => vec![*k as i64; *n],
-                    Rows::Named(..) => (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as i64 }).collect(),
+                    // a referenced row's length, read from its list's ends
+                    Rows::Named(Bounds::Offsets(ends), named) => named
+                        .iter()
+                        .map(|&r| (ends[r] - if r == 0 { 0 } else { ends[r - 1] }) as i64)
+                        .collect(),
+                    Rows::Named(Bounds::Stride(k, _), named) => vec![*k as i64; named.len()],
                 };
                 Value::i64(lens)
             }
