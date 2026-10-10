@@ -137,6 +137,22 @@ impl<O: OpLike> Builder<O> {
     pub fn add(&mut self, op: impl Into<O>, inputs: Vec<usize>) -> usize {
         self.push(NodeKind::Op(op.into()), inputs)
     }
+    /// copy `g`'s nodes in after the ones built so far, with `g`'s `Input` standing for the node
+    /// `input`, and return the copy of `g`'s output: `g` applied to `input`, inside this graph. Bodies
+    /// are closed (their `Input` is their own), so they copy as they are.
+    pub fn graft(&mut self, g: &Graph<O>, input: usize) -> usize
+    where
+        O: Clone,
+    {
+        let mut at = Vec::with_capacity(g.nodes.len());
+        for node in &g.nodes {
+            at.push(match &node.kind {
+                NodeKind::Input => input,
+                kind => self.push(kind.clone(), node.inputs.iter().map(|&e| at[e]).collect()),
+            });
+        }
+        at[g.output]
+    }
     pub fn finish(self, output: usize) -> Graph<O> {
         Graph { nodes: self.nodes, output }
     }

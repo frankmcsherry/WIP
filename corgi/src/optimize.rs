@@ -2,7 +2,7 @@
 //! (`cse`/`dce`) are vocabulary-agnostic in spirit; the semantic peephole pattern-
 //! matches core `Field`/`Tuple`, so it reaches through `NumOp::Core`.
 
-use crate::graph::{Graph, Node, NodeKind};
+use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred};
 use crate::value::{Scalar, Value};
 use std::collections::HashMap;
@@ -120,23 +120,13 @@ pub fn peephole(g: &Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
-/// inline `g1: A -> B` into `g2: B -> C`, returning `g1 ; g2 : A -> C`. `g2`'s `Input` is replaced by
-/// `g1`'s output; its other nodes are appended with edges remapped. Body sub-graphs are self-contained
-/// (their `Input` is local), so they copy verbatim — only top-level edges shift.
+/// `g1: A -> B` then `g2: B -> C`, as one graph `A -> C`: `g2`'s `Input` is `g1`'s output.
 fn compose(g1: &Graph<NumOp>, g2: &Graph<NumOp>) -> Graph<NumOp> {
-    let mut nodes = g1.nodes.clone();
-    let mut remap = vec![0usize; g2.nodes.len()];
-    for (i, node) in g2.nodes.iter().enumerate() {
-        match &node.kind {
-            NodeKind::Input => remap[i] = g1.output, // g2's parameter becomes g1's result
-            _ => {
-                let inputs = node.inputs.iter().map(|&e| remap[e]).collect();
-                remap[i] = nodes.len();
-                nodes.push(Node { kind: node.kind.clone(), inputs });
-            }
-        }
-    }
-    Graph { nodes, output: remap[g2.output] }
+    let mut b = Builder::default();
+    let x = b.input();
+    let mid = b.graft(g1, x);
+    let out = b.graft(g2, mid);
+    b.finish(out)
 }
 
 /// map fusion — the memory-bound lever: two passes over a list become one. `MapList(b1)` feeding
