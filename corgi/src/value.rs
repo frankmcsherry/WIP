@@ -422,6 +422,22 @@ impl Storage {
     }
 }
 
+/// `$body`, a `Vec<$T>`, built with `$T` the narrowest storage holding every integer from `$lo` to
+/// `$hi`, as a leaf: how an op whose results have a bound it knows writes them, with no pass to
+/// find their range.
+macro_rules! at_holding {
+    ($lo:expr, $hi:expr, $T:ident => $body:expr) => {
+        match $crate::value::Storage::holding($lo, $hi) {
+            $crate::value::Storage::U8 => { type $T = u8; $crate::value::Prim::U8(std::sync::Arc::new($body)) }
+            $crate::value::Storage::I8 => { type $T = i8; $crate::value::Prim::I8(std::sync::Arc::new($body)) }
+            $crate::value::Storage::I16 => { type $T = i16; $crate::value::Prim::I16(std::sync::Arc::new($body)) }
+            $crate::value::Storage::I32 => { type $T = i32; $crate::value::Prim::I32(std::sync::Arc::new($body)) }
+            $crate::value::Storage::I64 => { type $T = i64; $crate::value::Prim::I64(std::sync::Arc::new($body)) }
+        }
+    };
+}
+pub(crate) use at_holding;
+
 /// the random-storage test mode's storage for a leaf from `lo` to `hi`: a pseudo-random one of
 /// those that hold it, from a sequence per thread, so a run repeats.
 #[cfg(feature = "random-storage")]
@@ -1146,12 +1162,12 @@ impl Value {
     /// Integers from 0 to `hi`, collected at the narrowest storage that holds that range with no
     /// pass to find it: how an op that knows its bound (a length, a run's number) writes.
     pub(crate) fn upto(hi: usize, xs: impl Iterator<Item = usize>) -> Value {
-        Value::Prim(match Storage::holding(0, hi as i64) {
-            Storage::U8 => Prim::U8(Arc::new(xs.map(|x| x as u8).collect())),
-            Storage::I16 => Prim::I16(Arc::new(xs.map(|x| x as i16).collect())),
-            Storage::I32 => Prim::I32(Arc::new(xs.map(|x| x as i32).collect())),
-            _ => Prim::I64(Arc::new(xs.map(|x| x as i64).collect())),
-        })
+        Value::Prim(at_holding!(0, hi as i64, T => xs.map(|x| x as T).collect()))
+    }
+    /// Integers from 0 to `hi`, computed as `i64`s, stored at the narrowest storage that holds that
+    /// range (a pass to store them, none to find it).
+    pub(crate) fn within(xs: Vec<i64>, hi: usize) -> Value {
+        Value::Prim(Prim::I64(Arc::new(xs)).to_storage(Storage::holding(0, hi as i64)))
     }
     /// Floats.
     pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(Arc::new(xs.into_iter().map(f64_key).collect()))) }

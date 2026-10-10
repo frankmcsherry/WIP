@@ -161,7 +161,8 @@ impl CmpOp {
                 // Leaves: a search per needle (a walk for a dense row of needles in order; a
                 // branch-free binary search, sixteen needles at a time, otherwise). See `search`.
                 if let Some((lo_c, hi_c)) = find_leaf(&nb, &nvals, hb, hvals) {
-                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)]))));
+                    let h = hvals.len();
+                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::within(lo_c, h), Value::within(hi_c, h)]))));
                 }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
@@ -192,7 +193,9 @@ impl CmpOp {
                         hi_c.push((upper.0[k] - hs) as i64);
                     }
                 }
-                Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])))
+                // within a haystack row, so at most the haystack's elements
+                let h = hvals.len();
+                Value::List(nb, Box::new(Value::Prod(vec![Value::within(lo_c, h), Value::within(hi_c, h)])))
             }
         })
     }
