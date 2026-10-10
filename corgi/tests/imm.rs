@@ -1,8 +1,8 @@
 //! Constant operands run as immediates: `Program` rewrites a binary op on a pair holding a literal,
 //! `(x, c) op`, into one op that carries `c` (`corgi::immediates`). These check every arithmetic
 //! and word op, the six comparisons and lane min/max against the same program evaluated as parsed
-//! (pair and literal column, no rewrite), on random columns of each storage (Int as bytes, Int as
-//! `i64`s, Float) and the constants at the edges of an Int, through the path that writes into an
+//! (pair and literal column, no rewrite), on random columns of each storage (Int as bytes and as
+//! each signed width, Float) and the constants at the edges of an Int, through the path that writes into an
 //! operand it owns; then where the rewrite fires, and where it must not.
 
 use corgi::{dce, eval_graph, immediates, lower_effects, parse_ml, Program, Value};
@@ -34,6 +34,9 @@ fn nodes_after(src: &str) -> usize {
 #[derive(Clone, Copy, Debug)]
 enum Col {
     Bytes,
+    I8,
+    I16,
+    I32,
     I64,
     Float,
 }
@@ -45,6 +48,21 @@ fn rows(col: Col, n: usize, rng: &mut Rng) -> Value {
             let mut xs: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
             xs.extend([0, 1, 127, 128, 255]);
             Value::u8(xs)
+        }
+        Col::I8 => {
+            let mut xs: Vec<i8> = (0..n).map(|_| rng.next() as i8).collect();
+            xs.extend([0, 1, -1, i8::MAX, i8::MIN]);
+            Value::i8(xs)
+        }
+        Col::I16 => {
+            let mut xs: Vec<i16> = (0..n).map(|_| rng.next() as i16).collect();
+            xs.extend([0, 1, -1, 255, 256, i16::MAX, i16::MIN]);
+            Value::i16(xs)
+        }
+        Col::I32 => {
+            let mut xs: Vec<i32> = (0..n).map(|_| rng.next() as i32).collect();
+            xs.extend([0, 1, -1, 255, 256, i32::MAX, i32::MIN]);
+            Value::i32(xs)
         }
         Col::I64 => {
             let mut xs: Vec<i64> = (0..n).map(|_| rng.next() as i64).collect();
@@ -80,7 +98,7 @@ fn constants(col: Col) -> &'static [&'static str] {
 #[test]
 fn arithmetic_with_a_constant_matches_the_pair_form() {
     let mut rng = Rng(5);
-    for col in [Col::Bytes, Col::I64, Col::Float] {
+    for col in [Col::Bytes, Col::I8, Col::I16, Col::I32, Col::I64, Col::Float] {
         let ops: &[&str] = match col {
             Col::Float => &["add", "sub", "mul", "div"],
             _ => &["add", "sub", "mul", "div", "rem", "add_b64", "sub_b64", "mul_b64", "and", "or", "xor"],
@@ -99,7 +117,7 @@ fn arithmetic_with_a_constant_matches_the_pair_form() {
 #[test]
 fn comparisons_and_min_max_with_a_constant_match_the_pair_form() {
     let mut rng = Rng(7);
-    for col in [Col::Bytes, Col::I64, Col::Float] {
+    for col in [Col::Bytes, Col::I8, Col::I16, Col::I32, Col::I64, Col::Float] {
         for c in constants(col) {
             let xs = rows(col, 300, &mut rng);
             // the literal on the right, and on the left, where comparisons flip

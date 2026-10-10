@@ -4,7 +4,7 @@
 
 use crate::shape::shape_of_value;
 use std::sync::Arc;
-use crate::value::{with_empty_row, Bounds, Prim, Rows, Tags, Value};
+use crate::value::{with_empty_row, Bounds, Elem, Prim, Rows, Tags, Value};
 
 pub(crate) use generators::*;
 
@@ -139,22 +139,41 @@ mod generators {
             ok[r] &= inside;
             pos.push(if inside { hs + x as usize } else { usize::MAX });
         }
-        Ok(match index {
-            Value::Prim(p) => {
-                let mut pos = Vec::with_capacity(p.len());
-                match p {
-                    Prim::I64(xs) => xs.iter().enumerate().for_each(|(j, &x)| {
-                        let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), x as u64, &mut pos)
-                    }),
-                    Prim::U8(_) => (0..p.len()).for_each(|j| {
-                        let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), p.word_at(j), &mut pos)
-                    }),
+        // positions at any integer storage, each read as its word (so a negative one is past
+        // every row): one loop per storage.
+        fn leaf<T: Elem>(xs: &[T], owners: &Owners, hay: Rows, ok: &mut [bool]) -> Vec<usize> {
+            let mut pos = Vec::with_capacity(xs.len());
+            xs.iter().enumerate().for_each(|(j, &x)| {
+                let r = owners.get(j);
+                resolve(ok, r, hay.span(r), x.word(), &mut pos)
+            });
+            pos
+        }
+        // a list of positions: one owner per row, so its span is read once per row.
+        fn list<T: Elem>(bounds: &Bounds, xs: &[T], owners: &Owners, hay: Rows, ok: &mut [bool]) -> Vec<usize> {
+            let mut pos = Vec::with_capacity(xs.len());
+            for i in 0..bounds.len() {
+                let r = owners.get(i);
+                let (s, e) = bounds.span(i);
+                let span = hay.span(r);
+                xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x.word(), &mut pos));
+            }
+            pos
+        }
+        macro_rules! positions {
+            ($p:expr, $f:ident($($arg:expr),*)) => {
+                match $p {
+                    Prim::U8(xs) => $f($($arg,)* xs, owners, hay, ok),
+                    Prim::I8(xs) => $f($($arg,)* xs, owners, hay, ok),
+                    Prim::I16(xs) => $f($($arg,)* xs, owners, hay, ok),
+                    Prim::I32(xs) => $f($($arg,)* xs, owners, hay, ok),
+                    Prim::I64(xs) => $f($($arg,)* xs, owners, hay, ok),
                     Prim::F64(_) => return Err("gather: positions are integers, not floats".into()),
                 }
-                IndexPlan::Leaf(pos)
-            }
+            };
+        }
+        Ok(match index {
+            Value::Prim(p) => IndexPlan::Leaf(positions!(p, leaf())),
             Value::Unit(n) => IndexPlan::Unit(*n),
             Value::Prod(fields) => {
                 IndexPlan::Prod(fields.iter().map(|f| index_plan(f, owners, hay, ok)).collect::<Result<_, _>>()?)
@@ -162,17 +181,7 @@ mod generators {
             // a list of positions (the common case) resolves row by row with no owner column; a list
             // of anything else hands its elements their rows.
             Value::List(bounds, vals) => match &**vals {
-                Value::Prim(Prim::I64(xs)) => {
-                    let mut pos = Vec::with_capacity(xs.len());
-                    // one owner per row of positions, so its span is read once per row.
-                    for i in 0..bounds.len() {
-                        let r = owners.get(i);
-                        let (s, e) = bounds.span(i);
-                        let span = hay.span(r);
-                        xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x as u64, &mut pos));
-                    }
-                    IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(pos)))
-                }
+                Value::Prim(p) => IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(positions!(p, list(bounds))))),
                 inner => {
                     let mut rows = Vec::with_capacity(inner.len());
                     for i in 0..bounds.len() {

@@ -9,6 +9,7 @@ fn round_trip(v: &Value) {
     let (back, read) = read_from(&buf).unwrap();
     assert_eq!(read, buf.len(), "read_from consumed {read} of {} bytes", buf.len());
     assert_eq!(&back, v, "round trip changed the value");
+    assert_eq!(format!("{back:?}"), format!("{v:?}"), "round trip changed a storage");
 }
 
 /// One of each constructor, at each leaf width, including the empty cases.
@@ -20,6 +21,9 @@ fn corpus() -> Vec<Value> {
         Value::u8(vec![1, 2, 3]),                       // an odd payload length, to exercise padding
         Value::f64(vec![1.5, -0.0, f64::NAN, 4.0, 5.0]),
         Value::i64(vec![-1, 0, 12345, i64::MIN]),
+        Value::i8(vec![-1, 0, i8::MIN]),               // odd payload lengths at each signed width
+        Value::i16(vec![-1, 0, i16::MIN]),
+        Value::i32(vec![-1, 0, i32::MIN]),
         Value::Prod(vec![]),
         Value::Prod(vec![Value::i64(vec![1, 2]), Value::u8(vec![3, 4])]),
         Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::f64(vec![9.0, 8.0, 7.0, 6.0]))),
@@ -113,9 +117,12 @@ fn random_value(rng: &mut Rng, rows: usize, depth: usize) -> Value {
     // At depth 0 only leaves, so recursion always terminates.
     let arms = if depth == 0 { 2 } else { 5 };
     match rng.below(arms) {
-        0 => match rng.below(3) {
+        0 => match rng.below(6) {
             0 => Value::u8((0..rows).map(|_| rng.next() as u8).collect()),
             1 => Value::f64((0..rows).map(|_| f64::from_bits(rng.next())).collect()),
+            2 => Value::i8((0..rows).map(|_| rng.next() as i8).collect()),
+            3 => Value::i16((0..rows).map(|_| rng.next() as i16).collect()),
+            4 => Value::i32((0..rows).map(|_| rng.next() as i32).collect()),
             _ => Value::i64((0..rows).map(|_| rng.next() as i64).collect()),
         },
         1 => Value::Unit(rows),

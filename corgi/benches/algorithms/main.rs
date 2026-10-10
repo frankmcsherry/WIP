@@ -6,7 +6,8 @@
 //!
 //! `--check` compares on small inputs without timing; `--explain` prints each program's lowered
 //! graph; `--profile` prints time per op; `--optimize` runs `corgi::optimize` on each program first;
-//! `--scale K` makes the lists of numbers K times longer in K times fewer rows.
+//! `--scale K` makes the lists of numbers K times longer in K times fewer rows. With
+//! `CORGI_NARROW=1` each input's integers are held at the narrowest storage that holds them.
 
 mod common;
 mod common_data;

@@ -202,7 +202,7 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
             }
         };
     }
-    go!(U8, I64, F64)
+    go!(U8, I8, I16, I32, I64, F64)
 }
 
 /// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
@@ -218,7 +218,7 @@ fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize,
             }
         };
     }
-    go!(U8, I64, F64)
+    go!(U8, I8, I16, I32, I64, F64)
 }
 
 /// The leaf lanes of `a` and `b`, in structural order, when the shape is nothing but leaves,
@@ -268,7 +268,7 @@ fn wide<'a>(lanes: &[(&'a Prim, &'a Prim)]) -> Option<Vec<(&'a [i64], &'a [i64])
 fn lanes_level<IA: Rows, IB: Rows>(lanes: &[(&Prim, &Prim)], ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
     // a lane whose two sides are held at different storages meets first, so that each lane's keys
     // read alike on both sides.
-    if lanes.iter().any(|(pa, pb)| pa.bits() != pb.bits()) {
+    if lanes.iter().any(|(pa, pb)| pa.storage() != pb.storage()) {
         let met: Vec<(Prim, Prim)> = lanes.iter().map(|(pa, pb)| Prim::meet((*pa).clone(), (*pb).clone())).collect();
         let refs: Vec<(&Prim, &Prim)> = met.iter().map(|(a, b)| (a, b)).collect();
         return lanes_level(&refs, ia, ib, open, tree);

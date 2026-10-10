@@ -2,13 +2,13 @@
 //! DuckDB.
 //!
 //!   python3 benches/tpch/prepare.py DIR [SCALE_FACTOR]          # the data, DuckDB's answers and times
-//!   CORGI_TPCH=DIR cargo bench --bench tpch [-- NAME ...] [--check] [--profile]
+//!   [CORGI_NARROW=1] CORGI_TPCH=DIR cargo bench --bench tpch [-- NAME ...] [--check] [--profile]
 //!
 //! Each query is `algorithms/tpch/NAME.col`, whose header names the SQL it answers (`# sql:`), the
 //! columns it reads (`# columns:`, the program's input in that order, from any tables) and its output's
 //! kinds (`# output:`: `u` an Int, `f` a Float, `s` a string; `[..]` for a list of rows). Each
 //! table is one row: each column is a one-row `List`. `--profile` (with `--features profile`) prints
-//! time per op.
+//! time per op. `CORGI_NARROW=1` loads each column of numbers at the narrowest storage that holds it.
 
 use corgi::{Bounds, Program, Value};
 use std::collections::HashMap;
@@ -46,12 +46,18 @@ fn read_u64s(path: &Path) -> Vec<u64> {
     bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
+/// a column of numbers as the harness holds it: `i64`s, or with `CORGI_NARROW=1` the narrowest
+/// storage that holds the column, which measures what narrow data buys.
+fn narrow(v: Value) -> Value {
+    if std::env::var("CORGI_NARROW").is_ok_and(|n| n == "1") { v.narrowed() } else { v }
+}
+
 /// a column as a one-row list: numbers as `List<Int>`, strings as `List<List<Int>>` (held as bytes).
 fn column(dir: &Path, name: &str) -> Value {
     let one_row = |v: Value| Value::List(Bounds::offsets(vec![v.len()]), Box::new(v));
     let numbers = dir.join(format!("{name}.u64"));
     if numbers.exists() {
-        return one_row(Value::i64(read_u64s(&numbers).into_iter().map(|x| x as i64).collect()));
+        return one_row(narrow(Value::i64(read_u64s(&numbers).into_iter().map(|x| x as i64).collect())));
     }
     let ends: Vec<usize> = read_u64s(&dir.join(format!("{name}.ends"))).into_iter().map(|e| e as usize).collect();
     let bytes = std::fs::read(dir.join(format!("{name}.bytes"))).unwrap();

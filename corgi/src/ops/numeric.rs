@@ -15,7 +15,7 @@ use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
-use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value};
+use crate::value::{f64_key, f64_of_key, Elem, Prim, Scalar, Storage, Value, TILE};
 use std::sync::Arc;
 
 /// the named monoid reductions — `List<Int> -> Int` per row, each a one-pass SIMD-friendly
@@ -115,54 +115,346 @@ fn map_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     }
 }
 
-/// `f(own, other)` lane by lane, into `own`'s buffer when it is uniquely held, else fresh.
-fn zip_into<T: Copy, U: Copy>(mut own: Arc<Vec<T>>, other: &[U], f: impl Fn(T, U) -> T) -> Arc<Vec<T>> {
-    if let Some(dst) = Arc::get_mut(&mut own) {
-        for (x, &y) in dst.iter_mut().zip(other) { *x = f(*x, y); }
-        own
-    } else {
-        Arc::new(own.iter().zip(other).map(|(&x, &y)| f(x, y)).collect())
-    }
+/// An integer storage a kernel computes at: its lane type, and how a leaf held there is borrowed
+/// and made. Each integer op's loop is compiled once per lane it computes at (`u8`, `i16`, `i32`,
+/// `i64`; [`at_storage`]), reading its operands as that type (a tile at a time from any other
+/// storage) and writing it: code grows with the ops times the lanes, never with pairs of storages.
+/// Each op plans the storage it computes at from what its operands can hold ([`span`], [`plan`]),
+/// so no result leaves it and no lane needs a check; only at `i64` does arithmetic wrap, as it
+/// always has.
+trait Lane: Elem {
+    const STORAGE: Storage;
+    /// the integer `x`, which the plan made sure fits.
+    fn of(x: i64) -> Self;
+    fn slice(p: &Prim) -> Option<&[Self]>;
+    /// the leaf's rows to write over, when it is held at this storage and nothing else holds it.
+    fn slice_mut(p: &mut Prim) -> Option<&mut [Self]>;
+    fn wrap(v: Arc<Vec<Self>>) -> Prim;
+    fn add(self, y: Self) -> Self;
+    fn sub(self, y: Self) -> Self;
+    fn mul(self, y: Self) -> Self;
+    /// truncating, with `x / 0 = 0`.
+    fn div(self, y: Self) -> Self;
+    /// the remainder of the truncating division, with `x % 0 = x`.
+    fn rem(self, y: Self) -> Self;
+    fn and(self, y: Self) -> Self;
+    fn or(self, y: Self) -> Self;
+    fn xor(self, y: Self) -> Self;
+    fn neg(self) -> Self;
+    /// every bit set for a negative value, none otherwise.
+    fn sign(self) -> Self;
+    /// shifts by fewer bits than the lane has: arithmetic to the right for the signed lanes.
+    fn shr(self, k: u32) -> Self;
+    fn shl(self, k: u32) -> Self;
 }
 
-/// a binary integer kernel: `f` on each pair, written as `i64`s — into an `i64` operand's buffer
-/// when one is uniquely held. A byte operand is read where it lies, each element widened as it is
-/// read, never as a column of its own.
-fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
-    match (a, b) {
-        (Prim::I64(x), Prim::I64(y)) => Prim::I64(bin_into(x, y, f)),
-        (Prim::I64(x), Prim::U8(y)) => Prim::I64(zip_into(x, &y, |p, q: u8| f(p, q as i64))),
-        (Prim::U8(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: u8| f(p as i64, q))),
-        (Prim::U8(x), Prim::U8(y)) => {
-            Prim::I64(Arc::new(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)).collect()))
+macro_rules! lane {
+    ($($t:ty => $V:ident),+) => { $(
+        impl Lane for $t {
+            const STORAGE: Storage = Storage::$V;
+            #[inline] fn of(x: i64) -> Self { x as $t }
+            fn slice(p: &Prim) -> Option<&[Self]> { if let Prim::$V(v) = p { Some(v) } else { None } }
+            fn slice_mut(p: &mut Prim) -> Option<&mut [Self]> { if let Prim::$V(v) = p { Arc::get_mut(v).map(|v| &mut v[..]) } else { None } }
+            fn wrap(v: Arc<Vec<Self>>) -> Prim { Prim::$V(v) }
+            #[inline] fn add(self, y: Self) -> Self { self.wrapping_add(y) }
+            #[inline] fn sub(self, y: Self) -> Self { self.wrapping_sub(y) }
+            #[inline] fn mul(self, y: Self) -> Self { self.wrapping_mul(y) }
+            #[inline] fn div(self, y: Self) -> Self { if y == 0 { 0 } else { self.wrapping_div(y) } }
+            #[inline] fn rem(self, y: Self) -> Self { if y == 0 { self } else { self.wrapping_rem(y) } }
+            #[inline] fn and(self, y: Self) -> Self { self & y }
+            #[inline] fn or(self, y: Self) -> Self { self | y }
+            #[inline] fn xor(self, y: Self) -> Self { self ^ y }
+            #[inline] fn neg(self) -> Self { self.wrapping_neg() }
+            #[allow(unused_comparisons)]
+            #[inline] fn sign(self) -> Self { if self < 0 { !0 } else { 0 } }
+            #[inline] fn shr(self, k: u32) -> Self { self >> k }
+            #[inline] fn shl(self, k: u32) -> Self { self << k }
         }
-        _ => unreachable!("int_pairs: integer leaves, checked by the caller"),
-    }
+    )+ };
 }
+lane!(u8 => U8, i8 => I8, i16 => I16, i32 => I32, i64 => I64);
 
-/// a unary integer kernel: `f` on each element, written as `i64`s — in place in a uniquely held
-/// `i64` leaf; a byte leaf is read where it lies.
-fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
-    match a {
-        Prim::I64(x) => Prim::I64(map_into(x, f)),
-        Prim::U8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
-        Prim::F64(_) => unreachable!("int_map: an integer leaf, checked by the caller"),
-    }
-}
-
-/// `$apply(args.., body)` with the integer lane body of the `BinOp` `$op`: exact within `i64`,
-/// wrapping past it; truncating division with `x / 0 = 0` and `x % 0 = x`. The op is matched
-/// ONCE, above the loop, so each arm is one concrete closure the loop inlines and vectorizes.
-macro_rules! int_body {
-    ($op:expr, $apply:ident($($arg:expr),*)) => {
-        match $op {
-            BinOp::Add => $apply($($arg,)* |x: i64, y: i64| x.wrapping_add(y)),
-            BinOp::Sub => $apply($($arg,)* |x: i64, y: i64| x.wrapping_sub(y)),
-            BinOp::Mul => $apply($($arg,)* |x: i64, y: i64| x.wrapping_mul(y)),
-            BinOp::Div => $apply($($arg,)* |x: i64, y: i64| if y == 0 { 0 } else { x.wrapping_div(y) }),
-            BinOp::Rem => $apply($($arg,)* |x: i64, y: i64| if y == 0 { x } else { x.wrapping_rem(y) }),
+/// `$body` with `$C` the lane type an op planned at the storage `$s` computes at: the body compiled
+/// once per lane. `i8` computes at `i16` (what it holds is stored back at `i8`), as small negative
+/// values are rare enough not to pay for a lane of their own; a division or remainder, which
+/// no vector unit does, computes at `i32` or `i64` (`wide`).
+macro_rules! at_storage {
+    ($s:expr, $C:ident => $body:expr) => {
+        match $s {
+            Storage::U8 => { type $C = u8; $body }
+            Storage::I8 | Storage::I16 => { type $C = i16; $body }
+            Storage::I32 => { type $C = i32; $body }
+            Storage::I64 => { type $C = i64; $body }
         }
     };
+    (wide $s:expr, $C:ident => $body:expr) => {
+        match Storage::join($s, Storage::I32) {
+            Storage::I64 => { type $C = i64; $body }
+            _ => { type $C = i32; $body }
+        }
+    };
+}
+
+/// rows `at..at + n` of an integer leaf as `C`s: the leaf's own slice when it is held at `C`,
+/// otherwise converted into `buf` (the plan made sure `C` holds every value).
+fn tile<'a, C: Lane>(p: &'a Prim, at: usize, n: usize, buf: &'a mut Vec<C>) -> &'a [C] {
+    fn read<S: Elem, C: Lane>(xs: &[S], buf: &mut Vec<C>) {
+        buf.clear();
+        buf.extend(xs.iter().map(|&x| C::of(x.word() as i64)));
+    }
+    if let Some(xs) = C::slice(p) {
+        return &xs[at..at + n];
+    }
+    match p {
+        Prim::U8(v) => read(&v[at..at + n], buf),
+        Prim::I8(v) => read(&v[at..at + n], buf),
+        Prim::I16(v) => read(&v[at..at + n], buf),
+        Prim::I32(v) => read(&v[at..at + n], buf),
+        Prim::I64(v) => read(&v[at..at + n], buf),
+        Prim::F64(_) => unreachable!("an integer kernel reads integer leaves"),
+    }
+    buf
+}
+
+/// a column written at a storage a tile at a time, from tiles computed at one that holds it (the
+/// plan made sure every value fits): what a kernel writes when it doesn't write in place.
+struct Writer(Prim);
+
+impl Writer {
+    fn new(s: Storage, n: usize) -> Writer {
+        Writer(match s {
+            Storage::U8 => Prim::U8(Arc::new(Vec::with_capacity(n))),
+            Storage::I8 => Prim::I8(Arc::new(Vec::with_capacity(n))),
+            Storage::I16 => Prim::I16(Arc::new(Vec::with_capacity(n))),
+            Storage::I32 => Prim::I32(Arc::new(Vec::with_capacity(n))),
+            Storage::I64 => Prim::I64(Arc::new(Vec::with_capacity(n))),
+        })
+    }
+    fn put<C: Lane>(&mut self, xs: &[C]) {
+        fn put<C: Lane, O: Lane>(v: &mut Arc<Vec<O>>, xs: &[C]) {
+            Arc::get_mut(v).expect("a writer's leaf is its own").extend(xs.iter().map(|&x| O::of(x.word() as i64)));
+        }
+        match &mut self.0 {
+            Prim::U8(v) => put(v, xs),
+            Prim::I8(v) => put(v, xs),
+            Prim::I16(v) => put(v, xs),
+            Prim::I32(v) => put(v, xs),
+            Prim::I64(v) => put(v, xs),
+            Prim::F64(_) => unreachable!("a writer holds integers"),
+        }
+    }
+}
+
+/// where a kernel's results go when they can't be written over its first operand: over the second
+/// operand's rows, when it is held at the results' storage and nothing else holds it, or into a
+/// column written at their storage.
+enum Sink {
+    OverB,
+    New(Writer),
+}
+
+impl Sink {
+    /// the sink for `n` results at `out`, computed at `C`, beside a second operand `b` (if any).
+    fn new<C: Lane>(b: Option<&mut Prim>, out: Storage, n: usize) -> Sink {
+        if out == C::STORAGE && b.is_some_and(|b| C::slice_mut(b).is_some()) {
+            return Sink::OverB;
+        }
+        Sink::New(Writer::new(out, n))
+    }
+    /// the results for rows `at..`, out of line, as only the loop computing them is per op.
+    #[inline(never)]
+    fn put<C: Lane>(&mut self, b: Option<&mut Prim>, at: usize, cs: &[C]) {
+        match self {
+            Sink::OverB => {
+                let b = C::slice_mut(b.expect("a second operand")).expect("an operand to write over");
+                b[at..at + cs.len()].copy_from_slice(cs);
+            }
+            Sink::New(w) => w.put(cs),
+        }
+    }
+    fn done(self, b: Option<Prim>) -> Prim {
+        match self {
+            Sink::OverB => b.expect("a second operand"),
+            Sink::New(w) => w.0,
+        }
+    }
+}
+
+/// `f` over a tile in place: `xs[k] = f(xs[k], ys[k])`. The one loop compiled per op (and lane);
+/// out of line, so both of `pairs`'s ways of reaching it share it.
+#[inline(never)]
+fn over<C: Lane>(xs: &mut [C], ys: &[C], f: &impl Fn(C, C) -> C) {
+    xs.iter_mut().zip(ys).for_each(|(x, &y)| *x = f(*x, y));
+}
+
+/// `f` on each pair, computed at `C` a tile at a time (an operand held elsewhere is read as `C`),
+/// and stored at `out`, which `C` holds. At `out = C`, over `a`'s own rows when nothing else holds
+/// them, else into a new column; otherwise each tile of `a` is copied out, computed over, and put
+/// ([`Sink`]).
+fn pairs<C: Lane>(mut a: Prim, mut b: Prim, out: Storage, f: impl Fn(C, C) -> C) -> Prim {
+    let n = a.len();
+    let (mut ba, mut bb) = (Vec::new(), Vec::new());
+    if out == C::STORAGE && C::slice_mut(&mut a).is_some() {
+        for at in (0..n).step_by(TILE) {
+            let m = TILE.min(n - at);
+            let ys = tile(&b, at, m, &mut bb);
+            over(&mut C::slice_mut(&mut a).expect("checked")[at..at + m], ys, &f);
+        }
+        return a;
+    }
+    if out == C::STORAGE && C::slice_mut(&mut b).is_none() {
+        let mut v = Vec::with_capacity(n);
+        for at in (0..n).step_by(TILE) {
+            let m = TILE.min(n - at);
+            let (xs, ys) = (tile(&a, at, m, &mut ba), tile(&b, at, m, &mut bb));
+            v.extend(xs.iter().zip(ys).map(|(&x, &y)| f(x, y)));
+        }
+        return C::wrap(Arc::new(v));
+    }
+    let mut sink = Sink::new::<C>(Some(&mut b), out, n);
+    let mut cs = Vec::with_capacity(TILE.min(n));
+    for at in (0..n).step_by(TILE) {
+        let m = TILE.min(n - at);
+        cs.clear();
+        cs.extend_from_slice(tile(&a, at, m, &mut ba));
+        over(&mut cs, tile(&b, at, m, &mut bb), &f);
+        sink.put(Some(&mut b), at, &cs);
+    }
+    sink.done(Some(b))
+}
+
+/// `f` over a tile in place, as `over` is for `pairs`.
+#[inline(never)]
+fn over1<C: Lane>(xs: &mut [C], f: &impl Fn(C) -> C) {
+    xs.iter_mut().for_each(|x| *x = f(*x));
+}
+
+/// `f` on each element, computed and stored as `pairs` does.
+fn map<C: Lane>(mut a: Prim, out: Storage, f: impl Fn(C) -> C) -> Prim {
+    let n = a.len();
+    if out == C::STORAGE {
+        if let Some(xs) = C::slice_mut(&mut a) {
+            over1(xs, &f);
+            return a;
+        }
+        let (mut buf, mut v) = (Vec::new(), Vec::with_capacity(n));
+        for at in (0..n).step_by(TILE) {
+            let m = TILE.min(n - at);
+            v.extend(tile(&a, at, m, &mut buf).iter().map(|&x| f(x)));
+        }
+        return C::wrap(Arc::new(v));
+    }
+    let mut sink = Sink::new::<C>(None, out, n);
+    let (mut buf, mut cs) = (Vec::new(), Vec::with_capacity(TILE.min(n)));
+    for at in (0..n).step_by(TILE) {
+        let m = TILE.min(n - at);
+        cs.clear();
+        cs.extend_from_slice(tile(&a, at, m, &mut buf));
+        over1(&mut cs, &f);
+        sink.put(None, at, &cs);
+    }
+    sink.done(None)
+}
+
+/// the interval an op plans with for an operand: for a narrow leaf, the least and greatest of its
+/// values, found in a pass at its own width (a leaf with no rows plans as 0); for an `i64` leaf,
+/// all of `i64`, as a pass over it would cost about what the op does.
+fn span(p: &Prim) -> (i128, i128) {
+    if storage(p) == Storage::I64 {
+        return (i64::MIN as i128, i64::MAX as i128);
+    }
+    p.int_range().map_or((0, 0), |(lo, hi)| (lo as i128, hi as i128))
+}
+
+/// the storage of an integer leaf.
+fn storage(p: &Prim) -> Storage {
+    p.storage().expect("an integer leaf")
+}
+
+/// the narrowest storage holding an interval of results: `i64` when the interval passes it, as
+/// a result past `i64` wraps.
+fn plan((lo, hi): (i128, i128)) -> Storage {
+    if lo < i64::MIN as i128 || hi > i64::MAX as i128 {
+        Storage::I64
+    } else {
+        Storage::holding(lo as i64, hi as i64)
+    }
+}
+
+/// every value `x op y` can take for `x` and `y` in two intervals: the plan for the op's output.
+/// A divisor's interval holds 0 unless it is one constant (a storage's always does), and dividing
+/// by 0 gives 0 and leaves a remainder of `x`.
+fn arith_range(op: BinOp, (a0, a1): (i128, i128), (b0, b1): (i128, i128)) -> (i128, i128) {
+    match op {
+        BinOp::Add => (a0 + b0, a1 + b1),
+        BinOp::Sub => (a0 - b1, a1 - b0),
+        BinOp::Mul => {
+            let c = [a0 * b0, a0 * b1, a1 * b0, a1 * b1];
+            (c.into_iter().min().unwrap(), c.into_iter().max().unwrap())
+        }
+        // a constant divisor divides the ends; any other keeps a quotient within the dividend's
+        // magnitude, and its sign too unless the divisor can be negative
+        BinOp::Div if b0 == b1 && b0 != 0 => {
+            let (p, q) = (a0 / b0, a1 / b0);
+            (p.min(q), p.max(q))
+        }
+        BinOp::Div if b0 == b1 => (0, 0),
+        BinOp::Div if b0 < 0 => {
+            let m = a1.max(-a0);
+            (-m, m)
+        }
+        BinOp::Div => (a0.min(0), a1.max(0)),
+        // a remainder has the dividend's sign, and is smaller than a constant divisor
+        BinOp::Rem if b0 == b1 && b0 != 0 => {
+            let m = b0.abs() - 1;
+            (a0.max(-m).min(0), a1.min(m).max(0))
+        }
+        BinOp::Rem => (a0.min(0), a1.max(0)),
+    }
+}
+
+/// a binary op on two integer leaves, computed at the storage that holds both operands and every
+/// result, then stored at the result's own storage when that is narrower.
+fn int_bin(op: BinOp, a: Prim, b: Prim) -> Prim {
+    let (sa, sb) = (storage(&a), storage(&b));
+    // a sum, difference or product with an `i64` is planned at `i64` whatever the other holds,
+    // so the other isn't scanned
+    let wide = (sa == Storage::I64 || sb == Storage::I64) && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul);
+    let out = if wide { Storage::I64 } else { plan(arith_range(op, span(&a), span(&b))) };
+    let at = Storage::join(Storage::join(sa, sb), out);
+    match op {
+        BinOp::Add => at_storage!(at, C => pairs::<C>(a, b, out, C::add)),
+        BinOp::Sub => at_storage!(at, C => pairs::<C>(a, b, out, C::sub)),
+        BinOp::Mul => at_storage!(at, C => pairs::<C>(a, b, out, C::mul)),
+        BinOp::Div => at_storage!(wide at, C => pairs::<C>(a, b, out, C::div)),
+        BinOp::Rem => at_storage!(wide at, C => pairs::<C>(a, b, out, C::rem)),
+    }
+}
+
+/// `x op c` for an integer leaf and an integer constant, planned as `int_bin`. By a power of two,
+/// `div` and `rem` are shifts: a negative dividend is biased by `c - 1` first, so the quotient
+/// still rounds toward zero (and the remainder takes its sign).
+fn int_imm(op: BinOp, a: Prim, c: i64) -> Prim {
+    let sa = storage(&a);
+    let out = plan(arith_range(op, span(&a), (c as i128, c as i128)));
+    let at = Storage::join(Storage::join(sa, Storage::holding(c, c)), out);
+    let pow2 = c > 1 && c.count_ones() == 1;
+    match op {
+        BinOp::Div | BinOp::Rem if !pow2 => at_storage!(wide at, C => {
+            let k = C::of(c);
+            if op == BinOp::Div { map::<C>(a, out, move |x| x.div(k)) } else { map::<C>(a, out, move |x| x.rem(k)) }
+        }),
+        _ => at_storage!(at, C => {
+            let (k, m, s) = (C::of(c), C::of(c.wrapping_sub(1)), c.trailing_zeros());
+            match op {
+                BinOp::Div => map::<C>(a, out, move |x| x.add(x.sign().and(m)).shr(s)),
+                BinOp::Rem => map::<C>(a, out, move |x| x.sub(x.add(x.sign().and(m)).shr(s).shl(s))),
+                BinOp::Add => map::<C>(a, out, move |x| x.add(k)),
+                BinOp::Sub => map::<C>(a, out, move |x| x.sub(k)),
+                _ => map::<C>(a, out, move |x| x.mul(k)),
+            }
+        }),
+    }
 }
 
 /// `$apply(args.., body)` with the float lane body of `$op`, on total-order keys (decode, IEEE op,
@@ -179,30 +471,6 @@ macro_rules! float_body {
     };
 }
 
-/// `$apply(args.., body)` with the lane body of the bitwise op `$op` on two `i64`s.
-macro_rules! bit_body {
-    ($op:expr, $apply:ident($($arg:expr),*)) => {
-        match $op {
-            BitOp::AddB64 => $apply($($arg,)* |x: i64, y: i64| x.wrapping_add(y)),
-            BitOp::SubB64 => $apply($($arg,)* |x: i64, y: i64| x.wrapping_sub(y)),
-            BitOp::MulB64 => $apply($($arg,)* |x: i64, y: i64| x.wrapping_mul(y)),
-            BitOp::And => $apply($($arg,)* |x: i64, y: i64| x & y),
-            BitOp::Or => $apply($($arg,)* |x: i64, y: i64| x | y),
-            BitOp::Xor => $apply($($arg,)* |x: i64, y: i64| x ^ y),
-        }
-    };
-}
-
-/// the bitwise ops that keep two bytes a byte, as a byte lane body, or `None`.
-fn byte_bits(op: BitOp) -> Option<fn(u8, u8) -> u8> {
-    match op {
-        BitOp::And => Some(|x, y| x & y),
-        BitOp::Or => Some(|x, y| x | y),
-        BitOp::Xor => Some(|x, y| x ^ y),
-        _ => None,
-    }
-}
-
 /// the error for two leaves of different kinds.
 fn mixed(op: impl std::fmt::Debug, a: &Prim, b: &Prim) -> String {
     let kind = |p: &Prim| if p.is_int() { "Int" } else { "Float" };
@@ -213,97 +481,125 @@ fn mixed(op: impl std::fmt::Debug, a: &Prim, b: &Prim) -> String {
 fn bin_eval(op: BinOp, a: Prim, b: Prim) -> Result<Prim, String> {
     Ok(match (a, b) {
         (Prim::F64(x), Prim::F64(y)) => Prim::F64(float_body!(op, bin_into(x, y))),
-        (a, b) if a.is_int() && b.is_int() => int_body!(op, int_pairs(a, b)),
+        (a, b) if a.is_int() && b.is_int() => int_bin(op, a, b),
         (a, b) => return Err(mixed(op, &a, &b)),
     })
 }
 
 /// `x op c` for a constant `c` of `x`'s kind.
 fn imm_eval(op: BinOp, a: Prim, c: Scalar) -> Result<Prim, String> {
-    fn with<T: Copy>(f: impl Fn(T, T) -> T, c: T) -> impl Fn(T) -> T {
-        move |x| f(x, c)
-    }
-    fn int_imm(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
-        int_map(a, with(f, c))
-    }
-    fn float_imm(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
-        Prim::F64(map_into(a, with(f, k)))
-    }
     Ok(match (a, c) {
-        (Prim::F64(x), Scalar::Float(k)) => float_body!(op, float_imm(x, k)),
-        // by a power of two, `div` and `rem` are shifts: a negative dividend is biased by `c - 1`
-        // first, so the quotient still rounds toward zero (and the remainder takes its sign).
-        (a, Scalar::Int(c)) if a.is_int() && c > 1 && c.count_ones() == 1 && matches!(op, BinOp::Div | BinOp::Rem) => {
-            let k = c.trailing_zeros();
-            match op {
-                BinOp::Div => int_map(a, move |x| (x + ((x >> 63) & (c - 1))) >> k),
-                _ => int_map(a, move |x| x - (((x + ((x >> 63) & (c - 1))) >> k) << k)),
+        (Prim::F64(x), Scalar::Float(k)) => {
+            fn float_imm(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
+                Prim::F64(map_into(a, move |x| f(x, k)))
             }
+            float_body!(op, float_imm(x, k))
         }
-        (a, Scalar::Int(c)) if a.is_int() => int_body!(op, int_imm(a, c)),
+        (a, Scalar::Int(c)) if a.is_int() => int_imm(op, a, c),
         (a, c) => return Err(format!("{op:?}: {} with the constant {c:?}", if a.is_int() { "an Int" } else { "a Float" })),
     })
 }
 
-/// a bitwise op on two integer leaves. Two byte leaves `and`, `or` and `xor` to bytes.
+/// a bitwise op on two integer leaves. `and`, `or` and `xor` of two's complement integers stay
+/// within the storage that holds both operands, and are computed there; the `_b64` verbs are
+/// 64-bit words.
 fn bits_eval(op: BitOp, a: Prim, b: Prim) -> Result<Prim, String> {
     if !(a.is_int() && b.is_int()) {
         return Err(mixed(op, &a, &b));
     }
-    if let (Prim::U8(x), Prim::U8(y), Some(f)) = (&a, &b, byte_bits(op)) {
-        return Ok(Prim::U8(bin_into(x.clone(), y.clone(), f)));
-    }
-    Ok(bit_body!(op, int_pairs(a, b)))
+    Ok(match op {
+        BitOp::AddB64 => pairs::<i64>(a, b, Storage::I64, i64::add),
+        BitOp::SubB64 => pairs::<i64>(a, b, Storage::I64, i64::sub),
+        BitOp::MulB64 => pairs::<i64>(a, b, Storage::I64, i64::mul),
+        _ => {
+            let at = Storage::join(storage(&a), storage(&b));
+            at_storage!(at, C => match op {
+                BitOp::And => pairs::<C>(a, b, at, C::and),
+                BitOp::Or => pairs::<C>(a, b, at, C::or),
+                _ => pairs::<C>(a, b, at, C::xor),
+            })
+        }
+    })
 }
 
-/// `x op c`, bitwise, for an integer leaf. A byte leaf against a byte constant `and`s, `or`s and
-/// `xor`s to bytes (`c and 223`, the case fold of text).
+/// `x op c`, bitwise, for an integer leaf. Computed where `x` and `c` both fit; `x and c` for a
+/// `c` that is not negative is from 0 to `c`, and stored there (`c and 223`, the case fold of
+/// text, stays bytes; a hash `and 255` becomes bytes).
 fn bits_imm(op: BitOp, a: Prim, c: i64) -> Result<Prim, String> {
-    fn int_imm(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
-        int_map(a, move |x| f(x, c))
-    }
     if !a.is_int() {
         return Err(format!("{op:?}: a Float"));
     }
-    if let (Prim::U8(x), Some(f), 0..=255) = (&a, byte_bits(op), c) {
-        let c = c as u8;
-        return Ok(Prim::U8(map_into(x.clone(), move |x| f(x, c))));
-    }
-    Ok(bit_body!(op, int_imm(a, c)))
+    let sa = storage(&a);
+    let at = Storage::join(sa, Storage::holding(c, c));
+    let out = match op {
+        BitOp::And if c >= 0 => {
+            let (lo, hi) = span(&a);
+            Storage::holding(0, if lo >= 0 { c.min(hi as i64) } else { c })
+        }
+        _ => at,
+    };
+    Ok(match op {
+        BitOp::AddB64 => map::<i64>(a, Storage::I64, move |x| x.wrapping_add(c)),
+        BitOp::SubB64 => map::<i64>(a, Storage::I64, move |x| x.wrapping_sub(c)),
+        BitOp::MulB64 => map::<i64>(a, Storage::I64, move |x| x.wrapping_mul(c)),
+        _ => at_storage!(at, C => {
+            let k = C::of(c);
+            match op {
+                BitOp::And => map::<C>(a, out, move |x| x.and(k)),
+                BitOp::Or => map::<C>(a, out, move |x| x.or(k)),
+                _ => map::<C>(a, out, move |x| x.xor(k)),
+            }
+        }),
+    })
 }
 
-/// a shift by `k` of an integer leaf, the op matched once above the loop.
+/// a shift by `k` of an integer leaf, on its 64-bit word; a byte shifted right is a byte.
 fn shift_eval(op: ShiftOp, a: Prim, k: u32) -> Result<Prim, String> {
     if !a.is_int() {
         return Err(format!("{op:?}: a Float"));
     }
     Ok(match op {
-        ShiftOp::ShlB64 if k >= 64 => int_map(a, |_| 0),
-        ShiftOp::ShrB64 if k >= 64 => int_map(a, |_| 0),
-        ShiftOp::ShlB64 => int_map(a, move |x| ((x as u64) << k) as i64),
-        ShiftOp::ShrB64 => int_map(a, move |x| ((x as u64) >> k) as i64),
-        ShiftOp::RotlB64 => int_map(a, move |x| (x as u64).rotate_left(k % 64) as i64),
-        ShiftOp::RotrB64 => int_map(a, move |x| (x as u64).rotate_right(k % 64) as i64),
+        ShiftOp::ShrB64 if storage(&a) == Storage::U8 => map::<u8>(a, Storage::U8, move |x| x.checked_shr(k).unwrap_or(0)),
+        ShiftOp::ShlB64 if k >= 64 => map::<i64>(a, Storage::I64, |_| 0),
+        ShiftOp::ShrB64 if k >= 64 => map::<i64>(a, Storage::I64, |_| 0),
+        ShiftOp::ShlB64 => map::<i64>(a, Storage::I64, move |x| ((x as u64) << k) as i64),
+        ShiftOp::ShrB64 => map::<i64>(a, Storage::I64, move |x| ((x as u64) >> k) as i64),
+        ShiftOp::RotlB64 => map::<i64>(a, Storage::I64, move |x| (x as u64).rotate_left(k % 64) as i64),
+        ShiftOp::RotrB64 => map::<i64>(a, Storage::I64, move |x| (x as u64).rotate_right(k % 64) as i64),
     })
 }
 
-/// each row's reduction, reading the values at their storage (a byte leaf is not widened first).
+/// the storage a row's sum or prefix sum is planned at: the longest row's length times what the
+/// values' storage holds (a sum reads its values once, so a pass to find their least and greatest
+/// would double it).
+fn sum_storage(bounds: &crate::value::Bounds, s: Storage) -> Storage {
+    let n = (0..bounds.len()).map(|r| { let (a, b) = bounds.span(r); b - a }).max().unwrap_or(0) as i128;
+    let (lo, hi) = s.range();
+    plan((n * lo as i128, n * hi as i128))
+}
+
+/// each row's reduction, reading the values at their storage (a narrow leaf is not widened first).
 /// Sums and products wrap at the `i64` edge, as `add` and `mul` do. An empty row's sum is 0, its
-/// product 1, its minimum and maximum 0.
-fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: Red) -> Value {
+/// product 1, its minimum and maximum 0. A minimum or maximum is one of the values, and is held at
+/// their storage; a sum at the storage [`sum_storage`] plans.
+fn reduce_rows<T: Lane>(bounds: &crate::value::Bounds, xs: &[T], r: Red) -> Prim {
     let mut start = 0;
     let rows = bounds.ends().map(|end| {
         let row = &xs[start..end];
         start = end;
         row
     });
+    let int = |x: T| x.word() as i64;
     match r {
-        Red::Add => Value::i64(rows.map(|s| s.iter().fold(0i64, |a, &x| a.wrapping_add(x.into()))).collect()),
-        Red::Mul => Value::i64(rows.map(|s| s.iter().fold(1i64, |a, &x| a.wrapping_mul(x.into()))).collect()),
-        Red::Min => Value::i64(rows.map(|s| s.iter().map(|&x| x.into()).min().unwrap_or(0)).collect()),
-        Red::Max => Value::i64(rows.map(|s| s.iter().map(|&x| x.into()).max().unwrap_or(0)).collect()),
-        Red::All => Value::u8(rows.map(|s| s.iter().all(|&x| x.into() != 0) as u8).collect()),
-        Red::Any => Value::u8(rows.map(|s| s.iter().any(|&x| x.into() != 0) as u8).collect()),
+        Red::Add => {
+            let sums = rows.map(|s| s.iter().fold(0i64, |a, &x| a.wrapping_add(int(x)))).collect();
+            Prim::I64(Arc::new(sums)).to_storage(sum_storage(bounds, T::STORAGE))
+        }
+        Red::Mul => Prim::I64(Arc::new(rows.map(|s| s.iter().fold(1i64, |a, &x| a.wrapping_mul(int(x)))).collect())),
+        Red::Min => T::wrap(Arc::new(rows.map(|s| s.iter().copied().min().unwrap_or_default()).collect())),
+        Red::Max => T::wrap(Arc::new(rows.map(|s| s.iter().copied().max().unwrap_or_default()).collect())),
+        Red::All => Prim::U8(Arc::new(rows.map(|s| s.iter().all(|&x| int(x) != 0) as u8).collect())),
+        Red::Any => Prim::U8(Arc::new(rows.map(|s| s.iter().any(|&x| int(x) != 0) as u8).collect())),
     }
 }
 
@@ -327,7 +623,12 @@ impl ArithOp {
             ArithOp::Shift(op, k) => Value::Prim(shift_eval(*op, input.into_prim("shift")?, *k)?),
             ArithOp::Neg => Value::Prim(match input.into_prim("neg")? {
                 Prim::F64(v) => Prim::F64(map_into(v, |k| f64_key(-f64_of_key(k)))),
-                p => int_map(p, |x: i64| x.wrapping_neg()),
+                p => {
+                    let (lo, hi) = span(&p);
+                    let out = plan((-hi, -lo));
+                    let at = Storage::join(storage(&p), out);
+                    at_storage!(at, C => map::<C>(p, out, C::neg))
+                }
             }),
             ArithOp::ToFloat => {
                 let xs = input.as_i64("to_float")?;
@@ -335,14 +636,18 @@ impl ArithOp {
             }
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
-                match vals.into_prim("reduce values")? {
+                Value::Prim(match vals.into_prim("reduce values")? {
                     Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I8(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I16(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::I32(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::F64(_) => return Err("reduce: expected Int values, got Float".into()),
-                }
+                })
             }
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
+                let s = storage(&vals.clone().into_prim("scan values")?);
                 let mut xs = vals.into_i64("scan values")?; // owned -> inclusive prefix written in place
                 // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
                 // sequential within a row, so this is a single memory pass, not a vectorizable one.
@@ -368,7 +673,14 @@ impl ArithOp {
                     Red::All => prefix!(1i64, a, x => a & (x != 0) as i64), // running "all nonzero so far"
                     Red::Any => prefix!(0i64, a, x => a | (x != 0) as i64), // running "any nonzero so far"
                 }
-                let out = if matches!(r, Red::All | Red::Any) { Value::u8(xs.iter().map(|&x| x as u8).collect()) } else { Value::i64(xs) };
+                // a running minimum or maximum is one of the values; a prefix sum is planned as a sum
+                let out = match r {
+                    Red::All | Red::Any => Storage::U8,
+                    Red::Min | Red::Max => s,
+                    Red::Add => sum_storage(&bounds, s),
+                    Red::Mul => Storage::I64,
+                };
+                let out = Value::Prim(Prim::I64(Arc::new(xs)).to_storage(out));
                 Value::List(bounds, Box::new(out))
             }
         })
@@ -444,3 +756,6 @@ impl From<TextOp> for NumOp {
         NumOp::Text(t)
     }
 }
+
+#[cfg(test)]
+mod tests;

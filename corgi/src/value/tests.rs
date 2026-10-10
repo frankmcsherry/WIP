@@ -15,14 +15,75 @@ fn integers_are_equal_across_storages() {
     assert_eq!(h(&bytes), h(&wide));
     assert_ne!(Value::u8(vec![1]), Value::i64(vec![-255]));
     assert_ne!(Value::i64(vec![0]), Value::f64(vec![0.0]));
+    // the signed storages: the same values, at every storage that holds them
+    let all = [
+        Value::u8(vec![0, 7, 127]), Value::i8(vec![0, 7, 127]), Value::i16(vec![0, 7, 127]),
+        Value::i32(vec![0, 7, 127]), Value::i64(vec![0, 7, 127]),
+    ];
+    for a in &all {
+        for b in &all {
+            assert_eq!(a, b);
+            assert_eq!(h(a), h(b));
+        }
+    }
+    let neg = [Value::i8(vec![-1, -128]), Value::i16(vec![-1, -128]), Value::i32(vec![-1, -128]), Value::i64(vec![-1, -128])];
+    for a in &neg {
+        assert_eq!(a, &neg[3]);
+        assert_eq!(h(a), h(&neg[3]));
+    }
+    assert_ne!(Value::u8(vec![255]), Value::i8(vec![-1]));
 }
 
-/// Two integer leaves at different storages meet at `i64`; one storage meets as it is.
+/// A storage's keys order its values and fit its width, which the sort's packing relies on.
 #[test]
-fn meet_widens_bytes() {
+fn keys_order_and_fit_the_storage() {
+    fn check<T: Elem + Ord + Copy>(xs: &[T]) {
+        for &x in xs {
+            assert!(T::BITS == 64 || x.key() < 1 << T::BITS, "key past the width");
+            assert_eq!(T::from_key(x.key()), x);
+            for &y in xs {
+                assert_eq!(x.cmp(&y), x.key().cmp(&y.key()));
+            }
+        }
+    }
+    check(&[0u8, 1, 127, 128, 255]);
+    check(&[i8::MIN, -1, 0, 1, i8::MAX]);
+    check(&[i16::MIN, -1, 0, 1, i16::MAX]);
+    check(&[i32::MIN, -1, 0, 1, i32::MAX]);
+    check(&[i64::MIN, -1, 0, 1, i64::MAX]);
+    assert_eq!((-1i8).word(), u64::MAX, "a word is the sign-extended two's complement");
+    assert_eq!(255u8.word(), 255);
+}
+
+/// The narrowest storage that holds a range; two storages join at the narrowest holding both.
+#[test]
+fn storages_hold_and_join() {
+    use Storage::*;
+    assert_eq!(Storage::holding(0, 255), U8);
+    assert_eq!(Storage::holding(-1, 0), I8);
+    assert_eq!(Storage::holding(-1, 128), I16);
+    assert_eq!(Storage::holding(0, 1 << 20), I32);
+    assert_eq!(Storage::holding(i64::MIN, 0), I64);
+    assert_eq!(Storage::join(U8, I8), I16);
+    assert_eq!(Storage::join(U8, I16), I16);
+    assert_eq!(Storage::join(I8, I32), I32);
+    assert_eq!(Storage::join(U8, I64), I64);
+    for s in [U8, I8, I16, I32, I64] {
+        assert_eq!(Storage::join(s, s), s);
+        let (lo, hi) = s.range();
+        assert_eq!(Storage::holding(lo, hi), s);
+    }
+}
+
+/// Two integer leaves at different storages meet at the narrowest storage holding both; one
+/// storage meets as it is.
+#[test]
+fn meet_widens_to_the_join() {
     let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![1, 2])), Prim::I64(Arc::new(vec![-1, 3])));
     assert!(matches!((&a, &b), (Prim::I64(_), Prim::I64(_))));
     assert_eq!(a, Prim::I64(Arc::new(vec![1, 2])));
+    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![200])), Prim::I8(Arc::new(vec![-1])));
+    assert!(matches!((&a, &b), (Prim::I16(x), Prim::I16(y)) if x[0] == 200 && y[0] == -1));
     let xs = Arc::new(vec![5u8]);
     let (a, _) = Prim::meet(Prim::U8(xs.clone()), Prim::U8(Arc::new(vec![6])));
     assert!(matches!(a, Prim::U8(v) if Arc::ptr_eq(&v, &xs)), "one storage meets without a copy");

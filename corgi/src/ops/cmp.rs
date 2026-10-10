@@ -122,7 +122,7 @@ impl CmpOp {
                 };
                 // the runs the sort found, as it found them: each element's run, numbered densely
                 // over the whole column (a run never spans two rows)
-                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::i64(refined.into_iter().map(|r| r as i64).collect())])))
+                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::upto(refined.len(), refined.into_iter().map(|r| r as usize))])))
             }
 
             CmpOp::SortLimit(k) => {
@@ -161,7 +161,8 @@ impl CmpOp {
                 // Leaves: a search per needle (a walk for a dense row of needles in order; a
                 // branch-free binary search, sixteen needles at a time, otherwise). See `search`.
                 if let Some((lo_c, hi_c)) = find_leaf(&nb, &nvals, hb, hvals) {
-                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)]))));
+                    let h = hvals.len();
+                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::within(lo_c, h), Value::within(hi_c, h)]))));
                 }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
@@ -192,7 +193,9 @@ impl CmpOp {
                         hi_c.push((upper.0[k] - hs) as i64);
                     }
                 }
-                Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])))
+                // within a haystack row, so at most the haystack's elements
+                let h = hvals.len();
+                Value::List(nb, Box::new(Value::Prod(vec![Value::within(lo_c, h), Value::within(hi_c, h)])))
             }
         })
     }
@@ -212,14 +215,11 @@ enum Level {
 fn order_levels(v: &Value, out: &mut Vec<Level>) {
     match v {
         Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
-        Value::List(inner, _) => {
+        Value::List(inner, vals) => {
             // the elements by position, a row past its end reading zero (the least value of any
             // shape), then the length: a proper prefix ties its padded rows and comes first.
             out.push(Level::Elems(v.clone()));
-            out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
-                let (s, e) = inner.span(i);
-                (e - s) as i64
-            }).collect())));
+            out.push(Level::Col(Value::upto(vals.len(), (0..inner.len()).map(|i| { let (s, e) = inner.span(i); e - s }))));
         }
         other => out.push(Level::Col(other.clone())),
     }

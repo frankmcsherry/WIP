@@ -9,6 +9,7 @@ use crate::engine::{
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
+use crate::value::at_holding;
 use std::sync::Arc;
 
 /// overwrite `acc`'s rows at positions `active` (in order) with `new`'s rows — the scatter inverse of
@@ -472,11 +473,11 @@ impl<L: OpLike> Op<L> {
                 Value::List(nb.into(), Box::new(gather_lanes(&[Some(&av), Some(&bv)], &tags, &off)))
             }
 
-            // each row's length, read off the bounds in one pass (no per-element work).
+            // each row's length, read off the bounds in one pass (no per-element work), at the
+            // storage that holds the length of all the elements, which no row passes.
             Op::Len => {
-                let (rows, _vals) = input.rows_of("Len")?;
-                let lens = (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as i64 }).collect();
-                Value::i64(lens)
+                let (rows, vals) = input.rows_of("Len")?;
+                Value::upto(vals.len(), (0..rows.len()).map(|r| { let (s, e) = rows.span(r); e - s }))
             }
 
             // re-partition each row into k-wide sub-rows. Pure: the values never move — only the bounds
@@ -756,11 +757,12 @@ impl<L: OpLike> Op<L> {
                 // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
                 // payload (a partition); a referenced haystack takes the general path below.
                 if let (Value::List(ib, ivals), Value::Prim(p), Rows::Part(_)) = (&idx, hvals, hb) {
-                    if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::I64(_))) {
+                    if ib.len() == 1 && matches!(&**ivals, Value::Prim(q) if q.is_int()) {
                         // Raw Gather reads zero out of range, not an all-or-nothing error row: a
                         // clamped read and a select, no separate scan. This is the one path that
-                        // CONSUMES the indices — it rewrites that buffer into the result — so it is
-                        // also the only one that takes ownership.
+                        // CONSUMES the indices — it rewrites that buffer into the result (narrow
+                        // positions are widened into one first) — so it is also the only one that
+                        // takes ownership.
                         let p = p.clone();
                         let Value::List(ib, ivals) = idx else { unreachable!() };
                         let idxs = ivals.into_words("Gather indices")?;
@@ -780,45 +782,22 @@ impl<L: OpLike> Op<L> {
                 let (ib, ivals) = idx.into_list("GatherTry indices")?;
                 let (hb, hvals) = haystack.rows_of("GatherTry haystack")?;
                 assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
-                let idxs = ivals.as_words("GatherTry indices")?;
-                // the clean case first: one branch-free pass resolves every index and notes whether
-                // any is out of its row. Only when one is does the routing below run.
-                let mut pos = Vec::with_capacity(idxs.len());
-                let mut ok = true;
-                for r in 0..ib.len() {
-                    let (is, ie) = ib.span(r);
-                    let (hs, he) = hb.span(r);
-                    let rowlen = (he - hs) as u64;
-                    for &x in &idxs[is..ie] {
-                        ok &= x < rowlen;
-                        pos.push(hs.wrapping_add(x as usize));
+                // positions at any integer storage, read in place
+                let routed = match ivals.into_prim("GatherTry indices")? {
+                    Prim::U8(xs) => resolve_try(&ib, hb, &xs),
+                    Prim::I8(xs) => resolve_try(&ib, hb, &xs),
+                    Prim::I16(xs) => resolve_try(&ib, hb, &xs),
+                    Prim::I32(xs) => resolve_try(&ib, hb, &xs),
+                    Prim::I64(xs) => resolve_try(&ib, hb, &xs),
+                    Prim::F64(_) => return Err("GatherTry: positions are integers, not floats".into()),
+                };
+                let (tags, off, abs, missing) = match routed {
+                    Ok(pos) => {
+                        let found = Value::sum_tagged(Tags::Const(0, pos.len()), vec![gather(hvals, &pos), Value::Unit(0)]);
+                        return Ok(Value::List(ib, Box::new(found)));
                     }
-                }
-                if ok && !pos.is_empty() {
-                    let found = Value::sum_tagged(Tags::Const(0, pos.len()), vec![gather(hvals, &pos), Value::Unit(0)]);
-                    return Ok(Value::List(ib, Box::new(found)));
-                }
-                // one pass routes each index AND records its within-lane offset — the size its
-                // lane had when it arrived — so the assignment needs no second pass to derive.
-                let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
-                let mut abs = Vec::new(); // absolute haystack positions of the found elements (lane 0)
-                let mut missing = 0usize; // how many indices are out of their row (lane 1)
-                for r in 0..ib.len() {
-                    let (is, ie) = ib.span(r);
-                    let (hs, he) = hb.span(r);
-                    let rowlen = he - hs;
-                    for &x in &idxs[is..ie] {
-                        if (x as usize) < rowlen {
-                            tags.push(0u8);
-                            off.push(abs.len());
-                            abs.push(hs + x as usize);
-                        } else {
-                            tags.push(1u8);
-                            off.push(missing);
-                            missing += 1;
-                        }
-                    }
-                }
+                    Err(routed) => routed,
+                };
                 let lanes = vec![gather(hvals, &abs), Value::Unit(missing)];
                 let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
                 Value::List(ib, Box::new(sum))
@@ -845,9 +824,10 @@ impl<L: OpLike> Op<L> {
                     }
                     prev = e;
                 }
+                // within a top row, so at most the elements there are
                 let ranges = Value::List(
                     ob,
-                    Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])),
+                    Box::new(Value::Prod(vec![Value::within(lo_c, vals.len()), Value::within(hi_c, vals.len())])),
                 );
                 let flat = Value::List(new_ob.into(), Box::new(vals));
                 Value::Prod(vec![ranges, flat])
@@ -862,15 +842,21 @@ impl<L: OpLike> Op<L> {
 
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
+            // The values are at most the largest `n`, and are written at the storage that holds it.
             Op::Iota => {
                 let ns = input.as_i64("Iota")?;
+                let most = ns.iter().copied().max().unwrap_or(0).max(1) - 1;
+                let total = ns.iter().map(|&n| n.max(0) as usize).sum();
                 let mut bounds = Vec::with_capacity(ns.len());
-                let mut vals = Vec::new();
-                for &n in ns.iter() {
-                    vals.extend(0..n); // empty when n <= 0
-                    bounds.push(vals.len());
-                }
-                Value::List(bounds.into(), Box::new(Value::i64(vals)))
+                let vals = at_holding!(0, most, T => {
+                    let mut vals = Vec::with_capacity(total);
+                    for &n in ns.iter() {
+                        vals.extend((0..n).map(|x| x as T)); // empty when n <= 0
+                        bounds.push(vals.len());
+                    }
+                    vals
+                });
+                Value::List(bounds.into(), Box::new(Value::Prim(vals)))
             }
 
             // per row [lo, hi): iota with a start, empty when lo >= hi.
@@ -878,13 +864,22 @@ impl<L: OpLike> Op<L> {
                 let (lo, hi) = input.into_pair("Range")?;
                 let (lo, hi) = (lo.as_i64("Range lo")?, hi.as_i64("Range hi")?);
                 assert_eq!(lo.len(), hi.len(), "Range: lo/hi row count");
+                // the values are from the least start to the greatest end of the rows not empty,
+                // and are written at the storage that holds that
+                let rows = || lo.iter().zip(hi.iter()).filter(|(a, z)| a < z);
+                let least = rows().map(|(&a, _)| a).min().unwrap_or(0);
+                let most = rows().map(|(_, &z)| z - 1).max().unwrap_or(0);
+                let total = rows().map(|(&a, &z)| z.wrapping_sub(a) as usize).sum();
                 let mut bounds = Vec::with_capacity(lo.len());
-                let mut vals = Vec::new();
-                for (&a, &z) in lo.iter().zip(hi.iter()) {
-                    vals.extend(a..z.max(a));
-                    bounds.push(vals.len());
-                }
-                Value::List(bounds.into(), Box::new(Value::i64(vals)))
+                let vals = at_holding!(least, most, T => {
+                    let mut vals = Vec::with_capacity(total);
+                    for (&a, &z) in lo.iter().zip(hi.iter()) {
+                        vals.extend((a..z.max(a)).map(|x| x as T));
+                        bounds.push(vals.len());
+                    }
+                    vals
+                });
+                Value::List(bounds.into(), Box::new(Value::Prim(vals)))
             }
 
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
@@ -1000,3 +995,49 @@ fn chunk_kept(bounds: &Bounds, vals: &Value, k: usize) -> Value {
     gather(vals, &idx)
 }
 
+/// `GatherTry`'s positions (each read as its word, so a negative one is past every row) resolved
+/// against their haystack rows. The clean case first: one branch-free pass resolves every position
+/// and notes whether any is out of its row, giving the haystack positions. Only when one is does
+/// a second pass route each to its lane: the tags, each position's within-lane offset, the found
+/// positions and the count missing.
+#[allow(clippy::type_complexity)]
+fn resolve_try<T: crate::value::Elem>(ib: &Bounds, hb: Rows, xs: &[T]) -> Result<Vec<usize>, (Vec<u8>, Vec<usize>, Vec<usize>, usize)> {
+    let mut pos = Vec::with_capacity(xs.len());
+    let mut ok = true;
+    for r in 0..ib.len() {
+        let (is, ie) = ib.span(r);
+        let (hs, he) = hb.span(r);
+        let rowlen = (he - hs) as u64;
+        for &x in &xs[is..ie] {
+            let x = x.word();
+            ok &= x < rowlen;
+            pos.push(hs.wrapping_add(x as usize));
+        }
+    }
+    if ok && !pos.is_empty() {
+        return Ok(pos);
+    }
+    // one pass routes each position AND records its within-lane offset — the size its lane had
+    // when it arrived — so the assignment needs no second pass to derive.
+    let (mut tags, mut off) = (Vec::with_capacity(xs.len()), Vec::with_capacity(xs.len()));
+    let mut abs = Vec::new(); // absolute haystack positions of the found elements (lane 0)
+    let mut missing = 0usize; // how many positions are out of their row (lane 1)
+    for r in 0..ib.len() {
+        let (is, ie) = ib.span(r);
+        let (hs, he) = hb.span(r);
+        let rowlen = (he - hs) as u64;
+        for &x in &xs[is..ie] {
+            let x = x.word();
+            if x < rowlen {
+                tags.push(0u8);
+                off.push(abs.len());
+                abs.push(hs + x as usize);
+            } else {
+                tags.push(1u8);
+                off.push(missing);
+                missing += 1;
+            }
+        }
+    }
+    Err((tags, off, abs, missing))
+}
