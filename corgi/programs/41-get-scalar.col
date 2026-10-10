@@ -1,9 +1,8 @@
-# scalar point access — `get` fetches ONE element of a row's list by index (one O(1) lookup). The
-# total form `get` routes a hit to Found(element) and a miss to Oob(index), a committed Sum lane
-# rather than a panic (the ParseU64 discipline); `get` asserts in-bounds instead. `head` is just
-# `get 0`, so an empty list is Oob 0 and needs no separate non-emptiness proof. Here the haystack
-# is [0..n): index n-1 hits (Found n-1), index n is one past the end (Oob n).
+# scalar point access — `get` fetches ONE element of a row's list by index (one O(1) lookup). Plain
+# `get` is lossy: an index outside the row reads the zero of the element's shape. `try_get` checks
+# instead: a hit goes to lane 0 with its element, a miss to lane 1 as `()`. `head` is `get 0`. Here
+# the haystack is [0..n): index n-1 hits, and index n is one past the end.
 # n = 5
-# = Sum tags=[1] [([], []), ()x1]
+# = ([4], [0], Sum tags=[0] [[4], ()x0], Sum tags=[1] [[], ()x1])
 let hay = input iota in
-(((input, 1) sub, hay) get, (input, hay) get)
+(((input, 1) sub, hay) get, (input, hay) get, ((input, 1) sub, hay) try_get, (input, hay) try_get)

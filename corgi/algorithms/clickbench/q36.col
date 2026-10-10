@@ -11,4 +11,3 @@ let views = (counter, (date, (dont, (refresh, key) zip) zip) zip) zip
           (((x, 0) eq, (r, 0) eq) min, (k len, 0) gt) min) min, (k, 1))) filter in
 let ranked = views group map ((k, ones) -> (ones len neg, k)) sort_limit 10 in
 ranked map ((d, k) -> (k, d neg))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> ("", z))))

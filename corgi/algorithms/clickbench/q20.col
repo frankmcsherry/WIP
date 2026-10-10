@@ -4,7 +4,7 @@
 # output: u
 # corgi has no substring search: a string contains "google" when, split at "e" (its last byte, which
 # occurs once in it), some piece other than the last ends with "googl" (its last bytes read with
-# gather_try, since a piece may be shorter).
+# gather, which reads 0 past the end of a shorter piece).
 input map (u ->
     let pieces = u split "e" in
     let n = pieces len in
@@ -12,7 +12,6 @@ input map (u ->
         let m = p len in
         let long = (m, 5) ge in
         let lo = (long, (m, 5) sub, 0) select in
-        let tail = ((lo, (lo, 5) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))) in
+        let tail = ((lo, (lo, 5) add) range, p) gather in
         (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) min) in
     (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1) add, n) lt, e) min) fold_any) fold_add
-    try match (0 (n -> n), 1 (_ -> 0))

@@ -6,7 +6,7 @@
 # Approximated: three columns stand for SELECT * (the bench exports only the columns queries read).
 # corgi has no substring search: a string contains "google" when, split at "e" (its last byte, which
 # occurs once in it), some piece other than the last ends with "googl" (its last bytes read with
-# gather_try, since a piece may be shorter).
+# gather, which reads 0 past the end of a shorter piece).
 let (time, watch, url) = input in
 let google = url map (u ->
     let pieces = u split "e" in
@@ -15,9 +15,8 @@ let google = url map (u ->
         let m = p len in
         let long = (m, 5) ge in
         let lo = (long, (m, 5) sub, 0) select in
-        let tail = ((lo, (lo, 5) add) range, p) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))) in
+        let tail = ((lo, (lo, 5) add) range, p) gather in
         (long, (tail, "googl") zip map ((a, c) -> (a, c) eq) fold_all) min) in
     (n, (n iota, ends) zip) cap_list map ((n, (i, e)) -> (((i, 1) add, n) lt, e) min) fold_any) in
 let sorted = (google, (time, (watch, url) zip) zip) zip map ((g, (t, (w, u))) -> (g, (t, w, u))) filter sort_limit 10 in
 sorted map ((t, w, u) -> (t, w, u))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, ""))))

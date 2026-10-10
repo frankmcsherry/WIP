@@ -18,4 +18,3 @@ rows group map (((f, s), vs) ->
     let sq = vs map ((q, _, _, _) -> q) fold_add in
     (f enlist, s enlist, sq, vs map ((_, p, _, _) -> p) fold_add, vs map ((_, _, dp, _) -> dp) fold_add,
         vs map ((_, _, _, c) -> c) fold_add, (sq to_float, n to_float) div, n))
-    try match (0 (r -> r), 1 (_ -> 0 iota map (z -> ("", "", z, z, z, z, 0.0, z))))

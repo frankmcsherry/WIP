@@ -7,4 +7,4 @@ let counts = (starts, s) zip cut map (r -> r len) in
 let top = counts fold_max in
 # Runs come out in value order, so the first run with the top count is the smallest value.
 let winners = (top, (values, counts) zip) cap_list map ((top, (v, c)) -> ((c, top) eq, v)) filter in
-winners head try match (0 (v -> v), 1 (_ -> 0))
+winners head

@@ -10,4 +10,3 @@ let ranked = (region, (adv, (width, user) zip) zip) zip group map ((r, vs) ->
      (vs map ((_, (w, _)) -> w) fold_add to_float, n to_float) div,
      vs map ((_, (_, u)) -> u) dedup len)) sort_limit 10 in
 ranked map ((_, r, a, c, w, u) -> (r, a, c, w, u))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, z, 0.0, z))))

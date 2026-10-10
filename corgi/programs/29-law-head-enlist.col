@@ -3,7 +3,7 @@
 # And as a bonus of the structural order, `sort head` is the minimum of each row's list for ANY
 # element shape; the second conjunct checks it against the known minimum (0) of each iota row.
 # n = 8
-# = Sum tags=[0] [[1], ()x0]
+# = [1]
 let xs = input iota in
 let retract = (xs map (x -> x enlist head), xs) eq in
 let minima = (xs map (x -> (x, 1) add iota) map (r -> r sort head), xs map (x -> 0)) eq in

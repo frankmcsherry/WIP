@@ -1,7 +1,6 @@
-# zip: the TOTAL Zip. Per SEQ row, two inner lists of equal length zip into Ok (a List<(X,Y)>);
-# a length-mismatched row lands in Err carrying its two inner lists. Here element e gives lhs [0..e)
-# and rhs [0..e+(e&1)) — so even e zips (Ok) and odd e mismatches (Err). The clean `zip` needs the
-# size pass to prove the inner bounds agree; zip handles ragged pairs with no proof.
+# zip and try_zip. Plain `zip` keeps the shorter list's length; `try_zip` puts a row whose lists
+# differ in length in lane 1 as `()`, and zips the others in lane 0. Here element e gives lhs [0..e)
+# and rhs [0..e+(e&1)) — so even e zips (lane 0) and odd e mismatches (lane 1).
 # n = 4
-# = Sum tags=[1] [List ends=[] <List ends=[] <([], [])>>, ()x1]
-input iota map (x -> (x iota, (x, x and 1) add iota) zip)
+# = List ends=[4] <(List ends=[0, 1, 3, 6] <([0, 0, 1, 0, 1, 2], [0, 0, 1, 0, 1, 2])>, Sum tags=[0, 1, 0, 1] [List ends=[0, 2] <([0, 1], [0, 1])>, ()x2])>
+input iota map (x -> let pair = (x iota, (x, x and 1) add iota) in (pair zip, pair try_zip))

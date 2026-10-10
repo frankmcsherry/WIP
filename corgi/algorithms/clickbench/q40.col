@@ -12,4 +12,4 @@ let views = (counter, (date, (refresh, (source, (refhash, urlhash) zip) zip) zip
          ((h, d), 1))) filter in
 let ranked = views group map (((h, d), ones) -> (ones len neg, h, d)) sort_limit 110 in
 ((100, (ranked len, 110) min) range, ranked) gather
-    try match (0 (top -> top map ((x, h, d) -> (h, d, x neg))), 1 (_ -> 0 iota map (z -> (z, z, z))))
+    map ((x, h, d) -> (h, d, x neg))

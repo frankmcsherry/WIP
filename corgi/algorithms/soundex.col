@@ -14,7 +14,8 @@ let steps = (0, (w, codes) zip) foldscan ((last, (c, d)) ->
     ((hw, last, d) select, (keep, d))) in
 # The first letter is written as itself, so its digit is dropped (but it still counts as last).
 let kept = (w len iota, steps.1) zip map ((i, (keep, d)) -> (((i, 0) gt, keep) min, d)) filter in
-let first = (0, w) get in
+# An empty word has no first letter, and writes '0' in its place.
+let first = (0, w) try_get match (0 (c -> c), 1 (_ -> 48)) in
 let upper = ((first, 97) ge, (first, 32) sub, first) select enlist in
 let padded = ((upper, kept) append, "000") append in
-((0, 4) range, padded) gather try match (0 (code -> code), 1 (_ -> "0000"))
+((0, 4) range, padded) gather

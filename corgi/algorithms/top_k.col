@@ -5,4 +5,4 @@
 let sorted = input sort in
 let n = sorted len in
 let picks = (n, (0, (n, 3) min) range) cap_list map ((n, k) -> ((n, 1) sub, k) sub) in
-(picks, sorted) gather try match (0 (top -> top), 1 (_ -> 0 iota))
+(picks, sorted) gather

@@ -6,10 +6,10 @@
 //! spellings of a capture — by value and by reference — agree, and that references stay references
 //! (over one arena) through the ops that move rows.
 
-use corgi::{eval_graph, lower_effects, parse_ml, shape_of_value, show, Value};
+use corgi::{eval_graph, parse_ml, shape_of_value, show, Value};
 
 fn run(src: &str, input: Value) -> Value {
-    let g = lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("parse {src:?}: {e}")));
+    let g = parse_ml(src).unwrap_or_else(|e| panic!("parse {src:?}: {e}"));
     eval_graph(&g, input)
 }
 
@@ -188,7 +188,7 @@ fn cap_list_of_a_referenced_list_agrees_with_the_copy() {
     );
     assert_eq!(by_ref, by_value);
     assert_eq!(show(&by_ref), show(&via_gather));
-    assert_eq!(show(&by_ref), "Sum tags=[0] [List ends=[6] <[0, 0, 1, 1, 2, 2]>, ()x0]");
+    assert_eq!(show(&by_ref), "List ends=[6] <[0, 0, 1, 1, 2, 2]>");
 }
 
 /// `ref` of a product references its list fields, so `Field` is ordinary projection and a list
@@ -211,7 +211,7 @@ fn field_of_a_referenced_product() {
         seed(6),
     );
     assert_eq!(by_ref, by_value);
-    assert_eq!(show(&by_ref), "Sum tags=[0] [List ends=[6] <[0, 0, 1, 1, 2, 2]>, ()x0]");
+    assert_eq!(show(&by_ref), "List ends=[6] <[0, 0, 1, 1, 2, 2]>");
 }
 
 /// a Box where a list is required is the shape error "clone first", not a silent copy.
@@ -251,7 +251,7 @@ fn wco_step_searches_through_references() {
     // [10,20); 25 -> (5,6), 29 -> (9,10); 30 -> (0,1), 99 -> (10,10) (absent) in [30,40)
     assert_eq!(
         show(&a),
-        "Sum tags=[0, 0, 0, 0] [List ends=[2, 4, 6, 8] <([3, 9, 0, 5, 5, 9, 0, 10], [4, 10, 1, 6, 6, 10, 1, 10])>, ()x0]"
+        "List ends=[2, 4, 6, 8] <([3, 9, 0, 5, 5, 9, 0, 10], [4, 10, 1, 6, 6, 10, 1, 10])>"
     );
 }
 

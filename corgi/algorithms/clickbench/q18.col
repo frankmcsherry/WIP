@@ -8,4 +8,3 @@ let (user, time, phrase) = input in
 let ranked = (user, (time, phrase) zip) zip map ((u, (t, s)) -> ((u, ((t, 60) div, 60) rem, s), 1)) group
     map (((u, m, s), ones) -> (ones len neg, u, m, s)) sort_limit 10 in
 ranked map ((d, u, m, s) -> (u, m, s, d neg))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, "", z))))

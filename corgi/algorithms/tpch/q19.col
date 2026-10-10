@@ -34,4 +34,3 @@ let group = (at map ((lo, _) -> lo), parts) gather map ((_, g) -> g) in
     let in2 = ((g, 2) eq, ((q, 10) ge, (q, 20) le) min) min in
     let in3 = ((g, 3) eq, ((q, 20) ge, (q, 30) le) min) min in
     (((in1, in2) max, in3) max, r) mul) fold_add
-    try match (0 (x -> x), 1 (_ -> 0))

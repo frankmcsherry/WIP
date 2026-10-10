@@ -8,4 +8,3 @@
 let (user, phrase) = input in
 let groups = (user, phrase) zip map ((u, s) -> ((u, s), 1)) group map (((u, s), ones) -> (u, s, ones len)) in
 ((0, (groups len, 10) min) range, groups) gather
-    try match (0 (top -> top map ((u, s, c) -> (u, s, c))), 1 (_ -> 0 iota map (z -> (z, "", z))))

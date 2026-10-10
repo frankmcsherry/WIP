@@ -9,4 +9,4 @@ let (_, ds) = (x, 19 iota) foldscan ((v, k) ->
 let digits = ds filter in
 let n = digits len in
 let back = (n, n iota) cap_list map ((n, i) -> ((n, 1) sub, i) sub) in
-(back, digits) gather try match (0 (s -> s), 1 (_ -> ""))
+(back, digits) gather

@@ -16,4 +16,4 @@ let last = ((s2, 0, row0), s1) fold (((s2, i, prev), c) ->
         (v, v)) in
     (s2, i1, (i1 enlist, row.1) append)) in
 let (s2, _, row) = last in
-(s2 len, row) get try match (0 (d -> d), 1 (_ -> 0))
+(s2 len, row) get

@@ -10,4 +10,3 @@ let found = (wanted map ((_, p) -> p), s) find in
 (wanted, found) zip map (((x, p), (lo, hi)) ->
     let copies = (hi, lo) sub in
     ((p, x) eq, (copies, 2) ge, (copies, 1) ge) select) fold_any
-    try match (0 (r -> r), 1 (_ -> 0))

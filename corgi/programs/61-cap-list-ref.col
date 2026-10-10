@@ -3,7 +3,7 @@
 # copies nothing; the body's `get` reads through the reference. Without the `ref`, `cap_list` copies the
 # list into every element (same answer, `elements x length` cost) — the choice is in the program.
 # n = 6
-# = Sum tags=[0] [(List ends=[6] <[0, 0, 1, 1, 2, 2]>, List ends=[6] <[0, 0, 1, 1, 2, 2]>), ()x0]
+# = (List ends=[6] <[0, 0, 1, 1, 2, 2]>, List ends=[6] <[0, 0, 1, 1, 2, 2]>)
 let xs = input iota in
 let ys = xs map (y -> (y, 2) div) in
 let by_ref = (xs ref, ys) cap_list map ((c, y) -> (y, c) get) in

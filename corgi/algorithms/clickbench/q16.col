@@ -7,4 +7,3 @@ let (user, phrase) = input in
 let ranked = (user, phrase) zip map ((u, s) -> ((u, s), 1)) group
     map (((u, s), ones) -> (ones len neg, u, s)) sort_limit 10 in
 ranked map ((d, u, s) -> (u, s, d neg))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, "", z))))

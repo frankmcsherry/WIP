@@ -5,4 +5,3 @@
 let (region, user) = input in
 let ranked = (region, user) zip group map ((r, us) -> (us dedup len neg, r)) sort_limit 10 in
 ranked map ((d, r) -> (r, d neg))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z))))

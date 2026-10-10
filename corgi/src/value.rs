@@ -132,9 +132,14 @@ impl Bounds {
             Bounds::Offsets(_) => None,
         }
     }
-    /// iterate the per-row end offsets (materialized for `Stride`).
+    /// iterate the per-row end offsets (materialized for `Stride`). One iterator type for both
+    /// forms, with the form decided once rather than per row: the offsets, or the stride's multiples.
     pub(crate) fn ends(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.len()).map(move |i| self.end(i))
+        let (offsets, k, rows): (&[usize], usize, usize) = match self {
+            Bounds::Offsets(v) => (v, 0, 0),
+            Bounds::Stride(k, rows) => (&[], *k, *rows),
+        };
+        offsets.iter().copied().chain((1..=rows).map(move |i| i * k))
     }
     /// materialize the general end-offset form — for ops not yet stride-aware, and for eq/show.
     pub fn to_vec(&self) -> Vec<usize> {
@@ -160,18 +165,6 @@ impl Bounds {
         }
         let k = last / n;
         ends.iter().enumerate().all(|(i, &e)| e == (i + 1) * k).then_some(k)
-    }
-
-    /// recover the uniform `Stride` form if this partition happens to be uniform. `From<Vec<usize>>`
-    /// is this check applied at construction; this is it applied to a partition already in hand, so
-    /// a caller that must rebuild a `Bounds` does not have to unwrap and re-wrap the buffer.
-    pub(crate) fn compact(self) -> Bounds {
-        if let Bounds::Offsets(v) = &self {
-            if let Some(k) = Bounds::uniform(v) {
-                return Bounds::Stride(k, v.len());
-            }
-        }
-        self
     }
 }
 
@@ -841,30 +834,6 @@ impl Prim {
             let idx: Vec<usize> = idx.into_iter().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).collect();
             self.gather_or_zero(&idx)
         }
-    }
-
-    /// Validate one row of positions and gather it. Exact identity indices reuse the haystack
-    /// leaf; an `i64` haystack otherwise validates and rewrites the owned index buffer in one
-    /// pass, while other storages keep an all-or-nothing validation pass.
-    pub(crate) fn gather_words_checked_owned(&self, mut idx: Vec<u64>, rowlen: usize) -> Option<Prim> {
-        // A List invariant guarantees the flattened one-row leaf has exactly `rowlen`
-        // elements. Identity reuse and checked indexing both rely on that correspondence.
-        debug_assert_eq!(self.len(), rowlen, "gather: bounds/leaf length mismatch");
-        let identity = idx.len() == rowlen
-            && (rowlen == 0 || (idx[0] == 0 && idx.iter().enumerate().all(|(i, &x)| x == i as u64)));
-        if identity {
-            return Some(self.clone());
-        }
-        if let Prim::I64(v) = self {
-            for x in idx.iter_mut() {
-                if *x >= rowlen as u64 {
-                    return None;
-                }
-                *x = v[*x as usize] as u64;
-            }
-            return Some(Prim::I64(Arc::new(i64s_of_words(idx))));
-        }
-        (!idx.iter().any(|&x| x >= rowlen as u64)).then(|| self.gather_words_owned(idx))
     }
 
     fn show(&self) -> String {

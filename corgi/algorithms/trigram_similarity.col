@@ -15,4 +15,4 @@ let g2 = (((0, (n2, 2) sub) range, p2) gather, (((1, (n2, 1) sub) range, p2) gat
 # Shared grams: those of the first set found in the second.
 let shared = (g1, g2) find map ((lo, hi) -> (hi, lo) gt) fold_add in
 let either = ((g1 len, g2 len) add, shared) sub in
-(shared to_float, either to_float) div try match (0 (x -> x), 1 (_ -> 0.0))
+(shared to_float, either to_float) div

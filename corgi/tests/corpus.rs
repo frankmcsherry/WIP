@@ -1,8 +1,7 @@
 //! The example corpus: `programs/*.col` files, each a self-contained `ml` program that GENERATES
 //! its own data with `iota` (seeded only by a size). A `# n = …` header gives the seed and `# =`
 //! the expected `show` output; everything else is the program. This test runs each and golden-checks
-//! it: a failure no `try` takes up shows in the output as the `Sum{T | Unit}` a trailing `try` would
-//! reveal.
+//! it.
 //! Re-bless the goldens after an intended change with `CORGI_BLESS=1 cargo test --test corpus`.
 
 use corgi::{show, Program, Shape, Value};
@@ -55,7 +54,6 @@ fn corpus_matches_goldens() {
         let text = std::fs::read_to_string(&path).unwrap();
         let (n, expected, prog) = parse_col(&text);
         let p = Program::compile_ml(&prog).unwrap_or_else(|e| panic!("{who}: parse: {e}"));
-        // the lowered program is well-typed in the pure vocabulary — the typer covers effects.
         p.shape(&Shape::Int).unwrap_or_else(|e| panic!("{who}: shape: {e}"));
         let got = show(&p.run(Value::i64(vec![n as i64])));
         if bless {

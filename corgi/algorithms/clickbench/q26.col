@@ -5,4 +5,3 @@
 let (time, phrase) = input in
 let sorted = (time, phrase) zip map ((t, s) -> ((s len, 0) gt, (t, s))) filter sort_limit 10 in
 sorted map ((_, s) -> s)
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> "")))

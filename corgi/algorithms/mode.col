@@ -6,4 +6,4 @@ let counts = xs map (x -> (x, 1)) group map ((v, ones) -> (v, ones fold_add)) in
 let top = counts map ((_, c) -> c) fold_max in
 # Groups come out in value order, so the first group with the top count is the smallest value.
 let winners = (top, counts) cap_list map ((top, (v, c)) -> ((c, top) eq, v)) filter in
-winners head try match (0 (v -> v), 1 (_ -> 0))
+winners head

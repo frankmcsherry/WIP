@@ -23,7 +23,7 @@ pub(crate) fn str_value(bytes: Vec<u8>) -> Value {
 /// (`branch` also takes one but is parsed specially: its count may be an enum name; `and` takes
 /// one optionally: `x and 255` masks by a constant, `(x, y) and` is the pair form.)
 pub(crate) fn takes_num(name: &str) -> bool {
-    matches!(name, "shl_b64" | "shr_b64" | "rotl_b64" | "rotr_b64" | "chunk" | "sort_limit")
+    matches!(name, "shl_b64" | "shr_b64" | "rotl_b64" | "rotr_b64" | "chunk" | "try_chunk" | "sort_limit")
 }
 
 /// the spellings the integer change retired, each pointed at what replaces it: a typed op such as
@@ -43,6 +43,8 @@ pub(crate) fn retired(name: &str) -> Option<String> {
         "signed" => "'signed' is retired: integers are signed values already".into(),
         "to_f32" | "to_f64" => format!("'{name}' is retired: use to_float"),
         "parse_u64" => "'parse_u64' is retired: use parse_int".into(),
+        "gather_try" => "'gather_try' is retired: `gather` reads the zero of the element's shape past a row, and `try_get` checks one position".into(),
+        "try" => "'try' is retired: the plain ops are lossy, and each checked op is its own word (try_get, try_gather, try_zip, try_chunk) returning Sum{T | ()}".into(),
         // two right shifts that agree on non-negative integers and differ on negative ones made a
         // wrong answer easy to write; the word shift and division are each spelled for what they are
         "shr" => "'shr' is retired: `shr_b64 k` shifts the 64-bit word (zeros in from the top), and `(x, 2^k) div` divides (toward zero)".into(),
@@ -57,11 +59,11 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
     let k = || -> Result<u32, String> { n().map(|k| k.min(u32::MAX as u64) as u32) };
     Ok(match name {
         "transpose" => Op::Transpose.into(),
-        // One name per fallible method — each is its checked `Try*` form (a row the lossy kernel
-        // would read zeros for, truncate or cut short lands in Err); `effect::lower_effects` threads
-        // the Err lane past the ops downstream, and `try` marks where the program takes it up as
-        // data. The lossy kernels (`Op::Gather`, `Op::Zip`, ..) stay host-only.
-        "zip" => Op::TryZip.into(),      // per row: inner lengths agree, else Err
+        // The ops that can lose something are lossy under their plain names: `zip` keeps the shorter
+        // list's length, `gather`/`get` read the zero of the element's shape past a row, `chunk` drops
+        // a short last piece. Each has a checked form, `try_zip` and so on, built in ml.rs
+        // (`try_word`): a `Sum{T | ()}` whose lane 1 holds the rows that would have lost something.
+        "zip" => Op::Zip.into(),         // per row: as long as the shorter list
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
         // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
         // iso-inverses (Zip pairs any two columns; `slices` materializes any ranges, incl. Find's),
@@ -83,19 +85,17 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cut" => Op::Cut.into(),              // [(mask, x)] -> [[x]]: a piece starts at each marked x
         "find" => CmpOp::Find.into(),
         // point access — `gather` (per row, positions of any shape into that row's list, each integer
-        // leaf replaced by its element) errs per ROW. `get` is the same op on one position per row;
-        // `head` (= get 0) and `slices` (= map(range); gather) are built in ml.rs. `gather_try` is the
-        // DISTINCT per-element gather (`List<Sum{Found | Missing}>`), each element's miss as data.
-        "gather" => Op::TryGather.into(),     // per row all-or-nothing over its positions
-        "get" => Op::TryGather.into(),        // gather on one position per row: (i, list) -> list[i]
+        // leaf replaced by its element; a position past the row reads the zero of its shape). `get`
+        // is the same op on one position per row; `head` (= get 0) and `slices` (= map(range);
+        // gather) are built in ml.rs.
+        "gather" => Op::Gather.into(),
+        "get" => Op::Gather.into(),           // gather on one position per row: (i, list) -> list[i]
         "range" => Op::Range.into(),          // (lo, hi) -> [lo, hi), empty when lo >= hi
-        "gather_try" => Op::GatherTry.into(), // DISTINCT per-element gather: List<Sum{Found | Missing}>
-        "try" => Op::Try.into(), // handle a fallible stage here: its Fail<T> = Sum{T | Unit} is now data to match
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
         "append" => Op::Append.into(), // (List<X>, List<X>) -> List<X>  row-wise concat (the list-monoid ⊕)
         "len" => Op::Len.into(),       // List<X> -> Int  per-row element count, read off the bounds
-        "chunk" => Op::TryChunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records; a row must divide by k
+        "chunk" => Op::Chunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records; a short last piece is dropped
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})
         "iota" => Op::Iota.into(),
         "unwrap" => Op::Unwrap.into(),

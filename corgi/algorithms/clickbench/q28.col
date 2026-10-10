@@ -12,10 +12,10 @@
 let refs = input map (r -> ((r len, 0) gt, r)) filter in
 let keyed = refs map (r ->
     let n = r len in
-    let http = (((0, (0, 7) add) range, r) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))), "http://") zip map ((a, c) -> (a, c) eq) fold_all in
-    let https = (((0, (0, 8) add) range, r) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))), "https://") zip map ((a, c) -> (a, c) eq) fold_all in
+    let http = (((0, (0, 7) add) range, r) gather, "http://") zip map ((a, c) -> (a, c) eq) fold_all in
+    let https = (((0, (0, 8) add) range, r) gather, "https://") zip map ((a, c) -> (a, c) eq) fold_all in
     let at = (https, 8, (http, 7, 0) select) select in
-    let www = (((at, (at, 4) add) range, r) gather_try map (b -> b match (0 (x -> x), 1 (_ -> 0))), "www.") zip map ((a, c) -> (a, c) eq) fold_all in
+    let www = (((at, (at, 4) add) range, r) gather, "www.") zip map ((a, c) -> (a, c) eq) fold_all in
     let slashes = (n iota, r) zip map ((i, c) -> ((c, 47) eq, i)) filter in
     let newlines = (n iota, r) zip map ((i, c) -> ((c, 10) eq, i)) filter in
     # the first '/' at or after a position: the least slash not before it (the largest Int if none)
@@ -37,4 +37,3 @@ let ranked = keyed group
         ((c, 1000) gt, (k, (rs map (r -> r len) fold_add to_float, c to_float) div, c, rs sort head))) filter
     map ((k, l, c, m) -> (l neg, k, l, c, m)) sort_limit 25 in
 ranked map ((_, k, l, c, m) -> (k, l, c, m))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> ("", 0.0, z, ""))))

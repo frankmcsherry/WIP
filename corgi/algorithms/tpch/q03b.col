@@ -20,4 +20,3 @@ let ranges = (orders map ((k, _, _) -> k), lines map ((k, _) -> k)) find in
 let revs = (ranges, lines map ((_, r) -> r)) slices map (rs -> rs fold_add) in
 let per = (orders, revs) zip map (((k, dt, pr), r) -> ((r, 0) gt, (r neg, dt, k, pr, r))) filter sort_limit 10 in
 per map ((_, dt, k, pr, r) -> (k, r, dt, pr))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, z, z))))

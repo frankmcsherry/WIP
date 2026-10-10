@@ -15,8 +15,8 @@ let totals_ok = (opens fold_max, closes fold_max) eq in
 let level = ((opens, closes) zip, closer) zip map (((o, c), k) -> ((o, c) sub, k) add) in
 let kind = bs map (c -> ((c, 91) ge, (c, 123) ge) add) in
 let items = ((level, bs len iota) zip, (closer, kind) zip) zip sort in
-let kinds_ok = items chunk 2 map (pair ->
+# A row with an odd number of brackets cannot pair up; `try_chunk` sets it aside unread.
+let kinds_ok = items try_chunk 2 match (0 (pairs -> pairs map (pair ->
     let ((_, (c0, k0)), (_, (c1, k1))) = ((0, pair) get, (1, pair) get) in
-    (((c0, 0) eq, (c1, 1) eq) min, (k0, k1) eq) min) fold_all
-    try match (0 (k -> k), 1 (_ -> 0)) in
-((prefix_ok, totals_ok) min, kinds_ok) min try match (0 (r -> r), 1 (_ -> 0))
+    (((c0, 0) eq, (c1, 1) eq) min, (k0, k1) eq) min) fold_all), 1 (_ -> 0)) in
+((prefix_ok, totals_ok) min, kinds_ok) min

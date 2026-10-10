@@ -200,8 +200,8 @@ mod generators {
     }
 
     impl IndexPlan {
-        /// as [`IndexPlan::fill`], with a position outside its row reading the zero of the element's
-        /// shape (see [`gather_or_zero`]).
+        /// the index value with each leaf replaced by the haystack elements its positions name, a
+        /// position outside its row reading the zero of the element's shape (see [`gather_or_zero`]).
         pub(crate) fn fill_or_zero(self, hvals: &Value) -> Result<Value, String> {
             Ok(match self {
                 IndexPlan::Leaf(pos) => gather_or_zero(hvals, &pos)?,
@@ -210,17 +210,6 @@ mod generators {
                 IndexPlan::List(bounds, inner) => Value::List(bounds, Box::new(inner.fill_or_zero(hvals)?)),
                 IndexPlan::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(|l| l.fill_or_zero(hvals)).collect::<Result<_, _>>()?),
             })
-        }
-
-        /// the index value with each leaf replaced by the haystack elements its positions name.
-        pub(crate) fn fill(self, hvals: &Value) -> Value {
-            match self {
-                IndexPlan::Leaf(pos) => gather(hvals, &pos),
-                IndexPlan::Unit(n) => Value::Unit(n),
-                IndexPlan::Prod(fields) => Value::Prod(fields.into_iter().map(|f| f.fill(hvals)).collect()),
-                IndexPlan::List(bounds, inner) => Value::List(bounds, Box::new(inner.fill(hvals))),
-                IndexPlan::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(|l| l.fill(hvals)).collect()),
-            }
         }
     }
 

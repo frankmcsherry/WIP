@@ -5,5 +5,6 @@
 let (q, key) = input in
 let pairs = q split "&" map (p ->
     let parts = p split "=" in
-    ((0, parts) get, (1, parts) get try match (0 (v -> v), 1 (_ -> "")))) in
-(key, pairs) cap_list map ((key, (k, v)) -> ((k, key) eq, v)) filter head try
+    ((0, parts) get, (1, parts) get)) in
+let found = (key, pairs) cap_list map ((key, (k, v)) -> ((k, key) eq, v)) filter in
+(0, found) try_get

@@ -16,4 +16,3 @@ let at = (lines map ((k, _) -> k), parts map ((k, _) -> k)) find in
 let promo = (at map ((lo, _) -> lo), parts) gather map ((_, f) -> f) in
 let revs = lines map ((_, r) -> r) in
 ((promo, revs) zip map ((f, r) -> (f, r) mul) fold_add, revs fold_add)
-    try match (0 (x -> x), 1 (_ -> (0, 0)))

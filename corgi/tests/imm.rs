@@ -5,7 +5,7 @@
 //! `i64`s, Float) and the constants at the edges of an Int, through the path that writes into an
 //! operand it owns; then where the rewrite fires, and where it must not.
 
-use corgi::{dce, eval_graph, immediates, lower_effects, parse_ml, Program, Value};
+use corgi::{dce, eval_graph, immediates, parse_ml, Program, Value};
 
 struct Rng(u64);
 impl Rng {
@@ -22,7 +22,7 @@ fn run(src: &str, input: Value) -> Value {
 
 /// the program as parsed: pairs with a literal stay pairs.
 fn run_pair(src: &str, input: Value) -> Value {
-    eval_graph(&lower_effects(&parse_ml(src).unwrap_or_else(|e| panic!("{src}: {e}"))), input)
+    eval_graph(&parse_ml(src).unwrap_or_else(|e| panic!("{src}: {e}")), input)
 }
 
 /// nodes left once the rewrite and dead-node sweep have run: `input` plus one immediate op is 2.

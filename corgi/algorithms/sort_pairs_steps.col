@@ -8,4 +8,3 @@ let p1 = s1 map ((_, q, _) -> q) in
 let b1 = (p1, xs map ((_, b) -> b)) gather in
 let s2 = ((s1 map ((_, _, r) -> r), b1) zip, p1) zip sort_by in
 (s1 map ((a, _, _) -> a), s2 map (((_, b), _, _) -> b)) zip
-    try match (0 (r -> r), 1 (_ -> 0 iota map (z -> (z, z))))
