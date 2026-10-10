@@ -12,4 +12,4 @@ let prev = (idx map (i -> ((i, 1) max, 1) sub), word) gather in
 # Keep every non-space, and a space that follows a non-space when another non-space comes later.
 let keep = (total, (idx, (word, (before, prev) zip) zip) zip) cap_list map ((total, (i, (w, (b, p)))) ->
     (w, (((i, 0) gt, p) min, (total, b) gt) min) max) in
-(keep, s) zip filter try match (0 (t -> t), 1 (_ -> ""))
+(keep, s) zip filter

@@ -40,4 +40,3 @@ let per = same group map ((n, rs) -> (n, rs fold_add)) in
 let nat = (per map ((n, _) -> n), akeys) find in
 let names = (nat map ((lo, _) -> lo), anations) gather map ((_, name) -> name) in
 (names, per map ((_, r) -> r)) zip map ((name, r) -> (r neg, name, r)) sort map ((_, name, r) -> (name, r))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> ("", z))))

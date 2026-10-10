@@ -104,9 +104,7 @@ fn fuse_maps_collapses_adjacent_passes() {
 
 #[test]
 fn cancel_isos_drops_inverse_pairs() {
-    // Transpose then (PURE) Zip is the identity on List<(X,Y)>; cancellation removes both. Built with
-    // `Op::Zip` directly: the SURFACE `zip` is now the `TryZip` FailOp (fallible — not a pure inverse,
-    // so it can't cancel without optimizer demotion), while the optimizer still targets the pure op.
+    // Transpose then Zip is the identity on List<(X,Y)>; cancellation removes both.
     let mut b: Builder<NumOp> = Builder::default();
     let inp = b.input();
     let f1 = b.add(NumOp::Core(Op::Field(1)), vec![inp]);

@@ -20,4 +20,3 @@ let text = (input, zeros) append chunk 3 map (g ->
 # The characters made from padding become '='.
 let cut = (text len, pad) sub in
 (cut, (text len iota, text) zip) cap_list map ((cut, (k, ch)) -> ((k, cut) ge, 61, ch) select)
-    try match (0 (t -> t), 1 (_ -> ""))

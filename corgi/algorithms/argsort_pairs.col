@@ -2,4 +2,3 @@
 # `sort_by` on the pairs, carrying each one's position.
 # Input a `List<(Int, Int)>` per row. Output a `List<Int>` of positions.
 (input, input len iota) zip sort_by map ((_, q, _) -> q)
-    try match (0 (r -> r), 1 (_ -> 0 iota))

@@ -16,4 +16,4 @@ let marked = (breaks, at) zip filter in
 let starts = (0 enlist, marked) append in
 let ends = (marked, n enlist) append in
 let longest = (ends, starts) zip map ((e, s) -> (e, s) sub) fold_max in
-(sessions, ((n, 0) eq, 0, longest) select) try match (0 (r -> r), 1 (_ -> (0, 0)))
+(sessions, ((n, 0) eq, 0, longest) select)

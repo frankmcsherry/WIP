@@ -7,8 +7,7 @@ fn int(xs: &[i64]) -> Value {
     Value::i64(xs.to_vec())
 }
 
-/// run through the effect layer and render: a failure no `try` takes up shows in the output as the
-/// `Sum{T | Unit}` a trailing `try` would reveal.
+/// run through `Program` and render.
 fn run_ml(src: &str, arg: &Value) -> String {
     let p = Program::compile_ml(src).expect("parse error");
     show(&p.run(arg.clone()))
@@ -162,12 +161,19 @@ fn string_literal_broadcasts() {
 }
 
 #[test]
-fn head_sugar_is_a_failop() {
-    // `head` is the get FailOp: a non-empty row -> Found(first), an EMPTY row -> Oob — both carried in
-    // the err-mask, shown TRY'd as Sum{T | Unit}. No panic, no total/unchecked split. (`(input, 1) add
-    // iota` is [0..n+1); `input iota` at n=0 is the empty row.)
-    assert_eq!(run_ml("(input, 1) add iota head", &int(&[3])), "Sum tags=[0] [[0], ()x0]");
-    assert_eq!(run_ml("input iota head", &int(&[0])), "Sum tags=[1] [[], ()x1]");
+fn head_and_the_checked_words() {
+    // `head` is `get 0`, lossy: an EMPTY row reads the zero of the element's shape. Each `try_` word
+    // puts a row its op would lose something on in lane 1 as `()`, and runs the op on the rest in
+    // lane 0. (`(input, 1) add iota` is [0..n+1); `input iota` at n=0 is the empty row.)
+    assert_eq!(run_ml("(input, 1) add iota head", &int(&[3])), "[0]");
+    assert_eq!(run_ml("input iota head", &int(&[0])), "[0]");
+    assert_eq!(run_ml("(0, input iota) try_get", &int(&[2, 0])), "Sum tags=[0, 1] [[0], ()x1]");
+    // against a row of two: positions 2 and -1 are out, 1 is in; no positions at all is in, even
+    // against an empty row.
+    assert_eq!(run_ml("(input, 2 iota) try_get", &int(&[2, -1, 1])), "Sum tags=[1, 1, 0] [[1], ()x2]");
+    assert_eq!(run_ml("(input enlist, 2 iota) try_gather", &int(&[2, -1, 1])), "Sum tags=[1, 1, 0] [List ends=[1] <[1]>, ()x2]");
+    assert_eq!(run_ml("(0 iota, input iota) try_gather", &int(&[0, 2])), "Sum tags=[0, 0] [List ends=[0, 0] <[]>, ()x0]");
+    assert_eq!(run_ml("input iota try_chunk 2", &int(&[4, 3])), "Sum tags=[0, 1] [List ends=[2] <List ends=[2, 4] <[0, 1, 2, 3]>>, ()x1]");
 }
 
 #[test]

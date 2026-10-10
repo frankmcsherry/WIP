@@ -699,6 +699,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
+                Apply::Op(name, arg) if name.starts_with("try_") => try_word(b, id, name, *arg),
                 Apply::Op(name, _) if matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(sort_word(b, id, name)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
@@ -727,11 +728,11 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 }
                 Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
                 // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
-                // row errs (carried in the err-mask, observed by a downstream TRY), not a panic.
+                // row reads the zero of the element's shape, as `get` does.
                 Apply::Head => {
                     let zero = b.add(Op::Lit(int_lit(0)), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
-                    Ok(b.add(Op::TryGather, vec![pair]))
+                    Ok(b.add(Op::Gather, vec![pair]))
                 }
             }
         }
@@ -740,7 +741,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
 
 /// `(ranges, list) slices`: each `(lo, hi)` range of row r becomes the sub-list `list[r][lo..hi)`.
 /// The word `map(range); gather`: the ranges become nested position lists, and `gather` keeps their
-/// structure. A range with `lo >= hi` is empty; one reaching past the row errs the row.
+/// structure. A range with `lo >= hi` is empty; a position past the row reads the zero of its shape.
 fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
     let ranges = b.add(Op::Field(0), vec![pair]);
     let list = b.add(Op::Field(1), vec![pair]);
@@ -752,7 +753,77 @@ fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
     };
     let positions = b.add(Op::MapList(Box::new(range)), vec![ranges]);
     let args = b.tuple(vec![positions, list]);
-    b.add(Op::TryGather, vec![args])
+    b.add(Op::Gather, vec![args])
+}
+
+/// the checked ops, as words over the lossy ones: mark each row the op would lose something on,
+/// `branch` the input on the mark, run the op on lane 0 and make lane 1 `()`. The result is a
+/// `Sum{T | ()}` for the program to `match`. A row is marked when
+/// - `(i, xs) try_get`: `i` is outside `0 .. xs len`;
+/// - `(ps, xs) try_gather`: a position in `ps` is outside it (the least below 0, or the greatest at
+///   `xs len` or past it);
+/// - `(xs, ys) try_zip`: `xs len` and `ys len` differ;
+/// - `xs try_chunk k`: `xs len` leaves a remainder by `k` (the remainder is the mark).
+fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> Result<usize, String> {
+    use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, Pred, Red};
+    fn on(b: &mut Builder<NumOp>, op: impl Into<NumOp>, l: usize, r: usize) -> usize {
+        let pair = b.tuple(vec![l, r]);
+        b.add(op, vec![pair])
+    }
+    fn lit(b: &mut Builder<NumOp>, n: i64, like: usize) -> usize {
+        b.add(Op::Lit(int_lit(n)), vec![like])
+    }
+    // `i` outside `0 .. n`
+    fn outside(b: &mut Builder<NumOp>, i: usize, n: usize) -> usize {
+        let zero = lit(b, 0, i);
+        let below = on(b, CmpOp::Rel(Pred::Lt), i, zero);
+        let above = on(b, CmpOp::Rel(Pred::Ge), i, n);
+        on(b, ArithOp::Bits(BitOp::Or), below, above)
+    }
+    let (op, mark): (NumOp, usize) = match name {
+        "try_get" | "try_gather" => {
+            let (ps, xs) = (b.add(Op::Field(0), vec![x]), b.add(Op::Field(1), vec![x]));
+            let n = b.add(Op::Len, vec![xs]);
+            let mark = if name == "try_get" {
+                outside(b, ps, n)
+            } else {
+                // the least and the greatest position; an empty `ps` has neither, and its 0s are no mark
+                let lo = b.add(ArithOp::Reduce(Red::Min), vec![ps]);
+                let hi = b.add(ArithOp::Reduce(Red::Max), vec![ps]);
+                let zero = lit(b, 0, lo);
+                let below = on(b, CmpOp::Rel(Pred::Lt), lo, zero);
+                let above = on(b, CmpOp::Rel(Pred::Ge), hi, n);
+                let count = b.add(Op::Len, vec![ps]);
+                let some = on(b, CmpOp::Rel(Pred::Gt), count, zero);
+                let above = on(b, CmpOp::Min, above, some);
+                on(b, ArithOp::Bits(BitOp::Or), below, above)
+            };
+            (Op::Gather.into(), mark)
+        }
+        "try_zip" => {
+            let (xs, ys) = (b.add(Op::Field(0), vec![x]), b.add(Op::Field(1), vec![x]));
+            let (nx, ny) = (b.add(Op::Len, vec![xs]), b.add(Op::Len, vec![ys]));
+            (Op::Zip.into(), on(b, CmpOp::Rel(Pred::Ne), nx, ny))
+        }
+        "try_chunk" => {
+            let k = arg.ok_or("try_chunk needs a width")?;
+            if k == 0 {
+                return Err("try_chunk width must be positive".into());
+            }
+            let n = b.add(Op::Len, vec![x]);
+            let width = lit(b, k as i64, n);
+            (Op::Chunk(k as usize).into(), on(b, ArithOp::Bin(BinOp::Rem), n, width))
+        }
+        other => return Err(format!("unknown op '{other}' (the checked ops are try_get, try_gather, try_zip and try_chunk)")),
+    };
+    let arm = |op: NumOp| {
+        let mut bb = Builder::default();
+        let i = bb.input();
+        let out = bb.add(op, vec![i]);
+        bb.finish(out)
+    };
+    let routed = on(b, Op::Branch(2), x, mark);
+    Ok(b.add(Op::MapSum(vec![(0, arm(op)), (1, arm(Op::Unit.into()))]), vec![routed]))
 }
 
 /// `sort`, `dedup` and `group` as words over `sort_by` (stable by key, a payload carried along, and

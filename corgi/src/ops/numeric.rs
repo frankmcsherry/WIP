@@ -193,14 +193,23 @@ macro_rules! bit_body {
     };
 }
 
-/// the bitwise ops that keep two bytes a byte, as a byte lane body, or `None`.
-fn byte_bits(op: BitOp) -> Option<fn(u8, u8) -> u8> {
-    match op {
-        BitOp::And => Some(|x, y| x & y),
-        BitOp::Or => Some(|x, y| x | y),
-        BitOp::Xor => Some(|x, y| x ^ y),
-        _ => None,
-    }
+/// the bitwise ops that keep two bytes a byte, each applied with its byte lane body, or `None`. The
+/// body is written into each arm rather than returned as a function pointer, which would be a call
+/// per byte.
+macro_rules! byte_bits {
+    ($op:expr, $apply:ident($($arg:expr),*)) => {
+        match $op {
+            BitOp::And => Some($apply($($arg,)* |x: u8, y: u8| x & y)),
+            BitOp::Or => Some($apply($($arg,)* |x: u8, y: u8| x | y)),
+            BitOp::Xor => Some($apply($($arg,)* |x: u8, y: u8| x ^ y)),
+            _ => None,
+        }
+    };
+}
+
+/// `x op c` over bytes, in place when `x` is uniquely owned.
+fn byte_imm(x: Arc<Vec<u8>>, c: u8, f: impl Fn(u8, u8) -> u8) -> Arc<Vec<u8>> {
+    map_into(x, move |x| f(x, c))
 }
 
 /// the error for two leaves of different kinds.
@@ -250,9 +259,12 @@ fn bits_eval(op: BitOp, a: Prim, b: Prim) -> Result<Prim, String> {
     if !(a.is_int() && b.is_int()) {
         return Err(mixed(op, &a, &b));
     }
-    if let (Prim::U8(x), Prim::U8(y), Some(f)) = (&a, &b, byte_bits(op)) {
-        return Ok(Prim::U8(bin_into(x.clone(), y.clone(), f)));
-    }
+    let (a, b) = match (a, b) {
+        (Prim::U8(x), Prim::U8(y)) if matches!(op, BitOp::And | BitOp::Or | BitOp::Xor) => {
+            return Ok(Prim::U8(byte_bits!(op, bin_into(x, y)).expect("a byte op")));
+        }
+        ab => ab,
+    };
     Ok(bit_body!(op, int_pairs(a, b)))
 }
 
@@ -265,10 +277,12 @@ fn bits_imm(op: BitOp, a: Prim, c: i64) -> Result<Prim, String> {
     if !a.is_int() {
         return Err(format!("{op:?}: a Float"));
     }
-    if let (Prim::U8(x), Some(f), 0..=255) = (&a, byte_bits(op), c) {
-        let c = c as u8;
-        return Ok(Prim::U8(map_into(x.clone(), move |x| f(x, c))));
-    }
+    let a = match a {
+        Prim::U8(x) if matches!(op, BitOp::And | BitOp::Or | BitOp::Xor) && (0..=255).contains(&c) => {
+            return Ok(Prim::U8(byte_bits!(op, byte_imm(x, c as u8)).expect("a byte op")));
+        }
+        a => a,
+    };
     Ok(bit_body!(op, int_imm(a, c)))
 }
 

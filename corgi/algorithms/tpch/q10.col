@@ -27,4 +27,3 @@ let natk = (cat map ((lo, _) -> lo), cs) gather map ((_, n) -> n) in
 let nat = (natk, ns map ((k, _) -> k)) find in
 let names = (nat map ((lo, _) -> lo), ns) gather map ((_, name) -> name) in
 (top, names) zip map (((_, c, r), name) -> (c, r, name))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, ""))))

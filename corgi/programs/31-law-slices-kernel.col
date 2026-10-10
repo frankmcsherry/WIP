@@ -3,7 +3,7 @@
 # (iota, plus the captured lo), and point-gather. The fused op earns its keep as ONE
 # expand-and-gather pass; this law says it adds no expressive power.
 # n = 8
-# = Sum tags=[0] [[1], ()x0]
+# = [1]
 let hay = input iota in
 let lohi = hay map (x -> ((x, 2) div, x)) in
 let fused = (lohi, hay) slices in

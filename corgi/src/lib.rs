@@ -22,7 +22,6 @@
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
 
 pub mod bytes;
-pub(crate) mod effect;
 pub(crate) mod engine;
 pub mod explain;
 pub(crate) mod frontend;
@@ -33,7 +32,6 @@ pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
 
-pub use effect::lower_effects;
 pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;

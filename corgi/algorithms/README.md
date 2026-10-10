@@ -155,13 +155,9 @@ now, at about the same cost (above).
    - Rewrite: a gather whose haystack is a literal reads the literal's one row.
    - At stake: soundex `lit` 196 (45%), base64_encode `lit` 370 (53%). base64_encode_arith removes
      the table by hand and is 45% faster.
-2. **`get` with a zero default is the raw gather.** `(i, xs) get try match (0 (v -> v), 1 (_ -> 0))`
-   reads zero out of range, which is exactly what the lossy `Gather` does.
-   - The rewrite removes the per-element check and the lane merge at the end.
-   - It also removes the failure path: whenever any row misses, the checked gather first copies the
-     Ok rows of the whole haystack.
-   - At stake: median_percentile's two scalar lookups cost 87 (33%). Also mode, the stack peek in
-     balanced_brackets, and itoa. A `get_or d` word is the general form (see friction below).
+2. **`get` with a zero default is the raw gather.** Done: the plain `get`/`gather`/`zip`/`chunk` are
+   the lossy kernels, so `(i, xs) get` reads zero out of range, and the checked forms are the words
+   `try_get` and so on, written only where a program wants the miss.
 3. **Run CSE and the peephole in `Program`.**
    - Repeated `len`, compares, `iota`s and constant seeds today run once per occurrence.
    - Measured with `--optimize`: gcd 11% faster, the rest unchanged. Cheap, but small on its own.
@@ -188,7 +184,7 @@ now, at about the same cost (above).
    - An affine map over a range folds into the range.
    - Copy list rows (`get k` of split pieces in query_param) as blocks too.
 
-   At stake:
+   At stake (measured when `gather` was the checked `TryGather`):
    - levenshtein: TryGather 301 + Range 189;
    - moving_average: TryGather 148 + Range 68 (79%);
    - trigram_similarity: TryGather 126 + Range 72;
@@ -202,21 +198,12 @@ now, at about the same cost (above).
      trigram_similarity 100, moving_average_prefix 40, sessionize 38, kadane_prefix 37.
    - Cheap shifts are also what make the fold-to-scan rewrites in 8 pay: kadane_prefix's scans and
      reduction cost 30 together, but its shift costs 94 (Append 37, Iota 20, TryGather 37).
-7. **Checks that cannot fail, and the plumbing they bring.** Length facts that flow from `iota`,
-   `len`, `map`, `chunk`, `split`, `group` and `range` show the check cannot fail in all of these:
-   - every `zip` here pairs maps of one list, or a list with `len x iota`;
-   - `get k` reads rows of `chunk n` with k < n;
-   - `head` of a group's values, or `get 0` of a `split`;
-   - positions come from `range(a, len xs - k)`.
-
-   The checked op then runs as its raw kernel. With nothing left to fail, the effect lowering adds
-   no `Lift`/`HoistProd`/`Squash`, and the user's closing `try match` is a match on a sum with one
-   live lane: the identity.
-   - 24 of the 36 programs end in a `try match` written only to remove a `Fail` that cannot happen.
-     The lowered corpus has 90 checked ops and 176 plumbing nodes.
-   - When nothing fails the plumbing costs almost nothing. The gain is TryGather's check, the closing
-     `Unwrap` (query_param 34, ipv4_parse 8), and graphs the other rewrites can see through.
-   - This is what optimizing out the Try overhead amounts to.
+7. **Checks that cannot fail, and the plumbing they bring.** Done the same way as 2: the corpus's
+   checks that could not fail (every `zip` here pairs maps of one list, or a list with `len x iota`;
+   `get k` reads rows of `chunk n` with k < n; positions come from `range(a, len xs - k)`) were the
+   checked ops plus a closing `try match` to remove a `Fail` that could not happen. They are now the
+   plain ops, with no `try match`. Where a miss can happen and its default is not zero (soundex's
+   empty word, query_param's missing key), the program says `try_get`.
 
 ### Loops
 
@@ -300,7 +287,7 @@ item in NOTES.md, an execution strategy rather than a graph rewrite.
 ## Language friction met while writing
 
 - **Defaults and empty values:**
-  - A default costs four ops: `get try match (0 (v -> v), 1 (_ -> d))`. `get_or d` would be one.
+  - A default other than zero costs a check and a branch: `try_get match (0 (v -> v), 1 (_ -> d))`.
   - A typed empty list for a fallback arm is spelled `0 iota map (z -> …)`.
 - **Missing list words:** lag or shift, exclusive scan, take, drop, slice, split-where-mask,
   pairwise, descending sort or top-k, and tuple to list.

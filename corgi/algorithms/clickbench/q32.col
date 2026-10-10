@@ -8,4 +8,3 @@ let rows = (watchid, (ip, (refresh, width) zip) zip) zip map ((e, (i, (r, w))) -
 let ranked = rows group map (((e, i), vs) -> let n = vs len in
     (n neg, e, i, n, vs map ((r, _) -> r) fold_add, (vs map ((_, w) -> w) fold_add to_float, n to_float) div)) sort_limit 10 in
 ranked map ((_, e, i, n, r, w) -> (e, i, n, r, w))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, z, z, 0.0))))

@@ -8,7 +8,7 @@
 //! Method (after collie's bake-off harness): inline Rust ceilings in THIS binary, same input data,
 //! best-of-`reps` timing (min rejects scheduler/turbo noise), `black_box` on input and output so LLVM
 //! can't elide the work, deterministic LCG-scrambled inputs (no rng dep). Inputs are built once and
-//! handed to effect-aware `eval` by Arc-clone inside the loop (outside the timer) — a real pipeline's
+//! handed to `eval` by Arc-clone inside the loop (outside the timer) — a real pipeline's
 //! column flow. `--smoke` runs every family with tiny inputs; `--family A` (repeatable, or a comma-
 //! separated list) selects families A-I or R (arrangement). Examples:
 //! `cargo bench --bench gaps -- --smoke`; `cargo bench --bench gaps -- --family C,R`.
@@ -19,7 +19,7 @@
 //! `cargo bench --bench gaps`.
 
 use corgi::{Bounds,
-    arrange, eval_graph, lower_effects, parse_ml, ArithOp, BinOp, Builder, Graph, NumOp,
+    arrange, eval_graph, parse_ml, ArithOp, BinOp, Builder, Graph, NumOp,
     Op, Program, Scalar, Value,
 };
 use std::env;
@@ -28,37 +28,28 @@ use std::time::{Duration, Instant};
 
 // ----- harness -----------------------------------------------------------
 
-/// best-of-`reps` wall time for one whole-graph `eval` of a LOWERED surface graph (see `compile`):
-/// `filter`, `gather`, `slices`, `branch`, etc. are fallible in the current vocabulary, and the
-/// lowering threads their `Fail<T> = Sum{T | Unit}` past the ops downstream. The arg is cloned (Arc
-/// bump) outside the timer, matching a pipeline that hands an owned column to each op.
+/// best-of-`reps` wall time for one whole-graph `eval` of a surface graph (see `compile`). The arg
+/// is cloned (Arc bump) outside the timer, matching a pipeline that hands an owned column to each op.
 fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
     // run through `Program`, the path a user's program takes (constant operands as immediates, and
     // on branches that have one, the program's buffer pool kept from run to run).
     let p = Program::from_graph(g.clone());
     if std::env::var_os("GAPS_CHECK").is_some() {
-        assert_eq!(corgi::show(&eval_graph(&lower_effects(g), arg.clone())), corgi::show(&p.run(arg.clone())));
+        assert_eq!(corgi::show(&eval_graph(g, arg.clone())), corgi::show(&p.run(arg.clone())));
     }
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
         let t = Instant::now();
         let out = black_box(p.run(black_box(a)));
-        // an un-`try`'d failure makes the output `Sum{T | Unit}`; rows in the Unit lane are its errors. No
-        // benchmark program yields an Option-like value of its own, so this reads only that lane.
-        let failed = matches!(&out, Value::Sum(_, lanes) if lanes.len() == 2 && matches!(lanes[1], Value::Unit(n) if n > 0));
         black_box(out); // include output destruction in the timer, as rust_t's closures do
-        let elapsed = t.elapsed();
-        assert!(!failed, "benchmark input unexpectedly exercised a fallible op's error lane");
-        best = best.min(elapsed);
+        best = best.min(t.elapsed());
     }
     best
 }
 
-/// Raw kernel timing, used only by the H safety and I pointer-chase controls to isolate the cost of
-/// the effect check from the underlying gather. This is not the normal surface execution path.
+/// the graph as given, without `Program`'s rewrites: the H safety and I pointer-chase controls.
 fn corgi_raw_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
-    let g = &lower_effects(g);
     let mut best = Duration::MAX;
     for _ in 0..reps {
         let a = arg.clone();
@@ -118,8 +109,8 @@ fn row_chain(task: &str, n: usize, ck: Duration, rk: Duration, r1: Duration) {
     );
 }
 
-/// the safety comparison: ns/row for corgi's TOTAL gather (vectorized check + gather) and corgi-raw
-/// (no check), against three Rust ceilings — `get_unchecked` (no safety), indexed `h[i[k]]` (panicking
+/// the safety comparison: ns/row for corgi's checked gather (`try_gather`: a check, then the gather)
+/// and its plain gather (no check), against three Rust ceilings — `get_unchecked` (no safety), indexed `h[i[k]]` (panicking
 /// per-element bounds check), and `.get()` collected to `Option<Vec>` (the total Rust analog, which
 /// discovers failure SEQUENTIALLY and short-circuits on the first miss).
 #[allow(clippy::too_many_arguments)]
@@ -172,7 +163,7 @@ fn sorted_list(n: usize) -> Value {
 }
 
 fn compile(src: &str) -> Graph<NumOp> {
-    // as written; `corgi_t` runs it through a `Program`, which lowers it.
+    // as written; `corgi_t` runs it through a `Program`.
     parse_ml(src).unwrap_or_else(|e| panic!("compile {src:?}: {e}"))
 }
 
@@ -871,7 +862,7 @@ fn family_arrange(n: usize, reps: u32) {
 
 // ----- driver ------------------------------------------------------------
 
-/// time corgi (the lowered surface path + the raw kernel) and the three Rust ceilings for `gather`
+/// time corgi (the checked word and the plain gather) and the three Rust ceilings for `gather`
 /// with an `arith` applied to each gathered value — the SAME arith in corgi's `map` body and in every
 /// Rust closure, so the comparison is honest. `unsafe` = `get_unchecked`; `idx` = panicking `h[i[k]]`;
 /// `opt` = `.get()` mapped through `arith`, collected to `Option<Vec>` (the total Rust path).
@@ -881,15 +872,15 @@ fn bench_gather(
     reps: u32,
     idx: &[i64],
     hay: &[i64],
-    g: &Graph<NumOp>,
+    (checked, plain): (&Graph<NumOp>, &Graph<NumOp>),
     arith: fn(i64) -> i64,
 ) {
     let arg = Value::Prod(vec![
         Value::List(vec![n].into(), Box::new(Value::i64(idx.to_vec()))),
         Value::List(vec![n].into(), Box::new(Value::i64(hay.to_vec()))),
     ]);
-    let cs = corgi_t(g, &arg, reps);
-    let cr = corgi_raw_t(g, &arg, reps);
+    let cs = corgi_t(checked, &arg, reps);
+    let cr = corgi_t(plain, &arg, reps);
     // all three Rust variants are iterator-collect (allocate + write ONCE, no zero-init pass), so only
     // the safety mechanism differs: unchecked load, panicking index, or `.get()`->Option.
     let ru = rust_t(reps, || {
@@ -919,8 +910,8 @@ fn bench_gather(
     row_safety(label, n, cs, cr, ru, ri, ro);
 }
 
-/// the safety bench: corgi's TOTAL gather (a FailOp — one vectorized "all in range" sweep, then the
-/// gather) vs the Rust ceilings, with NO downstream op and with a 1- and 3-op arith chain mapped over
+/// the safety bench: corgi's checked gather (`try_gather`: each row's least and greatest position
+/// against its length, then the gather) and its plain one vs the Rust ceilings, with NO downstream op and with a 1- and 3-op arith chain mapped over
 /// the gathered values. The chain tests whether corgi amortizes its ONE check across the compute while
 /// Rust's total `.get()` path re-pays the `Option` per element. RANDOM (scrambled) and SEQUENTIAL
 /// patterns; all indices are in range, so the check never actually fires.
@@ -928,10 +919,14 @@ fn family_safety(n: usize, reps: u32) {
     let hay: Vec<i64> = (0..n as i64).collect();
     let idx_rand: Vec<i64> = scrambled(n).iter().map(|&x| x % n as i64).collect();
     let idx_seq: Vec<i64> = (0..n as i64).collect();
-    let g_plain = compile("input gather");
-    let g_add = compile("input gather map (v -> (v, 7) add)");
-    let g_chain = compile("input gather map (v -> (v, 7) add shr_b64 1 and 255)");
-    type GatherCase<'a> = (&'a str, &'a Graph<NumOp>, fn(i64) -> i64);
+    let both = |after: &str| {
+        let checked = compile(&format!("input try_gather match (0 (x -> x), 1 (_ -> 0 iota)){after}"));
+        (checked, compile(&format!("input gather{after}")))
+    };
+    let g_plain = both("");
+    let g_add = both(" map (v -> (v, 7) add)");
+    let g_chain = both(" map (v -> (v, 7) add shr_b64 1 and 255)");
+    type GatherCase<'a> = (&'a str, &'a (Graph<NumOp>, Graph<NumOp>), fn(i64) -> i64);
     let cases: [GatherCase<'_>; 3] = [
         ("gather", &g_plain, |v| v),
         ("gath+add", &g_add, |v| v.wrapping_add(7)),
@@ -940,10 +935,10 @@ fn family_safety(n: usize, reps: u32) {
     // Run every random control before a sequential identity candidate. If an identity fast path is
     // present, its missing output allocation cannot change state for the following random control.
     for (label, g, arith) in cases {
-        bench_gather(&format!("{label}_rand"), n, reps, &idx_rand, &hay, g, arith);
+        bench_gather(&format!("{label}_rand"), n, reps, &idx_rand, &hay, (&g.0, &g.1), arith);
     }
     for (label, g, arith) in cases {
-        bench_gather(&format!("{label}_seq"), n, reps, &idx_seq, &hay, g, arith);
+        bench_gather(&format!("{label}_seq"), n, reps, &idx_seq, &hay, (&g.0, &g.1), arith);
     }
 }
 

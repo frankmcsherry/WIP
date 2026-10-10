@@ -10,4 +10,3 @@ let ranked = (counter, url) zip map ((c, u) -> ((u len, 0) gt, (c, u len))) filt
     map ((c, ls) -> let n = ls len in ((n, 1000) gt, (c, (ls fold_add to_float, n to_float) div, n))) filter
     map ((c, l, n) -> (l neg, c, l, n)) sort_limit 25 in
 ranked map ((_, c, l, n) -> (c, l, n))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, 0.0, z))))

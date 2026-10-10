@@ -57,7 +57,7 @@ from one `--profile` run, taken while `sort`, `dedup` and `group` were the kerne
 | q17 | 70.43 | 9.99 | 7.05 | As q16; the SQL's unordered LIMIT made deterministic by key order, which corgi's group gives for free. |
 | q18 | 84.00 | 22.67 | 3.71 | GroupKey 79 ms; the top ten is `sort_limit` (4 ms). |
 | q19 | 0.98 | 0.12 | 8.17 | DuckDB skips row groups by min/max (zone maps); corgi scans 1M. |
-| q20 | 333.98 | 37.22 | 8.97 | Approximated in method (no substring search). gather_try 109 ms + split 85 ms + the "googl" literal filled per piece 43 ms. |
+| q20 | 333.98 | 37.22 | 8.97 | Approximated in method (no substring search). gather_try 109 ms (now the plain gather) + split 85 ms + the "googl" literal filled per piece 43 ms. |
 | q21 | 333.48 | 5.59 | 59.66 | DuckDB runs the cheap predicate first and LIKE only on survivors (5.8 ms); corgi searches all 1M URLs. |
 | q22 | 436.49 | 17.59 | 24.81 | Approximated in method. Two splits, two gather_trys; see q20. |
 | q23 | 340.07 | 37.23 | 9.13 | Approximated: three columns for SELECT *. Cost is q20's search. |

@@ -2,4 +2,3 @@
 # Input a `List<(Int, Int)>` per row. Output up to ten pairs per row.
 let s = input sort in
 ((0, (s len, 10) min) range, s) gather
-    try match (0 (r -> r), 1 (_ -> 0 iota map (z -> (z, z))))

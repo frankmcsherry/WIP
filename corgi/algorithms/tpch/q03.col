@@ -25,4 +25,3 @@ let joined = (matched map ((lo, _) -> lo), orders) gather in
 let per = (joined, matched map ((_, rev) -> rev)) zip group
     map (((k, dt, pr), revs) -> let r = revs fold_add in (r neg, dt, k, pr, r)) sort_limit 10 in
 per map ((_, dt, k, pr, r) -> (k, r, dt, pr))
-    try match (0 (x -> x), 1 (_ -> 0 iota map (z -> (z, z, z, z))))

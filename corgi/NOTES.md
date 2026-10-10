@@ -83,9 +83,6 @@ src/
   optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
                the unoptimized graph; tested for semantic preservation on every corpus program, so the
                passes are latent, not dead.
-  effect.rs    the effect layer as a REWRITE: `lower_effects` threads `Fail<T>` columns past the ops
-               downstream by inserting `MapSum`-on-the-Ok-lane / `Lift` / `Hoist*` / `Squash`. No
-               second evaluator: the lowered graph is pure vocabulary.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture
@@ -95,11 +92,10 @@ src/
                LIST elim: Gather (P, List<X>) -> P[X] replaces every integer leaf of P (any shape:
                one position, a list, nested lists, products, sums) by the row's element there;
                `get` is Gather on one position per row (`head` = get 0, so an
-               empty row errs — no non-emptiness proof). Fold (B,List<A>)->B is the accumulating
+               empty row reads the zero of the element's shape). Fold (B,List<A>)->B is the accumulating
                elim; FoldScan (T,List<A>)->(T,List<R>) (mapAccumL — the scan kernel; `scan` is sugar =
                FoldScan with body (a,x)->(b,b), field 1). Gather (positions per row, nested or flat;
-               the result keeps their structure) is the one fetch kernel, with a checked per-row form and
-               `gather_try` (per element, Sum{Found|Missing}); `slices` = map(range); gather. Plus Unit
+               the result keeps their structure) is the one fetch kernel; `slices` = map(range); gather. Plus Unit
                (X -> Unit) and the arithmetic + named reductions in `numeric`.
                plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
                List⊗List (Flatten / the word `slices`), List⊗Sum (Unweave/Weave) — and the fused forms/producers
@@ -127,17 +123,14 @@ src/
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp =
                arithmetic on two Ints or two Floats (the kind from the operands) + the `_b64` and
                bitwise ops (an Int as its 64-bit word) + shifts + the named reductions and scans.
-    fail.rs    the failure family: `Fail<T> = Sum{Ok:T | Err:Unit}` as ordinary data. The `Try*` checked
-               producers (gather/zip/chunk), `Lift`/`Squash`, and the
-               three distributive laws `HoistProd`/`HoistList`/`HoistSum` (Fail commuted out through each
-               functor). The evals live here; `Op::eval` dispatches to them first.
     text.rs    TextOp: Split(u8) + ParseInt. A string is a List<Int> of its bytes (held as bytes); both
                total — ParseInt returns Sum{Ok: Int | Err: ()}, no data-dependent panic.
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
-    program.rs `Program`: parse, lower effects, type and run in one path (compile_ml / shape /
-               run).
+               The words are built here: sort/dedup/group over sort_by, slices, head, and the
+               checked ops try_get/try_gather/try_zip/try_chunk (check, branch, lossy op on lane 0).
+    program.rs `Program`: parse, type and run in one path (compile_ml / shape / run).
 tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text · effect · kernel · ref ·
         fail_allocations   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
@@ -237,20 +230,13 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   Column(u8 tags, Arc<Vec<usize>> within-lane offsets) }` — the `Sum`-side twin of `Bounds`, and the
   dynamic mirror of `columnar`'s `Discriminant` (whose "homogeneous" state stores `[tag, count]` and
   synthesises identity offsets). `Const` is the ONE-TAG case: it costs two words at any row count,
-  because row `i`'s offset in the single lane is `i`. It is what `inject` and `lift` build, and what
-  a `Fail` column that has not actually failed stays in — so a fallible pipeline in its normal state
-  carries no witness columns at all. Uniformity is O(1) to detect (`const_tag`) and it PROPAGATES: a
+  because row `i`'s offset in the single lane is `i`. It is what `inject` builds, and what `branch` builds when every
+  row goes to one lane — so a checked op whose rows all fit (a `try_` word) carries no witness
+  columns at all. Uniformity is O(1) to detect (`const_tag`) and it PROPAGATES: a
   gather of a one-tag sum is one, a lane map leaves the assignment alone, and `unwrap`/`sort`/
   `compare` each take a no-witness path on it. Equality and hash are by the ASSIGNMENT, so a `Const`
   and the equivalent `Column` are interchangeable — including on the wire, where the codec records
   which form the sender held (as it does for `Bounds`).
-- **`Fail<T> = Sum{T | Unit}`, so "did anything fail" is a field read.** The Err lane carries no
-  payload, only a length, so the failure count is O(1) on any fallible column. `into_fail`,
-  `squash`, `hoist_prod` and `hoist_list` ask that FIRST and take a no-copy path when the answer is
-  zero; materialising a `Vec<bool>` mask to discover it was the cost of the common case. The static
-  optimizer cannot do this work instead: `lower_effects` inserts `Lift`/`Squash`/`Hoist*` only where
-  a column genuinely CAN fail, so there are no trivially-cancellable pairs to peephole — whether it
-  *did* fail is a runtime property, which is why the check lives in the ops.
 - **Leaves are immutable Arc, cloned by refcount; eval moves to last use.** The last reader holds the
   sole Arc, so `into_*` move the buffer and pointwise ops are able to mutate in place (the shifts do).
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
@@ -283,36 +269,27 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
   all ragged input, take the general per-round gather and scatter.
 
-## Failure as data, threaded by a rewrite
+## Failure: lossy ops, and checked ones as words
 
-The surface's fallible verbs (`get`/`head`, `gather`, `zip`, `slices`, `chunk`)
-are checked: a row the raw kernel would answer lossily (below) lands in the Err lane
-of `Fail<T> = Sum{ Ok: T | Err: Unit }` (`ops/fail.rs`). Everything downstream is written against `T`;
-`effect::lower_effects` makes that well-typed by inserting ordinary ops — a pure op fed a `Fail<T>`
-becomes `MapSum([(0, op)])` on the packed Ok lane, a second fallible op adds a `Squash`, a `Tuple`
-with a fallible field `Lift`s the pure ones and `HoistProd`s, and a body-bearing op whose body fails
-`HoistList`s / `HoistSum`s the per-element errors out to the row (all-or-nothing). `try` is the
-identity on values: it marks where the program takes the `Sum{T | Unit}` up as data to `match` on.
+The ops that can lose something are lossy under their plain names, and nothing in corgi panics on
+data: `gather`/`get`/`head`/`slices` read the zero of the element's shape for a position outside its
+row (zero bits, the empty list, a sum's lane 0, so a sum must have at least one lane); `zip` keeps
+each row's shortest column; `chunk` drops a row's remainder. `branch` is total (a tag of n-1 or more
+goes to the last lane).
 
-So there is ONE evaluator and ONE typer. `Program::run` = `eval_graph(lower_effects(g))`; the
-corpus test types every lowered program with `shape_of`, which is what proves the discipline: an op
-applied to a fallible column where lowering forgot to lift would be a shape error. A failure no
-`try` takes up reaches the output, which is then `Fail<T>`: `run` returns it as the value, and
-`Program::shape` shows it in the output's type.
+Each has a checked form, a WORD built in `frontend/ml.rs` (`try_word`), not a kernel: `try_get`,
+`try_gather`, `try_zip`, `try_chunk`. A word marks each row its op would lose something on, routes
+the input with `branch 2` on the mark, runs the lossy op on lane 0 and makes lane 1 `()`. The result
+is `Sum{T | ()}`, and the program takes it up as data — usually with a `match`. Nothing threads it
+past later ops implicitly: a program that wants the error carried further says so with ordinary
+ops (a `map_variant 0`, or a `branch` on the combined tags of two checked results).
 
-The raw kernels (`Op::Gather`, `Chunk`, `Zip`) stay in the enum for hosts (DDIR uses them); they are
-not on the surface. They are lossy, and nothing in corgi panics on data:
-the raw `Gather` reads the zero of the element's shape for a position outside its row (zero bits, the
-empty list, a sum's lane 0, so a sum must have at least one lane); the raw `Zip` keeps each row's
-shortest column; the raw `Chunk` drops a row's remainder. Their `Try` forms, the surface ops, report
-those rows as errors instead. `Branch` is total (a tag of n-1 or
-more goes to the last lane) and is the surface `branch`. `gather_try` is distinct: the per-ELEMENT
-`List<Sum{Found | Missing}>`, a value the program handles itself, not a per-row effect. Every "maybe"
-result has this one shape: Ok first, the failures only counted (`Fail<T>`, `gather_try`, `parse_int`).
-
-**Audit rule, kept from the old gates:** an analysis threaded through a fixpoint (`Fold`/`FoldScan`'s
-accumulator back-edge) must treat the fed-back value as unknown; the lowering does this by making the
-accumulator itself a `Fail<B>`, so a row that errs on any round stays Err.
+A word is only as fast as the primitives it is spelled with, so writing these as words is also how
+primitive gaps show up. `branch` and `cap_sum` return at once when every row goes to one lane (the
+no-error case of every checked op); `len` reads lengths as differences of the ends. With no errors
+`try_chunk` measures at the old kernel's speed, `try_get` 1.3x, `try_zip` 4x (two `i64` length
+columns where the kernel compared the bounds in place) and `try_gather` 2.6x (its check is two
+per-row reductions, where the kernel checked as it gathered).
 
 ## Done (foundations in place)
 

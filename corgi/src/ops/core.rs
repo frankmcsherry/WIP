@@ -150,8 +150,8 @@ pub enum Op<L> {
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
     Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse. With agreeing
                     // bounds a pure rewrap — no data moves. Total but lossy: a row whose columns
-                    // differ in length keeps the shortest (only then is data copied). `TryZip`, the
-                    // surface `zip`, reports such a row as an error instead.
+                    // differ in length keeps the shortest (only then is data copied). The word
+                    // `try_zip` puts such a row in a lane of its own instead.
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values (its
                     // inverse is the word `slices`: map(range); gather)
     Unweave,        // List<Sum{A|B|..}> -> (tags:List<U8>, List<A>, List<B>, ..)  destructure a
@@ -179,14 +179,10 @@ pub enum Op<L> {
                     // element. Chains compose in-language — gather(gather(v,i),j) = gather(v,
                     // gather(i,j)), so index math stays index math.
                     // Total but lossy: a position outside its row reads the ZERO of the element's
-                    // shape (zero bits, the empty list, a sum's lane 0). `TryGather` reports it as an
-                    // error row instead; when positions are proven in range the two agree.
+                    // shape (zero bits, the empty list, a sum's lane 0). The words `try_get` and
+                    // `try_gather` put such a row in a lane of its own instead.
     Range,          // (lo:Int, hi:Int) -> List<Int>  per row [lo, hi), empty when lo >= hi: `iota` with
                     // a start. Total.
-    GatherTry,      // (idx:List<Int>, haystack:List<T>) -> List<Sum{Found:T | Missing}>  TOTAL vector
-                    // access: each index found or missing, the failure shape `Fail<T>` has (Ok first,
-                    // the misses only counted). A bounds-proof pass demotes `GatherTry` to `Gather` +
-                    // `inject 0` when the Missing lane is provably empty.
     Iota,           // Int -> List<Int>  per row [0,1,…,n-1] (empty for n <= 0) — a List-introducer / data generator
     Unit,           // X -> Unit  forget the payload, keep the length — how a column becomes the `None`
                     // lane of `Option = Sum{Unit | T}` (e.g. `branch 2 map_variant 1 (x -> x unit)`).
@@ -208,23 +204,7 @@ pub enum Op<L> {
                     // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
                     // chunked record stream feeds the stride fast paths. Total but lossy: a row that
                     // doesn't divide by `k` drops its remainder (and only then are values copied).
-                    // `TryChunk`, the surface `chunk`, reports such a row as an error instead.
-
-    // ---- the failure family (see `ops::fail`) — failure as data: `Fail<T> = Sum{Ok:T | Err:Unit}`.
-    // The `Try*` ops are the checked forms of the lossy kernels above (a row the kernel would read
-    // zeros for, truncate or cut short lands in Err); `Lift`/`Squash`/`Hoist*` are the plumbing
-    // `effect::lower_effects` inserts so pure programs run on the Ok lane. All ordinary ops, with one
-    // eval each.
-    TryGather,      // (idx:P, haystack:List<T>) -> Fail<P[T]>              per row all-or-nothing
-    TryChunk(usize),// List<X> -> Fail<List<List<X>>>                       row length divides by k
-    TryZip,         // (List<X>, List<Y>) -> Fail<List<(X,Y)>>              inner lengths agree
-    Lift,           // X -> Fail<X>                                         every row Ok
-    Squash,         // Fail<Fail<T>> -> Fail<T>                             the monad join
-    HoistProd,      // (Fail<A>, Fail<B>, ..) -> Fail<(A, B, ..)>           errs if ANY field errs
-    HoistList,      // List<Fail<T>> -> Fail<List<T>>                       errs if ANY element errs
-    HoistSum(Vec<usize>), // Sum{.. Fail<A> ..} -> Fail<Sum{.. A ..}>       the listed lanes are Fail
-    Try,            // the TRY marker: identity on values. The lowering reads it as "handled here" —
-                    // the point past which a fallible column is ordinary data the program matches on.
+                    // The word `try_chunk` puts such a row in a lane of its own instead.
 }
 
 impl<L: OpLike> Op<L> {
@@ -232,10 +212,6 @@ impl<L: OpLike> Op<L> {
     /// which is what makes this the typer when run on zero rows (see `graph::shape_of`). No op fails
     /// on data: a value of the right shape always has a result.
     pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
-        // the failure family lives in `ops::fail`; everything else is below.
-        if super::fail::is_family(self) {
-            return super::fail::eval(self, input);
-        }
         Ok(match self {
             Op::Lit(v) => fill(v, input.len()),
 
@@ -403,6 +379,13 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("CapSum expects (X, Sum), got (.., {})", shape_of_value(&s)));
                 };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
+                // every row in one lane, in row order: that lane pairs with the whole context.
+                if let Some(t) = tags.const_tag() {
+                    let mut ctx: Vec<Value> = (0..lanes.len()).map(|_| gather(&x, &[])).collect();
+                    ctx[t] = x;
+                    let new = ctx.into_iter().zip(lanes).map(|(c, lane)| Value::Prod(vec![c, lane])).collect();
+                    return Ok(Value::Sum(tags, new));
+                }
                 let mut per = vec![Vec::new(); lanes.len()];
                 for (i, t) in tags.tags_iter().enumerate() {
                     per[t].push(i);
@@ -475,7 +458,22 @@ impl<L: OpLike> Op<L> {
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
                 let (rows, _vals) = input.rows_of("Len")?;
-                let lens = (0..rows.len()).map(|r| { let (s, e) = rows.span(r); (e - s) as i64 }).collect();
+                let lens = match rows {
+                    // a partition's lengths are the differences of its ends (a stride's, one number)
+                    Rows::Part(Bounds::Offsets(ends)) => {
+                        let mut lens = Vec::with_capacity(ends.len());
+                        lens.extend(ends.first().map(|&e| e as i64));
+                        lens.extend(ends.windows(2).map(|w| (w[1] - w[0]) as i64));
+                        lens
+                    }
+                    Rows::Part(Bounds::Stride(k, n)) => vec![*k as i64; *n],
+                    // a referenced row's length, read from its list's ends
+                    Rows::Named(Bounds::Offsets(ends), named) => named
+                        .iter()
+                        .map(|&r| (ends[r] - if r == 0 { 0 } else { ends[r - 1] }) as i64)
+                        .collect(),
+                    Rows::Named(Bounds::Stride(k, _), named) => vec![*k as i64; named.len()],
+                };
                 Value::i64(lens)
             }
 
@@ -500,21 +498,33 @@ impl<L: OpLike> Op<L> {
             // within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch")?;
-                // a tag is read as its word, so a negative one is past every lane and goes to the last
-                let tags = tags_v.as_words("Branch tags")?;
-                assert_eq!(data.len(), tags.len(), "Branch: payload/discriminant length");
+                assert_eq!(data.len(), tags_v.len(), "Branch: payload/discriminant length");
                 if *n > 256 {
                     return Err(format!("Branch: arity {n} exceeds the u8 tag width"));
                 }
                 if *n == 0 {
                     return Err("Branch: a sum of no lanes has nowhere to put a row".into());
                 }
+                // a tag is read as its word, so a negative one is past every lane and goes to the last
+                let last = n.saturating_sub(1) as u64;
+                // every row to one lane: the payload IS that lane, and the others are empty.
+                let one = match &tags_v {
+                    Value::Prim(Prim::U8(t)) => one_lane(t, |x| x as u64, last),
+                    Value::Prim(Prim::I64(t)) => one_lane(t, |x| x as u64, last),
+                    _ => None,
+                };
+                if let Some(t) = one {
+                    let rows = data.len();
+                    let mut variants: Vec<Value> = (0..*n).map(|_| gather(&data, &[])).collect();
+                    variants[t] = data;
+                    return Ok(Value::sum_tagged(Tags::Const(t, rows), variants));
+                }
+                let tags = tags_v.as_words("Branch tags")?;
                 // one pass builds the tag column, each lane's row list, AND the within-variant offset
                 // (a row's offset is its lane's size when it arrives) — no decode/recompute afterwards.
                 let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n];
                 let mut tag8 = Vec::with_capacity(tags.len());
                 let mut off = Vec::with_capacity(tags.len());
-                let last = n.saturating_sub(1) as u64;
                 for (i, &t) in tags.iter().enumerate() {
                     let t = t.min(last) as usize;
                     tag8.push(t as u8);
@@ -771,59 +781,6 @@ impl<L: OpLike> Op<L> {
                 index_plan(&idx, &Owners::Identity, hb, &mut ok)?.fill_or_zero(hvals)?
             }
 
-            // total vector access: each index either names a haystack-row element (Found) or is out of
-            // that row's bounds (Missing, only counted). The per-element test is branchless (a
-            // comparison to a u64); only the routing into the two lanes is data-dependent. Output is a
-            // list (the index list's bounds) of Sum{Found:T | Missing}.
-            Op::GatherTry => {
-                let (idx, haystack) = input.into_pair("GatherTry")?;
-                let (ib, ivals) = idx.into_list("GatherTry indices")?;
-                let (hb, hvals) = haystack.rows_of("GatherTry haystack")?;
-                assert_eq!(ib.len(), hb.len(), "GatherTry: indices/haystack row count");
-                let idxs = ivals.as_words("GatherTry indices")?;
-                // the clean case first: one branch-free pass resolves every index and notes whether
-                // any is out of its row. Only when one is does the routing below run.
-                let mut pos = Vec::with_capacity(idxs.len());
-                let mut ok = true;
-                for r in 0..ib.len() {
-                    let (is, ie) = ib.span(r);
-                    let (hs, he) = hb.span(r);
-                    let rowlen = (he - hs) as u64;
-                    for &x in &idxs[is..ie] {
-                        ok &= x < rowlen;
-                        pos.push(hs.wrapping_add(x as usize));
-                    }
-                }
-                if ok && !pos.is_empty() {
-                    let found = Value::sum_tagged(Tags::Const(0, pos.len()), vec![gather(hvals, &pos), Value::Unit(0)]);
-                    return Ok(Value::List(ib, Box::new(found)));
-                }
-                // one pass routes each index AND records its within-lane offset — the size its
-                // lane had when it arrived — so the assignment needs no second pass to derive.
-                let (mut tags, mut off) = (Vec::with_capacity(idxs.len()), Vec::with_capacity(idxs.len()));
-                let mut abs = Vec::new(); // absolute haystack positions of the found elements (lane 0)
-                let mut missing = 0usize; // how many indices are out of their row (lane 1)
-                for r in 0..ib.len() {
-                    let (is, ie) = ib.span(r);
-                    let (hs, he) = hb.span(r);
-                    let rowlen = he - hs;
-                    for &x in &idxs[is..ie] {
-                        if (x as usize) < rowlen {
-                            tags.push(0u8);
-                            off.push(abs.len());
-                            abs.push(hs + x as usize);
-                        } else {
-                            tags.push(1u8);
-                            off.push(missing);
-                            missing += 1;
-                        }
-                    }
-                }
-                let lanes = vec![gather(hvals, &abs), Value::Unit(missing)];
-                let sum = Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tags)), off), lanes);
-                Value::List(ib, Box::new(sum))
-            }
-
             // DESTRUCTURE one list layer: return the per-inner-list ranges (relative to
             // each top row's flattened span) AND the one-level-flattened values. Both
             // outputs are lists at the SAME top stratum, so they bundle as a Prod, and the
@@ -889,13 +846,6 @@ impl<L: OpLike> Op<L> {
 
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
             Op::Unit => Value::Unit(input.len()),
-
-            // TRY is the identity on values; the effect lowering reads it as the handling point.
-            Op::Try => input,
-
-            // the failure family was dispatched to `ops::fail::eval` above.
-            Op::TryGather | Op::TryChunk(_)
-            | Op::TryZip | Op::Lift | Op::Squash | Op::HoistProd | Op::HoistList | Op::HoistSum(_) => unreachable!("ops::fail::eval handles the failure family"),
 
             // branchless blend: a two-source `gather_lanes` reading each row's own position from the
             // lane its mask selects (`then` when nonzero). Both operands are full columns, so the
@@ -988,6 +938,14 @@ fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
     }
     let vals = if ragged { chunk_kept(&bounds, &vals, k) } else { vals };
     Value::List(outer.into(), Box::new(Value::List(Bounds::Stride(k, total), Box::new(vals))))
+}
+
+/// the one lane every tag sends its row to (a tag past the last lane goes to the last), if they
+/// all agree. Read in blocks, so a column that does not agree stops early and one that does is a
+/// branch-free pass.
+fn one_lane<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, last: u64) -> Option<usize> {
+    let t = word(*tags.first()?).min(last);
+    tags.chunks(256).all(|c| c.iter().fold(true, |ok, &x| ok & (word(x).min(last) == t))).then_some(t as usize)
 }
 
 /// `Chunk(k)`'s values when some row doesn't divide by `k`: each row's first `len / k * k` elements.

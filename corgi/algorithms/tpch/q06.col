@@ -9,4 +9,3 @@ let (date, disc, qty, price) = input in
         let keep = ((((d, 8766) ge, (d, 9131) lt) min, ((k, 5) ge, (k, 7) le) min) min, (q, 24) lt) min in
         (keep, (p, k) mul))
     filter fold_add
-    try match (0 (s -> s), 1 (_ -> 0))

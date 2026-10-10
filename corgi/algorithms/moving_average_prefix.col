@@ -7,4 +7,4 @@ let starts = ((xs len, 3) max, 3) sub iota in
 let pre = (0 enlist, xs scan_add) append in
 let hi = (starts map (i -> (i, 4) add), pre) gather in
 let lo = (starts, pre) gather in
-(hi, lo) zip map ((h, l) -> (h, l) sub) try match (0 (sums -> sums), 1 (_ -> 0 iota))
+(hi, lo) zip map ((h, l) -> (h, l) sub)

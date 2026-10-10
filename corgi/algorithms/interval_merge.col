@@ -10,6 +10,5 @@ let marks = ((0, 0), sorted) foldscan (((seen, reach), (lo, hi)) ->
     ((1, (reach, hi) max), (start, (lo, hi)))) .1 in
 let ids = marks map ((start, _) -> start) scan_add in
 # ids and marks come from the same list, so the zip cannot fail; the fallback is never taken.
-let tagged = (ids, marks map ((_, iv) -> iv)) zip try
-    match (0 (z -> z), 1 (_ -> 0 iota map (z -> (z, (z, z))))) in
+let tagged = (ids, marks map ((_, iv) -> iv)) zip in
 tagged group map ((_, ivs) -> (ivs map ((lo, _) -> lo) fold_min, ivs map ((_, hi) -> hi) fold_max))

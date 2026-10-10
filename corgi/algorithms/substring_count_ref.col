@@ -7,4 +7,3 @@ let starts = (((n, 1) add, m) max, m) sub iota in
 ((text ref, pat), starts) cap_list map (((text, pat), i) ->
     let w = ((i, (i, pat len) add) range, text) gather in
     (w, pat) zip map ((a, b) -> (a, b) eq) fold_all) fold_add
-    try match (0 (c -> c), 1 (_ -> 0))

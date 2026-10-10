@@ -2,7 +2,7 @@
 # pair of positions gives a pair of elements, a list of them a list, a sum a sum (tags untouched), and
 # one position — `get` — one element. Each position is relative to its row's list.
 # n = 4
-# = Sum tags=[0] [([20], ([0], [30]), List ends=[4] <[0, 10, 20, 30]>, Sum tags=[1] [[], [30]]), ()x0]
+# = ([20], ([0], [30]), List ends=[4] <[0, 10, 20, 30]>, Sum tags=[1] [[], [30]])
 let xs = input iota map (x -> (x, 10) mul) in
 let one = (2, xs) get in
 let pair = ((0, 3), xs) gather in

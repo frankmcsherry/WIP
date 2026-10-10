@@ -11,4 +11,4 @@ let views = (counter, (date, (refresh, (link, (download, url) zip) zip) zip) zip
           (((r, 0) eq, (l, 0) ne) min, (w, 0) eq) min) min, (u, 1))) filter in
 let ranked = views group map ((u, ones) -> (ones len neg, u)) sort_limit 1010 in
 ((1000, (ranked len, 1010) min) range, ranked) gather
-    try match (0 (top -> top map ((d, u) -> (u, d neg))), 1 (_ -> 0 iota map (z -> ("", z))))
+    map ((d, u) -> (u, d neg))

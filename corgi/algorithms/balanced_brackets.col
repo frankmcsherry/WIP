@@ -10,13 +10,13 @@ let (ok, stack) = ((1, ""), input) fold (((ok, stack), c) ->
     # the opener a closer needs: ( for ), [ for ], { for }
     let want = ((c, 41) eq, 40, ((c, 93) eq, 91, 123) select) select in
     let n = stack len in
-    let top = (((n, 1) max, 1) sub, stack) get try match (0 (t -> t), 1 (_ -> 0)) in
+    let top = (((n, 1) max, 1) sub, stack) get in
     let matched = ((n, 0) gt, (top, want) eq) min in
     # 0: push, 1: pop, 2: leave the stack as it is
     let action = (open, 0, (close, 1, 2) select) select in
     let stack2 = ((c, stack), action) branch 3 match (
         0 ((c, s) -> (s, c enlist) append),
-        1 ((_, s) -> ((0, ((s len, 1) max, 1) sub) range, s) gather try match (0 (t -> t), 1 (_ -> ""))),
+        1 ((_, s) -> ((0, ((s len, 1) max, 1) sub) range, s) gather),
         2 ((_, s) -> s)) in
     ((ok, (close, matched, 1) select) min, stack2)) in
 (ok, (stack len, 0) eq) min

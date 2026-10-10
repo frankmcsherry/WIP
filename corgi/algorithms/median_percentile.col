@@ -5,6 +5,6 @@ let n = s len in
 # The lower median is at (n - 1) / 2; nearest rank puts p90 at ceil(9n / 10) - 1.
 let mid = ((n, 1) sub, 2) div in
 let rank = ((((n, 9) mul, 9) add, 10) div, 1) sub in
-let median = (mid, s) get try match (0 (v -> v), 1 (_ -> 0)) in
-let p90 = (rank, s) get try match (0 (v -> v), 1 (_ -> 0)) in
+let median = (mid, s) get in
+let p90 = (rank, s) get in
 (median, p90)
