@@ -1069,6 +1069,29 @@ impl Value {
     /// Floats.
     pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(Arc::new(xs.into_iter().map(f64_key).collect()))) }
 
+    /// the same value with each integer leaf held at the narrowest storage that holds its values.
+    /// Storage is never part of a value, so no answer changes: a host tool, for handing corgi
+    /// narrow columns.
+    pub fn narrowed(self) -> Value {
+        self.restored(&mut Storage::holding)
+    }
+
+    /// the same value with each integer leaf re-stored at `pick(lo, hi)`, a storage holding its
+    /// least and greatest values (`(0, 0)` for a leaf with no rows). Floats stay as they are, and
+    /// so does a referenced arena, whose sharing the references rely on.
+    pub(crate) fn restored(self, pick: &mut impl FnMut(i64, i64) -> Storage) -> Value {
+        match self {
+            Value::Prim(p) if p.is_int() => {
+                let (lo, hi) = p.int_range().unwrap_or((0, 0));
+                Value::Prim(p.to_storage(pick(lo, hi)))
+            }
+            Value::Prod(vs) => Value::Prod(vs.into_iter().map(|v| v.restored(pick)).collect()),
+            Value::Sum(tags, lanes) => Value::Sum(tags, lanes.into_iter().map(|v| v.restored(pick)).collect()),
+            Value::List(b, v) => Value::List(b, Box::new(v.restored(pick))),
+            v @ (Value::Prim(_) | Value::Unit(_) | Value::Ref(..)) => v,
+        }
+    }
+
     /// a Sum from its discriminant `tags` (stored as a u8 leaf column — ≤256 variants) and the
     /// per-variant columns (every lane present; a variant no row carries is an empty column). The
     /// one place tags cross from `usize` into the `Prim` fold. The within-variant offset is computed

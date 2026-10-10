@@ -1,13 +1,14 @@
 //! ClickBench's queries written in corgi, checked against DuckDB's answers and timed against DuckDB.
 //!
 //!   python3 benches/clickbench/prepare.py DIR hits_0.parquet      # the data, DuckDB's answers and times
-//!   CORGI_CLICKBENCH=DIR cargo bench --bench clickbench [-- NAME ...] [--check]
+//!   [CORGI_NARROW=1] CORGI_CLICKBENCH=DIR cargo bench --bench clickbench [-- NAME ...] [--check]
 //!
 //! Each query is `algorithms/clickbench/NAME.col`, whose header names the SQL it answers (`# sql:`), the
 //! columns it reads (`# columns:`, the program's input in that order) and its output's kinds
 //! (`# output:`: `u` or `i` an Int, `f` a Float to four decimals, `g` a Float to twelve significant
 //! digits, `s` a string; `[..]` for a list of rows). The whole table is one row: each column is a
 //! one-row `List`. `--profile` (with `--features profile`) prints each query's time per op.
+//! `CORGI_NARROW=1` loads each column of numbers at the narrowest storage that holds it.
 
 use corgi::{Bounds, Program, Value};
 use std::collections::HashMap;
@@ -49,13 +50,19 @@ fn read_u64s(path: &Path) -> Vec<u64> {
 /// signed order; flipping it back gives the `i64`.
 const SIGN_FLIPPED: [&str; 6] = ["WatchID", "ClientIP", "UserID", "TraficSourceID", "URLHash", "RefererHash"];
 
+/// a column of numbers as the harness holds it: `i64`s, or with `CORGI_NARROW=1` the narrowest
+/// storage that holds the column, which measures what narrow data buys.
+fn narrow(v: Value) -> Value {
+    if std::env::var("CORGI_NARROW").is_ok_and(|n| n == "1") { v.narrowed() } else { v }
+}
+
 /// a column as a one-row list: numbers as `List<Int>`, strings as `List<List<Int>>` (held as bytes).
 fn column(dir: &Path, name: &str) -> Value {
     let one_row = |v: Value| Value::List(Bounds::offsets(vec![v.len()]), Box::new(v));
     let numbers = dir.join(format!("{name}.u64"));
     if numbers.exists() {
         let flip = if SIGN_FLIPPED.contains(&name) { 1 << 63 } else { 0 };
-        return one_row(Value::i64(read_u64s(&numbers).into_iter().map(|x| (x ^ flip) as i64).collect()));
+        return one_row(narrow(Value::i64(read_u64s(&numbers).into_iter().map(|x| (x ^ flip) as i64).collect())));
     }
     let ends: Vec<usize> = read_u64s(&dir.join(format!("{name}.ends"))).into_iter().map(|e| e as usize).collect();
     let bytes = std::fs::read(dir.join(format!("{name}.bytes"))).unwrap();

@@ -100,6 +100,8 @@ pub fn run_case<R>(cfg: &Cfg, name: &str, what: &str, src: &str, input: Value, e
     if !cfg.names.is_empty() && !cfg.names.iter().any(|n| name.contains(n.as_str())) {
         return;
     }
+    // `CORGI_NARROW=1` hands corgi each integer column at the narrowest storage that holds it
+    let input = if std::env::var("CORGI_NARROW").is_ok_and(|n| n == "1") { input.narrowed() } else { input };
     let graph = parse_ml(src).unwrap_or_else(|e| panic!("{name}: {e}"));
     let p = Program::from_graph(if cfg.optimize { corgi::optimize(&graph) } else { graph });
     let rows = input.len();
