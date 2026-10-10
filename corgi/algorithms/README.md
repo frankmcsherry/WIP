@@ -46,6 +46,7 @@ top_pairs programs).
 | kadane_prefix | the same from prefix sums | 133 | 11.7 | 11.3 |
 | levenshtein | edit distance, the textbook table | 2800 | 79.6 | 35.2 |
 | linear_regression | least-squares slope and intercept | 238 | 8.9 | 26.8 |
+| linear_regression_sums | the same from four Float sums | 65.5 | 9.6 | 6.8 |
 | luhn | Luhn check of a digit string | 105 | 6.9 | 15.2 |
 | median_percentile | median and 90th percentile | 242 | 76.6 | 3.2 |
 | mode | most frequent value | 477 | 114 | 4.2 |
@@ -215,7 +216,8 @@ The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Th
 
 8. **Folds whose state is a monoid or an affine map become reductions and scans.**
    - A fold that updates each field independently, `acc.k ⊕ f_k(x)`, is a `map` plus one reduction
-     per field: linear_regression's four sums. This needs an ordered float sum, which corgi lacks.
+     per field: linear_regression's four sums. Float sums run in row order, so this is exact:
+     linear_regression_sums, by hand, is 6.8x Rust against the fold's 25x.
    - A running max carried in a foldscan is an exclusive `scan_max` (interval_merge).
    - `acc * c + x` composes as affine maps and so is associative (ipv4_parse's `acc*256 + v`,
      horner).
@@ -294,7 +296,7 @@ item in NOTES.md, an execution strategy rather than a graph rewrite.
 - **`eq` on lists was thought missing.** The comments described `eq` as comparing leaves, though it
   compares any shape structurally. query_param first compared `hash`es for that reason.
 - **Arithmetic:**
-  - No shift by a variable amount, and no float reductions or scans.
+  - No shift by a variable amount. (Float reductions and scans now exist: linear_regression_sums.)
   - When integers were unsigned, `n - 1` wrapped, so the programs spell it `((n, 1) max, 1) sub`.
     Ints are signed now: `n - 1` is -1, and `iota` or `range` to it is empty.
 - **Closed bodies:**

@@ -18,10 +18,11 @@ use crate::graph::{Graph, OpLike};
 use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value};
 use std::sync::Arc;
 
-/// the named monoid reductions — `List<Int> -> Int` per row, each a one-pass SIMD-friendly
-/// horizontal fold (the fast paths a general `fold` over the same monoid would be ~20x slower than).
-/// `Min`/`Max` go by value, and an empty row's is 0, the zero of an integer (a program that wants
-/// another default tests `len` and `select`s it); `All`/`Any` are the mask AND/OR, written as bytes.
+/// the named monoid reductions — `List<Int> -> Int` or `List<Float> -> Float` per row, each a
+/// one-pass horizontal fold (the fast paths a general `fold` over the same monoid would be ~20x
+/// slower than). A Float sum or product adds or multiplies in row order, so it rounds as the `fold`
+/// does. `Min`/`Max` go by value, and an empty row's is 0 (a program that wants another default
+/// tests `len` and `select`s it); `All`/`Any` are the mask AND/OR, written as bytes, over Ints only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Red {
     Add, // `fold_add` (sum) / `scan_add` (prefix sum)
@@ -81,8 +82,8 @@ pub enum ArithOp {
     Shift(ShiftOp, u32),   // Int -> Int
     Neg,                   // X -> X   negate an Int (wrapping at the edge) or a Float
     ToFloat,               // Int -> Float   the nearest `f64`
-    Reduce(Red),           // List<Int> -> Int      per-row monoid reduction (sum/prod/min/max/all/any)
-    Scan(Red),             // List<Int> -> List<Int>  per-row inclusive monoid PREFIX scan. The monoid
+    Reduce(Red),           // List<X> -> X          per-row monoid reduction (sum/prod/min/max/all/any), X Int or Float
+    Scan(Red),             // List<X> -> List<X>    per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
                            // general `FoldScan` re-evals the body per element (catastrophic on one long
                            // row — see performance.md). `Reduce` is its drop-the-prefix sibling.
@@ -321,6 +322,43 @@ fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: 
     }
 }
 
+/// each row's reduction of Floats, held as their order keys. A sum is the fold of `add` from 0.0 in
+/// row order, and a product the fold of `mul` from 1.0, so each rounds as that fold does. The least
+/// and greatest compare the keys, which is the order `min` and `max` use; an empty row's are 0.0.
+/// `fold_all` and `fold_any` read a mask, which is an Int.
+fn reduce_floats(bounds: &crate::value::Bounds, ks: &[u64], r: Red) -> Result<Value, String> {
+    let mut start = 0;
+    let rows = bounds.ends().map(|end| {
+        let row = &ks[start..end];
+        start = end;
+        row
+    });
+    let zero = f64_key(0.0);
+    let out: Vec<u64> = match r {
+        Red::Add => rows.map(|s| f64_key(s.iter().fold(0.0, |a, &k| a + f64_of_key(k)))).collect(),
+        Red::Mul => rows.map(|s| f64_key(s.iter().fold(1.0, |a, &k| a * f64_of_key(k)))).collect(),
+        Red::Min => rows.map(|s| s.iter().copied().min().unwrap_or(zero)).collect(),
+        Red::Max => rows.map(|s| s.iter().copied().max().unwrap_or(zero)).collect(),
+        Red::All | Red::Any => return Err("fold_all and fold_any read a mask, which is an Int, not a Float".into()),
+    };
+    Ok(Value::Prim(Prim::F64(Arc::new(out))))
+}
+
+/// each row's inclusive prefix under `step`, written over `xs` in place, starting from `id` in every
+/// row. The recurrence is sequential within a row, so this is one pass over memory, not a
+/// vectorizable one.
+fn prefix_rows<T: Copy>(bounds: &crate::value::Bounds, xs: &mut [T], id: T, step: impl Fn(T, T) -> T) {
+    let mut start = 0;
+    for end in bounds.ends() {
+        let mut a = id;
+        for slot in &mut xs[start..end] {
+            a = step(a, *slot);
+            *slot = a;
+        }
+        start = end;
+    }
+}
+
 impl ArithOp {
     fn eval(&self, input: Value) -> Result<Value, String> {
         Ok(match self {
@@ -352,37 +390,39 @@ impl ArithOp {
                 match vals.into_prim("reduce values")? {
                     Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::F64(_) => return Err("reduce: expected Int values, got Float".into()),
+                    Prim::F64(ks) => reduce_floats(&bounds, &ks, *r)?,
                 }
             }
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
-                let mut xs = vals.into_i64("scan values")?; // owned -> inclusive prefix written in place
-                // one monomorphic loop per monoid (no per-element dispatch); the recurrence is
-                // sequential within a row, so this is a single memory pass, not a vectorizable one.
-                macro_rules! prefix {
-                    ($id:expr, $a:ident, $x:ident => $comb:expr) => {{
-                        let mut start = 0;
-                        for end in bounds.ends() {
-                            let mut $a = $id;
-                            for slot in &mut xs[start..end] {
-                                let $x = *slot;
-                                $a = $comb;
-                                *slot = $a;
-                            }
-                            start = end;
+                let out = match vals.into_prim("scan values")? {
+                    // Floats as their keys: a running sum or product decodes, adds in row order and
+                    // encodes; a running least or greatest compares the keys.
+                    Prim::F64(ks) => {
+                        let mut ks = Arc::unwrap_or_clone(ks);
+                        let float = |f: fn(f64, f64) -> f64| move |a: u64, k: u64| f64_key(f(f64_of_key(a), f64_of_key(k)));
+                        match r {
+                            Red::Add => prefix_rows(&bounds, &mut ks, f64_key(0.0), float(|a, x| a + x)),
+                            Red::Mul => prefix_rows(&bounds, &mut ks, f64_key(1.0), float(|a, x| a * x)),
+                            Red::Min => prefix_rows(&bounds, &mut ks, u64::MAX, u64::min),
+                            Red::Max => prefix_rows(&bounds, &mut ks, u64::MIN, u64::max),
+                            Red::All | Red::Any => return Err("scan_all and scan_any read a mask, which is an Int, not a Float".into()),
                         }
-                    }};
-                }
-                match r {
-                    Red::Add => prefix!(0i64, a, x => a.wrapping_add(x)),
-                    Red::Mul => prefix!(1i64, a, x => a.wrapping_mul(x)),
-                    Red::Min => prefix!(i64::MAX, a, x => a.min(x)),
-                    Red::Max => prefix!(i64::MIN, a, x => a.max(x)),
-                    Red::All => prefix!(1i64, a, x => a & (x != 0) as i64), // running "all nonzero so far"
-                    Red::Any => prefix!(0i64, a, x => a | (x != 0) as i64), // running "any nonzero so far"
-                }
-                let out = if matches!(r, Red::All | Red::Any) { Value::u8(xs.iter().map(|&x| x as u8).collect()) } else { Value::i64(xs) };
+                        Value::Prim(Prim::F64(Arc::new(ks)))
+                    }
+                    ints => {
+                        let mut xs = Value::Prim(ints).into_i64("scan values")?; // owned: the prefix is written in place
+                        match r {
+                            Red::Add => prefix_rows(&bounds, &mut xs, 0, i64::wrapping_add),
+                            Red::Mul => prefix_rows(&bounds, &mut xs, 1, i64::wrapping_mul),
+                            Red::Min => prefix_rows(&bounds, &mut xs, i64::MAX, i64::min),
+                            Red::Max => prefix_rows(&bounds, &mut xs, i64::MIN, i64::max),
+                            Red::All => prefix_rows(&bounds, &mut xs, 1, |a, x| a & (x != 0) as i64), // all nonzero so far
+                            Red::Any => prefix_rows(&bounds, &mut xs, 0, |a, x| a | (x != 0) as i64), // any nonzero so far
+                        }
+                        if matches!(r, Red::All | Red::Any) { Value::u8(xs.iter().map(|&x| x as u8).collect()) } else { Value::i64(xs) }
+                    }
+                };
                 Value::List(bounds, Box::new(out))
             }
         })

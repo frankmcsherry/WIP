@@ -1,0 +1,15 @@
+# linear_regression with its four sums as reductions instead of one fold: each is `fold_add` over
+# one mapped column. A Float sum adds in row order, as the fold does, so the answer is the same bit
+# for bit. Input a `List<(x, y)>` of `Float`s. Output `(slope, intercept)`, two `Float`s.
+let pts = input in
+let n = pts len to_float in
+let sx = pts map ((x, _) -> x) fold_add in
+let sy = pts map ((_, y) -> y) fold_add in
+let sxx = pts map ((x, _) -> (x, x) mul) fold_add in
+let sxy = pts map ((x, y) -> (x, y) mul) fold_add in
+let num = ((n, sxy) mul, (sx, sy) mul) sub in
+let den = ((n, sxx) mul, (sx, sx) mul) sub in
+let slope = ((den, 0.0) eq, 0.0, (num, den) div) select in
+let intercept = ((sy, (slope, sx) mul) sub, n) div in
+let empty = (pts len, 0) eq in
+((empty, 0.0, slope) select, (empty, 0.0, intercept) select)

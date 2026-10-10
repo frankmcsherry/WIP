@@ -158,6 +158,42 @@ fn float_arithmetic_is_ieee() {
     }
 }
 
+#[test]
+fn float_reductions_and_scans_run_in_row_order() {
+    // rows chosen so the order of addition changes the rounding: 1e16 + 1 rounds back to 1e16
+    let rows: Vec<Vec<f64>> = vec![vec![1e16, 1.0, -1e16], vec![-1e16, 1e16, 1.0], vec![], vec![-2.5, 0.5, -0.0, 3.0]];
+    let mut ends = Vec::new();
+    for r in &rows {
+        ends.push(ends.last().copied().unwrap_or(0) + r.len());
+    }
+    let input = Value::List(ends.into(), Box::new(Value::f64(rows.concat())));
+    let fold = |id: f64, f: fn(f64, f64) -> f64| -> Vec<u64> { rows.iter().map(|r| r.iter().fold(id, |a, &x| f(a, x)).to_bits()).collect() };
+    let pick = |f: fn(f64, f64) -> f64| -> Vec<u64> {
+        rows.iter().map(|r| r.iter().copied().reduce(f).unwrap_or(0.0).to_bits()).collect()
+    };
+    assert_eq!(float_bits(run("input fold_add", input.clone())), fold(0.0, |a, x| a + x));
+    assert_eq!(float_bits(run("input fold_mul", input.clone())), fold(1.0, |a, x| a * x));
+    assert_eq!(float_bits(run("input fold_min", input.clone())), pick(f64::min));
+    assert_eq!(float_bits(run("input fold_max", input.clone())), pick(f64::max));
+    assert_eq!(float_bits(run("input fold_add", input.clone()))[..2], [0f64.to_bits(), 1f64.to_bits()]);
+    // a scan keeps each prefix: its last is the row's fold
+    let scan = |id: f64, f: fn(f64, f64) -> f64| -> Vec<u64> {
+        rows.iter().flat_map(|r| r.iter().scan(id, move |a, &x| { *a = f(*a, x); Some(a.to_bits()) })).collect()
+    };
+    let flat = |v: Value| match v {
+        Value::List(_, vals) => float_bits(*vals),
+        other => panic!("expected a list, got {}", shape_of_value(&other)),
+    };
+    assert_eq!(flat(run("input scan_add", input.clone())), scan(0.0, |a, x| a + x));
+    assert_eq!(flat(run("input scan_mul", input.clone())), scan(1.0, |a, x| a * x));
+    assert_eq!(flat(run("input scan_max", input.clone())), scan(f64::NEG_INFINITY, f64::max));
+    // all and any read masks, which are Ints
+    let floats = Shape::List(Box::new(Shape::Float));
+    for src in ["input fold_all", "input fold_any", "input scan_all", "input scan_any"] {
+        assert!(Program::compile_ml(src).unwrap().shape(&floats).is_err(), "{src}");
+    }
+}
+
 /// a splitmix64 step, the reference for the mixer below.
 fn splitmix64(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
