@@ -418,6 +418,24 @@ impl Storage {
     }
 }
 
+/// the random-storage test mode's storage for a leaf from `lo` to `hi`: a pseudo-random one of
+/// those that hold it, from a sequence per thread, so a run repeats.
+#[cfg(feature = "random-storage")]
+pub(crate) fn random_storage(lo: i64, hi: i64) -> Storage {
+    use std::cell::Cell;
+    thread_local! { static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) }; }
+    let r = STATE.with(|s| {
+        let x = s.get().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s.set(x);
+        x >> 33
+    });
+    let holds: Vec<Storage> = [Storage::U8, Storage::I8, Storage::I16, Storage::I32, Storage::I64]
+        .into_iter()
+        .filter(|s| { let (a, b) = s.range(); a <= lo && hi <= b })
+        .collect();
+    holds[r as usize % holds.len()]
+}
+
 /// the order-preserving key of an `f64`: negatives flip every bit, the rest flip the sign bit, so
 /// the unsigned order of keys is `f64::total_cmp`. A float leaf stores these.
 pub(crate) fn f64_key(f: f64) -> u64 {
@@ -1195,8 +1213,8 @@ impl Value {
         }
     }
 
-    /// borrow an integer leaf as `i64`s — for an op that only READS its operand. A byte leaf
-    /// widens (a copy); an `i64` leaf is borrowed.
+    /// borrow an integer leaf as `i64`s — for an op that only READS its operand. A leaf held
+    /// narrower widens (a copy); an `i64` leaf is borrowed.
     ///
     /// `into_i64` forces ownership, and ownership is a full column COPY whenever anyone else still
     /// holds the buffer: a graph node with fan-out 2, or a caller that keeps its input. Measured on
@@ -1212,7 +1230,7 @@ impl Value {
     }
 
     /// take an integer leaf as an owned `i64` buffer — for an op that REWRITES its operand in
-    /// place. Moves the buffer out at refcount 1, and copies it when shared or held as bytes.
+    /// place. Moves the buffer out at refcount 1, and copies it when shared or held narrower.
     pub fn into_i64(self, who: &str) -> Result<Vec<i64>, String> {
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
@@ -1222,7 +1240,7 @@ impl Value {
     }
 
     /// an integer leaf as 64-bit words (two's complement) — how positions, counts and tags are
-    /// read, so a negative one is past every row. Borrowed from an `i64` leaf.
+    /// read, so a negative one is past every row. Borrowed from an `i64` leaf, widened from others.
     pub(crate) fn as_words(&self, who: &str) -> Result<std::borrow::Cow<'_, [u64]>, String> {
         use std::borrow::Cow;
         match self {

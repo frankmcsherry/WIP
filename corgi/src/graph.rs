@@ -94,11 +94,24 @@ pub(crate) fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Valu
             NodeKind::Tuple => {
                 Value::Prod(node.inputs.iter().map(|&i| take(&mut vals, &mut uses, i)).collect())
             }
-            NodeKind::Op(o) => o.eval(take(&mut vals, &mut uses, node.inputs[0]))?,
+            NodeKind::Op(o) => produced(o.eval(take(&mut vals, &mut uses, node.inputs[0]))?),
         };
         vals.push(Some(v));
     }
     Ok(vals[g.output].take().unwrap())
+}
+
+/// an op's result as the ops after it see it: itself, or in the random-storage test mode, with each
+/// integer leaf re-stored at a pseudo-random storage that holds its values.
+#[cfg(not(feature = "random-storage"))]
+#[inline(always)]
+fn produced(v: Value) -> Value {
+    v
+}
+
+#[cfg(feature = "random-storage")]
+fn produced(v: Value) -> Value {
+    v.restored(&mut crate::value::random_storage)
 }
 
 /// shape-check the graph given the input's shape: `eval` on a ZERO-ROW column of that shape. Every

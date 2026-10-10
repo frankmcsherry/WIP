@@ -273,7 +273,7 @@ fn shift_eval(op: ShiftOp, a: Prim, k: u32) -> Result<Prim, String> {
     })
 }
 
-/// each row's reduction, reading the values at their storage (a byte leaf is not widened first).
+/// each row's reduction, reading the values at their storage (a narrow leaf is not widened first).
 /// Sums and products wrap at the `i64` edge, as `add` and `mul` do. An empty row's sum is 0, its
 /// product 1, its minimum and maximum 0.
 fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: Red) -> Value {

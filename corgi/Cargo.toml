@@ -10,6 +10,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 [features]
 # time per op kind over a run (`corgi::explain::profile`); off, it costs nothing.
 profile = []
+# a test mode: every integer leaf an op produces is re-stored at a pseudo-random storage that holds
+# its values, so no answer may depend on storage. Off, it costs nothing.
+random-storage = []
 
 [[bench]]
 name = "eval"

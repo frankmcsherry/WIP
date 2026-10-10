@@ -358,7 +358,10 @@ arithmetic. Unsigned 64-bit values above 2^63 have no storage of their own: a ha
 Then the signed widths (2026-10): `i8`, `i16` and `i32` join bytes and `i64` as storages (unsigned
 only at a byte). Two storages meet at the narrowest that holds both (a byte and an `i8` meet at
 `i16`); movement ops keep their input's storage, and arithmetic still computes and writes `i64`.
-Nothing yet narrows; narrow columns come only from hosts.
+Nothing yet narrows; narrow columns come only from hosts (`Value::narrowed`, and `CORGI_NARROW=1`
+in the suites). The `random-storage` feature is the check that storage stays invisible: every
+integer leaf an op produces is re-stored at a pseudo-random storage that holds it, and every test
+and suite check must still pass.
 
 ## Live work — the DDIR consumer
 
