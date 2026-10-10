@@ -578,11 +578,12 @@ macro_rules! prim {
                 if !self.is_int() {
                     return None;
                 }
+                // at the storage's own width, where the loops vectorize widest
                 match self {
-                    $( Prim::$V(v) => v.iter().map(|&x| x.word() as i64).fold(None, |r, x| match r {
-                        None => Some((x, x)),
-                        Some((lo, hi)) => Some((x.min(lo), x.max(hi))),
-                    }), )+
+                    $( Prim::$V(v) => {
+                        let (lo, hi) = (v.iter().copied().min()?, v.iter().copied().max()?);
+                        Some((lo.word() as i64, hi.word() as i64))
+                    } )+
                 }
             }
 
@@ -966,7 +967,7 @@ impl Prim {
     /// `f(a[k], b[k + skew])` for `k` in `0..n`, two integer leaves at any storages read a tile at a
     /// time as `i64`s: how a compare of two storages runs without converting either column.
     pub(crate) fn int_tiles<T>(a: &Prim, b: &Prim, n: usize, skew: usize, f: impl Fn(i64, i64) -> T) -> Vec<T> {
-        let (mut ba, mut bb) = ([0i64; TILE], [0i64; TILE]);
+        let (mut ba, mut bb) = (Vec::new(), Vec::new());
         let mut out = Vec::with_capacity(n);
         for at in (0..n).step_by(TILE) {
             let m = TILE.min(n - at);
@@ -977,25 +978,23 @@ impl Prim {
     }
 
     /// rows `at..at + n` (at most [`TILE`]) of an integer leaf as `i64`s: the leaf's own slice when
-    /// it is held as `i64`s, otherwise widened into `buf`. How a kernel reads an operand at any
-    /// storage a tile at a time, so no operand is converted whole and only one kernel per op exists.
+    /// it is held as `i64`s, otherwise widened into `buf`. How a compare reads two storages that
+    /// meet at `i64` a tile at a time, so neither is converted whole.
     #[inline]
-    pub(crate) fn int_tile<'a>(&'a self, at: usize, n: usize, buf: &'a mut [i64; TILE]) -> &'a [i64] {
-        fn widen<T: Elem>(xs: &[T], buf: &mut [i64; TILE]) -> usize {
-            for (b, &x) in buf.iter_mut().zip(xs) {
-                *b = x.word() as i64;
-            }
-            xs.len()
+    pub(crate) fn int_tile<'a>(&'a self, at: usize, n: usize, buf: &'a mut Vec<i64>) -> &'a [i64] {
+        fn widen<T: Elem>(xs: &[T], buf: &mut Vec<i64>) {
+            buf.clear();
+            buf.extend(xs.iter().map(|&x| x.word() as i64));
         }
-        let n = match self {
+        match self {
             Prim::I64(v) => return &v[at..at + n],
             Prim::U8(v) => widen(&v[at..at + n], buf),
             Prim::I8(v) => widen(&v[at..at + n], buf),
             Prim::I16(v) => widen(&v[at..at + n], buf),
             Prim::I32(v) => widen(&v[at..at + n], buf),
             Prim::F64(_) => unreachable!("int_tile: an integer leaf"),
-        };
-        &buf[..n]
+        }
+        buf
     }
 
     /// the leaf at a storage that also holds the constant `c`, when its own can't (`None` when it
