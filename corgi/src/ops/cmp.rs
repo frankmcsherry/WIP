@@ -122,7 +122,7 @@ impl CmpOp {
                 };
                 // the runs the sort found, as it found them: each element's run, numbered densely
                 // over the whole column (a run never spans two rows)
-                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::i64(refined.into_iter().map(|r| r as i64).collect())])))
+                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::upto(refined.len(), refined.into_iter().map(|r| r as usize))])))
             }
 
             CmpOp::SortLimit(k) => {
@@ -212,14 +212,11 @@ enum Level {
 fn order_levels(v: &Value, out: &mut Vec<Level>) {
     match v {
         Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
-        Value::List(inner, _) => {
+        Value::List(inner, vals) => {
             // the elements by position, a row past its end reading zero (the least value of any
             // shape), then the length: a proper prefix ties its padded rows and comes first.
             out.push(Level::Elems(v.clone()));
-            out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
-                let (s, e) = inner.span(i);
-                (e - s) as i64
-            }).collect())));
+            out.push(Level::Col(Value::upto(vals.len(), (0..inner.len()).map(|i| { let (s, e) = inner.span(i); e - s }))));
         }
         other => out.push(Level::Col(other.clone())),
     }

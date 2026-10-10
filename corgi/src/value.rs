@@ -1143,6 +1143,16 @@ impl Value {
     pub fn i16(xs: Vec<i16>) -> Value { Value::Prim(Prim::I16(Arc::new(xs))) }
     pub fn i32(xs: Vec<i32>) -> Value { Value::Prim(Prim::I32(Arc::new(xs))) }
     pub fn i64(xs: Vec<i64>) -> Value { Value::Prim(Prim::I64(Arc::new(xs))) }
+    /// Integers from 0 to `hi`, collected at the narrowest storage that holds that range with no
+    /// pass to find it: how an op that knows its bound (a length, a run's number) writes.
+    pub(crate) fn upto(hi: usize, xs: impl Iterator<Item = usize>) -> Value {
+        Value::Prim(match Storage::holding(0, hi as i64) {
+            Storage::U8 => Prim::U8(Arc::new(xs.map(|x| x as u8).collect())),
+            Storage::I16 => Prim::I16(Arc::new(xs.map(|x| x as i16).collect())),
+            Storage::I32 => Prim::I32(Arc::new(xs.map(|x| x as i32).collect())),
+            _ => Prim::I64(Arc::new(xs.map(|x| x as i64).collect())),
+        })
+    }
     /// Floats.
     pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(Arc::new(xs.into_iter().map(f64_key).collect()))) }
 

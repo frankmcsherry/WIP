@@ -79,13 +79,10 @@ fn position(cs: &[char], at: usize) -> String {
     format!("{line}:{col}")
 }
 
-/// an Int constant, held as a byte when it is one (so a byte column meeting it stays bytes, as text
-/// meeting `40` does) and as an `i64` otherwise.
+/// an Int constant, held at the narrowest storage that holds it (so a byte column meeting it stays
+/// bytes, as text meeting `40` does).
 fn int_lit(n: i64) -> Value {
-    match u8::try_from(n) {
-        Ok(b) => Value::u8(vec![b]),
-        Err(_) => Value::i64(vec![n]),
-    }
+    Value::i64(vec![n]).narrowed()
 }
 
 /// the tokens of `s`, and the char offset where each begins. `#` starts a comment to end of line.

@@ -289,7 +289,7 @@ pub(crate) fn try_gather<L: OpLike>(input: Value) -> Result<Value, String> {
         assert_eq!(idx.len(), hb.len(), "TryGather: indices/haystack row count");
         // the leaf fast path indexes the payload directly, so row 0 must BE the payload (a
         // partition); a referenced haystack takes the row-relative path.
-        matches!(idx, Value::List(ib, ivals) if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::I64(_))))
+        matches!(idx, Value::List(ib, ivals) if ib.len() == 1 && matches!(&**ivals, Value::Prim(q) if q.is_int()))
             && matches!(hvals, Value::Prim(_))
             && matches!(hb, Rows::Part(_))
     };
