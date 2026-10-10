@@ -3,6 +3,6 @@
 # columns: AdvEngineID
 # output: [u,u]
 # Most frequent first: sort on (-count, key).
-input map (a -> ((a, 0) ne, (a, 1))) filter group
-    map ((a, ones) -> (ones len neg, a)) sort
+input map (a -> ((a, 0) ne, (a, ()))) filter group
+    map ((a, rows) -> (rows len neg, a)) sort
     map ((d, a) -> (a, d neg))

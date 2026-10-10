@@ -4,6 +4,6 @@
 # columns: SearchEngineID SearchPhrase
 # output: [u,s,u]
 let (engine, phrase) = input in
-let ranked = (engine, phrase) zip map ((e, s) -> ((s len, 0) gt, ((e, s), 1))) filter group
-    map (((e, s), ones) -> (ones len neg, e, s)) sort_limit 10 in
+let ranked = (engine, phrase) zip map ((e, s) -> ((s len, 0) gt, ((e, s), ()))) filter group
+    map (((e, s), rows) -> (rows len neg, e, s)) sort_limit 10 in
 ranked map ((d, e, s) -> (e, s, d neg))

@@ -114,8 +114,9 @@ takes 9.8 s and DuckDB 0.9 s.
 3. **Missing words: substring search and string min/max.**
    - q20–q23 spend 9–60× on split-and-compare.
    - MIN(Referer) by sorting each group is 1.4 s of q28.
-4. **COUNT(\*) without value lists.** `(k, 1) group … ones len` builds lists only to count
-   them. Run lengths (`adjacent`, `cut`) or a bincount for a small key domain would not.
+4. **COUNT(\*) without value lists.** `(k, ()) group … rows len` builds lists only to count
+   them. Run lengths (`adjacent`, `cut`) or a bincount for a small key domain would not. (The
+   payload is `()`, not a column of 1s, so the sort has nothing to carry.)
 5. **Predicate chains.** Each comparison, and each AND (`min` of two masks), is its own pass. DuckDB
    fuses them, evaluates the cheap ones first (q21's LIKE runs only on survivors), and skips blocks
    by min/max (q19).
