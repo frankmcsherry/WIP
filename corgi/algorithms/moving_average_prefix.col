@@ -2,7 +2,7 @@
 # difference of two prefix sums four apart. The rewrite of a sliding-window sum (an invertible
 # monoid) that turns 4 reads per window into 2. Input a `List<Int>`; output as `moving_average`.
 let xs = input in
-let starts = (((xs len, 3) max, 3) sub) iota in
+let starts = ((xs len, 3) max, 3) sub iota in
 # pre[i] = xs[0] + .. + xs[i - 1], so pre has n + 1 entries.
 let pre = (0 enlist, xs scan_add) append in
 let hi = (starts map (i -> (i, 4) add), pre) gather in

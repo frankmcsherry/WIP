@@ -27,9 +27,13 @@
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
-//!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root
+//!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root; '(' … ')' is a tuple
 //!   LIT    = '-'? DIGITS                                        -- an Int
 //!          | '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)?  -- a Float, with a fraction or exponent
+//!
+//! Parentheses build a tuple wherever they appear: `(e)` in an expression is a one-field tuple, as
+//! `(x)` is in a pattern and `(int)` in a shape. Nothing needs them for grouping, as stages apply
+//! by juxtaposition.
 //!
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
@@ -593,7 +597,7 @@ impl P {
                     es.push(self.expr()?);
                 }
                 self.eat(&Tok::RParen)?;
-                Ok(if es.len() == 1 { es.pop().unwrap() } else { E::Tuple(es) })
+                Ok(E::Tuple(es))
             }
             Some(Tok::Ident(_)) => {
                 let at = self.at(self.i);

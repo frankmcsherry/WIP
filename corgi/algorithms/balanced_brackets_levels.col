@@ -8,7 +8,7 @@ let bs = input map (c -> ((((((c, 40) eq, (c, 41) eq) max, (c, 91) eq) max, (c, 
     ((c, 123) eq, (c, 125) eq) max) max, c)) filter in
 let closer = bs map (c -> (((c, 41) eq, (c, 93) eq) max, (c, 125) eq) max) in
 let closes = closer scan_add in
-let opens = (bs len iota, closes) zip map ((i, c) -> (((i, 1) add, c) sub)) in
+let opens = (bs len iota, closes) zip map ((i, c) -> ((i, 1) add, c) sub) in
 let prefix_ok = (closes, opens) zip map ((c, o) -> (c, o) le) fold_all in
 let totals_ok = (opens fold_max, closes fold_max) eq in
 # an opener's level counts itself; a closer's is the level it closes

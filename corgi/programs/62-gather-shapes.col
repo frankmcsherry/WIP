@@ -7,5 +7,5 @@ let xs = input iota map (x -> (x, 10) mul) in
 let one = (2, xs) get in
 let pair = ((0, 3), xs) gather in
 let list = (input iota, xs) gather in
-let sum = (((3, 1) branch 2), xs) gather in
+let sum = ((3, 1) branch 2, xs) gather in
 (one, pair, list, sum)

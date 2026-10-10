@@ -9,5 +9,5 @@ let walk = ((0, 0), s) foldscan (((b, k), c) ->
 let ((b, k), emitted) = walk in
 let finished = emitted filter in
 # The run still open at the end, if the string was not empty.
-let last = (((k, 0) gt, (b, k)) enlist) filter in
+let last = ((k, 0) gt, (b, k)) enlist filter in
 (finished, last) append

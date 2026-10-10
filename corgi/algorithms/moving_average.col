@@ -2,6 +2,6 @@
 # `List<Int>`. Output a `List<Int>` of max(n - 3, 0) window sums.
 let xs = input in
 # Windows start at 0 .. n - 3; a row shorter than four has none.
-let starts = (((xs len, 3) max, 3) sub) iota in
+let starts = ((xs len, 3) max, 3) sub iota in
 let windows = (starts map (i -> (i, (i, 4) add)), xs) slices in
 windows map (w -> w fold_add) try match (0 (sums -> sums), 1 (_ -> 0 iota))

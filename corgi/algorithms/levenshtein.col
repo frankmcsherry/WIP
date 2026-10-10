@@ -2,7 +2,7 @@
 # the table per byte of s1. Input `(s1, s2)`, two `List<Int>` of bytes. Output the distance, an
 # `Int`.
 let (s1, s2) = input in
-let row0 = ((s2 len, 1) add) iota in
+let row0 = (s2 len, 1) add iota in
 let last = ((s2, 0, row0), s1) fold (((s2, i, prev), c) ->
     let n = s2 len in
     # prev[j] (the diagonal) and prev[j + 1] (the cell above), beside s2[j].
