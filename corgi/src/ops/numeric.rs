@@ -15,7 +15,7 @@ use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
-use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value};
+use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value, TILE};
 use std::sync::Arc;
 
 /// the named monoid reductions — `List<Int> -> Int` per row, each a one-pass SIMD-friendly
@@ -115,25 +115,62 @@ fn map_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
     }
 }
 
-/// an integer leaf's values as `i64`s behind an `Arc`, for the kernels that write in place: an
-/// `i64` leaf is its own buffer (a refcount bump), a narrower one converts (one pass).
-fn int_arc(p: Prim) -> Arc<Vec<i64>> {
-    match p {
-        Prim::I64(v) => v,
-        p => Arc::new(p.ints()),
+/// `f(own, other)` lane by lane into `own`'s buffer when it is uniquely held (fresh otherwise), with
+/// `other` read a tile at a time at its own storage ([`Prim::int_tile`]).
+fn tiled_into(mut own: Arc<Vec<i64>>, other: &Prim, f: impl Fn(i64, i64) -> i64) -> Arc<Vec<i64>> {
+    let mut buf = [0i64; TILE];
+    if let Some(dst) = Arc::get_mut(&mut own) {
+        for (k, xs) in dst.chunks_mut(TILE).enumerate() {
+            let ys = other.int_tile(k * TILE, xs.len(), &mut buf);
+            for (x, &y) in xs.iter_mut().zip(ys) { *x = f(*x, y); }
+        }
+        own
+    } else {
+        let mut out = Vec::with_capacity(own.len());
+        for (k, xs) in own.chunks(TILE).enumerate() {
+            let ys = other.int_tile(k * TILE, xs.len(), &mut buf);
+            out.extend(xs.iter().zip(ys).map(|(&x, &y)| f(x, y)));
+        }
+        Arc::new(out)
     }
 }
 
-/// a binary integer kernel: `f` on each pair, written as `i64`s — into an operand's buffer when
-/// one is uniquely held. Operands held narrower convert to `i64`s first.
+/// a binary integer kernel: `f` on each pair, written as `i64`s — into an `i64` operand's buffer
+/// when one is uniquely held. An operand held narrower is read a tile at a time, never converted
+/// whole, so there is one loop per op whatever the storages.
 fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
-    Prim::I64(bin_into(int_arc(a), int_arc(b), f))
+    Prim::I64(match (a, b) {
+        (Prim::I64(x), Prim::I64(y)) => bin_into(x, y, f),
+        (Prim::I64(x), b) => tiled_into(x, &b, f),
+        (a, Prim::I64(y)) => tiled_into(y, &a, |q, p| f(p, q)),
+        (a, b) => {
+            let (mut ba, mut bb) = ([0i64; TILE], [0i64; TILE]);
+            let mut out = Vec::with_capacity(a.len());
+            for at in (0..a.len()).step_by(TILE) {
+                let n = TILE.min(a.len() - at);
+                let (xs, ys) = (a.int_tile(at, n, &mut ba), b.int_tile(at, n, &mut bb));
+                out.extend(xs.iter().zip(ys).map(|(&x, &y)| f(x, y)));
+            }
+            Arc::new(out)
+        }
+    })
 }
 
 /// a unary integer kernel: `f` on each element, written as `i64`s — in place in a uniquely held
-/// `i64` leaf; a leaf held narrower converts to `i64`s first.
+/// `i64` leaf; a leaf held narrower is read a tile at a time.
 fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
-    Prim::I64(map_into(int_arc(a), f))
+    Prim::I64(match a {
+        Prim::I64(x) => map_into(x, f),
+        a => {
+            let mut buf = [0i64; TILE];
+            let mut out = Vec::with_capacity(a.len());
+            for at in (0..a.len()).step_by(TILE) {
+                let n = TILE.min(a.len() - at);
+                out.extend(a.int_tile(at, n, &mut buf).iter().map(|&x| f(x)));
+            }
+            Arc::new(out)
+        }
+    })
 }
 
 /// `$apply(args.., body)` with the integer lane body of the `BinOp` `$op`: exact within `i64`,

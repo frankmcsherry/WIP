@@ -345,6 +345,10 @@ pub(crate) trait Elem: Copy + Ord + Default + std::fmt::Debug {
 
 const SIGN: u64 = 1 << 63;
 
+/// the rows a kernel reads an operand in at a time when it must widen it: small enough that the
+/// widened block stays in L1 beside the output, large enough that the per-tile dispatch vanishes.
+pub(crate) const TILE: usize = 1024;
+
 impl Elem for u8 {
     const BITS: u32 = 8;
     #[inline] fn key(self) -> u64 { self as u64 }
@@ -816,6 +820,11 @@ macro_rules! prim {
             /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and
             /// scalar on NEON; the dense column-vs-column compare is [`Prim::rel`].
             pub(crate) fn cmp_idx(&self, ia: &[usize], ib: &[usize], other: &Prim) -> Vec<i8> {
+                // integers at two storages compare pair by pair, by value: converting either
+                // whole would cost the column for the pairs (a search reads a few per needle).
+                if self.storage() != other.storage() && self.is_int() && other.is_int() {
+                    return ia.iter().zip(ib).map(|(&i, &j)| self.int_at(i).cmp(&other.int_at(j)) as i8).collect();
+                }
                 let (a, b) = Prim::meet_ref(self, other);
                 match (&*a, &*b) {
                     $( (Prim::$V(a), Prim::$V(b)) =>
@@ -829,6 +838,9 @@ macro_rules! prim {
             /// row i) and `skew` 1 the adjacent (row k vs row k+1). Both sides are read
             /// sequentially, so this vectorizes where [`Prim::cmp_idx`] is two gathers per lane.
             pub(crate) fn cmp_dense(&self, other: &Prim, n: usize, skew: usize) -> Vec<i8> {
+                if Prim::meet_wide(self, other) {
+                    return Prim::int_tiles(self, other, n, skew, |x, y| (x > y) as i8 - (x < y) as i8);
+                }
                 let (a, b) = Prim::meet_ref(self, other);
                 match (&*a, &*b) {
                     $( (Prim::$V(a), Prim::$V(b)) => (0..n)
@@ -844,6 +856,9 @@ macro_rules! prim {
             /// lane-wise relational compare of two columns → a 0/1 byte mask. The three order-flags
             /// arrive pre-resolved (`lt`/`eq`/`gt`), so the lane body is branchless and vectorizes.
             pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
+                if Prim::meet_wide(self, other) {
+                    return Prim::int_tiles(self, other, self.len(), 0, |x, y| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u8);
+                }
                 let (a, b) = Prim::meet_ref(self, other);
                 match (&*a, &*b) {
                     $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
@@ -936,6 +951,51 @@ impl Prim {
     #[inline]
     pub(crate) fn int_at(&self, i: usize) -> i64 {
         self.word_at(i) as i64
+    }
+
+    /// two integer leaves at different storages that would meet at `i64`: then a dense kernel reads
+    /// them a tile at a time ([`Prim::int_tiles`]) rather than converting the narrower whole. (Two
+    /// that meet narrower convert, since the narrow compare is the faster one.)
+    pub(crate) fn meet_wide(a: &Prim, b: &Prim) -> bool {
+        match (a.storage(), b.storage()) {
+            (Some(x), Some(y)) => x != y && Storage::join(x, y) == Storage::I64,
+            _ => false,
+        }
+    }
+
+    /// `f(a[k], b[k + skew])` for `k` in `0..n`, two integer leaves at any storages read a tile at a
+    /// time as `i64`s: how a compare of two storages runs without converting either column.
+    pub(crate) fn int_tiles<T>(a: &Prim, b: &Prim, n: usize, skew: usize, f: impl Fn(i64, i64) -> T) -> Vec<T> {
+        let (mut ba, mut bb) = ([0i64; TILE], [0i64; TILE]);
+        let mut out = Vec::with_capacity(n);
+        for at in (0..n).step_by(TILE) {
+            let m = TILE.min(n - at);
+            let (xs, ys) = (a.int_tile(at, m, &mut ba), b.int_tile(at + skew, m, &mut bb));
+            out.extend(xs.iter().zip(ys).map(|(&x, &y)| f(x, y)));
+        }
+        out
+    }
+
+    /// rows `at..at + n` (at most [`TILE`]) of an integer leaf as `i64`s: the leaf's own slice when
+    /// it is held as `i64`s, otherwise widened into `buf`. How a kernel reads an operand at any
+    /// storage a tile at a time, so no operand is converted whole and only one kernel per op exists.
+    #[inline]
+    pub(crate) fn int_tile<'a>(&'a self, at: usize, n: usize, buf: &'a mut [i64; TILE]) -> &'a [i64] {
+        fn widen<T: Elem>(xs: &[T], buf: &mut [i64; TILE]) -> usize {
+            for (b, &x) in buf.iter_mut().zip(xs) {
+                *b = x.word() as i64;
+            }
+            xs.len()
+        }
+        let n = match self {
+            Prim::I64(v) => return &v[at..at + n],
+            Prim::U8(v) => widen(&v[at..at + n], buf),
+            Prim::I8(v) => widen(&v[at..at + n], buf),
+            Prim::I16(v) => widen(&v[at..at + n], buf),
+            Prim::I32(v) => widen(&v[at..at + n], buf),
+            Prim::F64(_) => unreachable!("int_tile: an integer leaf"),
+        };
+        &buf[..n]
     }
 
     /// the leaf at a storage that also holds the constant `c`, when its own can't (`None` when it
