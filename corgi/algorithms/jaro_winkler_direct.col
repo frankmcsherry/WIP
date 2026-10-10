@@ -5,8 +5,8 @@ let (l1, l2) = (s1 len, s2 len) in
 # The match window: max(l1, l2) / 2 - 1, saturating at zero.
 let d = ((((l1, l2) max, 2) div, 1) max, 1) sub in
 # Number the bytes: s1 as (i, c), s2 as (j, c, matched).
-let s1x = ((0, s1) foldscan ((i, c) -> ((i, 1) add, (i, c)))) .1 in
-let s2x = ((0, s2) foldscan ((j, c) -> ((j, 1) add, (j, c, 0)))) .1 in
+let s1x = (0, s1) foldscan ((i, c) -> ((i, 1) add, (i, c))) .1 in
+let s2x = (0, s2) foldscan ((j, c) -> ((j, 1) add, (j, c, 0))) .1 in
 # The greedy match: for each byte of s1, take the first unmatched equal byte of s2 in the window.
 let matching = ((d, s2x), s1x) foldscan (((d, st), (i, c)) ->
     let cand = ((d, i, c), st) cap_list map (((d, i, c), (j, ch, m)) ->
@@ -19,16 +19,16 @@ let matching = ((d, s2x), s1x) foldscan (((d, st), (i, c)) ->
 let ((_, s2m), per1) = matching in
 let m = per1 map ((hit, _, _, _) -> hit) fold_add in
 # Transpositions: rank the matched bytes of each string, then compare equal ranks.
-let rank2 = ((0, s2m) foldscan ((k, (_, ch, mm)) -> let k2 = (k, mm) add in (k2, (ch, mm, k2)))) .1 in
-let rank1 = ((0, per1) foldscan ((k, (hit, _, _, c)) -> let k2 = (k, hit) add in (k2, (c, hit, k2)))) .1 in
+let rank2 = (0, s2m) foldscan ((k, (_, ch, mm)) -> let k2 = (k, mm) add in (k2, (ch, mm, k2))) .1 in
+let rank1 = (0, per1) foldscan ((k, (hit, _, _, c)) -> let k2 = (k, hit) add in (k2, (c, hit, k2))) .1 in
 let t2 = (rank2, rank1) cap_list map ((rank2, (c, hit, k)) ->
     let mis = ((c, k), rank2) cap_list map (((c, k), (ch, mm, k2)) -> ((mm, (k2, k) eq) min, (ch, c) ne) min) fold_any in
     (mis, hit) min) fold_add in
 let t = (t2, 2) div in
 # The common prefix, up to four bytes.
-let prefix = (((0, 1), per1) fold (((p, alive), (_, same, lt4, _)) ->
+let prefix = ((0, 1), per1) fold (((p, alive), (_, same, lt4, _)) ->
     let a2 = ((alive, same) min, lt4) min in
-    ((p, a2) add, a2))) .0 in
+    ((p, a2) add, a2)) .0 in
 let fm = m to_float in
 let jaro = ((((fm, l1 to_float) div, (fm, l2 to_float) div) add, ((fm, t to_float) sub, fm) div) add, 3.0) div in
 let jaro = ((m, 0) eq, 0.0, jaro) select in

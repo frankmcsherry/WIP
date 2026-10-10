@@ -1,9 +1,9 @@
 # The three most frequent words of a text (ties: the smaller word), with their
 # counts.
 # Input a `List<Int>` of bytes, words separated by single spaces. Output a `List<(List<Int>, Int)>`.
-let words = input split " " map (w -> (((w len, 0) gt), w)) filter in
+let words = input split " " map (w -> ((w len, 0) gt, w)) filter in
 let counts = words map (w -> (w, 1)) group map ((w, ones) -> (w, ones len)) in
 # most frequent first: sort on (-count, word).
 let ranked = counts map ((w, c) -> (c neg, w, c)) sort in
-let k = ((ranked len, 3) min) in
+let k = (ranked len, 3) min in
 ((0, k) range, ranked) gather try match (0 (top -> top map ((_, w, c) -> (w, c))), 1 (_ -> 0 iota map (z -> ("", z))))

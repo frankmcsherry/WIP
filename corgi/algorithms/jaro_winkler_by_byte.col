@@ -5,8 +5,8 @@ let (s1, s2) = input in
 let (l1, l2) = (s1 len, s2 len) in
 let d = ((((l1, l2) max, 2) div, 1) max, 1) sub in
 # Positions grouped by byte: List<(byte, List<position>)>.
-let g1 = ((0, s1) foldscan ((i, c) -> ((i, 1) add, (c, i)))) .1 group in
-let g2 = ((0, s2) foldscan ((j, c) -> ((j, 1) add, (c, j)))) .1 group in
+let g1 = (0, s1) foldscan ((i, c) -> ((i, 1) add, (c, i))) .1 group in
+let g2 = (0, s2) foldscan ((j, c) -> ((j, 1) add, (c, j))) .1 group in
 # For each byte of s1, the s2 positions holding it (empty if none).
 let bs = ((g1 map ((c, _) -> c), g2 map ((c, _) -> c)) find, g2 map ((_, js) -> js)) slices try
     match (0 (ok -> ok map (x -> x flatten .1)), 1 (_ -> 0 iota map (z -> z iota))) in
@@ -18,10 +18,10 @@ let per = (d, ab) cap_list map ((d, ((c, al), bl)) ->
     let hi = (highs, bl) find map ((_, h) -> h) in
     let lu = (lo, hi) zip try match (0 (ok -> ok), 1 (_ -> 0 iota map (z -> (z, z)))) in
     # The two-pointer merge with scalar state: p = max(p + hit, L), hit = p < U.
-    let sc = (((0, 0), lu) foldscan (((p, m), (l, u)) ->
+    let sc = ((0, 0), lu) foldscan (((p, m), (l, u)) ->
         let q = ((p, m) add, l) max in
         let hit = (q, u) lt in
-        ((q, hit), ((q, (q, hit) add), hit)))) .1 in
+        ((q, hit), ((q, (q, hit) add), hit))) .1 in
     let mb = (sc map ((r, _) -> r), bl) slices try match (0 (ok -> ok flatten .1), 1 (_ -> 0 iota)) in
     let ma = (sc map ((_, h) -> h), al) zip filter try match (0 (ok -> ok), 1 (_ -> 0 iota)) in
     ((c, ma) cap_list map ((c, a) -> (a, c)), (c, mb) cap_list map ((c, b) -> (b, c)), sc map ((_, h) -> h) fold_add)) in

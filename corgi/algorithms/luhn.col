@@ -4,9 +4,9 @@
 # string is not valid).
 let ds = input map (c -> (c, 48) sub) in
 let n = ds len in
-let sum = (n, ((ds len) iota, ds) zip) cap_list map ((n, (i, d)) ->
+let sum = (n, (ds len iota, ds) zip) cap_list map ((n, (i, d)) ->
     # the digit's position counted from the right; odd positions are doubled.
-    let second = ((((n, i) sub, 1) sub) and 1, 1) eq in
+    let second = (((n, i) sub, 1) sub and 1, 1) eq in
     let twice = (d, 2) mul in
     let twice = ((twice, 9) gt, (twice, 9) sub, twice) select in
     (second, twice, d) select) fold_add in

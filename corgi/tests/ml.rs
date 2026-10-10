@@ -31,6 +31,17 @@ fn sum_scores_with_destructure() {
     assert_eq!(run_ml(src, &sample()), "[300, 300, 1500]");
 }
 
+/// Parentheses build a tuple in an expression as they do in a pattern and a shape: `(x)` is a
+/// one-field tuple, and a pattern `(x)` takes one apart.
+#[test]
+fn parentheses_around_one_expression_build_a_tuple() {
+    let input = Value::Prod(vec![int(&[1, 2]), int(&[3, 4])]);
+    let pairs = "let (src, dst) = input in ((src), (dst))";
+    assert_eq!(Program::compile_ml(pairs).unwrap().run(input.clone()), Value::Prod(vec![Value::Prod(vec![int(&[1, 2])]), Value::Prod(vec![int(&[3, 4])])]));
+    let round_trip = "let (x, y) = input in let ((a), (b)) = ((x), (y)) in (a, b) add";
+    assert_eq!(run_ml(round_trip, &input), "[4, 6]");
+}
+
 #[test]
 fn match_contact() {
     let src = "input.2 map_variant 1 (p -> (p, 1000000) add) unwrap";
