@@ -14,7 +14,7 @@
 //!          | 'enum' IDENT '=' IDENT shape? ('|' IDENT shape?)* 'in' expr  -- a compile-time table; names ERASE here
 //!   shape  = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
-//!   pat    = IDENT | '_' | '(' pat (',' pat)* ')'      -- irrefutable: names, wildcards, tuples
+//!   pat    = IDENT | '_' | '(' (pat (',' pat)*)? ')'   -- irrefutable: names, wildcards, tuples
 //!   pipe   = atom apply*                               -- juxtaposition; chain ends before `in`
 //!   apply  = 'map' '(' lambda ')'
 //!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
@@ -27,13 +27,14 @@
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
-//!   atom   = '(' expr (',' expr)* ')' | IDENT | LIT | STR   -- 'input' is the root; '(' … ')' is a tuple
+//!   atom   = '(' (expr (',' expr)*)? ')' | IDENT | LIT | STR   -- 'input' is the root; '(' … ')' is a tuple
 //!   LIT    = '-'? DIGITS                                        -- an Int
 //!          | '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)?  -- a Float, with a fraction or exponent
 //!
 //! Parentheses build a tuple wherever they appear: `(e)` in an expression is a one-field tuple, as
-//! `(x)` is in a pattern and `(int)` in a shape. Nothing needs them for grouping, as stages apply
-//! by juxtaposition.
+//! `(x)` is in a pattern and `(int)` in a shape, and `()` is the tuple with no fields, the unit, in
+//! all three (in a pattern it binds nothing). Nothing needs parentheses for grouping, as stages
+//! apply by juxtaposition.
 //!
 //! A literal is a column of one constant, as long as the input of the scope it appears in (a
 //! lambda's parameter, or `input`). Bodies are closed, so that is the length of every value in
@@ -360,6 +361,11 @@ impl P {
     fn pat(&mut self) -> Result<Pat, String> {
         if self.peek() == Some(&Tok::LParen) {
             self.bump();
+            // `()`, the tuple with no fields: the unit, which binds nothing
+            if self.peek() == Some(&Tok::RParen) {
+                self.bump();
+                return Ok(Pat::Tuple(Vec::new()));
+            }
             let mut pats = vec![self.pat()?];
             while self.peek() == Some(&Tok::Comma) {
                 self.bump();
@@ -591,6 +597,11 @@ impl P {
         match self.peek() {
             Some(Tok::LParen) => {
                 self.bump();
+                // `()`, the tuple with no fields: the unit value
+                if self.peek() == Some(&Tok::RParen) {
+                    self.bump();
+                    return Ok(E::Tuple(Vec::new()));
+                }
                 let mut es = vec![self.expr()?];
                 while self.peek() == Some(&Tok::Comma) {
                     self.bump();
@@ -672,6 +683,8 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
         // A body is closed, so every value in it has the length of the body's input: filling a
         // constant to that length is always right.
         E::Lit(v) => Ok(b.add(Op::Lit(v.clone()), vec![env[ROOT]])),
+        // the tuple with no fields is the unit, as long as the scope's input
+        E::Tuple(es) if es.is_empty() => Ok(b.add(Op::Unit, vec![env[ROOT]])),
         E::Tuple(es) => {
             let ids = es.iter().map(|x| lower(x, env, b)).collect::<Result<Vec<_>, _>>()?;
             Ok(b.tuple(ids))
