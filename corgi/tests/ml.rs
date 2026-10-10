@@ -42,6 +42,16 @@ fn parentheses_around_one_expression_build_a_tuple() {
     assert_eq!(run_ml(round_trip, &input), "[4, 6]");
 }
 
+/// `()` is the tuple with no fields, the unit, in an expression and in a pattern, as in a shape.
+#[test]
+fn empty_parentheses_are_the_unit() {
+    let input = Value::Prod(vec![int(&[1, 2]), int(&[3, 4])]);
+    let keyed = Program::compile_ml("let (k, v) = input in (k, ())").unwrap().run(input.clone());
+    assert_eq!(keyed, Value::Prod(vec![int(&[1, 2]), Value::Unit(2)]));
+    let unkeyed = "let ((a, b), ()) = (input, ()) in (a, b) add";
+    assert_eq!(run_ml(unkeyed, &input), "[4, 6]");
+}
+
 #[test]
 fn match_contact() {
     let src = "input.2 map_variant 1 (p -> (p, 1000000) add) unwrap";
