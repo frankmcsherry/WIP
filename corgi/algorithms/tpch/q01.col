@@ -1,11 +1,12 @@
-# TPC-H Q1, in integers: per (return flag, line status), shipped up to 1998-09-02: sums of quantity,
-# price, discounted price and charged price, the mean quantity, and the count.
+# TPC-H Q1, in integers (each flag is its byte): per (return flag, line status), shipped up to
+# 1998-09-02: sums of quantity, price, discounted price and charged price, the mean quantity, and the
+# count.
 # sql: SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice),
 # sql:   sum(l_extendedprice * (100 - l_discount)), sum(l_extendedprice * (100 - l_discount) * (100 + l_tax)),
 # sql:   sum(l_quantity)::DOUBLE / count(*), count(*)
 # sql:   FROM lineitem WHERE l_shipdate <= 10471 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
 # columns: l_returnflag l_linestatus l_quantity l_extendedprice l_discount l_tax l_shipdate
-# output: [s,s,u,u,u,u,f,u]
+# output: [u,u,u,u,u,u,f,u]
 let (rf, ls, qty, price, disc, tax, date) = input in
 let rows = (((rf, ls) zip, (qty, price) zip) zip, ((disc, tax) zip, date) zip) zip
     map ((((f, s), (q, p)), ((d, t), dt)) ->

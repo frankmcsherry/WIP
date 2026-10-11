@@ -10,7 +10,8 @@ one-row list.
     CORGI_TPCH=DIR cargo bench --bench tpch [-- NAME ...] [--check] [--profile]
 
 The columns are integers throughout: prices in cents, discounts and taxes in percent, quantities in
-units, dates in days since 1970. Each query's SQL computes the same integer expressions, so the
+units, dates in days since 1970, and the two flags (`l_returnflag`, `l_linestatus`) as their byte.
+TPC-H declares the flags CHAR(1), and each is always one ASCII letter. Each query's SQL computes the same integer expressions, so the
 answers match exactly.
 
 ## How the joins are written
@@ -43,7 +44,6 @@ run, in ms. DuckDB holds the tables in memory and runs on one thread.
 | query | what | corgi | DuckDB 1 thread | × |
 |---|---|---|---|---|
 | q01 | group by two flags, 6 aggregates | 37.95 | 18.71 | 2.03 |
-| q01b | q01 with the flags as bytes, not strings | 29.08 | 18.60 | 1.56 |
 | q03 | 3-way: lineitems probe sorted orders, then group | 8.12 | 5.95 | 1.36 |
 | q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 12.92 | 5.95 | 2.17 |
 | q03c | q03b without the lineitem sort (stored in key order) | 5.82 | 6.14 | 0.95 |
@@ -54,15 +54,19 @@ run, in ms. DuckDB holds the tables in memory and runs on one thread.
 | q14 | 2-way, `LIKE 'PROMO%'` | 5.20 | 2.98 | 1.74 |
 | q19 | 2-way, OR of three string-heavy predicates (`eq` on strings) | 110.04 | 23.81 | 4.62 |
 
-q01 and q01b were measured again after `group` became a word over `sort_by`: 1.25× and 1.10× the
+q01, and q01 with the flags as bytes, were measured again after `group` became a word over `sort_by`: 1.25× and 1.10× the
 kernel's time; the other queries moved less than 5%. The word makes about seven more passes over
 the 1.18M rows that pass q01's filter, about 1 ms each: references to the two keys, those
 references in sorted order, run starts, the filter that keeps one key per group, and the cut. The
 sort itself is not cheap. The keys are strings, so it takes the list arm, and with four distinct
 keys every row stays tied through every level: 12 of the kernel's 31 ms (7.5 ms with the flags as
-bytes, q01b). Moving the four summed columns into group order is 3.5 ms more. Adding each row into
+bytes). Moving the four summed columns into group order is 3.5 ms more. Adding each row into
 its group's sums as it is scanned would do neither, and that is how DuckDB answers in 19 ms; corgi
 has no op for it (a scatter-add, a reduce by a small key).
+
+The flags have since become bytes in the data, rather than strings converted in the query (q01b, now
+removed). Measured 2026-10-11: q01 takes 18.9 ms against DuckDB's 13.6 (DuckDB is faster on byte flags
+too), and q10 4.2 ms against 5.5.
 
 The joins run 1.1–1.4× DuckDB (q03, q05), and 0.95× when the large table is already in key order
 (q03c). Where string predicates dominate, they run 2.3–4.6× (q10, q12, q19).
