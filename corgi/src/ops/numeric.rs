@@ -306,19 +306,24 @@ fn shift_eval(op: ShiftOp, a: Prim, k: u32) -> Result<Prim, String> {
 /// Sums and products wrap at the `i64` edge, as `add` and `mul` do. An empty row's sum is 0, its
 /// product 1, its minimum and maximum 0.
 fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: Red) -> Value {
-    let mut start = 0;
-    let rows = bounds.ends().map(|end| {
-        let row = &xs[start..end];
-        start = end;
-        row
-    });
     match r {
-        Red::Add => Value::i64(rows.map(|s| s.iter().fold(0i64, |a, &x| a.wrapping_add(x.into()))).collect()),
-        Red::Mul => Value::i64(rows.map(|s| s.iter().fold(1i64, |a, &x| a.wrapping_mul(x.into()))).collect()),
-        Red::Min => Value::i64(rows.map(|s| s.iter().map(|&x| x.into()).min().unwrap_or(0)).collect()),
-        Red::Max => Value::i64(rows.map(|s| s.iter().map(|&x| x.into()).max().unwrap_or(0)).collect()),
-        Red::All => Value::u8(rows.map(|s| s.iter().all(|&x| x.into() != 0) as u8).collect()),
-        Red::Any => Value::u8(rows.map(|s| s.iter().any(|&x| x.into() != 0) as u8).collect()),
+        Red::Add => Value::i64(per_row(bounds, xs, |s| s.iter().fold(0i64, |a, &x| a.wrapping_add(x.into())))),
+        Red::Mul => Value::i64(per_row(bounds, xs, |s| s.iter().fold(1i64, |a, &x| a.wrapping_mul(x.into())))),
+        Red::Min => Value::i64(per_row(bounds, xs, |s| s.iter().map(|&x| x.into()).min().unwrap_or(0))),
+        Red::Max => Value::i64(per_row(bounds, xs, |s| s.iter().map(|&x| x.into()).max().unwrap_or(0))),
+        Red::All => Value::u8(per_row(bounds, xs, |s| s.iter().all(|&x| x.into() != 0) as u8)),
+        Red::Any => Value::u8(per_row(bounds, xs, |s| s.iter().any(|&x| x.into() != 0) as u8)),
+    }
+}
+
+/// `f` of each row's slice of `xs`; a stride's rows are its fixed-size chunks.
+fn per_row<T, R>(bounds: &crate::value::Bounds, xs: &[T], f: impl FnMut(&[T]) -> R) -> Vec<R> {
+    match bounds {
+        crate::value::Bounds::Stride(k, _) if *k > 0 => xs.chunks_exact(*k).map(f).collect(),
+        _ => {
+            let mut start = 0;
+            bounds.ends().map(|end| { let row = &xs[start..end]; start = end; row }).map(f).collect()
+        }
     }
 }
 

@@ -33,6 +33,42 @@ fn parse_int(digits: impl Iterator<Item = i64>) -> Option<i64> {
     any.then_some(acc)
 }
 
+/// [`TextOp::ParseInt`] over one storage: each row's digits, or the row in lane 1.
+fn parse_rows<T: Copy + Into<i64>>(ends: &Bounds, xs: &[T]) -> Value {
+    // the tags are written only once a row fails (every row before it parsed); while
+    // none has, the assignment is the constant one and costs nothing per row.
+    let mut tags: Option<Vec<u8>> = None;
+    let mut oks = Vec::with_capacity(ends.len());
+    let mut errs = 0usize;
+    let mut start = 0;
+    for end in ends.ends() {
+        match parse_int(xs[start..end].iter().map(|&x| x.into())) {
+            Some(v) => {
+                if let Some(t) = &mut tags {
+                    t.push(0);
+                }
+                oks.push(v);
+            }
+            None => {
+                tags.get_or_insert_with(|| vec![0; oks.len()]).push(1);
+                errs += 1;
+            }
+        }
+        start = end;
+    }
+    let rows = oks.len() + errs;
+    let assignment = match tags {
+        None if rows > 0 => Tags::Const(0, rows),
+        tags => {
+            let tags = tags.unwrap_or_default();
+            let mut count = [0usize; 2];
+            let off = tags.iter().map(|&t| { let p = count[t as usize]; count[t as usize] += 1; p }).collect();
+            Tags::column(Prim::U8(Arc::new(tags)), off)
+        }
+    };
+    Value::sum_tagged(assignment, vec![Value::i64(oks), Value::Unit(errs)])
+}
+
 /// [`TextOp::Split`] over one storage: `d` is the delimiter at that storage.
 fn split<T: Copy + PartialEq>(ends: &Bounds, bytes: &[T], d: T) -> (Vec<T>, Vec<usize>, Vec<usize>) {
     // one pass over the flat buffer: non-delimiter bytes copy through, each delimiter (and each
@@ -76,39 +112,11 @@ impl TextOp {
             }
             TextOp::ParseInt => {
                 let (ends, vals) = input.into_list("ParseInt")?;
-                let xs = vals.as_i64("ParseInt bytes")?;
-                // the tags are written only once a row fails (every row before it parsed); while
-                // none has, the assignment is the constant one and costs nothing per row.
-                let mut tags: Option<Vec<u8>> = None;
-                let mut oks = Vec::with_capacity(ends.len());
-                let mut errs = 0usize;
-                let mut start = 0;
-                for end in ends.ends() {
-                    match parse_int(xs[start..end].iter().copied()) {
-                        Some(v) => {
-                            if let Some(t) = &mut tags {
-                                t.push(0);
-                            }
-                            oks.push(v);
-                        }
-                        None => {
-                            tags.get_or_insert_with(|| vec![0; oks.len()]).push(1);
-                            errs += 1;
-                        }
-                    }
-                    start = end;
+                // text is bytes, read where they are; any other Int column is read as `i64`s
+                match &vals {
+                    Value::Prim(Prim::U8(bytes)) => parse_rows(&ends, bytes),
+                    _ => parse_rows(&ends, &vals.as_i64("ParseInt bytes")?),
                 }
-                let rows = oks.len() + errs;
-                let assignment = match tags {
-                    None if rows > 0 => Tags::Const(0, rows),
-                    tags => {
-                        let tags = tags.unwrap_or_default();
-                        let mut count = [0usize; 2];
-                        let off = tags.iter().map(|&t| { let p = count[t as usize]; count[t as usize] += 1; p }).collect();
-                        Tags::column(Prim::U8(Arc::new(tags)), off)
-                    }
-                };
-                Value::sum_tagged(assignment, vec![Value::i64(oks), Value::Unit(errs)])
             }
         })
     }

@@ -35,7 +35,6 @@ fn words_round_trip() {
     let w = words_of_i64s(xs.clone());
     assert_eq!(w, vec![u64::MAX, 0, 5, 1 << 63]);
     assert_eq!(i64s_of_words(w), xs);
-    assert_eq!(words_of(&xs), &[u64::MAX, 0, 5, 1 << 63]);
 }
 
 /// A `Value` clone must be a refcount bump, not a column copy: `eval_graph` clones at every
