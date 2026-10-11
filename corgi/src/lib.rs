@@ -36,7 +36,7 @@ pub use frontend::{parse_ml, Program};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;
 pub use ops::host::{HostKernel, HostOp};
-pub use ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred, Red, ShiftOp, TextOp};
+pub use ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred, Red, ShiftOp, TextOp};
 pub use optimize::{cancel_isos, cse, dce, fuse_maps, immediates, optimize, peephole};
 pub use shape::{shape_of_value, Shape};
 pub use value::{show, Bounds, Scalar, Tags, Value};

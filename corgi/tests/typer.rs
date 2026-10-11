@@ -103,3 +103,33 @@ fn mapsum_rejects_duplicate_variant() {
     let g = b.finish(out);
     assert!(shape_of(&g, &Shape::Sum(vec![Shape::Int, Shape::Int])).is_err());
 }
+
+#[test]
+fn a_tuple_pattern_takes_apart_exactly_its_fields() {
+    let int = Shape::Int;
+    let pair = Shape::Prod(vec![Shape::Int, Shape::Float]);
+    let unit = Shape::Prod(vec![]);
+    // (source, input shape, whether it types), each through `Program` and through the optimizer
+    let cases = [
+        ("let (a, b) = input in a", pair.clone(), true),
+        ("let (a) = input in a", pair.clone(), false),
+        ("let (a, b, c) = input in a", pair.clone(), false),
+        ("let () = input in input", pair.clone(), false),
+        ("let (_, _) = input in 1", pair.clone(), true),
+        ("let (_, _, _) = input in 1", pair.clone(), false),
+        ("let ((a), b) = input in b", Shape::Prod(vec![Shape::Prod(vec![int.clone(), int.clone()]), int.clone()]), false),
+        ("let ((a, c), b) = input in b", Shape::Prod(vec![Shape::Prod(vec![int.clone(), int.clone()]), int.clone()]), true),
+        ("let (a) = input in a", Shape::Prod(vec![int.clone()]), true),
+        ("input map ((a, b) -> 7)", list(pair.clone()), true),
+        ("input map ((a) -> a)", list(pair.clone()), false),
+        ("input map ((a, b, c) -> 7)", list(pair.clone()), false),
+        ("input map (() -> 7)", list(pair.clone()), false),
+        ("input map (() -> 7)", list(unit.clone()), true),
+    ];
+    for (src, shape, ok) in cases {
+        let p = corgi::Program::compile_ml(src).unwrap();
+        assert_eq!(p.shape(&shape).is_ok(), ok, "{src} on {shape}");
+        let optimized = corgi::optimize(&parse_ml(src).unwrap());
+        assert_eq!(shape_of(&optimized, &shape).is_ok(), ok, "{src} on {shape}, optimized");
+    }
+}
