@@ -178,7 +178,7 @@ pub enum Op<L> {
                     // state AND the output stream. The unifying scan kernel: `scan` is sugar for this
                     // (body `(a,x)->b` becomes `(a,x)->(b,b)`, take field 1). Expresses stateful maps a
                     // plain scan can't (running deltas, indexing, RLE). `Fold` is kept separate — the
-                    // R=Unit specialization, ~3x cheaper than FoldScan (no output pair, no recording).
+                    // R=Unit specialization, ~1.6x cheaper than FoldScan (no output pair, no output stitching).
     CapList,        // capture: (X, List<Y>) -> List<(X,Y)> — pair a context with every element
                     // (né Broadcast); the list-side closure capture. Copies X per element unless X
                     // is referenced — then it is one reference per element (a closure's `&ctx`).
