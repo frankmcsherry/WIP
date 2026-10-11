@@ -33,7 +33,7 @@
 //! unreferenced (empty) lane's shape hash equal — every row's OBSERVABLE value is identical, so sharing an
 //! id is correct (and more stable than derived `PartialEq`, which would call them distinct).
 
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Prim, Value};
 
 /// splitmix64 finalizer — a full-avalanche 64-bit mix. The one bit-mixing primitive; both the leaf
 /// hashing ([`Prim::hashes`]) and the structural [`combine`] build on it.
@@ -111,65 +111,75 @@ pub fn hash(v: &Value) -> Vec<u64> {
         // list = length first, then each element in order, folded by SPAN — so a `Stride` and the
         // equivalent `Offsets` hash identically (matching `Bounds` equality, which is by the
         // partition, not its representation). A list of leaves folds them in the row's own loop.
-        Value::List(bounds, vals) => match &**vals {
-            Value::Prim(Prim::U8(bytes)) => byte_rows(bounds, bytes),
-            Value::Prim(Prim::I64(xs)) => leaf_rows(bounds, xs, |x| x as u64),
-            Value::Prim(Prim::F64(keys)) => leaf_rows(bounds, keys, |k| k),
-            _ => {
-                let ch = hash(vals);
-                (0..bounds.len()).map(|r| hash_span(&ch, bounds.span(r))).collect()
-            }
-        },
+        Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
+            let ends: Vec<usize> = bounds.ends().collect();
+            leaf_list_rows(vals, ends.len(), |r| (if r == 0 { 0 } else { ends[r - 1] }, ends[r]))
+        }
+        Value::List(bounds, vals) => {
+            let ch = hash(vals);
+            (0..bounds.len()).map(|r| hash_span(&ch, bounds.span(r))).collect()
+        }
 
         // unit = no payload; every row hashes to the same constant.
         Value::Unit(n) => vec![UNIT; *n],
 
         // a referenced row hashes as the list row it names (a reference has the identity of what it
-        // names). The whole arena is hashed, even where the references name little of it.
-        Value::Ref(list, rows) => {
-            let rh = hash(list);
-            rows.iter().map(|&r| rh[r]).collect()
-        }
+        // names). A list of leaves hashes just the rows named; any other arena is hashed whole.
+        Value::Ref(list, rows) => match &**list {
+            Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
+                leaf_list_rows(vals, rows.len(), |i| bounds.span(rows[i]))
+            }
+            _ => {
+                let rh = hash(list);
+                rows.iter().map(|&r| rh[r]).collect()
+            }
+        },
     }
 }
 
-/// a list of bytes, a row at a time — the same fold as any list, computed faster. A byte has 256
-/// possible hashes, so each one's contribution to the fold comes from a table; and four rows run
-/// side by side (for as long as the shortest of them), so the multiply each byte waits on overlaps
-/// with three others'.
-fn byte_rows(bounds: &Bounds, bytes: &[u8]) -> Vec<u64> {
+/// `n` rows of a list of leaves, row `i` the elements `span(i)` of `vals`: the fold of each row,
+/// computed in the row's own loop.
+fn leaf_list_rows(vals: &Value, n: usize, span: impl Fn(usize) -> (usize, usize)) -> Vec<u64> {
+    match vals {
+        Value::Prim(Prim::U8(bytes)) => byte_rows(n, span, bytes),
+        Value::Prim(Prim::I64(xs)) => leaf_rows(n, span, xs, |x| x as u64),
+        Value::Prim(Prim::F64(keys)) => leaf_rows(n, span, keys, |k| k),
+        _ => unreachable!("a list of leaves"),
+    }
+}
+
+/// rows of bytes — the same fold as any list, computed faster. A byte has 256 possible hashes, so
+/// each one's contribution to the fold comes from a table; and four rows run side by side (for as
+/// long as the shortest of them), so the multiply each byte waits on overlaps with three others'.
+fn byte_rows(n: usize, span: impl Fn(usize) -> (usize, usize), bytes: &[u8]) -> Vec<u64> {
     let table: [u64; 256] = std::array::from_fn(|b| mix64(mix64(b as u64)));
     let step = |a: u64, b: u8| (a ^ table[b as usize]).wrapping_mul(K);
-    let ends: Vec<usize> = bounds.ends().collect();
-    let start = |r: usize| if r == 0 { 0 } else { ends[r - 1] };
-    let mut out = Vec::with_capacity(ends.len());
+    let row = |(s, e): (usize, usize)| bytes[s..e].iter().fold(combine(LIST, (e - s) as u64), |a, &b| step(a, b));
+    let mut out = Vec::with_capacity(n);
     let mut r = 0;
-    while r + 4 <= ends.len() {
-        let (s, e): ([usize; 4], [usize; 4]) = (std::array::from_fn(|j| start(r + j)), std::array::from_fn(|j| ends[r + j]));
-        let mut a: [u64; 4] = std::array::from_fn(|j| combine(LIST, (e[j] - s[j]) as u64));
-        let shortest = (0..4).map(|j| e[j] - s[j]).min().unwrap_or(0);
+    while r + 4 <= n {
+        let spans: [(usize, usize); 4] = std::array::from_fn(|j| span(r + j));
+        let mut a: [u64; 4] = std::array::from_fn(|j| combine(LIST, (spans[j].1 - spans[j].0) as u64));
+        let shortest = spans.iter().map(|(s, e)| e - s).min().unwrap_or(0);
         for i in 0..shortest {
             for j in 0..4 {
-                a[j] = step(a[j], bytes[s[j] + i]);
+                a[j] = step(a[j], bytes[spans[j].0 + i]);
             }
         }
-        out.extend((0..4).map(|j| bytes[s[j] + shortest..e[j]].iter().fold(a[j], |a, &b| step(a, b))));
+        out.extend((0..4).map(|j| bytes[spans[j].0 + shortest..spans[j].1].iter().fold(a[j], |a, &b| step(a, b))));
         r += 4;
     }
-    out.extend((r..ends.len()).map(|r| bytes[start(r)..ends[r]].iter().fold(combine(LIST, (ends[r] - start(r)) as u64), |a, &b| step(a, b))));
+    out.extend((r..n).map(|r| row(span(r))));
     out
 }
 
-/// a list of leaves other than bytes, a row at a time: each element's hash folded in as it is
-/// made, rather than written to a column first.
-fn leaf_rows<T: Copy>(bounds: &Bounds, xs: &[T], word: impl Fn(T) -> u64) -> Vec<u64> {
-    let mut start = 0;
-    bounds
-        .ends()
-        .map(|end| {
-            let a = xs[start..end].iter().fold(combine(LIST, (end - start) as u64), |a, &x| combine(a, mix64(word(x))));
-            start = end;
-            a
+/// rows of leaves other than bytes: each element's hash folded in as it is made, rather than
+/// written to a column first.
+fn leaf_rows<T: Copy>(n: usize, span: impl Fn(usize) -> (usize, usize), xs: &[T], word: impl Fn(T) -> u64) -> Vec<u64> {
+    (0..n)
+        .map(|r| {
+            let (s, e) = span(r);
+            xs[s..e].iter().fold(combine(LIST, (e - s) as u64), |a, &x| combine(a, mix64(word(x))))
         })
         .collect()
 }

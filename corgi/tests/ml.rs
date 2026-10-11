@@ -325,3 +325,44 @@ fn jaro_winkler_examples_match_the_reference() {
         }
     }
 }
+
+/// rows of words, each row a `List` of strings.
+fn word_rows(rows: &[&[&str]]) -> Value {
+    let (mut bytes, mut word_ends, mut row_ends) = (Vec::new(), Vec::new(), Vec::new());
+    for row in rows {
+        for w in *row {
+            bytes.extend(w.bytes());
+            word_ends.push(bytes.len());
+        }
+        row_ends.push(word_ends.len());
+    }
+    Value::List(
+        corgi::Bounds::offsets(row_ends),
+        Box::new(Value::List(corgi::Bounds::offsets(word_ends), Box::new(Value::u8(bytes)))),
+    )
+}
+
+#[test]
+fn hash_group_finds_the_groups_group_does() {
+    // the same groups as `group`, row by row, in another order; sorted, they agree
+    let input = word_rows(&[&["b", "a", "c", "a", "b", "a", ""], &[], &["x", "x"]]);
+    assert_eq!(
+        run_ml("input map (w -> (w, ())) hash_group map ((k, rows) -> (k clone, rows len)) sort", &input),
+        run_ml("input map (w -> (w, ())) group map ((k, rows) -> (k, rows len))", &input),
+    );
+    // a key comes out by reference: cloned, it is the key
+    assert_eq!(
+        run_ml("input map (w -> (w, ())) hash_group map ((k, _) -> k clone) sort", &input),
+        run_ml("input dedup", &input),
+    );
+}
+
+#[test]
+fn all_and_any_of_written_conditions() {
+    let input = word_rows(&[&["b", "a", "", "abc"]]);
+    assert_eq!(run_ml("input map (w -> ((w len, 0) gt, (w len, 1) le, (w, \"a\") ne) all)", &input), "List ends=[4] <[1, 0, 0, 0]>");
+    assert_eq!(run_ml("input map (w -> ((w len, 2) gt, (w, \"b\") eq) any)", &input), "List ends=[4] <[1, 0, 0, 1]>");
+    // a condition alone is itself; `all` of something not written as a tuple is an error
+    assert_eq!(run_ml("input map (w -> ((w len, 0) gt) all)", &input), run_ml("input map (w -> (w len, 0) gt)", &input));
+    assert!(Program::compile_ml("input map (w -> w all)").is_err());
+}

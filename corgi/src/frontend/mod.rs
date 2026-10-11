@@ -78,7 +78,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "cap_sum" => Op::CapSum.into(),   // capture: distribute a context into every sum lane
         "branch" => Op::Branch(n()? as usize).into(), // the demux; a tag of n-1 or more goes to the last lane
         "filter" => Op::Filter.into(), // [(mask, x)] -> [x]: keep the x whose mask is nonzero; total
-        // `sort`, `dedup` and `group` are words over `sort_by`, built in ml.rs (`sort_word`).
+        // `sort`, `dedup` and `group` are words over `sort_by`, built in ml.rs (`sort_word`), as is
+        // `hash_group` (`HASH_GROUP`, written in corgi) and `all`/`any` over a written tuple.
         "sort_by" => CmpOp::SortBy.into(), // [(k, v)] -> [(k, v, run)]: stable by k, v carried along, each run of equal k numbered
         "sort_limit" => CmpOp::SortLimit(n()? as usize).into(), // `sort`, then the first k of each row
         "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<Int>: 1 where a run of equal elements starts

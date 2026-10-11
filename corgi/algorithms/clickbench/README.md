@@ -100,20 +100,24 @@ takes 9.8 s and DuckDB 0.9 s.
 
 ## What the queries argue for
 
-1. **Grouping, dedup and count-distinct on byte strings.** Today these sort the strings
-   structurally. That is about 7 of corgi's 10 s: q33's `group` of 1M URLs takes 1.6 s, while
-   DuckDB answers the whole query in 29 ms. Either of these would avoid it:
-   - group on a 64-bit hash, and compare bytes only within equal hashes;
-   - dictionary codes: a reference column over a distinct list of strings is already a dictionary.
-
-   Order is only needed for the final top ten.
+1. **Grouping, dedup and count-distinct on byte strings.** These sorted the strings
+   structurally: q33's `group` of 1M URLs took 1.1 s, while DuckDB answers the whole query in
+   28 ms. q05, q12–q14, q33, q34, q36, q37 and q39 now use `hash_group`, which sorts 64-bit
+   hashes instead, hands keys back by reference, and checks the groups are exact (a row where two
+   keys share a hash is grouped by sorting the keys). Where a filter comes first, the key goes
+   through it by reference (`k ref`), so the filter moves references, not strings. q33 takes 92
+   ms, q36 36 ms, q12 5 ms. Order is only needed for the final top ten. q16–q18, q28 and q38 use
+   it too. It pays where the keys are many or long; for a few distinct short keys, sorting them
+   costs less than hashing every row, so q10, q11 (phone models) and TPC-H q01 and q12 keep
+   `group` (q10 and q01 measured 1.24x and 1.7x slower with `hash_group`).
 2. **Top-k** is `sort_limit` now. It sorts the order's levels one at a time and keeps, after
    each, only the first k and the ties at the k-th. q24–q26 went from 18–26× to 4×, and the final
    sorts of q33, q36 and q39 from 0.15–0.3 s to a few ms. Most of what remains in q24 is building
    and filtering the (time, phrase) pairs; q24r carries the phrases by reference and takes 4.7 ms.
 3. **Missing words: substring search and string min/max.**
    - q20–q23 spend 9–60× on split-and-compare.
-   - MIN(Referer) by sorting each group is 1.4 s of q28.
+   - q28 took MIN(Referer) by sorting each group's referers (0.9 s); `sort_limit 1` keeps only
+     the least, and q28 takes 0.69 s.
 4. **COUNT(\*) without value lists.** `(k, ()) group … rows len` builds lists only to count
    them. Run lengths (`adjacent`, `cut`) or a bincount for a small key domain would not. (The
    payload is `()`, not a column of 1s, so the sort has nothing to carry.)

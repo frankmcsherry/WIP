@@ -3,7 +3,6 @@
 # sql:   ORDER BY u DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase UserID
 # output: [s,u]
-let (key, user) = input in
-let ranked = (key, user) zip map ((s, u) -> ((s len, 0) gt, (s, u))) filter group
+let ranked = input zip map ((s, u) -> ((s len, 0) gt, (s ref, u))) filter hash_group
     map ((s, us) -> (us dedup len neg, s)) sort_limit 10 in
-ranked map ((d, s) -> (s, d neg))
+ranked map ((d, s) -> (s clone, d neg))

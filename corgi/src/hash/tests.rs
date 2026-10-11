@@ -53,6 +53,21 @@ fn lists_of_leaves_fold_their_elements() {
 }
 
 #[test]
+fn a_reference_hashes_as_the_row_it_names() {
+    // a reference into a list of bytes (or of i64s) hashes the named rows only, each as that row
+    let lists = [
+        Value::List(Bounds::offsets(vec![2, 2, 5, 9]), Box::new(Value::u8(b"abxyzlong".to_vec()))),
+        Value::List(Bounds::offsets(vec![1, 3, 3, 6]), Box::new(u(&[7, -1, 9, 4, 5, 6]))),
+    ];
+    for list in lists {
+        let rows = vec![3, 0, 2, 3, 1];
+        let named = Value::Ref(std::sync::Arc::new(list.clone()), std::sync::Arc::new(rows.clone()));
+        let whole = h(&list);
+        assert_eq!(h(&named), rows.iter().map(|&r| whole[r]).collect::<Vec<_>>());
+    }
+}
+
+#[test]
 fn stride_and_offsets_agree() {
     // representation-independence: the DEEP invariant for stable ids. A uniform list carried as a
     // `Stride` must hash the same as the equivalent end-offset form (they are `Bounds`-equal).

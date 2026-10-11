@@ -32,8 +32,8 @@ let keyed = refs map (r ->
     let hi = (matched, end, 0) select in
     let domain = ((lo, hi) range, r) gather in
     ((matched, domain, r) select, r)) in
-let ranked = keyed group
+let ranked = keyed hash_group
     map ((k, rs) -> let c = rs len in
-        ((c, 1000) gt, (k, (rs map (r -> r len) fold_add to_float, c to_float) div, c, rs sort head))) filter
+        ((c, 1000) gt, (k, (rs map (r -> r len) fold_add to_float, c to_float) div, c, rs sort_limit 1 head))) filter
     map ((k, l, c, m) -> (l neg, k, l, c, m)) sort_limit 25 in
-ranked map ((_, k, l, c, m) -> (k, l, c, m))
+ranked map ((_, k, l, c, m) -> (k clone, l, c, m))

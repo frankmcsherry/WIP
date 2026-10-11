@@ -54,7 +54,7 @@
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::{NumOp, Op, Pattern};
+use crate::ops::{CmpOp, NumOp, Op, Pattern};
 use crate::shape::Shape;
 use crate::value::Value;
 use std::collections::HashMap;
@@ -733,12 +733,29 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             }
             lower(body, &env2, b)
         }
+        // `(c1, c2, ..) all`: every condition holds; `any`: one does. Conditions are masks (0 or 1,
+        // as comparisons give), so these are `min` and `max` along the tuple as written.
+        E::Pipe(e, Apply::Op(name, None)) if name == "all" || name == "any" => {
+            let E::Tuple(conds) = &**e else {
+                return Err(format!("'{name}' takes a tuple of conditions, written out: (c1, c2, ..) {name}"));
+            };
+            let op = if name == "all" { CmpOp::Min } else { CmpOp::Max };
+            let (first, rest) = conds.split_first().ok_or_else(|| format!("'{name}' of no conditions"))?;
+            let mut acc = lower(first, env, b)?;
+            for c in rest {
+                let c = lower(c, env, b)?;
+                let pair = b.tuple(vec![acc, c]);
+                acc = b.add(op.clone(), vec![pair]);
+            }
+            Ok(acc)
+        }
         E::Pipe(e, ap) => {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
                 Apply::Op(name, arg) if name.starts_with("try_") => try_word(b, id, name, *arg),
                 Apply::Op(name, _) if matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(sort_word(b, id, name)),
+                Apply::Op(name, _) if name == "hash_group" => Ok(b.graft(&parse_ml(HASH_GROUP)?, id)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
@@ -864,6 +881,27 @@ fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> R
     Ok(b.add(Op::MapSum(vec![(0, arm(op)), (1, arm(Op::Unit.into()))]), vec![routed]))
 }
 
+/// `kvs hash_group`: `group` by hashing, the word written in corgi. Each row's `(key, value)`
+/// pairs, grouped by key: the groups in the order of their keys' hashes, not of the keys, and each
+/// key a reference into the row's keys (`clone` it to copy it out). Sorting the 64-bit hashes is
+/// much cheaper than sorting keys such as strings. The groups are exact: a group of equal hashes
+/// holds one key unless two keys share a hash, and its keys then change inside it. A row where
+/// that happens is grouped by sorting the keys themselves.
+const HASH_GROUP: &str = "
+    let (k, v) = input transpose in
+    let refs = k map (x -> x ref) in
+    let (_, kvs, runs) = (k map (x -> x hash), (refs, v) zip) zip sort_by transpose in
+    let starts = runs adjacent in
+    let changes = kvs map ((r, _) -> r) adjacent in
+    (((kvs, starts), (refs, v)), (changes, starts) ne) branch 2 match (
+        0 (((kvs, starts), _) ->
+            ((starts, kvs map ((r, _) -> r)) zip filter, (starts, kvs map ((_, x) -> x)) zip cut) zip),
+        1 ((_, (refs, v)) ->
+            let (keys, kvs, runs) = (refs, (refs, v) zip) zip sort_by transpose in
+            let starts = runs adjacent in
+            ((starts, keys) zip filter, (starts, kvs map ((_, x) -> x)) zip cut) zip))
+";
+
 /// `sort`, `dedup` and `group` as words over `sort_by` (stable by key, a payload carried along, and
 /// each element's run of equal keys), `adjacent`, `filter` and `cut`. `dedup` and `group` sort a
 /// list key by reference, so that only the keys they keep are copied out:
@@ -871,7 +909,6 @@ fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> R
 /// - `xs dedup` = the sorted elements that start a run;
 /// - `kvs group` = the keys that start a run, and the values cut where a run starts.
 fn sort_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
-    use crate::ops::CmpOp;
     let pair_up = |b: &mut Builder<NumOp>, l: usize, r: usize| {
         let pair = b.tuple(vec![l, r]);
         b.add(Op::Zip, vec![pair])
