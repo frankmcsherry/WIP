@@ -2,6 +2,7 @@
 //! `gather_lanes` (its multi-source form) — plus the bound helpers and `mod generators` (the `gather`-family
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
+use crate::pool::leaf;
 use crate::shape::shape_of_value;
 use std::sync::Arc;
 use crate::value::{with_empty_row, Bounds, Prim, Rows, Tags, Value};
@@ -243,7 +244,7 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
                 per[t].push(tags.offset_at(i));
             }
             let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
-            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
+            Value::Sum(Tags::column(Prim::U8(leaf(new_tags)), new_off), nv)
         }
         Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
         // a reference column: move the row numbers, never the arena. This one arm is the entire cost
@@ -289,7 +290,7 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
             for (k, (lane, at)) in lanes.iter().zip(&per).enumerate() {
                 nv.push(if k == 0 { gather_or_zero(lane, at)? } else { gather(lane, at) });
             }
-            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
+            Value::Sum(Tags::column(Prim::U8(leaf(new_tags)), new_off), nv)
         }
         // in range, the row numbers; out of range, an empty row of the arena (see `with_empty_row`).
         Value::Ref(list, rows) => {

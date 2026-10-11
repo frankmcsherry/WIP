@@ -2,6 +2,7 @@
 //! is a single `T0 -> T1` on one element, lifted 1:1 across the column; all
 //! cardinality change lives *inside* a `List`.
 
+use crate::pool::{collect, leaf, take, Buf};
 use crate::shape::{shape_of_value, Shape};
 use std::sync::Arc;
 
@@ -238,7 +239,7 @@ impl Tags {
         let offsets = within_offsets(tags.iter().copied(), arity);
         // tags are stored as a u8 discriminant, so the variant count must fit a u8 — else `t as u8`
         // would silently truncate a tag onto the wrong lane.
-        Tags::column(Prim::U8(Arc::new(tags.iter().map(|&t| t as u8).collect())), offsets)
+        Tags::column(Prim::U8(leaf(collect(tags.iter().map(|&t| t as u8)))), offsets)
     }
 
     /// the single tag every row carries, if there is one — the O(1) uniformity test.
@@ -421,7 +422,7 @@ macro_rules! prim {
     ($($V:ident => $t:ty),+ $(,)?) => {
         #[derive(Clone, Debug)]
         pub enum Prim {
-            $( $V(Arc<Vec<$t>>), )+
+            $( $V(Arc<Buf<$t>>), )+
         }
 
         impl Prim {
@@ -434,7 +435,7 @@ macro_rules! prim {
             pub(crate) fn append_rows(&self, ab: &Bounds, other: &Prim, bb: &Bounds) -> (Prim, Vec<usize>) {
                 match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) => {
-                        let mut out = Vec::with_capacity(a.len() + b.len());
+                        let mut out = take(a.len() + b.len());
                         let mut ends = Vec::with_capacity(ab.len());
                         let (mut sa, mut sb) = (0, 0);
                         for (ea, eb) in ab.ends().zip(bb.ends()) {
@@ -443,7 +444,7 @@ macro_rules! prim {
                             ends.push(out.len());
                             (sa, sb) = (ea, eb);
                         }
-                        (Prim::$V(Arc::new(out)), ends)
+                        (Prim::$V(leaf(out)), ends)
                     } )+
                     _ => unreachable!("append_rows: one storage"),
                 }
@@ -464,7 +465,7 @@ macro_rules! prim {
                             })
                             .collect();
                         let rows = parts[0].0.len();
-                        let mut out = Vec::with_capacity(vals.iter().map(|v| v.len()).sum());
+                        let mut out = take(vals.iter().map(|v| v.len()).sum());
                         if let Some(widths) = parts.iter().map(|(b, _)| b.strided()).collect::<Option<Vec<usize>>>() {
                             for r in 0..rows {
                                 for (v, &k) in vals.iter().zip(&widths) {
@@ -474,7 +475,7 @@ macro_rules! prim {
                                     }
                                 }
                             }
-                            return (Prim::$V(Arc::new(out)), Bounds::Stride(widths.iter().sum(), rows));
+                            return (Prim::$V(leaf(out)), Bounds::Stride(widths.iter().sum(), rows));
                         }
                         let mut ends = Vec::with_capacity(rows);
                         let mut starts = vec![0; parts.len()];
@@ -486,7 +487,7 @@ macro_rules! prim {
                             }
                             ends.push(out.len());
                         }
-                        (Prim::$V(Arc::new(out)), ends.into())
+                        (Prim::$V(leaf(out)), ends.into())
                     } )+
                 }
             }
@@ -503,7 +504,7 @@ macro_rules! prim {
                             out.extend_from_slice(&v[s..x]);
                             ends.push(out.len());
                         }
-                        (Prim::$V(Arc::new(out)), ends)
+                        (Prim::$V(leaf(out)), ends)
                     } )+
                     _ => unreachable!("blend_rows: one storage"),
                 }
@@ -513,18 +514,18 @@ macro_rules! prim {
             pub(crate) fn gather_blocks(&self, idx: &[usize], k: usize) -> Prim {
                 match self {
                     $( Prim::$V(v) => {
-                        let mut out = Vec::with_capacity(idx.len() * k);
+                        let mut out = take(idx.len() * k);
                         for &i in idx {
                             out.extend(v[i * k..(i + 1) * k].iter().copied());
                         }
-                        Prim::$V(Arc::new(out))
+                        Prim::$V(leaf(out))
                     } )+
                 }
             }
 
             /// keep the first `n` rows.
             pub(crate) fn truncate(&mut self, n: usize) {
-                match self { $( Prim::$V(v) => truncate_arc(v, n), )+ }
+                match self { $( Prim::$V(v) => truncate_leaf(v, n), )+ }
             }
 
             /// the storage width in bits.
@@ -557,34 +558,37 @@ macro_rules! prim {
             /// One fill, no index column: the broadcast a `gather` at a constant index amounts to.
             pub(crate) fn repeat(&self, i: usize, n: usize) -> Prim {
                 match self {
-                    $( Prim::$V(v) => Prim::$V(Arc::new(
-                        if n == 0 { Vec::new() } else { vec![v[i]; n] }
-                    )), )+
+                    $( Prim::$V(v) => Prim::$V(leaf({
+                        let mut o = take(n);
+                        o.resize(n, v[i]);
+                        o
+                    })), )+
                 }
             }
 
             /// row `j` of the result is row `idx[j]` of `self`.
             pub(crate) fn gather(&self, idx: &[usize]) -> Prim {
                 match self {
-                    $( Prim::$V(v) => Prim::$V(Arc::new(idx.iter().map(|&i| v[i]).collect())), )+
+                    $( Prim::$V(v) => Prim::$V(leaf(collect(idx.iter().map(|&i| v[i])))), )+
                 }
             }
 
             /// the rows whose mask element is nonzero, in order, in one pass with no branch on the
             /// mask: every row is written to the next free slot, and the slot is kept only if the
             /// mask says so. The buffer has room for every row (plus the one slot written past the
-            /// last kept row); a sparse mask touches only its front, so the rest costs no memory.
+            /// last kept row), taken from the pool and zeroed.
             pub(crate) fn compress(&self, mask: &[u8]) -> Prim {
                 match self {
                     $( Prim::$V(v) => {
-                        let mut out = vec![<$t>::default(); v.len() + 1];
+                        let mut out = take(v.len() + 1);
+                        out.resize(v.len() + 1, <$t>::default());
                         let mut len = 0;
                         for (&x, &b) in v.iter().zip(mask) {
                             out[len] = x;
                             len += (b != 0) as usize;
                         }
                         out.truncate(len);
-                        Prim::$V(Arc::new(out))
+                        Prim::$V(leaf(out))
                     } )+
                 }
             }
@@ -592,7 +596,7 @@ macro_rules! prim {
             /// `gather` with every position past the leaf reading zero (zero bits).
             pub(crate) fn gather_or_zero(&self, idx: &[usize]) -> Prim {
                 match self {
-                    $( Prim::$V(v) => Prim::$V(Arc::new(idx.iter().map(|&i| v.get(i).copied().unwrap_or_default()).collect())), )+
+                    $( Prim::$V(v) => Prim::$V(leaf(collect(idx.iter().map(|&i| v.get(i).copied().unwrap_or_default())))), )+
                 }
             }
 
@@ -615,7 +619,7 @@ macro_rules! prim {
                             Prim::$V(v) => v.as_slice(),
                             _ => panic!("gather_lanes: an integer meets a float"),
                         }).collect();
-                        Prim::$V(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)][o]).collect()))
+                        Prim::$V(leaf(collect(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)][o]))))
                     } )+
                 }
             }
@@ -645,7 +649,7 @@ macro_rules! prim {
 
             /// a leaf of this storage holding the elements whose keys `it` yields.
             pub(crate) fn like_keys_iter(&self, it: impl Iterator<Item = u64>) -> Prim {
-                match self { $( Prim::$V(_) => Prim::$V(Arc::new(it.map(<$t>::from_key).collect())), )+ }
+                match self { $( Prim::$V(_) => Prim::$V(leaf(it.map(<$t>::from_key).collect())), )+ }
             }
 
             /// stable per-element hash: each element's word (an integer's two's complement, a
@@ -686,7 +690,7 @@ macro_rules! prim {
                                 _ => panic!("concat: an integer meets a float"),
                             }
                         }
-                        Prim::$V(Arc::new(o))
+                        Prim::$V(leaf(o))
                     } )+
                 }
             }
@@ -711,7 +715,7 @@ macro_rules! prim {
                             for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = pick(x, *y); }
                             b
                         } else {
-                            Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| pick(x, y)).collect())
+                            leaf(collect(a.iter().zip(b.iter()).map(|(&x, &y)| pick(x, y))))
                         })
                     } )+
                     _ => unreachable!("meet brings both to one storage"),
@@ -737,8 +741,8 @@ macro_rules! prim {
                             }
                             b
                         } else {
-                            Arc::new(a.iter().zip(b.iter()).zip(pick)
-                                .map(|((&x, &y), &m)| if m != 0 { x } else { y }).collect())
+                            leaf(collect(a.iter().zip(b.iter()).zip(pick)
+                                .map(|((&x, &y), &m)| if m != 0 { x } else { y })))
                         })
                     } )+
                     _ => unreachable!("meet brings both to one storage"),
@@ -779,9 +783,8 @@ macro_rules! prim {
             pub(crate) fn rel(&self, other: &Prim, lt: bool, eq: bool, gt: bool) -> Vec<u8> {
                 let (a, b) = Prim::meet_ref(self, other);
                 match (&*a, &*b) {
-                    $( (Prim::$V(a), Prim::$V(b)) => a.iter().zip(b.iter())
-                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u8)
-                        .collect(), )+
+                    $( (Prim::$V(a), Prim::$V(b)) => collect(a.iter().zip(b.iter())
+                        .map(|(x, y)| ((lt & (x < y)) | (eq & (x == y)) | (gt & (x > y))) as u8)), )+
                     _ => unreachable!("meet brings both to one storage"),
                 }
             }
@@ -804,12 +807,12 @@ macro_rules! prim {
                     $( Prim::$V(a) => {
                         let y: $t = c.elem();
                         match (lt, eq, gt) {
-                            (true, false, false) => a.iter().map(|&x| (x < y) as u8).collect(),
-                            (true, true, false) => a.iter().map(|&x| (x <= y) as u8).collect(),
-                            (false, true, false) => a.iter().map(|&x| (x == y) as u8).collect(),
-                            (true, false, true) => a.iter().map(|&x| (x != y) as u8).collect(),
-                            (false, false, true) => a.iter().map(|&x| (x > y) as u8).collect(),
-                            (false, true, true) => a.iter().map(|&x| (x >= y) as u8).collect(),
+                            (true, false, false) => collect(a.iter().map(|&x| (x < y) as u8)),
+                            (true, true, false) => collect(a.iter().map(|&x| (x <= y) as u8)),
+                            (false, true, false) => collect(a.iter().map(|&x| (x == y) as u8)),
+                            (true, false, true) => collect(a.iter().map(|&x| (x != y) as u8)),
+                            (false, false, true) => collect(a.iter().map(|&x| (x > y) as u8)),
+                            (false, true, true) => collect(a.iter().map(|&x| (x >= y) as u8)),
                             // no flag or every flag: the predicate is constant
                             (all, _, _) => vec![all as u8; a.len()],
                         }
@@ -833,7 +836,7 @@ macro_rules! prim {
                             for x in dst.iter_mut() { *x = pick(*x); }
                             a
                         } else {
-                            Arc::new(a.iter().map(|&x| pick(x)).collect())
+                            leaf(collect(a.iter().map(|&x| pick(x))))
                         })
                     } )+
                 }
@@ -857,7 +860,7 @@ impl Prim {
     /// the leaf with integers at `i64`: a byte leaf widens (one pass), any other is itself.
     pub(crate) fn widen(&self) -> Prim {
         match self {
-            Prim::U8(v) => Prim::I64(Arc::new(v.iter().map(|&x| x as i64).collect())),
+            Prim::U8(v) => Prim::I64(leaf(collect(v.iter().map(|&x| x as i64)))),
             other => other.clone(),
         }
     }
@@ -888,7 +891,7 @@ impl Prim {
     /// an empty (zero-row) leaf: an integer one is `i64`, a float one is `F64`. Used to fill the
     /// unselected variants of an `Inject`.
     pub(crate) fn empty(int: bool) -> Prim {
-        if int { Prim::I64(Arc::new(Vec::new())) } else { Prim::F64(Arc::new(Vec::new())) }
+        if int { Prim::I64(leaf(Vec::new())) } else { Prim::F64(leaf(Vec::new())) }
     }
 
     /// A leaf whose positions are the owned `idx` (each a word: a negative position is past every
@@ -903,7 +906,7 @@ impl Prim {
             for x in idx.iter_mut() {
                 *x = v.get(*x as usize).copied().unwrap_or(0) as u64;
             }
-            Prim::I64(Arc::new(i64s_of_words(idx)))
+            Prim::I64(leaf(i64s_of_words(idx)))
         } else {
             let idx: Vec<usize> = idx.into_iter().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).collect();
             self.gather_or_zero(&idx)
@@ -955,11 +958,11 @@ fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
 impl Value {
     /// leaf-column constructors — the funnel results pass through, so the representation lives in one place.
     /// Integers held as bytes (each from 0 to 255): text, masks, tags.
-    pub fn u8(xs: Vec<u8>) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
+    pub fn u8(xs: Vec<u8>) -> Value { Value::Prim(Prim::U8(leaf(xs))) }
     /// Integers held as `i64`s.
-    pub fn i64(xs: Vec<i64>) -> Value { Value::Prim(Prim::I64(Arc::new(xs))) }
+    pub fn i64(xs: Vec<i64>) -> Value { Value::Prim(Prim::I64(leaf(xs))) }
     /// Floats.
-    pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(Arc::new(xs.into_iter().map(f64_key).collect()))) }
+    pub fn f64(xs: Vec<f64>) -> Value { Value::Prim(Prim::F64(leaf(collect(xs.into_iter().map(f64_key))))) }
 
     /// a Sum from its discriminant `tags` (stored as a u8 leaf column — ≤256 variants) and the
     /// per-variant columns (every lane present; a variant no row carries is an empty column). The
@@ -1059,6 +1062,14 @@ fn truncate_arc<T: Clone>(v: &mut Arc<Vec<T>>, n: usize) {
     }
 }
 
+/// keep a leaf's first `n` elements: in place when uniquely held, else a copy of them.
+fn truncate_leaf<T: crate::pool::Pooled>(v: &mut Arc<Buf<T>>, n: usize) {
+    match Arc::get_mut(v) {
+        Some(owned) => owned.truncate(n),
+        None => *v = leaf(collect(v[..n.min(v.len())].iter().copied())),
+    }
+}
+
 /// a `Sum` taken apart: its lane assignment and its lanes.
 pub type SumParts = (Tags, Vec<Value>);
 
@@ -1143,7 +1154,7 @@ impl Value {
     /// place. Moves the buffer out at refcount 1, and copies it when shared or held as bytes.
     pub fn into_i64(self, who: &str) -> Result<Vec<i64>, String> {
         match self {
-            Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
+            Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).map(Buf::into_vec).unwrap_or_else(|a| a.to_vec())),
             Value::Prim(Prim::U8(xs)) => Ok(xs.iter().map(|&x| x as i64).collect()),
             other => Err(wrong(who, "Int", &other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
         }

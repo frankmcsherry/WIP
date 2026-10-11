@@ -115,7 +115,7 @@ fn ignores_arc_identity_and_capacity() {
     let a = u(&[7, 8, 9]);
     let mut backing = Vec::with_capacity(64);
     backing.extend_from_slice(&[7i64, 8, 9]);
-    let b = Value::Prim(crate::value::Prim::I64(std::sync::Arc::new(backing)));
+    let b = Value::Prim(crate::value::Prim::I64(crate::pool::leaf(backing)));
     assert_eq!(h(&a), h(&b));
 }
 

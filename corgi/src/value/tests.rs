@@ -20,11 +20,11 @@ fn integers_are_equal_across_storages() {
 /// Two integer leaves at different storages meet at `i64`; one storage meets as it is.
 #[test]
 fn meet_widens_bytes() {
-    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![1, 2])), Prim::I64(Arc::new(vec![-1, 3])));
+    let (a, b) = Prim::meet(Prim::U8(crate::pool::leaf(vec![1, 2])), Prim::I64(crate::pool::leaf(vec![-1, 3])));
     assert!(matches!((&a, &b), (Prim::I64(_), Prim::I64(_))));
-    assert_eq!(a, Prim::I64(Arc::new(vec![1, 2])));
-    let xs = Arc::new(vec![5u8]);
-    let (a, _) = Prim::meet(Prim::U8(xs.clone()), Prim::U8(Arc::new(vec![6])));
+    assert_eq!(a, Prim::I64(crate::pool::leaf(vec![1, 2])));
+    let xs = crate::pool::leaf(vec![5u8]);
+    let (a, _) = Prim::meet(Prim::U8(xs.clone()), Prim::U8(crate::pool::leaf(vec![6])));
     assert!(matches!(a, Prim::U8(v) if Arc::ptr_eq(&v, &xs)), "one storage meets without a copy");
 }
 
@@ -79,7 +79,7 @@ fn one_tag_throughout_costs_no_columns() {
 fn const_and_column_assignments_agree() {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let konst = Tags::Const(1, 3);
-    let column = Tags::Column(Prim::U8(Arc::new(vec![1, 1, 1])), Arc::new(vec![0, 1, 2]));
+    let column = Tags::Column(Prim::U8(crate::pool::leaf(vec![1, 1, 1])), Arc::new(vec![0, 1, 2]));
     assert_eq!(konst, column);
     let h = |t: &Tags| {
         let mut s = DefaultHasher::new();

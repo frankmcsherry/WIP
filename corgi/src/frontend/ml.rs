@@ -85,7 +85,6 @@ use crate::ops::{CmpOp, NumOp, Op, Pattern};
 use crate::shape::Shape;
 use crate::value::{Prim, Scalar, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 // ----- tokens ------------------------------------------------------------
 
@@ -974,7 +973,7 @@ fn column(cs: &[&Const], shape: &Shape) -> Value {
                 Err(_) => Value::i64(xs),
             }
         }
-        Shape::Float => Value::Prim(Prim::F64(Arc::new(cs.iter().map(|c| match leaf(c) {
+        Shape::Float => Value::Prim(Prim::F64(crate::pool::leaf(cs.iter().map(|c| match leaf(c) {
             Scalar::Float(k) => k,
             Scalar::Int(_) => unreachable!("a Float constant"),
         }).collect()))),
