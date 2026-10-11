@@ -4,10 +4,22 @@
 # sql:   ORDER BY PageViews DESC, Title LIMIT 10
 # columns: CounterID EventDate DontCountHits IsRefresh Title
 # output: [s,u]
+# Grouped by hash, each key carried by reference. A hash group holds one key unless two keys share
+# a hash; its runs of equal keys (`adjacent`) say so, and if any group holds two the query runs
+# grouped by key instead.
 let (counter, date, dont, refresh, key) = input in
 let views = (counter, (date, (dont, (refresh, key) zip) zip) zip) zip
     map ((c, (d, (x, (r, k)))) ->
         ((((c, 62) eq, ((d, 15887) ge, (d, 15917) le) min) min,
-          (((x, 0) eq, (r, 0) eq) min, (k len, 0) gt) min) min, (k, ()))) filter in
-let ranked = views group map ((k, rows) -> (rows len neg, k)) sort_limit 10 in
-ranked map ((d, k) -> (k, d neg))
+          (((x, 0) eq, (r, 0) eq) min, (k len, 0) gt) min) min, (k hash, k ref))) filter in
+let groups = views group in
+let collided = (groups map ((h, ks) -> ks adjacent fold_add) fold_max, 1) gt in
+((groups, input), collided) branch 2 match (
+    0 ((groups, _) -> groups map ((h, ks) -> (ks len neg, (0, ks) get)) sort_limit 10
+        map ((d, k) -> (k clone, d neg))),
+    1 ((_, (counter, date, dont, refresh, key)) ->
+        (counter, (date, (dont, (refresh, key) zip) zip) zip) zip
+        map ((c, (d, (x, (r, k)))) ->
+            ((((c, 62) eq, ((d, 15887) ge, (d, 15917) le) min) min,
+              (((x, 0) eq, (r, 0) eq) min, (k len, 0) gt) min) min, (k, ()))) filter
+        group map ((k, rows) -> (rows len neg, k)) sort_limit 10 map ((d, k) -> (k, d neg))))

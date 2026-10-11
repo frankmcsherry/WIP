@@ -2,4 +2,8 @@
 # sql: SELECT COUNT(DISTINCT SearchPhrase) FROM hits
 # columns: SearchPhrase
 # output: u
-input dedup len
+# Distinct phrases counted as distinct hashes, each phrase carried by reference. A hash group holds
+# one phrase unless two share a hash (`adjacent` says so); then the phrases are counted themselves.
+let groups = input map (s -> (s hash, s ref)) group in
+let collided = (groups map ((h, ss) -> ss adjacent fold_add) fold_max, 1) gt in
+((groups, input), collided) branch 2 match (0 ((groups, _) -> groups len), 1 ((_, phrases) -> phrases dedup len))
