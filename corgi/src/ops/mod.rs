@@ -9,6 +9,6 @@ pub(crate) mod numeric;
 pub(crate) mod text;
 
 pub use self::cmp::{CmpOp, Pred};
-pub use self::core::Op;
+pub use self::core::{Op, Pattern};
 pub use self::numeric::{ArithOp, BinOp, BitOp, NumOp, Red, ShiftOp};
 pub use self::text::TextOp;

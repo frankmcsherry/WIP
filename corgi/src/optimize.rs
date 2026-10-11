@@ -3,7 +3,7 @@
 //! matches core `Field`/`Tuple`, so it reaches through `NumOp::Core`.
 
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred};
+use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred};
 use crate::value::{Scalar, Value};
 use std::collections::HashMap;
 
@@ -108,15 +108,23 @@ pub fn dce(g: &Graph<NumOp>) -> Graph<NumOp> {
     Graph { nodes: new_nodes, output: remap[g.output] }
 }
 
-/// peephole: `Field(i)` applied to a `Tuple` is just the tuple's i-th input.
+/// peephole: `Field(i)` applied to a `Tuple` is just the tuple's i-th input, and a pattern of n
+/// names or `_`s applied to a `Tuple` of n inputs is the tuple.
 pub fn peephole(g: &Graph<NumOp>) -> Graph<NumOp> {
     rewrite_graph(g, peephole, |kind, inputs, built, _| {
-        if let NodeKind::Op(NumOp::Core(Op::Field(i))) = kind {
-            if matches!(built[inputs[0]].kind, NodeKind::Tuple) {
-                return Some(Rewrite::Redirect(built[inputs[0]].inputs[*i]));
+        match kind {
+            NodeKind::Op(NumOp::Core(Op::Field(i))) if matches!(built[inputs[0]].kind, NodeKind::Tuple) => {
+                Some(Rewrite::Redirect(built[inputs[0]].inputs[*i]))
             }
+            NodeKind::Op(NumOp::Core(Op::Pattern(Pattern::Tuple(ps))))
+                if matches!(built[inputs[0]].kind, NodeKind::Tuple)
+                    && built[inputs[0]].inputs.len() == ps.len()
+                    && ps.iter().all(|p| *p == Pattern::Any) =>
+            {
+                Some(Rewrite::Redirect(inputs[0]))
+            }
+            _ => None,
         }
-        None
     })
 }
 

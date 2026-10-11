@@ -54,7 +54,7 @@
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::{NumOp, Op};
+use crate::ops::{NumOp, Op, Pattern};
 use crate::shape::Shape;
 use crate::value::Value;
 use std::collections::HashMap;
@@ -642,7 +642,25 @@ const ROOT: &str = " root";
 
 /// bind a pattern to a node: a name binds the node itself, `_` binds nothing, and a tuple pattern
 /// binds each sub-pattern to a `Field` projection of it.
-fn bind(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
+fn bind(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) -> Option<usize> {
+    match pat {
+        Pat::Name(x) => {
+            env.insert(x.clone(), id);
+            None
+        }
+        Pat::Wild => None,
+        // a pattern of n fields takes apart exactly n, at every level: one check of the whole
+        // pattern, which its names read through
+        Pat::Tuple(_) => {
+            let checked = b.add(Op::Pattern(pat.pattern()), vec![id]);
+            bind_fields(pat, checked, env, b);
+            Some(checked)
+        }
+    }
+}
+
+/// bind a checked tuple pattern's names to its fields, and its sub-patterns' to theirs.
+fn bind_fields(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
     match pat {
         Pat::Name(x) => {
             env.insert(x.clone(), id);
@@ -651,8 +669,18 @@ fn bind(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
         Pat::Tuple(pats) => {
             for (i, sub) in pats.iter().enumerate() {
                 let fid = b.add(Op::Field(i), vec![id]);
-                bind(sub, fid, env, b);
+                bind_fields(sub, fid, env, b);
             }
+        }
+    }
+}
+
+impl Pat {
+    /// the nesting of products this pattern takes apart.
+    fn pattern(&self) -> Pattern {
+        match self {
+            Pat::Name(_) | Pat::Wild => Pattern::Any,
+            Pat::Tuple(pats) => Pattern::Tuple(pats.iter().map(Pat::pattern).collect()),
         }
     }
 }
@@ -663,7 +691,10 @@ fn lower_body(pat: &Pat, body: &E) -> Result<Graph<NumOp>, String> {
     let bin = bb.input();
     let mut benv = Env::new();
     benv.insert(ROOT.to_string(), bin);
-    bind(pat, bin, &mut benv, &mut bb);
+    // the body's constants are as long as the checked parameter, so a closed body reads it
+    if let Some(checked) = bind(pat, bin, &mut benv, &mut bb) {
+        benv.insert(ROOT.to_string(), checked);
+    }
     let bout = lower(body, &benv, &mut bb)?;
     Ok(bb.finish(bout))
 }
@@ -692,7 +723,14 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
         E::Let(pat, bound, body) => {
             let id = lower(bound, env, b)?;
             let mut env2 = env.clone();
-            bind(pat, id, &mut env2, b);
+            // past a tuple pattern, the value it took apart is its checked form: the body's
+            // constants are as long as it, and a name it was bound to now means the checked value
+            if let Some(checked) = bind(pat, id, &mut env2, b) {
+                env2.insert(ROOT.to_string(), checked);
+                if let E::Var(name, _) = &**bound {
+                    env2.insert(name.clone(), checked);
+                }
+            }
             lower(body, &env2, b)
         }
         E::Pipe(e, ap) => {

@@ -134,6 +134,67 @@ impl Rounds {
     }
 }
 
+/// what a tuple pattern takes apart: a pattern of n fields, a product of exactly n fields (the unit,
+/// for none), each taken apart by its own pattern; a name or `_` takes anything.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum Pattern {
+    Any,
+    Tuple(Vec<Pattern>),
+}
+
+impl Pattern {
+    /// does `v` have this pattern's nesting? If not, which part of the pattern fails, and on what.
+    fn check(&self, v: &Value) -> Result<(), String> {
+        self.mismatch(v).map_or(Ok(()), |(part, got)| {
+            let at = if std::ptr::eq(part, self) { String::new() } else { format!("in the pattern {self}, ") };
+            Err(format!("{at}the pattern {part} takes apart {}, not {got}", part.wants()))
+        })
+    }
+
+    fn mismatch(&self, v: &Value) -> Option<(&Pattern, Shape)> {
+        let Pattern::Tuple(ps) = self else { return None };
+        match v {
+            Value::Prod(fields) if fields.len() == ps.len() => ps.iter().zip(fields).find_map(|(p, f)| p.mismatch(f)),
+            Value::Unit(_) if ps.is_empty() => None,
+            other => Some((self, shape_of_value(other))),
+        }
+    }
+
+    /// what a tuple pattern takes apart, in words.
+    fn wants(&self) -> String {
+        match self {
+            Pattern::Tuple(ps) if ps.is_empty() => "the unit".into(),
+            Pattern::Tuple(ps) if ps.len() == 1 => "a product of 1 field".into(),
+            Pattern::Tuple(ps) => format!("a product of {} fields", ps.len()),
+            Pattern::Any => "anything".into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+impl std::fmt::Display for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pattern::Any => write!(f, "_"),
+            Pattern::Tuple(ps) => {
+                write!(f, "(")?;
+                for (i, p) in ps.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
 /// the core op vocabulary: structure only — comparison/order is the `cmp` bucket (`ops::cmp`) and
 /// arithmetic the `numeric` layer. Generic over `L`, the layer used for body sub-graphs, so a higher layer's
 /// `map` bodies can use the higher vocabulary. `Op<L>` is not itself `OpLike` — the layer enum is (e.g.
@@ -149,6 +210,9 @@ pub enum Op<L> {
     // PROD — intro is the graph-structural `Tuple`. Products are transparent (fixed arity, no
     // witness column), so map is projection+rebuild and capture is `tuple` itself: no ops needed.
     Field(usize),   // elim:  (.., X_i, ..) -> X_i
+    Pattern(Pattern), // check: X -> X, where X has the pattern's nesting of products (see `Pattern`):
+                    //        what a tuple pattern takes apart, checked whole where it takes it apart.
+                    //        The pattern's names read through it.
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, Int-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
@@ -261,6 +325,11 @@ impl<L: OpLike> Op<L> {
     pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
         Ok(match self {
             Op::Lit(v) => fill(v, input.len()),
+
+            Op::Pattern(p) => {
+                p.check(&input)?;
+                input
+            }
 
             Op::Field(i) => {
                 let mut cols = input.into_prod("Field")?;
