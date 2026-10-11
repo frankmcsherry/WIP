@@ -33,6 +33,26 @@ fn storage_invariant() {
 }
 
 #[test]
+fn lists_of_leaves_fold_their_elements() {
+    // a list of leaves is folded in the row's own loop (bytes four rows at a time, from a table);
+    // it must be the fold of its elements' hashes, at every row length and count of rows
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+    for rows in [0usize, 1, 3, 4, 5, 9, 37] {
+        let lens: Vec<usize> = (0..rows).map(|_| (next() % 21) as usize).collect();
+        let ends: Vec<usize> = lens.iter().scan(0, |e, &l| { *e += l; Some(*e) }).collect();
+        let total = ends.last().copied().unwrap_or(0);
+        let bytes: Vec<u8> = (0..total).map(|_| next() as u8).collect();
+        let ints: Vec<i64> = (0..total).map(|_| next() as i64).collect();
+        for vals in [Value::u8(bytes), u(&ints), Value::f64(ints.iter().map(|&x| x as f64).collect())] {
+            let ch = h(&vals);
+            let want: Vec<u64> = (0..rows).map(|r| hash_span(&ch, (if r == 0 { 0 } else { ends[r - 1] }, ends[r]))).collect();
+            assert_eq!(h(&Value::List(Bounds::offsets(ends.clone()), Box::new(vals))), want, "{rows} rows");
+        }
+    }
+}
+
+#[test]
 fn stride_and_offsets_agree() {
     // representation-independence: the DEEP invariant for stable ids. A uniform list carried as a
     // `Stride` must hash the same as the equivalent end-offset form (they are `Bounds`-equal).
