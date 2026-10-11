@@ -116,7 +116,8 @@ takes 9.8 s and DuckDB 0.9 s.
    and filtering the (time, phrase) pairs; q24r carries the phrases by reference and takes 4.7 ms.
 3. **Missing words: substring search and string min/max.**
    - q20–q23 spend 9–60× on split-and-compare.
-   - MIN(Referer) by sorting each group is 1.4 s of q28.
+   - q28 took MIN(Referer) by sorting each group's referers (0.9 s); `sort_limit 1` keeps only
+     the least, and q28 takes 0.69 s.
 4. **COUNT(\*) without value lists.** `(k, ()) group … rows len` builds lists only to count
    them. Run lengths (`adjacent`, `cut`) or a bincount for a small key domain would not. (The
    payload is `()`, not a column of 1s, so the sort has nothing to carry.)
