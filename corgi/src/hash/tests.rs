@@ -33,6 +33,26 @@ fn storage_invariant() {
 }
 
 #[test]
+fn lists_of_leaves_are_storage_invariant() {
+    // a list of integers hashes by its values: held as bytes or as i64s, the same rows agree
+    let ends = vec![2, 2, 5];
+    let bytes = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::u8(vec![1, 2, 0, 200, 255])));
+    let words = Value::List(Bounds::offsets(ends.clone()), Box::new(u(&[1, 2, 0, 200, 255])));
+    assert_eq!(h(&bytes), h(&words));
+    // eight small integers and one large integer with the same little-endian bytes are different
+    // lists, and hash apart
+    let eight = Value::List(Bounds::offsets(vec![8]), Box::new(Value::u8(vec![1, 1, 0, 0, 0, 0, 0, 0])));
+    let one = Value::List(Bounds::offsets(vec![1]), Box::new(u(&[257])));
+    assert_ne!(h(&eight), h(&one));
+    // a list of one element is not the element, nor the empty list
+    assert_ne!(h(&Value::List(Bounds::offsets(vec![1]), Box::new(u(&[5])))), h(&u(&[5])));
+    assert_ne!(
+        h(&Value::List(Bounds::offsets(vec![0]), Box::new(Value::u8(vec![])))),
+        h(&Value::List(Bounds::offsets(vec![0]), Box::new(Value::f64(vec![])))),
+    );
+}
+
+#[test]
 fn stride_and_offsets_agree() {
     // representation-independence: the DEEP invariant for stable ids. A uniform list carried as a
     // `Stride` must hash the same as the equivalent end-offset form (they are `Bounds`-equal).

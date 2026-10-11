@@ -33,7 +33,8 @@
 //! unreferenced (empty) lane's shape hash equal — every row's OBSERVABLE value is identical, so sharing an
 //! id is correct (and more stable than derived `PartialEq`, which would call them distinct).
 
-use crate::value::Value;
+use crate::value::{Bounds, Prim, Value};
+use rapidhash::v3::{rapidhash_v3_seeded, RapidSecrets};
 
 /// splitmix64 finalizer — a full-avalanche 64-bit mix. The one bit-mixing primitive; both the leaf
 /// hashing ([`Prim::hashes`]) and the structural [`combine`] build on it.
@@ -105,9 +106,15 @@ pub fn hash(v: &Value) -> Vec<u64> {
                 .collect()
         }
 
-        // list = length first, then each element in order, folded by SPAN — so a `Stride` and the
-        // equivalent `Offsets` hash identically (matching `Bounds` equality, which is by the
-        // partition, not its representation).
+        // a list of leaves (text, say): each row's elements as one string of bytes (`leaf_rows`)
+        Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
+            let Value::Prim(p) = &**vals else { unreachable!() };
+            leaf_rows(bounds, p)
+        }
+
+        // any other list = length first, then each element in order, folded by SPAN — so a `Stride`
+        // and the equivalent `Offsets` hash identically (matching `Bounds` equality, which is by
+        // the partition, not its representation).
         Value::List(bounds, vals) => {
             let ch = hash(vals);
             (0..bounds.len()).map(|r| hash_span(&ch, bounds.span(r))).collect()
@@ -123,6 +130,46 @@ pub fn hash(v: &Value) -> Vec<u64> {
             rows.iter().map(|&r| rh[r]).collect()
         }
     }
+}
+
+// the seeds of a list of leaves' three byte strings, so that rows of different kinds of string
+// can't share one: integers that each fit in a byte, other integers as 64-bit words, floats' keys.
+const BYTES: RapidSecrets = RapidSecrets::seed(LIST);
+const WORDS: RapidSecrets = RapidSecrets::seed(LIST ^ 1);
+const FLOATS: RapidSecrets = RapidSecrets::seed(LIST ^ 2);
+
+/// a list of leaves, a row at a time: the row's elements as one string of bytes, through rapidhash
+/// (eight and more bytes per step, where folding an element at a time is one multiply per byte).
+/// A row of integers that each fit in a byte hashes as those bytes however it is stored, so storage
+/// stays invisible; any other integer row hashes its 64-bit words (little-endian), and a float row
+/// its keys, each under its own seed. Rows by span, so a `Stride` and its `Offsets` agree.
+fn leaf_rows(bounds: &Bounds, p: &Prim) -> Vec<u64> {
+    let mut bytes: Vec<u8> = Vec::new();
+    match p {
+        Prim::U8(b) => by_row(bounds, |s, e| rapidhash_v3_seeded(&b[s..e], &BYTES)),
+        Prim::I64(w) => by_row(bounds, |s, e| {
+            let row = &w[s..e];
+            bytes.clear();
+            if row.iter().all(|&x| (0..256).contains(&x)) {
+                bytes.extend(row.iter().map(|&x| x as u8));
+                rapidhash_v3_seeded(&bytes, &BYTES)
+            } else {
+                bytes.extend(row.iter().flat_map(|x| x.to_le_bytes()));
+                rapidhash_v3_seeded(&bytes, &WORDS)
+            }
+        }),
+        Prim::F64(k) => by_row(bounds, |s, e| {
+            bytes.clear();
+            bytes.extend(k[s..e].iter().flat_map(|x| x.to_le_bytes()));
+            rapidhash_v3_seeded(&bytes, &FLOATS)
+        }),
+    }
+}
+
+/// `f` of each row's span.
+fn by_row(bounds: &Bounds, mut f: impl FnMut(usize, usize) -> u64) -> Vec<u64> {
+    let mut start = 0;
+    bounds.ends().map(|end| { let h = f(start, end); start = end; h }).collect()
 }
 
 /// one list row's hash: length first, then each element in order, over the span `(s, e)` of the
