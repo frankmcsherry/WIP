@@ -242,34 +242,31 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   The WITNESS columns are Arc for the same reason — `Bounds::Offsets`, and a `Tags::Column`'s
   offsets — so a `Value` clone costs O(shape), not O(rows), at every shared edge in a graph.
   *Reuse policy:* an op that is elementwise AND same-storage (shifts, `bin_into`, `map_into`,
-  `lane_pick`, the in-place fold scatter) consumes its operand and rewrites it under
+  `lane_pick`) consumes its operand and rewrites it under
   `Arc::get_mut`/`make_mut` when uniquely owned — take the reuse wherever the shape allows. The
   fresh-allocating leaf ops (`gather`/`gather_lanes` = permutation, a byte leaf widening, `rel`/`cmp_idx`/
   the sort's pulled keys = a differently-typed result) allocate *by necessity*, not oversight — the access pattern
   or output type rules reuse out. (Cross-op intermediate elimination is the separate DPS backlog item.)
 - **`Fold`/`FoldScan` are cross-row lockstep, `O(total elements)`.** A general (non-associative) fold is
-  sequential *within* a row but vectorized *across* rows: round `t` folds in every still-active row's
-  `t`-th element in one body call, so `#rounds = the longest row`, not the element count. The active
-  set is maintained incrementally (`init_active` + per-round `retain(len > t)`), so per-round cost
-  tracks the *active* rows — total work `O(total elements)`, asymptotically optimal (each element
-  touched a constant number of times). The accumulator is scattered back **in place** for fixed-width
-  `B` (a leaf or product of leaves); a `List`/`Sum` `B` falls back to the `gather_lanes` rebuild.
+  sequential *within* a row but vectorized *across* rows: round `t` folds in every row that has a
+  `t`-th element, in one body call, so `#rounds = the longest row`, not the element count. The rows
+  are ranked once by length, longest first, so the rows still running are always the first ranks: a
+  round's states are the previous round's output as it stands, less the rows that just finished,
+  which are its last rows. Those are copied out once, and the state is cut in place (a prefix of
+  rows is a prefix of every buffer, a list's ends and a sum's tags included). One `gather_lanes`
+  puts the finished rows back in row order. A stride needs no ranking: every row runs every round.
 - **`FoldScan` (mapAccumL) is the scan kernel; `Fold` is its R=Unit specialization, kept for cost.**
   `FoldScan : (T,List<A>)->(T,List<R>)` by `(T,A)->(T,R)` threads a state and emits an output stream;
   `scan` lowers to it (body `(a,x)->(b,b)`, take field 1) — measured identical to a dedicated scan.
-  `Fold` does NOT lower to it: `FoldScan` with `R=Unit, .0` measured ~3.4x slower, because the body is
-  forced to emit a `(state, output)` PAIR each round (extra `Prod` build/teardown + it breaks the
-  body's in-place accumulator mutation) and the lockstep records output positions even for a dead
-  `Unit` stream — the `Unit` *values* are free, the *pairing* and *bookkeeping* are not. So `Fold` is
-  the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
+  `Fold` does NOT lower to it: `FoldScan` with `R=Unit, .0` measures about 1.6x slower on ragged
+  rows, because the body is forced to emit a `(state, output)` PAIR each round, and the outputs are
+  put back in list order even when they are a dead `Unit` stream — the `Unit` *values* are free, the
+  *pairing* and *bookkeeping* are not. So `Fold` is the no-pair/no-recording path. (Equivalently an optimizer rule `FoldScan[R=Unit].0 -> Fold` would
   recover it — DCE the dead output, skip recording — which restores the in-place mutation.)
 - **Named monoid reductions and scans** (`fold_add`/`mul`/`min`/`max`/`all`/`any` and the prefix `scan_add`/…) are the one-SIMD-pass fast
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Over
   Floats a sum or product runs in row order, so it is the `fold` of `add` or `mul` bit for bit
-  (`all`/`any` read masks, which are Ints). The
-  all-active fast path (move `acc` through the body, skip the identity acc-gather + scatter) is built,
-  but only for lists whose bounds are stored as `Bounds::Stride`; uniform lists held as offsets, and
-  all ragged input, take the general per-round gather and scatter.
+  (`all`/`any` read masks, which are Ints).
 
 ## Failure: lossy ops, and checked ones as words
 
@@ -358,8 +355,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   seam is already corgi's central invariant — **DPS along the 1:1 SEQ spine** (pointwise/leaf/cast/
   select/fold-accumulator: `dest size = input size`, pre-sizable), **allocate-and-return at `List`
   introductions** (filter/group/iota/slices: data-dependent size). Relation to FBIP: corgi ALREADY does
-  opportunistic refcount reuse (`get_mut`/`make_mut` in `bin_into`/`scatter_into`/`AddU64`/move-to-last-
-  use) — that's reuse *discovered* at runtime; DPS makes it *intentional* (explicit destination →
+  opportunistic refcount reuse (`get_mut`/`make_mut` in `bin_into`/`map_into`/move-to-last-use) — that's reuse *discovered* at runtime; DPS makes it *intentional* (explicit destination →
   guaranteed in-place, AND it threads through a chain, which is what unlocks fusion; per-op reuse
   already works, so the new value is specifically cross-op intermediate elimination). The `None`
   destination = "output is dead" idiom collapses `FoldScan -> Fold` (skip the tags/off recording + DCE

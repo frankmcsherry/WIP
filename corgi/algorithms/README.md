@@ -209,7 +209,7 @@ now, at about the same cost (above).
 ### Loops
 
 The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Their own time
-(machinery, not body) is:
+(machinery, not body), measured before folds ran rows in order of length (below), was:
 - levenshtein 1564 (53%), jaro_winkler_direct 1164 (47%), balanced_brackets 468 (40%);
 - linear_regression 161 (64%), gcd 159 (43%), kadane 140 (90%), run_length_encode_scan 111 (59%);
 - interval_merge 94 (26%), horner 46 (73%).
@@ -222,8 +222,9 @@ The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Th
    - `acc * c + x` composes as affine maps and so is associative (ipv4_parse's `acc*256 + v`,
      horner).
 9. **Loop-invariant state and per-row constants.**
-   - A field the body hands back unchanged is still gathered and scattered every round:
-     Levenshtein carries `s2`, JW carries the window `d`.
+   - A field the body hands back unchanged is still part of every round's state: Levenshtein
+     carries `s2`, JW carries the window `d`. It passes through each round as it is now, and is
+     copied once, when its row finishes.
    - A per-row constant that a body needs is copied to every element by `cap_list`: horner's x,
      luhn's n, two_sum's t, top_k's n, mode's top, normalize_whitespace's total.
    - Rewrites: keep invariant fields out of the round state and read them by row; give binary ops a
@@ -243,9 +244,9 @@ The lockstep `fold` and `foldscan` are the largest single cost in the corpus. Th
       capture is a 16-byte span per element (substring_count_ref's CapList is still 104 ns/row),
       and a literal is still filled once per row before it can be referenced.
 
-The machinery itself is a runtime matter rather than a rewrite. Every round gathers the active
-rows' state and scatters it back. Running rows in order of length would make the active rows a
-prefix, with no gather or scatter.
+The machinery itself is a runtime matter rather than a rewrite. Done: rows run in order of length,
+longest first, so the running rows are a prefix of the state and no round gathers or scatters it
+(kadane 0.37×, levenshtein 0.45×, balanced_brackets 0.50× of before).
 
 ### Sorting, grouping and searching
 
