@@ -106,8 +106,10 @@ takes 9.8 s and DuckDB 0.9 s.
    hashes instead, hands keys back by reference, and checks the groups are exact (a row where two
    keys share a hash is grouped by sorting the keys). Where a filter comes first, the key goes
    through it by reference (`k ref`), so the filter moves references, not strings. q33 takes 92
-   ms, q36 36 ms, q12 5 ms. Order is only needed for the final top ten. q16–q18 group on keys
-   with a string in them and could do the same.
+   ms, q36 36 ms, q12 5 ms. Order is only needed for the final top ten. q16–q18, q28 and q38 use
+   it too. It pays where the keys are many or long; for a few distinct short keys, sorting them
+   costs less than hashing every row, so q10, q11 (phone models) and TPC-H q01 and q12 keep
+   `group` (q10 and q01 measured 1.24x and 1.7x slower with `hash_group`).
 2. **Top-k** is `sort_limit` now. It sorts the order's levels one at a time and keeps, after
    each, only the first k and the ties at the k-th. q24–q26 went from 18–26× to 4×, and the final
    sorts of q33, q36 and q39 from 0.15–0.3 s to a few ms. Most of what remains in q24 is building

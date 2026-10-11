@@ -4,7 +4,6 @@
 # columns: UserID EventTime SearchPhrase
 # output: [i,u,s,u]
 # EventTime is Unix seconds, so the minute is (t / 60) % 60.
-let (user, time, phrase) = input in
-let ranked = (user, (time, phrase) zip) zip map ((u, (t, s)) -> ((u, ((t, 60) div, 60) rem, s), ())) group
+let ranked = input zip map ((u, t, s) -> ((u, ((t, 60) div, 60) rem, s), ())) hash_group
     map (((u, m, s), rows) -> (rows len neg, u, m, s)) sort_limit 10 in
-ranked map ((d, u, m, s) -> (u, m, s, d neg))
+ranked map ((d, u, m, s) -> (u, m, s clone, d neg))
