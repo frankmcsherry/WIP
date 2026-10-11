@@ -125,8 +125,12 @@ fn pairs_with_a_literal_become_immediates() {
     for src in ["(4, input) add", "(4, input) mul", "(4, input) eq", "(4, input) min", "(4, input) lt", "(4, input) le", "(4, input) xor"] {
         assert_eq!(nodes_after(src), 2, "{src}");
     }
-    // stays a pair: order matters, float on the left, no literal, a list literal
-    for src in ["(4, input) sub", "(4, input) rem", "(4, input) sub_b64", "(1.5, input) add", "(input, input) add", "(input, \"ab\") eq"] {
+    // a list literal, for eq and ne, on either side
+    for src in ["(input, \"ab\") eq", "(\"ab\", input) ne"] {
+        assert_eq!(nodes_after(src), 2, "{src}");
+    }
+    // stays a pair: order matters, float on the left, no literal, a list literal ordered
+    for src in ["(4, input) sub", "(4, input) rem", "(4, input) sub_b64", "(1.5, input) add", "(input, input) add", "(input, \"ab\") lt"] {
         assert!(nodes_after(src) > 2, "{src}");
     }
     // (that it reaches into bodies is a unit test in optimize.rs, where bodies can be read)
@@ -144,6 +148,21 @@ fn the_rewrite_keeps_every_answer() {
         "input iota map (x -> ((x, 3) mul, 7) add) fold_add",
     ] {
         assert_eq!(run(src, Value::i64(xs.clone())), run_pair(src, Value::i64(xs.clone())), "{src}");
+    }
+    // a column of strings (as bytes, and as `i64`s) against a list literal, on either side
+    let words = ["ab", "", "abc", "ba", "ab", "a", "abab", "ab"];
+    let mut ends = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    for w in words {
+        bytes.extend(w.bytes());
+        ends.push(bytes.len());
+    }
+    let as_bytes = Value::List(corgi::Bounds::offsets(ends.clone()), Box::new(Value::u8(bytes.clone())));
+    let as_ints = Value::List(corgi::Bounds::offsets(ends), Box::new(Value::i64(bytes.iter().map(|&b| b as i64).collect())));
+    for src in ["(input, \"ab\") eq", "(input, \"ab\") ne", "(\"ab\", input) eq", "(input, \"\") eq", "(input, \"abc\") ne"] {
+        for col in [&as_bytes, &as_ints] {
+            assert_eq!(run(src, col.clone()), run_pair(src, col.clone()), "{src}");
+        }
     }
     // a literal shared by two consumers, one of which can't take it as an immediate
     let src = "let c = 4 in ((input, c) add, (c, input) sub)";

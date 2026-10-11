@@ -15,7 +15,7 @@ use crate::engine::gather;
 use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
 use sort::{sort_blocks, sort_values, sort_values_only};
 use crate::shape::{same, shape_of_value};
-use crate::value::{Bounds, Scalar, Value};
+use crate::value::{Bounds, Prim, Scalar, Value};
 use search::find_leaf;
 use std::hint::select_unpredictable;
 
@@ -49,6 +49,9 @@ pub enum CmpOp {
     Rel(Pred), // (X, X) -> Int mask   compare row by row in structural order: leaves lane-wise by
                // value, lists/products/sums as `sort` orders them. The mask is 0/1, held as bytes.
     RelImm(Pred, Scalar), // X -> Int mask   `x pred c`, `c` a constant of x's kind
+    ListImm(Pred, Prim), // List<X> -> Int mask   `xs eq c` or `xs ne c`, `c` a constant list of leaves
+               // of xs's kind (a string literal, say): each row's length against c's, and only the
+               // rows whose length agrees read their elements, against c's
     Min,       // (X, X) -> X   lane-wise minimum, by value
     Max,       // (X, X) -> X   lane-wise maximum
     MinImm(Scalar), // X -> X   lane-wise min with a constant, in place
@@ -98,6 +101,24 @@ impl CmpOp {
                     return Err(format!("compare with a constant: {} against {c:?}", shape_of_value(&Value::Prim(p))));
                 }
                 Value::u8(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
+            }
+
+            CmpOp::ListImm(pred, c) => {
+                // a list, as the pair `(xs, c) eq` takes: a referenced list there is a shape error
+                let Value::List(bounds, vals) = &input else {
+                    return Err(format!("compare with a constant list: {} against {c:?}", shape_of_value(&input)));
+                };
+                let ne = matches!(pred, Pred::Ne);
+                Value::u8(match (&**vals, c) {
+                    (Value::Prim(Prim::U8(x)), Prim::U8(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
+                    (Value::Prim(Prim::I64(x)), Prim::I64(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
+                    (Value::Prim(Prim::U8(x)), Prim::I64(c)) => equal_to(bounds, x, c, ne, |a, b| a as i64 == b),
+                    (Value::Prim(Prim::I64(x)), Prim::U8(c)) => equal_to(bounds, x, c, ne, |a, b| a == b as i64),
+                    (Value::Prim(Prim::F64(x)), Prim::F64(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
+                    (other, _) => {
+                        return Err(format!("compare with a constant list: List<{}> against {:?}", shape_of_value(other), c));
+                    }
+                })
             }
 
             CmpOp::MinImm(c) | CmpOp::MaxImm(c) => {
@@ -394,4 +415,24 @@ fn batched_bound(
         }
         active.truncate(w);
     }
+}
+
+/// 1 where a row of `xs` equals the constant `c`, element by element (or, with `ne`, where it
+/// doesn't). Every row's length is compared with `c`'s in one pass, with no branch on the answer;
+/// then only the rows whose length agrees compare their elements with `c`'s.
+fn equal_to<T: Copy, U: Copy>(bounds: &Bounds, xs: &[T], c: &[U], ne: bool, same: impl Fn(T, U) -> bool) -> Vec<u8> {
+    let n = bounds.len();
+    let mut out = vec![ne as u8; n];
+    let (mut agree, mut w) = (vec![(0usize, 0usize); n], 0);
+    let mut start = 0;
+    for (k, end) in bounds.ends().enumerate() {
+        agree[w] = (k, start);
+        w += (end - start == c.len()) as usize;
+        start = end;
+    }
+    for &(k, s) in &agree[..w] {
+        let equal = xs[s..s + c.len()].iter().zip(c).fold(true, |eq, (&a, &b)| eq & same(a, b));
+        out[k] = (equal != ne) as u8;
+    }
+    out
 }

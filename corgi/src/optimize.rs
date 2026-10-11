@@ -212,6 +212,19 @@ pub fn immediates(g: &Graph<NumOp>) -> Graph<NumOp> {
         if !matches!(pair.kind, NodeKind::Tuple) || pair.inputs.len() != 2 {
             return None;
         }
+        // a list of leaves, one row: `eq` and `ne` take it as a constant list
+        if let NumOp::Cmp(CmpOp::Rel(p @ (Pred::Eq | Pred::Ne))) = op {
+            let list = |i: usize| match &built[pair.inputs[i]].kind {
+                NodeKind::Op(NumOp::Core(Op::Lit(Value::List(b, vals)))) if b.len() == 1 && b.end(0) == vals.len() => {
+                    match &**vals { Value::Prim(c) => Some(c.clone()), _ => None }
+                }
+                _ => None,
+            };
+            let found = list(1).map(|c| (pair.inputs[0], c)).or_else(|| list(0).map(|c| (pair.inputs[1], c)));
+            if let Some((x, c)) = found {
+                return Some(Rewrite::Replace(Node { kind: NodeKind::Op(NumOp::Cmp(CmpOp::ListImm(*p, c))), inputs: vec![x] }));
+            }
+        }
         let literal = |i: usize| match &built[pair.inputs[i]].kind {
             NodeKind::Op(NumOp::Core(Op::Lit(Value::Prim(p)))) if p.len() == 1 => Some(Scalar::of(p, 0)),
             _ => None,
