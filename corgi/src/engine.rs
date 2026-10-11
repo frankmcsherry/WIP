@@ -220,6 +220,15 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     match v {
         Value::Prim(p) => Value::Prim(p.gather(idx)),
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather(c, idx)).collect()),
+        // rows of one length: so are the rows taken, and each one's elements are where arithmetic says
+        Value::List(Bounds::Stride(k, _), vals) => {
+            let taken = match &**vals {
+                // leaves: a block of k per row, copied
+                Value::Prim(p) => Value::Prim(p.gather_blocks(idx, *k)),
+                vals => gather(vals, &idx.iter().flat_map(|&i| i * k..(i + 1) * k).collect::<Vec<_>>()),
+            };
+            Value::List(Bounds::Stride(*k, idx.len()), Box::new(taken))
+        }
         Value::List(bounds, vals) => {
             let mut elem = Vec::new();
             let mut nb = Vec::with_capacity(idx.len());

@@ -365,12 +365,6 @@ pub(crate) fn f64_of_key(k: u64) -> f64 {
     f64::from_bits(if k >> 63 == 1 { k ^ SIGN } else { !k })
 }
 
-/// the slice of `i64`s as their two's complement words: the same bytes, read as `u64`.
-pub(crate) fn words_of(xs: &[i64]) -> &[u64] {
-    // SAFETY: `i64` and `u64` have one size and alignment, and every bit pattern is a `u64`.
-    unsafe { std::slice::from_raw_parts(xs.as_ptr() as *const u64, xs.len()) }
-}
-
 /// the `u64` words as the `i64`s whose two's complement they are, in the same buffer.
 pub(crate) fn i64s_of_words(xs: Vec<u64>) -> Vec<i64> {
     let mut xs = std::mem::ManuallyDrop::new(xs);
@@ -433,6 +427,39 @@ macro_rules! prim {
         impl Prim {
             pub(crate) fn len(&self) -> usize {
                 match self { $( Prim::$V(v) => v.len(), )+ }
+            }
+
+            /// row by row, this leaf's row (by `ab`) and then `other`'s (by `bb`), and where each
+            /// row now ends. Both at one storage.
+            pub(crate) fn append_rows(&self, ab: &Bounds, other: &Prim, bb: &Bounds) -> (Prim, Vec<usize>) {
+                match (self, other) {
+                    $( (Prim::$V(a), Prim::$V(b)) => {
+                        let mut out = Vec::with_capacity(a.len() + b.len());
+                        let mut ends = Vec::with_capacity(ab.len());
+                        let (mut sa, mut sb) = (0, 0);
+                        for (ea, eb) in ab.ends().zip(bb.ends()) {
+                            out.extend_from_slice(&a[sa..ea]);
+                            out.extend_from_slice(&b[sb..eb]);
+                            ends.push(out.len());
+                            (sa, sb) = (ea, eb);
+                        }
+                        (Prim::$V(Arc::new(out)), ends)
+                    } )+
+                    _ => unreachable!("append_rows: one storage"),
+                }
+            }
+
+            /// for each `i` in `idx`, the block of `k` rows starting at `i * k`.
+            pub(crate) fn gather_blocks(&self, idx: &[usize], k: usize) -> Prim {
+                match self {
+                    $( Prim::$V(v) => {
+                        let mut out = Vec::with_capacity(idx.len() * k);
+                        for &i in idx {
+                            out.extend(v[i * k..(i + 1) * k].iter().copied());
+                        }
+                        Prim::$V(Arc::new(out))
+                    } )+
+                }
             }
 
             /// keep the first `n` rows.
@@ -1048,17 +1075,6 @@ impl Value {
             Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
             Value::Prim(Prim::U8(xs)) => Ok(xs.iter().map(|&x| x as i64).collect()),
             other => Err(format!("{who}: expected Int, got {}", shape_of_value(&other))),
-        }
-    }
-
-    /// an integer leaf as 64-bit words (two's complement) — how positions, counts and tags are
-    /// read, so a negative one is past every row. Borrowed from an `i64` leaf.
-    pub(crate) fn as_words(&self, who: &str) -> Result<std::borrow::Cow<'_, [u64]>, String> {
-        use std::borrow::Cow;
-        match self {
-            Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(words_of(xs))),
-            Value::Prim(Prim::U8(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| x as u64).collect())),
-            other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
         }
     }
 

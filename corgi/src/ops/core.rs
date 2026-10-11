@@ -555,6 +555,15 @@ impl<L: OpLike> Op<L> {
                 same(&shape_of_value(&av), &shape_of_value(&bv)).map_err(|e| format!("Append: {e}"))?;
                 // both are SEQ columns, hence equal row count by the product invariant (defensive).
                 assert_eq!(ab.len(), bb.len(), "Append: row count mismatch");
+                // leaves: each row's two runs copied in turn, with no index per element
+                let (av, bv) = match (av, bv) {
+                    (Value::Prim(pa), Value::Prim(pb)) => {
+                        let (pa, pb) = Prim::meet(pa, pb);
+                        let (vals, ends) = pa.append_rows(&ab, &pb, &bb);
+                        return Ok(Value::List(ends.into(), Box::new(Value::Prim(vals))));
+                    }
+                    other => other,
+                };
                 let cap = av.len() + bv.len();
                 let mut nb = Vec::with_capacity(ab.len());
                 let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
@@ -635,18 +644,12 @@ impl<L: OpLike> Op<L> {
                     variants[t] = data;
                     return Ok(Value::sum_tagged(Tags::Const(t, rows), variants));
                 }
-                let tags = tags_v.as_words("Branch tags")?;
-                // one pass builds the tag column, each lane's row list, AND the within-variant offset
-                // (a row's offset is its lane's size when it arrives) — no decode/recompute afterwards.
-                let mut groups: Vec<Vec<usize>> = vec![Vec::new(); *n];
-                let mut tag8 = Vec::with_capacity(tags.len());
-                let mut off = Vec::with_capacity(tags.len());
-                for (i, &t) in tags.iter().enumerate() {
-                    let t = t.min(last) as usize;
-                    tag8.push(t as u8);
-                    off.push(groups[t].len());
-                    groups[t].push(i);
-                }
+                // the tags read where they are stored
+                let (tag8, off, groups) = match &tags_v {
+                    Value::Prim(Prim::U8(t)) => route(t, |x| x as u64, *n),
+                    Value::Prim(Prim::I64(t)) => route(t, |x| x as u64, *n),
+                    other => return Err(format!("Branch tags: expected Int, got {}", shape_of_value(other))),
+                };
                 let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
                 Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), variants)
             }
@@ -1031,6 +1034,22 @@ fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
 fn one_lane<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, last: u64) -> Option<usize> {
     let t = word(*tags.first()?).min(last);
     tags.chunks(256).all(|c| c.iter().fold(true, |ok, &x| ok & (word(x).min(last) == t))).then_some(t as usize)
+}
+
+/// `Branch`'s routing, in one pass: each row's lane (a tag past the last lane goes to the last), its
+/// offset in that lane (the lane's size when the row arrives), and each lane's rows.
+fn route<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, n: usize) -> (Vec<u8>, Vec<usize>, Vec<Vec<usize>>) {
+    let last = n.saturating_sub(1) as u64;
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut tag8 = Vec::with_capacity(tags.len());
+    let mut off = Vec::with_capacity(tags.len());
+    for (i, &t) in tags.iter().enumerate() {
+        let t = word(t).min(last) as usize;
+        tag8.push(t as u8);
+        off.push(groups[t].len());
+        groups[t].push(i);
+    }
+    (tag8, off, groups)
 }
 
 /// `Chunk(k)`'s values when some row doesn't divide by `k`: each row's first `len / k * k` elements.
