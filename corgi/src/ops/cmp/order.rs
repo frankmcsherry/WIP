@@ -247,8 +247,14 @@ mod compare {
                                 }
                                 for &k in &agree[..w] {
                                     let ((s_a, e_a), (s_b, e_b)) = spans(k);
-                                    let pairs = x[s_a..e_a].iter().zip(&y[s_b..e_b]);
-                                    ord[k] = pairs.fold(false, |d, (p, q)| d | (p != q)) as i8;
+                                    let (x, y) = (&x[s_a..e_a], &y[s_b..e_b]);
+                                    // a short row by a loop; a long one by the slice compare, which
+                                    // reads a vector at a time
+                                    ord[k] = if x.len() <= 16 {
+                                        x.iter().zip(y).fold(false, |d, (p, q)| d | (p != q))
+                                    } else {
+                                        x != y
+                                    } as i8;
                                 }
                                 return ord;
                             } )*

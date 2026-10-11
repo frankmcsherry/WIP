@@ -100,13 +100,15 @@ takes 9.8 s and DuckDB 0.9 s.
 
 ## What the queries argue for
 
-1. **Grouping, dedup and count-distinct on byte strings.** Today these sort the strings
-   structurally. That is about 7 of corgi's 10 s: q33's `group` of 1M URLs takes 1.6 s, while
-   DuckDB answers the whole query in 29 ms. Either of these would avoid it:
-   - group on a 64-bit hash, and compare bytes only within equal hashes;
-   - dictionary codes: a reference column over a distinct list of strings is already a dictionary.
-
-   Order is only needed for the final top ten.
+1. **Grouping, dedup and count-distinct on byte strings.** These sorted the strings structurally:
+   q33's `group` of 1M URLs took 1.1 s, while DuckDB answers the whole query in 28 ms. q05,
+   q12–q14, q33, q34, q36, q37 and q39 now group on a 64-bit `hash`, carrying each key by
+   reference, and check the answer is exact: a hash group holds one key unless two keys share a
+   hash, its runs of equal keys (`adjacent`) say so, and if any group holds two the query runs
+   grouped by key instead. q33 takes 88 ms that way, of which the hash is 40 and the check 27.
+   Order is only needed for the final top ten. q16–q18 group on keys with a string in them and
+   could do the same; a dictionary (a reference column over the distinct strings) is the other
+   route.
 2. **Top-k** is `sort_limit` now. It sorts the order's levels one at a time and keeps, after
    each, only the first k and the ties at the k-th. q24–q26 went from 18–26× to 4×, and the final
    sorts of q33, q36 and q39 from 0.15–0.3 s to a few ms. Most of what remains in q24 is building

@@ -3,6 +3,13 @@
 # sql:   ORDER BY c DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase
 # output: [s,u]
-let ranked = input map (s -> ((s len, 0) gt, (s, ()))) filter group
-    map ((s, rows) -> (rows len neg, s)) sort_limit 10 in
-ranked map ((d, s) -> (s, d neg))
+# Grouped by hash, each key carried by reference. A hash group holds one key unless two keys share
+# a hash; its runs of equal keys (`adjacent`) say so, and if any group holds two the query runs
+# grouped by key instead.
+let groups = input map (s -> ((s len, 0) gt, (s hash, s ref))) filter group in
+let collided = (groups map ((h, ss) -> ss adjacent fold_add) fold_max, 1) gt in
+((groups, input), collided) branch 2 match (
+    0 ((groups, _) -> groups map ((h, ss) -> (ss len neg, (0, ss) get)) sort_limit 10
+        map ((d, s) -> (s clone, d neg))),
+    1 ((_, phrases) -> phrases map (s -> ((s len, 0) gt, (s, ()))) filter group
+        map ((s, rows) -> (rows len neg, s)) sort_limit 10 map ((d, s) -> (s, d neg))))
