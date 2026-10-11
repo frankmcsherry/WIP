@@ -101,27 +101,50 @@ fn with_list<T: Pooled, R>(f: impl FnOnce(&mut Vec<Vec<T>>, &mut usize) -> R) ->
         .flatten()
 }
 
-/// an empty buffer with room for `n` elements: from the pool when one fits (the smallest), else a
-/// fresh allocation.
+/// the pooled buffer with room for `n` that `rank` likes least, removed from the list. "Room" is a
+/// capacity from `n` to about `2n`, so a small request never takes, and pins, a large buffer that the
+/// next large request would want.
+fn find<T: Pooled, K: Ord>(n: usize, rank: impl Fn(&Vec<T>) -> K) -> Option<Vec<T>> {
+    with_list::<T, _>(|list, takes| {
+        *takes += 1;
+        let max = 2 * n + 64;
+        let best = (0..list.len()).filter(|&i| (n..=max).contains(&list[i].capacity())).min_by_key(|&i| rank(&list[i]))?;
+        Some(list.swap_remove(best))
+    })
+    .flatten()
+}
+
+/// an empty buffer with room for `n` elements: from the pool when one fits (the smallest, and of
+/// those the one holding the fewest elements, leaving full ones for [`take_init`]), else a fresh
+/// allocation.
 pub(crate) fn take<T: Pooled>(n: usize) -> Vec<T> {
     if n == 0 {
         return Vec::new();
     }
-    // "fits" is a capacity from `n` to about `2n`, so a small request never takes, and pins, a
-    // large buffer that the next large request would want.
-    let found = with_list::<T, _>(|list, takes| {
-        *takes += 1;
-        let max = 2 * n + 64;
-        let best = (0..list.len()).filter(|&i| (n..=max).contains(&list[i].capacity())).min_by_key(|&i| list[i].capacity())?;
-        Some(list.swap_remove(best))
-    })
-    .flatten();
-    match found {
+    match find::<T, _>(n, |v| (v.capacity(), v.len())) {
         Some(mut v) => {
             v.clear();
             v
         }
         None => Vec::with_capacity(n),
+    }
+}
+
+/// a buffer of exactly `n` initialized elements, for a kernel that writes slots in place rather than
+/// appending (compress): the pool's buffer that already holds the most initialized elements, so
+/// that only a tail it never had is zeroed; with no pool, a zeroed allocation (what `vec![0; n]`
+/// gives). The elements' values are whatever the buffer last held.
+pub(crate) fn take_init<T: Pooled>(n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    match find::<T, _>(n, |v| (std::cmp::Reverse(v.len().min(n)), v.capacity())) {
+        Some(mut v) => {
+            v.truncate(n);
+            v.resize(n, T::default());
+            v
+        }
+        None => vec![T::default(); n],
     }
 }
 
