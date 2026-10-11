@@ -3,7 +3,7 @@
 //! which `Rel` and `find` reduce to), `mod labels` (the block-label vocabulary the sort speaks and
 //! `dedup`/`group` read), and `group_bounds`; the merge kernel is `super::survey`.
 
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Bounds, Prim, Rows, Value};
 use std::cmp::Ordering;
 
 pub(crate) use compare::*;
@@ -207,17 +207,50 @@ mod compare {
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
-                // leaf elements of one width: each pair is one slice compare (a memcmp on bytes),
-                // with no element pairs built.
+                // leaf elements of one width: each pair is one slice compare, with no element pairs
+                // built. Equality reads every pair's lengths first, in a pass with no branch on the
+                // answer, and then the elements of only the pairs whose lengths agree.
                 macro_rules! slices {
                     ($($V:ident),*) => {
                         match (va, vb) {
                             $( (Value::Prim(Prim::$V(x)), Value::Prim(Prim::$V(y))) => {
-                                return (0..m).map(|k| {
-                                    let ((s_a, e_a), (s_b, e_b)) = (ba.span(pairs.left(k)), bb.span(pairs.right(k)));
-                                    let (x, y) = (&x[s_a..e_a], &y[s_b..e_b]);
-                                    if eq { (x != y) as i8 } else { x.cmp(y) as i8 }
-                                }).collect();
+                                let spans = |k: usize| (ba.span(pairs.left(k)), bb.span(pairs.right(k)));
+                                if !eq {
+                                    return (0..m).map(|k| {
+                                        let ((s_a, e_a), (s_b, e_b)) = spans(k);
+                                        x[s_a..e_a].cmp(&y[s_b..e_b]) as i8
+                                    }).collect();
+                                }
+                                let mut ord = vec![0i8; m];
+                                let (mut agree, mut w) = (vec![0usize; m], 0);
+                                let mut note = |k: usize, la: usize, lb: usize| {
+                                    let differ = la != lb;
+                                    ord[k] = differ as i8;
+                                    agree[w] = k;
+                                    w += !differ as usize;
+                                };
+                                match (pairs, ba, bb) {
+                                    // row against row of two lists: their ends, walked together
+                                    (Pairs::Diagonal(_), Rows::Part(pa), Rows::Part(pb)) => {
+                                        let (mut s_a, mut s_b) = (0, 0);
+                                        for (k, (e_a, e_b)) in pa.ends().zip(pb.ends()).enumerate() {
+                                            note(k, e_a - s_a, e_b - s_b);
+                                            (s_a, s_b) = (e_a, e_b);
+                                        }
+                                    }
+                                    _ => {
+                                        for k in 0..m {
+                                            let ((s_a, e_a), (s_b, e_b)) = spans(k);
+                                            note(k, e_a - s_a, e_b - s_b);
+                                        }
+                                    }
+                                }
+                                for &k in &agree[..w] {
+                                    let ((s_a, e_a), (s_b, e_b)) = spans(k);
+                                    let pairs = x[s_a..e_a].iter().zip(&y[s_b..e_b]);
+                                    ord[k] = pairs.fold(false, |d, (p, q)| d | (p != q)) as i8;
+                                }
+                                return ord;
                             } )*
                             _ => {}
                         }
