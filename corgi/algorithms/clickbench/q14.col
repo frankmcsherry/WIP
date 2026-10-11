@@ -3,7 +3,14 @@
 # sql:   ORDER BY c DESC, SearchEngineID, SearchPhrase LIMIT 10
 # columns: SearchEngineID SearchPhrase
 # output: [u,s,u]
+# Grouped by hash, each key carried by reference. A hash group holds one key unless two keys share
+# a hash; its runs of equal keys (`adjacent`) say so, and if any group holds two the query runs
+# grouped by key instead.
 let (engine, phrase) = input in
-let ranked = (engine, phrase) zip map ((e, s) -> ((s len, 0) gt, ((e, s), ()))) filter group
-    map (((e, s), rows) -> (rows len neg, e, s)) sort_limit 10 in
-ranked map ((d, e, s) -> (e, s, d neg))
+let groups = (engine, phrase) zip map ((e, s) -> ((s len, 0) gt, ((e, s) hash, (e, s ref)))) filter group in
+let collided = (groups map ((h, vs) -> vs adjacent fold_add) fold_max, 1) gt in
+((groups, input), collided) branch 2 match (
+    0 ((groups, _) -> groups map ((h, vs) -> let (e, s) = (0, vs) get in (vs len neg, e, s)) sort_limit 10
+        map ((d, e, s) -> (e, s clone, d neg))),
+    1 ((_, (engine, phrase)) -> (engine, phrase) zip map ((e, s) -> ((s len, 0) gt, ((e, s), ()))) filter group
+        map (((e, s), rows) -> (rows len neg, e, s)) sort_limit 10 map ((d, e, s) -> (e, s, d neg))))

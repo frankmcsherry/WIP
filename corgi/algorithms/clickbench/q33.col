@@ -2,5 +2,13 @@
 # sql: SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC, URL LIMIT 10
 # columns: URL
 # output: [s,u]
-let ranked = input map (u -> (u, ())) group map ((u, rows) -> (rows len neg, u)) sort_limit 10 in
-ranked map ((d, u) -> (u, d neg))
+# Grouped by hash, each URL carried by reference. A hash group holds one URL unless two URLs share
+# a hash; its runs of equal URLs (`adjacent`) say so. If any group holds two, the query runs grouped
+# by URL instead.
+let groups = input map (u -> (u hash, u ref)) group in
+let collided = (groups map ((h, us) -> us adjacent fold_add) fold_max, 1) gt in
+((groups, input), collided) branch 2 match (
+    0 ((groups, _) -> groups map ((h, us) -> (us len neg, (0, us) get)) sort_limit 10
+        map ((d, u) -> (u clone, d neg))),
+    1 ((_, urls) -> urls map (u -> (u, ())) group map ((u, rows) -> (rows len neg, u)) sort_limit 10
+        map ((d, u) -> (u, d neg))))

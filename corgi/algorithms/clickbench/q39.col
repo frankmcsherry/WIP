@@ -5,11 +5,27 @@
 # sql:   ORDER BY PageViews DESC, TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst LIMIT 10 OFFSET 1000
 # columns: CounterID EventDate IsRefresh TraficSourceID SearchEngineID AdvEngineID Referer URL
 # output: [i,u,u,s,s,u]
+# Grouped by hash, each key carried by reference. A hash group holds one key unless two keys share
+# a hash; its runs of equal keys (`adjacent`) say so, and if any group holds two the query runs
+# grouped by key instead.
 let (counter, date, refresh, source, engine, adv, referer, url) = input in
 let views = (counter, (date, (refresh, (source, (engine, (adv, (referer, url) zip) zip) zip) zip) zip) zip) zip
     map ((c, (d, (r, (t, (e, (a, (f, u))))))) ->
+        let s = (((e, 0) eq, (a, 0) eq) min, f, "") select in
         ((((c, 62) eq, ((d, 15887) ge, (d, 15917) le) min) min, (r, 0) eq) min,
-         ((t, e, a, (((e, 0) eq, (a, 0) eq) min, f, "") select, u), ()))) filter in
-let ranked = views group map (((t, e, a, s, u), rows) -> (rows len neg, t, e, a, s, u)) sort_limit 1010 in
-((1000, (ranked len, 1010) min) range, ranked) gather
-    map ((d, t, e, a, s, u) -> (t, e, a, s, u, d neg))
+         ((t, e, a, s, u) hash, (t, e, a, s ref, u ref)))) filter in
+let groups = views group in
+let collided = (groups map ((h, vs) -> vs adjacent fold_add) fold_max, 1) gt in
+((groups, input), collided) branch 2 match (
+    0 ((groups, _) -> let ranked = groups map ((h, vs) -> let (t, e, a, s, u) = (0, vs) get in (vs len neg, t, e, a, s, u))
+        sort_limit 1010 in
+        ((1000, (ranked len, 1010) min) range, ranked) gather
+        map ((d, t, e, a, s, u) -> (t, e, a, s clone, u clone, d neg))),
+    1 ((_, (counter, date, refresh, source, engine, adv, referer, url)) ->
+        let views = (counter, (date, (refresh, (source, (engine, (adv, (referer, url) zip) zip) zip) zip) zip) zip) zip
+            map ((c, (d, (r, (t, (e, (a, (f, u))))))) ->
+                ((((c, 62) eq, ((d, 15887) ge, (d, 15917) le) min) min, (r, 0) eq) min,
+                 ((t, e, a, (((e, 0) eq, (a, 0) eq) min, f, "") select, u), ()))) filter in
+        let ranked = views group map (((t, e, a, s, u), rows) -> (rows len neg, t, e, a, s, u)) sort_limit 1010 in
+        ((1000, (ranked len, 1010) min) range, ranked) gather
+        map ((d, t, e, a, s, u) -> (t, e, a, s, u, d neg))))
