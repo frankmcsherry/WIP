@@ -655,6 +655,20 @@ impl<L: OpLike> Op<L> {
                     check(&z)?;
                     return Ok(seed);
                 }
+                // every row the same length, as a stride says: every row runs every round, in row
+                // order, so the rounds need no schedule
+                if let Some(k) = bounds.strided() {
+                    let n = bounds.len();
+                    let mut acc = seed;
+                    for t in 0..k {
+                        let elt = gather(&vals, &(0..n).map(|r| r * k + t).collect::<Vec<_>>());
+                        acc = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
+                        if t == 0 {
+                            check(&acc)?;
+                        }
+                    }
+                    return Ok(acc);
+                }
                 let mut rounds = Rounds::new(&bounds);
                 let (mut acc, seed) = rounds.start(seed);
                 let mut done = Vec::new();
@@ -691,6 +705,29 @@ impl<L: OpLike> Op<L> {
                     let (state, r) = z.into_pair("FoldScan body")?;
                     check(&state)?;
                     return Ok(Value::Prod(vec![seed, Value::List(bounds, Box::new(r))]));
+                }
+                // every row the same length, as a stride says: every row runs every round, in row
+                // order, and row r's t-th output is row r of round t's
+                if let Some(k) = bounds.strided() {
+                    let n = bounds.len();
+                    let mut acc = seed;
+                    let mut chunks = Vec::with_capacity(k);
+                    for t in 0..k {
+                        let elt = gather(&vals, &(0..n).map(|r| r * k + t).collect::<Vec<_>>());
+                        let (state, r) = try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
+                        if t == 0 {
+                            check(&state)?;
+                        }
+                        acc = state;
+                        chunks.push(r);
+                    }
+                    let (mut tags, mut off) = (Vec::with_capacity(n * k), Vec::with_capacity(n * k));
+                    for r in 0..n {
+                        tags.extend(0..k);
+                        off.extend(std::iter::repeat_n(r, k));
+                    }
+                    let srcs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+                    return Ok(Value::Prod(vec![acc, Value::List(bounds, Box::new(gather_lanes(&srcs, &tags, &off)))]));
                 }
                 let mut rounds = Rounds::new(&bounds);
                 let (mut acc, seed) = rounds.start(seed);
