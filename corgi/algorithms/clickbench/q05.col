@@ -2,4 +2,4 @@
 # sql: SELECT COUNT(DISTINCT SearchPhrase) FROM hits
 # columns: SearchPhrase
 # output: u
-input dedup len
+input map (s -> (s, ())) hash_group len

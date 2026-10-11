@@ -128,7 +128,8 @@ src/
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
-               The words are built here: sort/dedup/group over sort_by, slices, head, and the
+               The words are built here: sort/dedup/group over sort_by, hash_group (written in
+               corgi itself, as source grafted in), all/any over a written tuple, slices, head, and the
                checked ops try_get/try_gather/try_zip/try_chunk (check, branch, lossy op on lane 0).
     program.rs `Program`: parse, type and run in one path (compile_ml / shape / run).
 tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text · effect · kernel · ref ·
