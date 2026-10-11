@@ -524,8 +524,9 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
 ///
 /// A FIXED-WIDTH level blends LANE-WISE: one pass reading both sides at the same position, which is
 /// a select instruction. A VARIABLE-WIDTH level (a `List` row is a span, a `Sum` row is a lane
-/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`].
-/// The split is per LEVEL, not per value:
+/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`],
+/// except a list of leaves, whose rows are copied a run at a time. The split is per LEVEL, not per
+/// value:
 /// a product blends each leaf field directly and only gathers the fields that need it.
 pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
     match (then, els) {
@@ -534,6 +535,14 @@ pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
             Value::Prod(ts.into_iter().zip(es).map(|(t, e)| blend(mask, t, e)).collect())
         }
         (Value::Unit(_), Value::Unit(_)) => Value::Unit(mask.len()),
+        // lists of leaves: each row's run copied from the side the mask picks, with no index per
+        // element
+        (Value::List(tb, tv), Value::List(eb, ev)) if matches!((&*tv, &*ev), (Value::Prim(_), Value::Prim(_))) => {
+            let (Value::Prim(t), Value::Prim(e)) = (*tv, *ev) else { unreachable!() };
+            let (t, e) = Prim::meet(t, e);
+            let (vals, ends) = t.blend_rows(&tb, &e, &eb, mask);
+            Value::List(ends.into(), Box::new(Value::Prim(vals)))
+        }
         // row `i` from lane `mask[i] != 0`, at its own position — the offsets are the identity.
         (t, e) => {
             let tags: Vec<usize> = mask.iter().map(|&m| (m != 0) as usize).collect();

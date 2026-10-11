@@ -24,6 +24,16 @@ fn sample() -> Value {
     ])
 }
 
+/// `select` over lists of leaves takes each row whole from the side its mask picks, whichever
+/// storage each side holds.
+#[test]
+fn select_picks_each_list_row() {
+    let words = Value::List(vec![2, 2, 5].into(), Box::new(int(&[1, 2, 300, 4, 5])));
+    let bytes = Value::List(vec![1, 3, 3].into(), Box::new(Value::u8(vec![7, 8, 9])));
+    let input = Value::Prod(vec![Value::u8(vec![1, 0, 1]), words, bytes]);
+    assert_eq!(run_ml("let (m, a, b) = input in (m, a, b) select", &input), "List ends=[2, 4, 7] <[1, 2, 8, 9, 300, 4, 5]>");
+}
+
 #[test]
 fn sum_scores_with_destructure() {
     let src = "let (subj, vals) = input.1 transpose in vals fold_add";

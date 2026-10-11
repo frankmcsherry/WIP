@@ -449,6 +449,24 @@ macro_rules! prim {
                 }
             }
 
+            /// row by row, this leaf's row (by `tb`) where `pick` is nonzero and `other`'s (by `eb`)
+            /// where it is zero, and where each row now ends. Both at one storage.
+            pub(crate) fn blend_rows(&self, tb: &Bounds, other: &Prim, eb: &Bounds, pick: &[u8]) -> (Prim, Vec<usize>) {
+                match (self, other) {
+                    $( (Prim::$V(t), Prim::$V(e)) => {
+                        let mut out = Vec::new();
+                        let mut ends = Vec::with_capacity(pick.len());
+                        for (i, &m) in pick.iter().enumerate() {
+                            let (v, (s, x)) = if m != 0 { (t, tb.span(i)) } else { (e, eb.span(i)) };
+                            out.extend_from_slice(&v[s..x]);
+                            ends.push(out.len());
+                        }
+                        (Prim::$V(Arc::new(out)), ends)
+                    } )+
+                    _ => unreachable!("blend_rows: one storage"),
+                }
+            }
+
             /// for each `i` in `idx`, the block of `k` rows starting at `i * k`.
             pub(crate) fn gather_blocks(&self, idx: &[usize], k: usize) -> Prim {
                 match self {
