@@ -53,6 +53,78 @@ shape-checker, an `ml` front-end, and a small optimizer. Standalone lib crate (n
 `cargo test` green; `cargo clippy --all-targets` clean; `cargo run --example tour` walks the
 language; `cargo bench --bench eval` measures throughput.
 
+## Where things stand (2026-10-12)
+
+A dated snapshot for whoever picks this up next. Numbers are from master at `6275a5d` on an M4 mini.
+
+**Benchmarks.** Each has a README with per-query or per-program times and what dominates each:
+- ClickBench, 43 queries on 1M rows: 2.1× DuckDB on one thread (geometric mean over q01–q42; 5.3×
+  on 2026-10-03). [`algorithms/clickbench/README.md`](algorithms/clickbench/README.md).
+- TPC-H, 8 of the 22 queries as 11 programs, scale factor 0.2: 0.92× DuckDB on one thread (2.0× on
+  2026-10-03). [`algorithms/tpch/README.md`](algorithms/tpch/README.md).
+- The algorithms corpus, 48 programs: 0.9–19× hand-written Rust, geometric mean 4.3×.
+  [`algorithms/README.md`](algorithms/README.md).
+- Single operations against idiomatic Rust: [`performance.md`](performance.md).
+
+**Landed since one Int (#74):** checked ops as words (#79); `Builder::graft` (#80); folds run rows
+longest first (#83, #84); Float reductions in row order (#82); exact tuple patterns (#86); the cheap
+forms' shortcuts (#87); list equality reads lengths first (#88) and compares with a literal in place
+(#89); a faster dependency-free hash for lists of numbers (#91); `hash_group`, a grouping word
+written in corgi that sorts 64-bit hashes and checks the groups are exact, with `all`/`any` (#93);
+`select` over lists copying each row whole (#94); filter choosing between compress and gather by
+how many rows it keeps (#97).
+
+**Open PRs:**
+- #95: TPC-H's one-character flags stored as their byte. Ready. q01 goes from 1.8× to 1.4× DuckDB;
+  existing TPC-H data directories need `prepare.py` run again.
+- #96: list rows move as ranges of elements (one copy per run of consecutive rows, at every level).
+  Ready; the decision is whether it is worth its code. ClickBench 0.93 of master's time (q24–q26 3–4×,
+  q28 1.38×); three corpus programs that repeat one short row are 9–17% slower; +151 −77 lines.
+- #50: reused leaf buffers, and evaluation bookkeeping once per graph. Conflicts with #97 and needs
+  a rebase. Open question: whether the ~21 ns per run that installing the pool costs is acceptable
+  (one-op programs on 8K rows are 7–15% slower). DDIR calls `eval_graph` directly, so it would get
+  the bookkeeping saving but not the pool.
+- #76 (draft): integer storages u8 through i64, with ops that keep results narrow. Parked; needs a
+  rebase over #79–#97 before its numbers mean anything.
+- #27: a fold over a product of monoids becomes one reduction per field. From 2026-09; can close.
+
+**Decided:**
+- No substring-search word: a host that needs LIKE provides it. ClickBench q20–q23 keep
+  split-and-compare as a record of the cost.
+- TPC-H grows only by queries that translate directly (q07, q08, q11, q15, q18 are candidates), not
+  ones that would measure planning (correlated subqueries, EXISTS, outer joins).
+- `hash`'s values may change: DDIR depends on its quality, not its values. A dependency for a faster
+  hash is undecided. The candidate is `foldhash`'s `quality` variant pinned to 0.2.0: 0.76 of master's
+  time over the fourteen `hash_group` queries, about 0.08 s of build, no dependencies of its own, the
+  same avalanche quality as rapidhash, and the same values only on 64-bit little-endian machines.
+  `foldhash::fast` fails avalanche on keys of 8 bytes or fewer; ahash's output depends on the CPU
+  and costs 1.4 s of build. A hash that reads a row as bytes must not depend on storage: a row is
+  hashed as one byte per element when every element is in 0..=255, whatever holds it, and otherwise
+  as 8-byte words under another seed. (corgi's own byte hash today has a mild weakness: its last
+  step is a multiply, so its low output bits are less mixed.)
+
+**Tried and set aside:**
+- 32-bit engine indexes (row ends, positions, offsets) with a 64-bit fallback chosen per array:
+  0.98–0.99 of master's time for about 285 lines and 10% more build time. Master had already
+  removed most of the index-heavy paths (byte masks, literal fills, element-wise append and select).
+- Choosing between range copies and positions from a sample of the first rows: dropped from #96 as
+  too complicated for what it bought (two corpus programs).
+- Filter by positions always: q01 16% and q12 14% slower than #97's choice by count.
+- Filter reading its mask as 64-row bit words (skip empty words, copy full ones): even with master
+  overall, and twice as slow where kept rows are scattered and copied as runs. Masks are bytes, so
+  it needs a packing pass, and number columns already compress at about memory speed.
+- `hash_group` for a few distinct short keys (ClickBench q10, q11; TPC-H q01, q12): 1.1–1.7× slower
+  than `group`, which sorts them directly.
+
+**Where the remaining time goes:**
+- ClickBench: sorting 1M 64-bit keys (integer GROUP BY and COUNT DISTINCT, and the sort inside
+  `hash_group`: about nine queries); the hash and the exactness check on long string keys (q33–q39);
+  substring search (left to the host); predicate chains, one pass per comparison, and DuckDB's
+  block skipping (q19); q29's ninety passes.
+- TPC-H: q01's grouping into four groups (a reduce by a small key, which corgi has no op for); `find`
+  where keys are unique; re-sorting tables that arrive sorted.
+- The corpus: loops written as folds and scans, interpreted once per element (3–16× Rust).
+
 ## Orientation (module map)
 
 ```
