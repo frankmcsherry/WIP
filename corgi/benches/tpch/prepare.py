@@ -10,8 +10,8 @@ and corgi compute the same integer expressions and their answers match exactly. 
 and `numpy` Python packages.
 
 Writes to OUT_DIR:
-- one file per column: `NAME.u64` (little-endian u64) for numbers, or `NAME.ends` (u64 row ends) and
-  `NAME.bytes` for strings;
+- one file per column: `NAME.u64` (little-endian u64) for numbers, `NAME.u8` for one-byte flags, or
+  `NAME.ends` (u64 row ends) and `NAME.bytes` for strings;
 - `expected/QUERY.txt`: DuckDB's answer to each query in `algorithms/tpch/`, in the canonical form the
   bench prints corgi's in (one row per line, tab-separated, strings in hex);
 - `duckdb.tsv`: DuckDB's best time per query, on one thread and on all of them, tables in memory.
@@ -26,13 +26,14 @@ QUERIES = os.path.join(HERE, '..', '..', 'algorithms', 'tpch')
 DAYS = "({} - DATE '1970-01-01')"
 CENTS = "CAST(round({} * 100) AS BIGINT)"
 
-# per table, the columns kept: name -> (SQL over the generated table, kind: u number, s string)
+# per table, the columns kept: name -> (SQL over the generated table, kind: u number, b byte, s string).
+# The flags are CHAR(1) in TPC-H and always one ASCII letter, so they are kept as that byte.
 TABLES = {
     'lineitem': {
         'l_orderkey': ('l_orderkey', 'u'), 'l_partkey': ('l_partkey', 'u'), 'l_suppkey': ('l_suppkey', 'u'),
         'l_quantity': ('CAST(l_quantity AS BIGINT)', 'u'), 'l_extendedprice': (CENTS.format('l_extendedprice'), 'u'),
         'l_discount': (CENTS.format('l_discount'), 'u'), 'l_tax': (CENTS.format('l_tax'), 'u'),
-        'l_returnflag': ('l_returnflag', 's'), 'l_linestatus': ('l_linestatus', 's'),
+        'l_returnflag': ('ascii(l_returnflag)', 'b'), 'l_linestatus': ('ascii(l_linestatus)', 'b'),
         'l_shipdate': (DAYS.format('l_shipdate'), 'u'), 'l_commitdate': (DAYS.format('l_commitdate'), 'u'),
         'l_receiptdate': (DAYS.format('l_receiptdate'), 'u'), 'l_shipinstruct': ('l_shipinstruct', 's'),
         'l_shipmode': ('l_shipmode', 's'),
@@ -98,6 +99,9 @@ def main():
                 vals = [x.encode() if isinstance(x, str) else bytes(x) for x in v]
                 np.cumsum([len(x) for x in vals], dtype=np.uint64).astype('<u8').tofile(os.path.join(out, c + '.ends'))
                 open(os.path.join(out, c + '.bytes'), 'wb').write(b''.join(vals))
+            elif kind == 'b':
+                assert ((0 <= v) & (v < 256)).all(), c
+                v.astype(np.uint8).tofile(os.path.join(out, c + '.u8'))
             else:
                 v.astype(np.int64).astype(np.uint64).astype('<u8').tofile(os.path.join(out, c + '.u64'))
     db.sql('DROP SCHEMA gen CASCADE')
