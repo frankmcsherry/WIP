@@ -162,3 +162,72 @@ fn compress_keeps_what_gather_at_the_kept_positions_does() {
         assert_eq!(compress(&v, &mask, kept.len()), gather(&v, &kept));
     }
 }
+/// `gather` element by element, as it was before list rows moved a range at a time: the reference
+/// the range copies must match. (A sum's arm is unchanged, so it is `gather`'s own.)
+fn by_positions(v: &Value, idx: &[usize]) -> Value {
+    match v {
+        Value::Prim(p) => Value::Prim(p.gather(idx)),
+        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| by_positions(c, idx)).collect()),
+        Value::Unit(_) => Value::Unit(idx.len()),
+        Value::List(bounds, vals) => {
+            let (mut elem, mut ends) = (Vec::new(), Vec::new());
+            for &i in idx {
+                let (s, e) = bounds.span(i);
+                elem.extend(s..e);
+                ends.push(elem.len());
+            }
+            Value::List(ends.into(), Box::new(by_positions(vals, &elem)))
+        }
+        Value::Ref(list, rows) => Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows[i]).collect())),
+        Value::Sum(..) => gather(v, idx),
+    }
+}
+
+/// Lists of every kind of element, moved by `gather`, `gather_lanes` and `blend` a range
+/// of rows at a time, agree with moving them element by element: rows taken in order, repeated,
+/// reversed and empty, at several depths.
+#[test]
+fn range_copies_match_element_positions() {
+    // equal as values: references compare by the rows they name
+    let same = |a: Value, b: Value| assert_eq!(clone_ref(a), clone_ref(b));
+    let bytes = |ends: Vec<usize>, xs: &[u8]| Value::List(ends.into(), Box::new(Value::u8(xs.to_vec())));
+    let strings = bytes(vec![2, 2, 5, 6, 6, 9], &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    let arena = Arc::new(bytes(vec![1, 3, 6], &[1, 2, 3, 4, 5, 6]));
+    // rows long enough to be copied a range at a time, rather than gathered by position
+    let long = |ends: &[usize]| Value::List(ends.to_vec().into(), Box::new(Value::u8((0..*ends.last().unwrap()).map(|i| i as u8).collect())));
+    let long_strings = long(&[20, 20, 37, 67, 67, 92]);
+    let values = [
+        strings.clone(),
+        long_strings.clone(),
+        // a list of (number, long string) pairs, and lists of long strings
+        Value::List(vec![1, 3, 3, 4, 6, 6].into(), Box::new(Value::Prod(vec![u(&[1, 2, 3, 4, 5, 6]), long_strings.clone()]))),
+        Value::List(vec![2, 3, 3, 4, 6, 6].into(), Box::new(long_strings.clone())),
+        // a list of (number, string) pairs
+        Value::List(vec![1, 3, 3, 4, 6, 6].into(), Box::new(Value::Prod(vec![u(&[1, 2, 3, 4, 5, 6]), strings.clone()]))),
+        // a stride list of pairs
+        Value::List(Bounds::Stride(2, 6), Box::new(Value::Prod(vec![u(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), Value::u8((0..12).collect())]))),
+        // a list of lists of strings
+        Value::List(vec![2, 3, 3, 4, 6, 6].into(), Box::new(strings.clone())),
+        // a list of sums with a string lane
+        Value::List(vec![1, 2, 2, 4, 5, 6].into(), Box::new(Value::sum(vec![0, 1, 1, 0, 1, 0], vec![u(&[7, 8, 9]), bytes(vec![1, 1, 3], &[4, 5, 6])]))),
+        // a list of references
+        Value::List(vec![2, 2, 3, 5, 6, 6].into(), Box::new(Value::Ref(arena, Arc::new(vec![2, 0, 1, 1, 2, 0])))),
+    ];
+    let idx = [3, 4, 5, 0, 1, 1, 2, 5, 4, 0];
+    let mask = [1u8, 1, 0, 1, 1, 1];
+    for v in &values {
+        same(gather(v, &idx), by_positions(v, &idx));
+        // two sources: row k of the second is row k of `v` reversed, so a row can come from either
+        let other = gather(v, &[5, 4, 3, 2, 1, 0]);
+        let (tags, off) = ([0usize, 0, 1, 1, 0, 1, 1], [0usize, 1, 2, 3, 4, 4, 0]);
+        let both = concat(&[v.clone(), other.clone()]);
+        let at: Vec<usize> = tags.iter().zip(&off).map(|(&t, &o)| t * 6 + o).collect();
+        same(gather_lanes(&[Some(v), Some(&other)], &tags, &off), by_positions(&both, &at));
+        let picks: Vec<usize> = mask.iter().enumerate().map(|(i, &m)| if m != 0 { 6 + i } else { i }).collect();
+        same(blend(&mask, other.clone(), v.clone()), by_positions(&concat(&[v.clone(), other]), &picks));
+    }
+    // lists held at different storages meet at `i64`
+    let words = Value::List(vec![2, 2, 5, 6, 6, 9].into(), Box::new(u(&[1, 2, 300, 4, 5, 6, 7, 8, 9])));
+    let picks: Vec<usize> = mask.iter().enumerate().map(|(i, &m)| if m != 0 { 6 + i } else { i }).collect();
+    same(blend(&mask, words.clone(), strings.clone()), by_positions(&concat(&[strings, words]), &picks));
+}
