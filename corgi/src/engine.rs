@@ -63,30 +63,12 @@ pub(crate) fn clone_ref(v: Value) -> Value {
 
 mod generators {
     //! Index generators — the `gather`-family currency. Each composite op is "make an index (and sometimes
-    //! re-segmented bounds), then `gather`": mask→survivors (`Filter`), bounds→owner-ids (`CapList`),
-    //! positions of any shape (`Gather`, via `index_plan`). The index math lives here; the op bodies in
+    //! re-segmented bounds), then `gather`": bounds→owner-ids (`CapList`), positions of any shape
+    //! (`Gather`, via `index_plan`). The index math lives here; the op bodies in
     //! `ops::core` just generate, gather, and re-wrap. (`Unwrap` reads the Sum's carried offset via
     //! `gather_lanes` — no generator; `Branch` groups by tag inline.)
 
     use super::*;
-
-    /// the mask family: over a list's `bounds` and a per-element 0/1 `mask`, the surviving (nonzero)
-    /// positions AND the re-counted per-row bounds, in one pass. Pairs with `gather` to realise `Filter`.
-    pub(crate) fn filter_mask(bounds: &Bounds, mask: &[u8]) -> (Vec<usize>, Vec<usize>) {
-        let mut idx = Vec::new();
-        let mut nb = Vec::with_capacity(bounds.len());
-        let mut start = 0;
-        for end in bounds.ends() {
-            for (off, &b) in mask[start..end].iter().enumerate() {
-                if b != 0 {
-                    idx.push(start + off);
-                }
-            }
-            nb.push(idx.len()); // cumulative survivors = this row's end offset
-            start = end;
-        }
-        (idx, nb)
-    }
 
     /// the capture family: expand a list's `bounds` to the owner row of each element — `[2,3,6]` →
     /// `[0,0,1,2,2,2]`. Pairs with `gather` to replicate the context side of `CapList`. (The inverse of
@@ -321,16 +303,37 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
     })
 }
 
-/// `filter`'s values in one pass per leaf: the rows whose mask element is nonzero, in order, for a
-/// leaf, a unit, or a product of those. `None` for a list, sum or reference, which keep the
-/// positions-then-gather path.
-pub(crate) fn compress(v: &Value, mask: &[u8]) -> Option<Value> {
-    match v {
-        Value::Prim(p) => Some(Value::Prim(p.compress(mask))),
-        Value::Prod(fields) => fields.iter().map(|f| compress(f, mask)).collect::<Option<_>>().map(Value::Prod),
-        Value::Unit(_) => Some(Value::Unit(mask.iter().filter(|&&b| b != 0).count())),
-        Value::List(..) | Value::Sum(..) | Value::Ref(..) => None,
+/// `filter`'s values: the `kept` rows whose mask element is nonzero, in order. When few are kept,
+/// their positions are gathered; otherwise a leaf compresses in one pass, and anything else
+/// gathers the kept positions.
+pub(crate) fn compress(v: &Value, mask: &[u8], kept: usize) -> Value {
+    // the kept positions, built once when first asked for: every position is written and the next
+    // overwrites it unless it was kept, so there is no branch
+    let positions = std::cell::OnceCell::new();
+    let at = || -> &[usize] {
+        positions.get_or_init(|| {
+            let mut idx = vec![0usize; kept + 1];
+            let mut n = 0;
+            for (i, &b) in mask.iter().enumerate() {
+                idx[n] = i;
+                n += (b != 0) as usize;
+            }
+            idx.truncate(kept);
+            idx
+        })
+    };
+    if kept * 8 < mask.len() {
+        return gather(v, at());
     }
+    fn dense<'a>(v: &Value, mask: &[u8], at: &dyn Fn() -> &'a [usize]) -> Value {
+        match v {
+            Value::Prim(p) => Value::Prim(p.compress(mask)),
+            Value::Prod(fields) => Value::Prod(fields.iter().map(|f| dense(f, mask, at)).collect()),
+            Value::Unit(_) => Value::Unit(mask.iter().filter(|&&b| b != 0).count()),
+            other => gather(other, at()),
+        }
+    }
+    dense(v, mask, &at)
 }
 
 /// `Unwrap` for lanes made of leaves (a leaf, or products of leaves): each row read from its lane
