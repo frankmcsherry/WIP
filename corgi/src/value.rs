@@ -491,21 +491,21 @@ macro_rules! prim {
                 }
             }
 
-            /// row by row, this leaf's row (by `tb`) where `pick` is nonzero and `other`'s (by `eb`)
-            /// where it is zero, and where each row now ends. Both at one storage.
-            pub(crate) fn blend_rows(&self, tb: &Bounds, other: &Prim, eb: &Bounds, pick: &[u8]) -> (Prim, Vec<usize>) {
-                match (self, other) {
-                    $( (Prim::$V(t), Prim::$V(e)) => {
-                        let mut out = Vec::new();
-                        let mut ends = Vec::with_capacity(pick.len());
-                        for (i, &m) in pick.iter().enumerate() {
-                            let (v, (s, x)) = if m != 0 { (t, tb.span(i)) } else { (e, eb.span(i)) };
-                            out.extend_from_slice(&v[s..x]);
-                            ends.push(out.len());
+            /// the elements of each span `(t, s, e)`, elements `s..e` of `srcs[t]`, in turn, each
+            /// copied whole. All at one storage.
+            pub(crate) fn copy_spans(srcs: &[&Prim], spans: &[(usize, usize, usize)]) -> Prim {
+                match srcs[0] {
+                    $( Prim::$V(_) => {
+                        let vs: Vec<&[$t]> = srcs.iter().map(|p| match p {
+                            Prim::$V(v) => &v[..],
+                            _ => unreachable!("copy_spans: one storage"),
+                        }).collect();
+                        let mut out = Vec::with_capacity(spans.iter().map(|&(_, s, e)| e - s).sum());
+                        for &(t, s, e) in spans {
+                            out.extend_from_slice(&vs[t][s..e]);
                         }
-                        (Prim::$V(Arc::new(out)), ends)
+                        Prim::$V(Arc::new(out))
                     } )+
-                    _ => unreachable!("blend_rows: one storage"),
                 }
             }
 
