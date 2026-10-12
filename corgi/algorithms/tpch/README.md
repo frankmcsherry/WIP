@@ -28,68 +28,70 @@ fails the whole table.
 Q3 is written three ways:
 - **q03:** probe from the large side into the sorted small side, then `group`.
 - **q03b:** each order finds its range in the sorted lineitems, and `slices` + `fold_add` sum the
-  range. No `group` is needed, but sorting the large side is 7 of its 13.6 ms.
+  range. No `group` is needed, but sorting the large side is 57% of its time.
 - **q03c:** q03b without that sort, since lineitem is stored in order-key order. It is the
-  fastest, at DuckDB's single-thread time.
+  fastest, 0.82× DuckDB's single-thread time.
 
 Which side to sort is a plan decision. Corgi can't express it today: it doesn't know a column is
 sorted, and `sort` is no cheaper on sorted input.
 
 ## Measured
 
-Measured 2026-10-03 on an M4 mini, at scale factor 0.2 (1.2M lineitem rows). Times are the best
-run, in ms. DuckDB holds the tables in memory and runs on one thread.
+Measured 2026-10-12 at master `6275a5d` on an M4 mini, at scale factor 0.2 (1.2M lineitem rows).
+Times are the best of three processes, in ms. DuckDB holds the tables in memory and runs on one
+thread. The last column is from one `--profile` run.
 
-| query | what | corgi | DuckDB 1 thread | × |
-|---|---|---|---|---|
-| q01 | group by two flags, 6 aggregates | 37.95 | 18.71 | 2.03 |
-| q01b | q01 with the flags as bytes, not strings | 29.08 | 18.60 | 1.56 |
-| q03 | 3-way: lineitems probe sorted orders, then group | 8.12 | 5.95 | 1.36 |
-| q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 12.92 | 5.95 | 2.17 |
-| q03c | q03b without the lineitem sort (stored in key order) | 5.82 | 6.14 | 0.95 |
-| q05 | 6-way join chain, group by nation | 6.81 | 6.42 | 1.06 |
-| q06 | filter and sum, no join | 4.95 | 1.85 | 2.68 |
-| q10 | 4-way, top 20 customers | 20.48 | 9.03 | 2.27 |
-| q12 | 2-way, string predicates (`eq` on strings), conditional counts | 70.22 | 15.25 | 4.60 |
-| q14 | 2-way, `LIKE 'PROMO%'` | 5.20 | 2.98 | 1.74 |
-| q19 | 2-way, OR of three string-heavy predicates (`eq` on strings) | 110.04 | 23.81 | 4.62 |
+| query | what | corgi | DuckDB 1 thread | × | what dominates |
+|---|---|---|---|---|---|
+| q01 | group by two flags, 6 aggregates | 34.05 | 18.76 | 1.82 | `group`'s sort 50%, the filter 35% |
+| q01b | q01 with the flags as bytes, not strings | 25.45 | 18.98 | 1.34 | the sort 46%, reading the flags as bytes 22% |
+| q03 | 3-way: lineitems probe sorted orders, then group | 6.36 | 6.27 | 1.01 | filters 40%, `find` 32% |
+| q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 11.96 | 5.67 | 2.11 | sorting lineitem 57% |
+| q03c | q03b without the lineitem sort (stored in key order) | 4.86 | 5.91 | 0.82 | filters 49%, `find` 20% |
+| q05 | 6-way join chain, group by nation | 5.16 | 6.31 | 0.82 | `find` 47%, filters 24% |
+| q06 | filter and sum, no join | 2.09 | 1.83 | 1.14 | ten passes of compares, ANDs and products |
+| q10 | 4-way, top 20 customers | 5.95 | 8.66 | 0.69 | `eq` with the flag 35%, filters 30% |
+| q12 | 2-way, string predicates, conditional counts | 7.25 | 14.99 | 0.48 | `eq` with the two ship modes 52% |
+| q14 | 2-way, `LIKE 'PROMO%'` | 2.71 | 2.94 | 0.92 | arithmetic and filters |
+| q19 | 2-way, OR of three string-heavy predicates | 7.82 | 22.88 | 0.34 | `eq` with string constants 57% |
 
-q01 and q01b were measured again after `group` became a word over `sort_by`: 1.25× and 1.10× the
-kernel's time; the other queries moved less than 5%. The word makes about seven more passes over
-the 1.18M rows that pass q01's filter, about 1 ms each: references to the two keys, those
-references in sorted order, run starts, the filter that keeps one key per group, and the cut. The
-sort itself is not cheap. The keys are strings, so it takes the list arm, and with four distinct
-keys every row stays tied through every level: 12 of the kernel's 31 ms (7.5 ms with the flags as
-bytes, q01b). Moving the four summed columns into group order is 3.5 ms more. Adding each row into
-its group's sums as it is scanned would do neither, and that is how DuckDB answers in 19 ms; corgi
-has no op for it (a scatter-add, a reduce by a small key).
+Geometric mean over the eleven programs: 0.92× DuckDB on one thread (2.0× on 2026-10-03). Taking one
+program per query (q01, q03c and the rest), 0.79×.
 
-The joins run 1.1–1.4× DuckDB (q03, q05), and 0.95× when the large table is already in key order
-(q03c). Where string predicates dominate, they run 2.3–4.6× (q10, q12, q19).
+Since 2026-10-03:
+- `eq` and `ne` against a string literal compare each row with the constant in place, lengths first
+  and then bytes (#88, #89). q12 went from 70 to 7 ms and q19 from 110 to 8: string predicates went
+  from 4.6× to 0.3–0.7×.
+- Filter chooses between compressing and gathering positions by how many rows it keeps (#97):
+  q05 and q14 about 1.3× faster.
+- Open PR #95 stores the two one-character flags (CHAR(1), always one ASCII letter) as their byte.
+  q01 then reads them like q01b, which goes; on regenerated data q01 takes 18.9 ms against DuckDB's
+  13.6 (1.39×). Existing data directories need `prepare.py` run again.
+
+The remaining gap is q01. It puts 1.2M rows into four groups: `group` sorts them, then moves the
+four summed columns into group order. DuckDB adds each row into its group's sums as it scans; corgi
+has no op for that (a scatter-add, a reduce by a small key).
+
+## Which queries are here
+
+Eight of TPC-H's 22: those that are joins on keys, a group, and arithmetic. The others need a
+query planner's work rather than an engine's: correlated subqueries (q02, q17, q20), EXISTS and
+NOT EXISTS (q04, q21, q22), an outer join (q13), or `LIKE '%…%'` (q09, q13, q16), which corgi leaves
+to the host. Translating them by hand would measure the translation more than corgi. q07, q08, q11,
+q15 and q18 are direct enough to add if wanted; q11 needs the `partsupp` table in `prepare.py`.
 
 ## What the joins argue for
 
-1. **String equality against a constant.** `eq` compares lists structurally, so
-   `(s, "BUILDING") eq` works. It costs about 20 ns per string, for two reasons:
-   - the literal is filled once per row (`lit`, 25 of q12's 70 ms);
-   - the list comparator builds index pairs for every element (`Rel(Eq)`, 41 ms).
-
-   Comparing against the constant in place (an immediate, as leaf constants already are) would
-   make it one pass over the bytes. These programs first compared `hash`es, on the belief that
-   `eq` took only leaves (its comments said so). For q12 and q19 that was 1.2–1.3× slower still.
-   For q10's one-byte flag it was faster (14.6 against 20.5 ms): there the per-row literal fill is
-   most of the cost.
-2. **Known sortedness.** Tables arrive in key order, and every query sorts its build side again.
+1. **Known sortedness.** Tables arrive in key order, and every query sorts its build side again.
    Skipping the sort (q03c) makes the range join the fastest form.
-3. **A lookup for unique keys.** Every join here is on a primary key, so `hi − lo` is 0 or 1.
-   `find` searches both bounds and then goes through a mask, a zip and a filter:
-   - `find` is 15–35% of the join queries, and `Filter` 25–37%.
-   - The lower bound plus one equality probe would do.
-4. **Late materialization.** Each step of q05's chain filters and gathers again the columns it
+2. **A lookup for unique keys.** Every join here is on a primary key, so `hi − lo` is 0 or 1.
+   `find` searches both bounds and then goes through a mask, a zip and a filter: `find` is 20–47%
+   of the join queries. The lower bound plus one equality probe would do.
+3. **Late materialization.** Each step of q05's chain filters and gathers again the columns it
    carries. Passing positions forward and gathering once at the end would avoid that. q10 does
    this by hand: it aggregates first, then looks up names for only the top 20.
-5. **Reduce by key for small key domains.** q01 spends 12–16 ms in `group` to put 1.2M rows into
-   4 groups, moving 4 value columns. After that comes fusion of predicate chains (q06's ten passes).
+4. **Reduce by key for small key domains** (q01, above). After that comes fusion of predicate
+   chains (q06's ten passes).
 
 Joining on several columns, such as (key, nation) in q05, is done as two lookups and an equality
 filter.
