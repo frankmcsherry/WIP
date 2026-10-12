@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, filter_mask, gather, gather_lanes, index_plan, owner_ids, take_ref,
+    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, take_ref,
     unwrap_leaves, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
@@ -524,25 +524,16 @@ impl<L: OpLike> Op<L> {
                 let (mask, vals) = pairs.into_pair("Filter element")?;
                 let m = mask.as_mask("Filter mask")?;
                 let m = &m[..];
-                // leaves (and products of them) compress in one pass each; the new row ends are a
-                // count of each row's kept elements. Lists, sums and references build positions
-                // and gather them.
-                match compress(&vals, m) {
-                    Some(kept) => {
-                        let mut nb = Vec::with_capacity(bounds.len());
-                        let (mut acc, mut start) = (0usize, 0usize);
-                        for end in bounds.ends() {
-                            acc += m[start..end].iter().filter(|&&b| b != 0).count();
-                            nb.push(acc);
-                            start = end;
-                        }
-                        Value::List(nb.into(), Box::new(kept))
-                    }
-                    None => {
-                        let (idx, nb) = filter_mask(&bounds, m);
-                        Value::List(nb.into(), Box::new(gather(&vals, &idx)))
-                    }
+                // the new row ends are a count of each row's kept elements, and the kept elements
+                // are taken as `compress` finds cheapest for how many there are.
+                let mut nb = Vec::with_capacity(bounds.len());
+                let (mut acc, mut start) = (0usize, 0usize);
+                for end in bounds.ends() {
+                    acc += m[start..end].iter().map(|&b| (b != 0) as usize).sum::<usize>();
+                    nb.push(acc);
+                    start = end;
                 }
+                Value::List(nb.into(), Box::new(compress(&vals, m, acc)))
             }
 
             // row-wise append: row r's output is a's row r elements followed by b's. A multi-source
