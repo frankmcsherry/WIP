@@ -3,8 +3,8 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, take_ref,
-    unwrap_leaves, Owners,
+    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, push_span, take_ref,
+    take_spans, unwrap_leaves, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{same, shape_of_value, Shape};
@@ -555,20 +555,16 @@ impl<L: OpLike> Op<L> {
                     }
                     other => other,
                 };
-                let cap = av.len() + bv.len();
+                // otherwise each row's two runs of elements, a's and then b's, a range at a time
+                let mut spans = Vec::with_capacity(2 * ab.len());
                 let mut nb = Vec::with_capacity(ab.len());
-                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
-                let (mut acc, mut sa, mut sb) = (0usize, 0usize, 0usize);
                 for r in 0..ab.len() {
-                    let (ea, eb) = (ab.end(r), bb.end(r));
-                    for p in sa..ea { tags.push(0); off.push(p); } // a's row-r elements ...
-                    for p in sb..eb { tags.push(1); off.push(p); } // ... then b's
-                    acc += (ea - sa) + (eb - sb);
-                    nb.push(acc);
-                    sa = ea;
-                    sb = eb;
+                    let ((sa, ea), (sb, eb)) = (ab.span(r), bb.span(r));
+                    push_span(&mut spans, 0, sa, ea);
+                    push_span(&mut spans, 1, sb, eb);
+                    nb.push(nb.last().copied().unwrap_or(0) + (ea - sa) + (eb - sb));
                 }
-                Value::List(nb.into(), Box::new(gather_lanes(&[Some(&av), Some(&bv)], &tags, &off)))
+                Value::List(nb.into(), Box::new(take_spans(&[&av, &bv], &spans)))
             }
 
             // each row's length, read off the bounds in one pass (no per-element work).
