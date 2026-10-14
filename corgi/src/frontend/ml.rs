@@ -27,6 +27,7 @@
 //!          | '.' NUM                                        -- projection
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
+//!   VARIANT = IDENT | ENUM '::' IDENT                   -- `Foo::Bar` where two enums declare a `Bar`
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
 //!   atom   = '(' (expr (',' expr)*)? ')' | IDENT | LIT | STR   -- 'input' is the root; '(' … ')' is a tuple
 //!   LIT    = '-'? DIGITS                                        -- an Int
@@ -77,6 +78,7 @@ enum Tok {
     Comma,
     Eq,
     Bar, // | — the variant separator in an `enum` declaration
+    PathSep, // :: — between an enum and its variant, `Foo::Bar`
     Ident(String),
     Num(u64),   // a non-negative integer: an op's parameter (`chunk 3`, `branch 2`), or an Int
     Lit(Value), // a constant no parameter can be: a negative Int (`-3`) or a Float (`0.7`)
@@ -147,6 +149,10 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
             '|' => {
                 i += 1;
                 Tok::Bar
+            }
+            ':' if cs.get(i + 1) == Some(&':') => {
+                i += 2;
+                Tok::PathSep
             }
             '"' => {
                 i += 1; // opening quote
@@ -273,18 +279,66 @@ enum E {
 
 // ----- parser ------------------------------------------------------------
 
+/// The `enum` declarations: compile-time tables, so names resolve at parse and erase from the AST,
+/// and the core stays positional. Two enums may declare the same variant name; a use of a shared
+/// name says which enum it means, `Foo::Bar`, as nothing is typed while parsing.
+#[derive(Clone, Default)]
+struct Enums {
+    decls: HashMap<String, Vec<(String, Option<Shape>)>>, // enum -> its variants and payload shapes (if declared), in tag order
+    owners: HashMap<String, Vec<String>>,                 // variant -> the enums declaring it, in order
+}
+
+impl Enums {
+    fn declare(&mut self, name: String, vs: Vec<(String, Option<Shape>)>) -> Result<(), String> {
+        if self.decls.contains_key(&name) {
+            return Err(format!("duplicate enum '{name}'"));
+        }
+        for (k, (v, _)) in vs.iter().enumerate() {
+            if vs[..k].iter().any(|(w, _)| w == v) {
+                return Err(format!("enum '{name}' declares '{v}' twice"));
+            }
+        }
+        for (v, _) in &vs {
+            self.owners.entry(v.clone()).or_default().push(name.clone());
+        }
+        self.decls.insert(name, vs);
+        Ok(())
+    }
+
+    /// the tag of variant `v`, and its enum: enum `e` if the use names it (`e::v`), else the one
+    /// enum that declares `v`.
+    fn tag(&self, e: Option<&str>, v: &str) -> Result<(usize, &str), String> {
+        let e = match (e, self.owners.get(v).map(Vec::as_slice)) {
+            (Some(e), _) => e,
+            (None, Some([e])) => e.as_str(),
+            (None, Some(es)) => {
+                let paths: Vec<String> = es.iter().map(|e| format!("{e}::{v}")).collect();
+                return Err(format!("'{v}' is a variant of {}: write {}", es.join(" and "), paths.join(" or ")));
+            }
+            (None, None) => return Err(format!("unknown variant '{v}'")),
+        };
+        let (e, vs) = self.decls.get_key_value(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
+        let tag = vs.iter().position(|(w, _)| w == v).ok_or_else(|| format!("enum '{e}' has no variant '{v}'"))?;
+        Ok((tag, e.as_str()))
+    }
+
+    /// the full lane shapes of enum `e` — an error if any variant left its payload undeclared.
+    fn lanes(&self, e: &str) -> Result<Vec<Shape>, String> {
+        let vs = self.decls.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
+        vs.iter()
+            .map(|(v, s)| s.clone().ok_or_else(|| format!("enum '{e}': variant '{v}' declares no payload shape")))
+            .collect()
+    }
+}
+
 struct P<'a> {
     toks: Vec<Tok>,
     i: usize,
     src: Vec<char>,
     starts: Vec<usize>, // char offset of each token
     seen: std::cell::Cell<usize>, // the last token looked at, where a parse error is reported
-    // the `enum` declarations' compile-time tables — names resolve HERE and erase from the AST,
-    // so the core stays positional. Variant names are global (one table, which starts as the
-    // scope's), hence unique program-wide.
-    variants: HashMap<String, (usize, String)>,   // variant name -> (tag, its enum)
-    enums: HashMap<String, Vec<Option<Shape>>>,   // enum name -> per-variant payload shape (if declared)
-    words: &'a HashMap<String, Graph<NumOp>>,     // the scope's words, which `call` reaches
+    enums: Enums,                             // the scope's, and then the program's own
+    words: &'a HashMap<String, Graph<NumOp>>, // the scope's words, which `call` reaches
 }
 
 impl<'a> P<'a> {
@@ -297,7 +351,6 @@ impl<'a> P<'a> {
             src: src.chars().collect(),
             starts,
             seen: std::cell::Cell::new(0),
-            variants: scope.variants.clone(),
             enums: scope.enums.clone(),
             words: &scope.words,
         })
@@ -384,16 +437,7 @@ impl<'a> P<'a> {
             self.bump();
             vs.push(self.variant_decl()?);
         }
-        let shapes: Vec<Option<Shape>> = vs.iter().map(|(_, s)| s.clone()).collect();
-        if self.enums.insert(name.clone(), shapes).is_some() {
-            return Err(format!("duplicate enum '{name}'"));
-        }
-        for (tag, (v, _)) in vs.into_iter().enumerate() {
-            if self.variants.insert(v.clone(), (tag, name.clone())).is_some() {
-                return Err(format!("duplicate variant '{v}'"));
-            }
-        }
-        Ok(())
+        self.enums.declare(name, vs)
     }
 
     /// the source position of token `k` (or of the end of input).
@@ -473,30 +517,27 @@ impl<'a> P<'a> {
                     self.eat(&Tok::RParen)?;
                     Ok(Shape::List(Box::new(inner)))
                 }
-                e => self.enum_shape(e).map(Shape::Sum),
+                e => self.enums.lanes(e).map(Shape::Sum),
             },
             other => Err(format!("expected a shape, found {other:?}")),
         }
     }
 
-    /// the full lane shapes of a declared enum — an error if any variant left its payload undeclared.
-    fn enum_shape(&self, e: &str) -> Result<Vec<Shape>, String> {
-        let lanes = self.enums.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
-        lanes
-            .iter()
-            .enumerate()
-            .map(|(k, s)| s.clone().ok_or_else(|| format!("enum '{e}': variant {k} declares no payload shape")))
-            .collect()
-    }
-
     /// a variant tag at a use site: a literal number, or a declared variant name — which also
-    /// names its enum, so `inject` by name knows the whole sum it builds.
+    /// names its enum, so `inject` by name knows the whole sum it builds. A name two enums declare
+    /// is written with its enum, `Foo::Bar`.
     fn variant(&mut self) -> Result<(usize, Option<String>), String> {
         match self.bump() {
             Some(Tok::Num(n)) => Ok((n as usize, None)),
             Some(Tok::Ident(v)) => {
-                let (tag, e) = self.variants.get(&v).cloned().ok_or_else(|| format!("unknown variant '{v}'"))?;
-                Ok((tag, Some(e)))
+                let (e, v) = if self.peek() == Some(&Tok::PathSep) {
+                    self.bump();
+                    (Some(v), self.ident()?)
+                } else {
+                    (None, v)
+                };
+                let (tag, e) = self.enums.tag(e.as_deref(), &v)?;
+                Ok((tag, Some(e.to_string())))
             }
             other => Err(format!("expected a variant tag, found {other:?}")),
         }
@@ -589,7 +630,7 @@ impl<'a> P<'a> {
             "inject" => {
                 let (tag, e) = self.variant()?;
                 let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
-                Ok(Apply::Inject(tag, self.enum_shape(&e)?))
+                Ok(Apply::Inject(tag, self.enums.lanes(&e)?))
             }
             // head: first element, sugar for `get 0` — checked (an empty row errs, carried in the err-mask).
             "head" => Ok(Apply::Head),
@@ -613,7 +654,7 @@ impl<'a> P<'a> {
                 let lanes = match self.bump() {
                     Some(Tok::Num(n)) => n,
                     Some(Tok::Ident(e)) => {
-                        self.enums.get(&e).ok_or_else(|| format!("unknown enum '{e}'"))?.len() as u64
+                        self.enums.decls.get(&e).ok_or_else(|| format!("unknown enum '{e}'"))?.len() as u64
                     }
                     other => return Err(format!("expected a lane count or enum, found {other:?}")),
                 };
@@ -1020,8 +1061,7 @@ fn sort_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
 #[derive(Clone, Default)]
 pub struct Scope {
     words: HashMap<String, Graph<NumOp>>,
-    variants: HashMap<String, (usize, String)>,
-    enums: HashMap<String, Vec<Option<Shape>>>,
+    enums: Enums,
 }
 
 impl Scope {
@@ -1042,25 +1082,30 @@ impl Scope {
     }
 
     /// Declare an enum for every program parsed in this scope: `enum Name = V0 shape? | …`, as a
-    /// program writes it but without the `in`. Its names are unique across the scope and every
-    /// program parsed in it, as within one program. On an error the scope is unchanged.
+    /// program writes it but without the `in`. Enum names are unique across the scope and every
+    /// program parsed in it, as within one program; a variant name two enums share is written
+    /// `Foo::Bar` where it is used. On an error the scope is unchanged.
     pub fn declare(&mut self, src: &str) -> Result<(), String> {
         let mut p = P::new(src, self)?;
         p.whole(P::enum_decl)?;
-        let P { variants, enums, .. } = p;
-        self.variants = variants;
+        let P { enums, .. } = p;
         self.enums = enums;
         Ok(())
     }
 
-    /// The tag of variant `name`, and the enum that declares it.
-    pub fn variant(&self, name: &str) -> Option<(usize, &str)> {
-        self.variants.get(name).map(|(tag, e)| (*tag, e.as_str()))
+    /// The tag of a variant, and its enum, resolved as a program resolves them: `Bar`, which one
+    /// enum declares, or `Foo::Bar`.
+    pub fn variant(&self, name: &str) -> Result<(usize, &str), String> {
+        match name.split_once("::") {
+            Some((e, v)) => self.enums.tag(Some(e), v),
+            None => self.enums.tag(None, name),
+        }
     }
 
-    /// The payload shape of each variant of enum `name`, in tag order (`None` where it declares none).
-    pub fn lanes(&self, name: &str) -> Option<&[Option<Shape>]> {
-        self.enums.get(name).map(|v| v.as_slice())
+    /// Enum `name`'s variants and their payload shapes (`None` where a variant declares none), in
+    /// tag order.
+    pub fn variants(&self, name: &str) -> Option<&[(String, Option<Shape>)]> {
+        self.enums.decls.get(name).map(Vec::as_slice)
     }
 }
 

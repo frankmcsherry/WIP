@@ -489,6 +489,8 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 - **JSONL / Extern** — `split`/`parse_int` landed as the `text` bucket (typed, not `Op::Extern`); `parse_json` remains open and still wants `Extern` or recursion (μ-types below).
 - **Named declarations — enum half DONE; struct half deliberately skipped.**
   `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
+  Two enums may declare the same variant name; a use of it then names its enum, `Foo::Bar` (nothing is typed while parsing, so the
+  name must pick the tag by itself), and an unqualified use of a shared name is a parse error that lists the choices.
   Use sites: `inject V` (the tag AND the whole sum's lane shapes off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
   Payload shapes: `enum Node = Lit int | Add (int, int) | Str List(int) | Wrap Other in …` — a variant may omit its shape unless the
   enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
@@ -497,7 +499,7 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are literals (`(x, 1) sub`; the core's `And`/`Shr`/`Gt` immediate kernels are ops with a parameter, `x shr 3`; `shr` later retired for `shr_b64` and `div`).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
   A host declares enums once for many programs with `Scope::declare("enum Size = Small int | Big (int, int)")`; each program parsed in
-  the scope uses them as if it had declared them, and variant names stay unique across the scope and its programs.
+  the scope uses them as if it had declared them. Enum names are unique across the scope and its programs; variant names may be shared.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).
 

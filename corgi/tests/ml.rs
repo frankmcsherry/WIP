@@ -163,7 +163,22 @@ fn errors_are_reported() {
     assert!(parse_ml("input inject Bogus").is_err()); // undeclared variant
     assert!(parse_ml("input branch Bogus").is_err()); // undeclared enum
     assert!(parse_ml("enum E = A | A in input").is_err()); // duplicate variant
-    assert!(parse_ml("enum E = A in enum F = A in input").is_err()); // variant names are global
+    // two enums may share a variant name, but then a use must say which
+    assert!(parse_ml("enum E = A int in enum F = A int in input inject A").is_err());
+}
+
+#[test]
+fn a_variant_name_two_enums_share_is_written_with_its_enum() {
+    let both = "enum Foo = Bar int | Qux int in enum Baz = Bar () | Zap int in ";
+    // `Foo::Bar` says which `Bar`; `Qux` is Foo's alone and needs no enum
+    let src = format!("{both} input inject Foo::Bar match (Foo::Bar (x -> x), Qux (_ -> 0))");
+    assert_eq!(run_ml(&src, &int(&[5])), "[5]");
+    let p = Program::compile_ml(&format!("{both} input inject Baz::Zap")).unwrap();
+    assert_eq!(p.shape(&Shape::Int).unwrap().to_string(), "{() | Int}");
+    let err = parse_ml(&format!("{both} input inject Bar")).err().unwrap();
+    assert!(err.ends_with("'Bar' is a variant of Foo and Baz: write Foo::Bar or Baz::Bar"), "{err}");
+    assert!(parse_ml(&format!("{both} input inject Baz::Qux")).is_err()); // not Baz's
+    assert!(parse_ml(&format!("{both} input inject Nope::Bar")).is_err());
 }
 
 /// `x -> 2x` over Ints, as a host kernel.
@@ -214,14 +229,20 @@ fn a_scope_declares_enums_for_every_program() {
     // the graph is the one a program declaring the enum itself would have
     let own = parse_ml("enum Size = Small int | Big (int, int) in input inject Small").unwrap();
     assert_eq!(own, parse_ml_in("input inject Small", &scope).unwrap());
-    // the host reads the declaration back
-    assert_eq!(scope.variant("Big"), Some((1, "Size")));
-    assert_eq!(scope.lanes("Size").unwrap()[1], Some(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    // names are unique across the scope and its programs, and a failed declaration changes nothing
-    assert!(parse_ml_in("enum Other = Small int in input", &scope).is_err());
-    assert!(scope.declare("enum Size = Tiny int").is_err());
-    assert!(scope.declare("enum Fits = Tiny int | Big int").is_err());
-    assert_eq!(scope.variant("Tiny"), None);
+    // the host reads the declaration back, and resolves names as a program does
+    assert_eq!(scope.variant("Big"), Ok((1, "Size")));
+    assert_eq!(scope.variants("Size").unwrap()[1], ("Big".to_string(), Some(Shape::Prod(vec![Shape::Int, Shape::Int]))));
+    // a program, or a later declaration, may share a variant name with the scope; uses then say which
+    assert!(parse_ml_in("enum Other = Small int in input inject Small", &scope).is_err());
+    let own = parse_ml_in("enum Other = Small int in input inject Size::Small", &scope).unwrap();
+    assert_eq!(own, parse_ml_in("input inject Small", &scope).unwrap());
+    scope.declare("enum Fits = Small () | Tiny int").unwrap();
+    assert!(scope.variant("Small").is_err());
+    assert_eq!(scope.variant("Fits::Small"), Ok((0, "Fits")));
+    // enum names are unique, and a failed declaration changes nothing
+    assert!(scope.declare("enum Size = Huge int").is_err());
+    assert!(scope.declare("enum Odd = Once int | Once ()").is_err());
+    assert!(scope.variant("Once").is_err());
     // a declaration, not a program
     assert!(scope.declare("enum Fits = Tiny int in input").is_err());
 }
