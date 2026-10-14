@@ -7,7 +7,7 @@ use crate::engine::{
     unwrap_leaves, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
-use crate::shape::{same, shape_of_value, Shape};
+use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
@@ -154,13 +154,17 @@ impl Pattern {
     fn check(&self, v: &Value) -> Result<(), String> {
         self.mismatch(v).map_or(Ok(()), |(part, got)| {
             let at = if std::ptr::eq(part, self) { String::new() } else { format!("in the pattern {self}, ") };
-            Err(format!("{at}the pattern {part} wants {}, not {got}", part.wants()))
+            let note = match got {
+                Value::Prod(fields) if fields.len() == 1 && part.mismatch(&fields[0]).is_none() => ONE_FIELD,
+                _ => "",
+            };
+            Err(format!("{at}the pattern {part} wants {}, not {}{note}", part.wants(), shape_of_value(got)))
         })
     }
 
-    /// the first part of the pattern `v` does not match, and the shape it met there. A column's
+    /// the first part of the pattern `v` does not match, and the value it met there. A column's
     /// shape is its structure, so this reads no rows.
-    fn mismatch(&self, v: &Value) -> Option<(&Pattern, Shape)> {
+    fn mismatch<'v>(&self, v: &'v Value) -> Option<(&Pattern, &'v Value)> {
         let fits = match (self, v) {
             (Pattern::Any, _) => return None,
             (Pattern::Tuple(ps), Value::Prod(fields)) if fields.len() == ps.len() => {
@@ -176,7 +180,7 @@ impl Pattern {
             (Pattern::Float, Value::Prim(p)) => !p.is_int(),
             _ => false,
         };
-        (!fits).then(|| (self, shape_of_value(v)))
+        (!fits).then_some((self, v))
     }
 
     /// what the pattern wants, in words.
@@ -797,8 +801,10 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("Inject: arity {} exceeds the u8 tag width", lanes.len()));
                 }
                 if let Some(declared) = &lanes[*tag] {
-                    if *declared != shape_of_value(&input) {
-                        return Err(format!("Inject: lane {tag} is declared {declared}, got {}", shape_of_value(&input)));
+                    let got = shape_of_value(&input);
+                    if *declared != got {
+                        let note = if one_field_of(&got, declared) { ONE_FIELD } else { "" };
+                        return Err(format!("Inject: lane {tag} is declared {declared}, got {got}{note}"));
                     }
                 }
                 let mut payload = Some(input);

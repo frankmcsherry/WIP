@@ -563,3 +563,16 @@ fn inject_fills_an_open_lane_with_its_payloads_shape() {
     let none = Program::compile_ml("enum Option = None () | Some in () inject None").err().unwrap();
     assert!(none.ends_with("inject None: enum 'Option' declares no payload shape for 'Some', whose empty lane needs one"), "{none}");
 }
+
+/// Parentheses build a tuple, so `(e)` where `e` was meant is a one-field tuple; a shape error on
+/// one that holds what was wanted says so.
+#[test]
+fn shape_errors_note_a_one_field_tuple() {
+    let note = "(a one-field tuple: parentheses build a tuple, so `(e)` is not `e`)";
+    for src in ["(([] : List(int)), [1]) append", "((input), 2) add", "((input), input) min", "(input) : int"] {
+        let err = shape_err(src, &Shape::Int);
+        assert!(err.ends_with(note), "{src}: {err}");
+    }
+    // a one-field tuple of something else is no such slip
+    assert_eq!(shape_err("(input) fold_add", &Shape::Int), "reduce: expected a list, got (Int)");
+}
