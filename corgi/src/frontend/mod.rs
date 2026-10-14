@@ -94,7 +94,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "range" => Op::Range.into(),          // (lo, hi) -> [lo, hi), empty when lo >= hi
         "flatten" => Op::Flatten.into(),
         "enlist" => Op::Enlist.into(),
-        "append" => Op::Append.into(), // (List<X>, List<X>) -> List<X>  row-wise concat (the list-monoid ⊕)
+        "append" => Op::Append.into(), // (List<X>, List<X>, ..) -> List<X>  row-wise concat (the list-monoid ⊕)
         "len" => Op::Len.into(),       // List<X> -> Int  per-row element count, read off the bounds
         "chunk" => Op::Chunk(n()? as usize).into(), // List<X> -> List<List<X>>  fixed k-wide records; a short last piece is dropped
         "unit" => Op::Unit.into(), // X -> Unit (the None of Option = Sum{Unit | T})

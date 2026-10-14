@@ -449,6 +449,48 @@ macro_rules! prim {
                 }
             }
 
+            /// row by row, each part's row in turn (by its bounds), and the rows' bounds:
+            /// [`Prim::append_rows`] for any number of parts, all at this leaf's storage. Parts of
+            /// one width per row (each an enlisted column, as a list of computed values is) make
+            /// rows of one width, read and written with no bounds per row.
+            pub(crate) fn append_rows_n(&self, parts: &[(&Bounds, &Prim)]) -> (Prim, Bounds) {
+                match self {
+                    $( Prim::$V(_) => {
+                        let vals: Vec<&[$t]> = parts
+                            .iter()
+                            .map(|(_, p)| match p {
+                                Prim::$V(v) => &v[..],
+                                _ => unreachable!("append_rows_n: one storage"),
+                            })
+                            .collect();
+                        let rows = parts[0].0.len();
+                        let mut out = Vec::with_capacity(vals.iter().map(|v| v.len()).sum());
+                        if let Some(widths) = parts.iter().map(|(b, _)| b.strided()).collect::<Option<Vec<usize>>>() {
+                            for r in 0..rows {
+                                for (v, &k) in vals.iter().zip(&widths) {
+                                    match k {
+                                        1 => out.push(v[r]),
+                                        k => out.extend_from_slice(&v[r * k..(r + 1) * k]),
+                                    }
+                                }
+                            }
+                            return (Prim::$V(Arc::new(out)), Bounds::Stride(widths.iter().sum(), rows));
+                        }
+                        let mut ends = Vec::with_capacity(rows);
+                        let mut starts = vec![0; parts.len()];
+                        for r in 0..rows {
+                            for (k, (b, _)) in parts.iter().enumerate() {
+                                let e = b.end(r);
+                                out.extend_from_slice(&vals[k][starts[k]..e]);
+                                starts[k] = e;
+                            }
+                            ends.push(out.len());
+                        }
+                        (Prim::$V(Arc::new(out)), ends.into())
+                    } )+
+                }
+            }
+
             /// row by row, this leaf's row (by `tb`) where `pick` is nonzero and `other`'s (by `eb`)
             /// where it is zero, and where each row now ends. Both at one storage.
             pub(crate) fn blend_rows(&self, tb: &Bounds, other: &Prim, eb: &Bounds, pick: &[u8]) -> (Prim, Vec<usize>) {

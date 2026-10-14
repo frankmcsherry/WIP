@@ -303,8 +303,9 @@ pub enum Op<L> {
                     // favour Select. Shape-generic: it IS `gather_lanes([else, then], mask, identity)`.
 
     // the List monoid + measure (both 1:1 on the SEQ — cardinality stays inside the list).
-    Append,         // (List<X>, List<X>) -> List<X>   row-wise concat: row i = a[i] ++ b[i] (the ⊕ of
-                    // the list monoid, [] its unit). Same-shape elements, as in Zip.
+    Append,         // (List<X>, List<X>, ..) -> List<X>  row-wise concat: row i = a[i] ++ b[i] ++ .. (the
+                    // ⊕ of the list monoid, [] its unit), over one or more lists. Same-shape elements,
+                    // as in Zip.
     Len,            // List<X> -> Int                  each row's element count, read straight off the
                     // bounds (O(1) — the count the structure already holds, not a fold over the row).
     Cut,            // List<(Int-mask, X)> -> List<List<X>>  cut each row into pieces: a piece starts
@@ -536,39 +537,62 @@ impl<L: OpLike> Op<L> {
                 Value::List(nb.into(), Box::new(compress(&vals, m, acc)))
             }
 
-            // row-wise append: row r's output is a's row r elements followed by b's. A multi-source
-            // gather over the two value columns ([a, b]) reuses the engine's `gather_lanes`, so it
-            // works for any element shape X (leaf / product / list / sum).
+            // row-wise append: row r's output is each list's row r elements in turn. A multi-source
+            // gather over the value columns reuses the engine's `gather_lanes`, so it works for any
+            // element shape X (leaf / product / list / sum). A list of computed values is this over
+            // enlisted columns: `(a enlist, b enlist, c enlist) append`, one pass.
             Op::Append => {
-                let (a, b) = input.into_pair("Append")?;
-                let (ab, av) = a.into_list("Append lhs")?;
-                let (bb, bv) = b.into_list("Append rhs")?;
-                same(&shape_of_value(&av), &shape_of_value(&bv)).map_err(|e| format!("Append: {e}"))?;
-                // both are SEQ columns, hence equal row count by the product invariant (defensive).
-                assert_eq!(ab.len(), bb.len(), "Append: row count mismatch");
-                // leaves: each row's two runs copied in turn, with no index per element
-                let (av, bv) = match (av, bv) {
-                    (Value::Prim(pa), Value::Prim(pb)) => {
-                        let (pa, pb) = Prim::meet(pa, pb);
-                        let (vals, ends) = pa.append_rows(&ab, &pb, &bb);
-                        return Ok(Value::List(ends.into(), Box::new(Value::Prim(vals))));
-                    }
-                    other => other,
-                };
-                let cap = av.len() + bv.len();
-                let mut nb = Vec::with_capacity(ab.len());
-                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
-                let (mut acc, mut sa, mut sb) = (0usize, 0usize, 0usize);
-                for r in 0..ab.len() {
-                    let (ea, eb) = (ab.end(r), bb.end(r));
-                    for p in sa..ea { tags.push(0); off.push(p); } // a's row-r elements ...
-                    for p in sb..eb { tags.push(1); off.push(p); } // ... then b's
-                    acc += (ea - sa) + (eb - sb);
-                    nb.push(acc);
-                    sa = ea;
-                    sb = eb;
+                let mut parts = Vec::new();
+                for c in input.into_prod("Append")? {
+                    parts.push(c.into_list("Append operand")?);
                 }
-                Value::List(nb.into(), Box::new(gather_lanes(&[Some(&av), Some(&bv)], &tags, &off)))
+                let Some((_, first)) = parts.first() else {
+                    return Err("Append expects a nonempty product of lists".into());
+                };
+                let shape = shape_of_value(first);
+                for (_, v) in &parts[1..] {
+                    same(&shape, &shape_of_value(v)).map_err(|e| format!("Append: {e}"))?;
+                }
+                if parts.len() == 1 {
+                    let (b, v) = parts.pop().unwrap();
+                    return Ok(Value::List(b, Box::new(v)));
+                }
+                // all SEQ columns, hence equal row count by the product invariant (defensive).
+                let rows = parts[0].0.len();
+                assert!(parts.iter().all(|(b, _)| b.len() == rows), "Append: row count mismatch");
+                // leaves: each row's runs copied in turn, with no index per element, at the widest
+                // storage among them
+                let leaves: Option<Vec<&Prim>> =
+                    parts.iter().map(|(_, v)| if let Value::Prim(p) = v { Some(p) } else { None }).collect();
+                if let Some(leaves) = leaves {
+                    let wide = leaves.iter().any(|p| p.bits() != leaves[0].bits());
+                    let prims: Vec<Prim> = leaves.iter().map(|p| if wide { p.widen() } else { (*p).clone() }).collect();
+                    let (vals, bounds) = match &prims[..] {
+                        [a, b] => {
+                            let (vals, ends) = a.append_rows(&parts[0].0, b, &parts[1].0);
+                            (vals, ends.into())
+                        }
+                        _ => {
+                            let runs: Vec<(&Bounds, &Prim)> = parts.iter().map(|(b, _)| b).zip(&prims).collect();
+                            prims[0].append_rows_n(&runs)
+                        }
+                    };
+                    return Ok(Value::List(bounds, Box::new(Value::Prim(vals))));
+                }
+                let cap = parts.iter().map(|(_, v)| v.len()).sum();
+                let mut nb = Vec::with_capacity(rows);
+                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+                let mut starts = vec![0usize; parts.len()];
+                for r in 0..rows {
+                    for (k, (b, _)) in parts.iter().enumerate() {
+                        let e = b.end(r);
+                        for p in starts[k]..e { tags.push(k); off.push(p); } // list k's row-r elements
+                        starts[k] = e;
+                    }
+                    nb.push(tags.len());
+                }
+                let srcs: Vec<Option<&Value>> = parts.iter().map(|(_, v)| Some(v)).collect();
+                Value::List(nb.into(), Box::new(gather_lanes(&srcs, &tags, &off)))
             }
 
             // each row's length, read off the bounds in one pass (no per-element work).

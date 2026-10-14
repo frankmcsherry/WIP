@@ -459,3 +459,23 @@ fn all_and_any_of_written_conditions() {
     assert_eq!(run_ml("input map (w -> ((w len, 0) gt) all)", &input), run_ml("input map (w -> (w len, 0) gt)", &input));
     assert!(Program::compile_ml("input map (w -> w all)").is_err());
 }
+
+/// `append` takes one or more lists, so a list of computed values is one append of enlisted
+/// columns, as long as each row has its elements.
+#[test]
+fn append_takes_any_number_of_lists() {
+    let input = Value::Prod(vec![int(&[1, 2]), int(&[300, 4])]);
+    let three = "let (a, b) = input in (a enlist, b enlist, (a, b) add enlist) append";
+    assert_eq!(run_ml(three, &input), "List ends=[3, 6] <[1, 300, 301, 2, 4, 6]>");
+    // the same as the pairs it replaces
+    let pairs = "let (a, b) = input in ((a enlist, b enlist) append, (a, b) add enlist) append";
+    assert_eq!(run_ml(three, &input), run_ml(pairs, &input));
+    // elements that are not leaves, and a single list
+    assert_eq!(
+        run_ml("let (a, b) = input in ((a, b) enlist, (b, a) enlist, ((a, b) add, 0) enlist) append", &input),
+        "List ends=[3, 6] <([1, 300, 301, 2, 4, 6], [300, 1, 0, 4, 2, 0])>",
+    );
+    assert_eq!(run_ml("let (a, b) = input in (a iota) append", &input), run_ml("input.0 iota", &input));
+    // lists held at different storages meet at the wider
+    assert_eq!(run_ml("(\"ab\", 300 enlist, input.0 enlist) append", &input), "List ends=[4, 8] <[97, 98, 300, 1, 97, 98, 300, 2]>");
+}
