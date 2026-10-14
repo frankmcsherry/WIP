@@ -2,12 +2,12 @@
 //! surfaces could target it; the one kept is the ML-flavoured `ml` expression language, concatenative
 //! by juxtaposition — a value followed by its operator stages with no separator (`input iota`), `let`
 //! is graph sharing, and `x -> body` is a closed body. The op-name table below is the whole vocabulary
-//! it reaches.
+//! it reaches, apart from the words a host binds in a `Scope`, which `call` reaches.
 
 pub(crate) mod ml;
 pub(crate) mod program;
 
-pub use ml::parse_ml;
+pub use ml::{parse_ml, parse_ml_in, Scope};
 pub use program::Program;
 
 use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pred, Red, ShiftOp, TextOp};

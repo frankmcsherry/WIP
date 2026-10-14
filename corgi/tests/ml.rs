@@ -1,7 +1,9 @@
 //! ML front-end tests: same demos through `let` and juxtaposed stages, plus a check that `let`
 //! sharing produces fewer nodes than the same join written with the shared subexpression inlined.
 
-use corgi::{parse_ml, show, Program, Value};
+use std::sync::Arc;
+
+use corgi::{parse_ml, parse_ml_in, show, Builder, HostKernel, HostOp, NumOp, Program, Scope, Shape, Value};
 
 fn int(xs: &[i64]) -> Value {
     Value::i64(xs.to_vec())
@@ -162,6 +164,66 @@ fn errors_are_reported() {
     assert!(parse_ml("input branch Bogus").is_err()); // undeclared enum
     assert!(parse_ml("enum E = A | A in input").is_err()); // duplicate variant
     assert!(parse_ml("enum E = A in enum F = A in input").is_err()); // variant names are global
+}
+
+/// `x -> 2x` over Ints, as a host kernel.
+struct Double;
+impl HostKernel for Double {
+    fn name(&self) -> &str { "double" }
+    fn input(&self) -> &Shape { &Shape::Int }
+    fn output(&self) -> &Shape { &Shape::Int }
+    fn eval(&self, input: Value) -> Result<Value, String> {
+        Ok(Value::i64(input.as_i64("double")?.iter().map(|x| 2 * x).collect()))
+    }
+}
+
+#[test]
+fn call_reaches_the_words_a_scope_binds() {
+    let mut scope = Scope::default();
+    // a host kernel is the graph of one node over the input
+    let mut b = Builder::<NumOp>::default();
+    let x = b.input();
+    let doubled = b.add(NumOp::Host(HostOp(Arc::new(Double))), vec![x]);
+    scope.word("double", b.finish(doubled)).unwrap();
+    // and a word may be written in corgi
+    scope.word("inc", parse_ml("(input, 1) add").unwrap()).unwrap();
+    // inside a lambda body, one after the other
+    let rows = Value::List(vec![2, 3].into(), Box::new(int(&[1, 2, 3])));
+    let g = parse_ml_in("input map (x -> x call double call inc)", &scope).unwrap();
+    assert_eq!(show(&Program::from_graph(g).run(rows)), "List ends=[2, 3] <[3, 5, 7]>");
+    // only the scope's words, and only through `call`
+    let err = parse_ml_in("input call triple", &scope).err().unwrap();
+    assert!(err.starts_with("1:12: no word 'triple' in scope"), "{err}");
+    assert!(parse_ml_in("input double", &scope).is_err());
+    assert!(parse_ml("input call inc").is_err());
+    assert!(scope.word("inc", parse_ml("input").unwrap()).is_err());
+    assert!(scope.word("two words", parse_ml("input").unwrap()).is_err());
+}
+
+#[test]
+fn a_scope_declares_enums_for_every_program() {
+    let mut scope = Scope::default();
+    scope.declare("enum Size = Small int | Big (int, int)").unwrap();
+    // one program builds a Size and another matches it; neither declares it
+    let small = Program::from_graph(parse_ml_in("input inject Small", &scope).unwrap());
+    let big = Program::from_graph(parse_ml_in("input inject Big", &scope).unwrap());
+    let total = parse_ml_in("input match (Small (n -> n), Big ((a, b) -> (a, b) add))", &scope).unwrap();
+    let total = Program::from_graph(total);
+    assert_eq!(show(&total.run(small.run(int(&[5])))), "[5]");
+    assert_eq!(show(&total.run(big.run(Value::Prod(vec![int(&[3]), int(&[4])])))), "[7]");
+    // the graph is the one a program declaring the enum itself would have
+    let own = parse_ml("enum Size = Small int | Big (int, int) in input inject Small").unwrap();
+    assert_eq!(own, parse_ml_in("input inject Small", &scope).unwrap());
+    // the host reads the declaration back
+    assert_eq!(scope.variant("Big"), Some((1, "Size")));
+    assert_eq!(scope.lanes("Size").unwrap()[1], Some(Shape::Prod(vec![Shape::Int, Shape::Int])));
+    // names are unique across the scope and its programs, and a failed declaration changes nothing
+    assert!(parse_ml_in("enum Other = Small int in input", &scope).is_err());
+    assert!(scope.declare("enum Size = Tiny int").is_err());
+    assert!(scope.declare("enum Fits = Tiny int | Big int").is_err());
+    assert_eq!(scope.variant("Tiny"), None);
+    // a declaration, not a program
+    assert!(scope.declare("enum Fits = Tiny int in input").is_err());
 }
 
 #[test]

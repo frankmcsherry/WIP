@@ -191,18 +191,23 @@ src/
                order over index pairs; compare_cols is the diagonal case), block labels, group_bounds.
                sort.rs: the indexed discrimination sort (dev/indexed-sort.md). survey.rs: the merge
                kernel, rank at a time (dev/lane-survey.md).
-    host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi.
+    host.rs    host kernels: `NumOp::Host`, an op whose eval is supplied from outside corgi. A program
+               reaches one by name with `call`, through the host's `Scope` (frontend/ml.rs).
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp =
                arithmetic on two Ints or two Floats (the kind from the operands) + the `_b64` and
                bitwise ops (an Int as its 64-bit word) + shifts + the named reductions and scans.
     text.rs    TextOp: Split(u8) + ParseInt. A string is a List<Int> of its bytes (held as bytes); both
                total — ParseInt returns Sum{Ok: Int | Err: ()}, no data-dependent panic.
   frontend/
-    mod.rs     the op-name resolve table (the whole vocabulary the surface reaches).
+    mod.rs     the op-name resolve table (the whole vocabulary the surface reaches, apart from the
+               words a host binds in a `Scope`).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
                The words are built here: sort/dedup/group over sort_by, hash_group (written in
                corgi itself, as source grafted in), all/any over a written tuple, slices, head, and the
                checked ops try_get/try_gather/try_zip/try_chunk (check, branch, lossy op on lane 0).
+               `Scope`: what a program names without defining it — the host's words (graphs, a host
+               kernel being one node), grafted by `x call name`, and enums declared once for every
+               program parsed in it (`parse_ml_in`).
     program.rs `Program`: parse, type and run in one path (compile_ml / shape / run).
 tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text · effect · kernel · ref ·
         fail_allocations   (no Builder-demo file —
@@ -491,6 +496,8 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
   Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are literals (`(x, 1) sub`; the core's `And`/`Shr`/`Gt` immediate kernels are ops with a parameter, `x shr 3`; `shr` later retired for `shr_b64` and `div`).
   Field-name projection (`s.a`) and record literals stay OUT: parse-time resolution would need globally-unique field names (a misapplied name silently projects the wrong index) or typed resolution, and destructuring covers the corpus without either.
+  A host declares enums once for many programs with `Scope::declare("enum Size = Small int | Big (int, int)")`; each program parsed in
+  the scope uses them as if it had declared them, and variant names stay unique across the scope and its programs.
   Mechanical closure capture (free vars threaded via `CapList`/`CapSum`) remains the open companion pass.
   Programs/28 exercises the whole bundle and the sum-heavy programs (09, 11, 18, 19, 23–25) use the named style; the numeric `inject tag arity` form is gone (a sum is only built from a declaration).
 

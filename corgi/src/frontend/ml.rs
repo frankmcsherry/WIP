@@ -23,6 +23,7 @@
 //!          | 'inject' VARIANT                               -- sum construction (its enum fully shaped)
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
 //!          | 'split' STR                                    -- delimiter as a one-byte string
+//!          | 'call' IDENT                                   -- a word the host bound in the `Scope`
 //!          | '.' NUM                                        -- projection
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
@@ -46,6 +47,12 @@
 //!
 //! An Int literal is an integer and a Float literal an `f64`; arithmetic takes its kind from its
 //! operands, so `(1.5, 2.5) add` is a float add and `(1, 2.5) add` a shape error.
+//!
+//! A program is parsed in a `Scope` (`parse_ml_in`; `parse_ml` is the empty one): names the host
+//! binds, as it binds `input`. `x call name` grafts the graph the host bound to `name` with `x` as
+//! its input — a host kernel is a graph of one node, and a word may also be written in corgi — and
+//! the scope's enums are declared in every program parsed in it. Only `call` reaches the host's
+//! words, so they and corgi's own never collide.
 //!
 //! e.g.  let (subj, vals) = input.1 transpose in vals fold_add
 //!       e match (0 (lo -> lo), 1 (hi -> (hi, 100) add))   -- exhaustive ⇒ Unwrap types it
@@ -253,6 +260,7 @@ enum Apply {
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, Vec<Shape>),    // tag + the declared sum's lane shapes -> Op::Inject
     Head, // `head`: sugar for `(0, list) get` — the first element (an empty row errs)
+    Call(Graph<NumOp>), // `call name`: the graph the scope binds to `name`, grafted onto the value
 }
 
 enum E {
@@ -265,19 +273,46 @@ enum E {
 
 // ----- parser ------------------------------------------------------------
 
-struct P {
+struct P<'a> {
     toks: Vec<Tok>,
     i: usize,
     src: Vec<char>,
     starts: Vec<usize>, // char offset of each token
     seen: std::cell::Cell<usize>, // the last token looked at, where a parse error is reported
     // the `enum` declarations' compile-time tables — names resolve HERE and erase from the AST,
-    // so the core stays positional. Variant names are global (one table), hence unique program-wide.
+    // so the core stays positional. Variant names are global (one table, which starts as the
+    // scope's), hence unique program-wide.
     variants: HashMap<String, (usize, String)>,   // variant name -> (tag, its enum)
     enums: HashMap<String, Vec<Option<Shape>>>,   // enum name -> per-variant payload shape (if declared)
+    words: &'a HashMap<String, Graph<NumOp>>,     // the scope's words, which `call` reaches
 }
 
-impl P {
+impl<'a> P<'a> {
+    /// a parser over `src`, its tables starting as `scope`'s.
+    fn new(src: &str, scope: &'a Scope) -> Result<Self, String> {
+        let (toks, starts) = lex(src)?;
+        Ok(P {
+            toks,
+            i: 0,
+            src: src.chars().collect(),
+            starts,
+            seen: std::cell::Cell::new(0),
+            variants: scope.variants.clone(),
+            enums: scope.enums.clone(),
+            words: &scope.words,
+        })
+    }
+
+    /// `f` over the whole input: an error is placed at the last token looked at, and tokens left
+    /// over are an error.
+    fn whole<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        let t = f(self).map_err(|e| format!("{}: {e}", self.at(self.seen.get())))?;
+        if self.i != self.toks.len() {
+            return Err(format!("{}: unexpected {:?}", self.at(self.i), self.toks[self.i]));
+        }
+        Ok(t)
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.seen.set(self.i);
         self.toks.get(self.i)
@@ -325,31 +360,40 @@ impl P {
             Ok(E::Let(pat, Box::new(bound), Box::new(body)))
         } else if self.is_kw("enum") {
             // `enum Name = V0 shape? | V1 shape? | … in body` — a declaration, not a value: it fills
-            // the tables and parses on into the body, leaving no AST node behind. A payload shape is
-            // needed only where the sum is BUILT by `inject` (every lane must then be declared);
-            // `branch Name` / `match` / `map_variant` read just the tags.
-            self.bump();
-            let name = self.ident()?;
-            self.eat(&Tok::Eq)?;
-            let mut vs = vec![self.variant_decl()?];
-            while self.peek() == Some(&Tok::Bar) {
-                self.bump();
-                vs.push(self.variant_decl()?);
-            }
+            // the tables and parses on into the body, leaving no AST node behind.
+            self.enum_decl()?;
             self.kw_in()?;
-            let shapes: Vec<Option<Shape>> = vs.iter().map(|(_, s)| s.clone()).collect();
-            if self.enums.insert(name.clone(), shapes).is_some() {
-                return Err(format!("duplicate enum '{name}'"));
-            }
-            for (tag, (v, _)) in vs.into_iter().enumerate() {
-                if self.variants.insert(v.clone(), (tag, name.clone())).is_some() {
-                    return Err(format!("duplicate variant '{v}'"));
-                }
-            }
             self.expr()
         } else {
             self.pipe()
         }
+    }
+
+    /// `enum Name = V0 shape? | V1 shape? | …`, into the tables. A payload shape is needed only
+    /// where the sum is BUILT by `inject` (every lane must then be declared); `branch Name` /
+    /// `match` / `map_variant` read just the tags.
+    fn enum_decl(&mut self) -> Result<(), String> {
+        if !self.is_kw("enum") {
+            return Err(format!("expected 'enum', found {:?}", self.peek()));
+        }
+        self.bump();
+        let name = self.ident()?;
+        self.eat(&Tok::Eq)?;
+        let mut vs = vec![self.variant_decl()?];
+        while self.peek() == Some(&Tok::Bar) {
+            self.bump();
+            vs.push(self.variant_decl()?);
+        }
+        let shapes: Vec<Option<Shape>> = vs.iter().map(|(_, s)| s.clone()).collect();
+        if self.enums.insert(name.clone(), shapes).is_some() {
+            return Err(format!("duplicate enum '{name}'"));
+        }
+        for (tag, (v, _)) in vs.into_iter().enumerate() {
+            if self.variants.insert(v.clone(), (tag, name.clone())).is_some() {
+                return Err(format!("duplicate variant '{v}'"));
+            }
+        }
+        Ok(())
     }
 
     /// the source position of token `k` (or of the end of input).
@@ -549,6 +593,13 @@ impl P {
             }
             // head: first element, sugar for `get 0` — checked (an empty row errs, carried in the err-mask).
             "head" => Ok(Apply::Head),
+            // call: a word the host bound in the scope (`Scope::word`). Only `call` reaches the
+            // scope's words, so they and corgi's own never collide.
+            "call" => {
+                let w = self.ident()?;
+                let g = self.words.get(&w).ok_or_else(|| format!("no word '{w}' in scope"))?;
+                Ok(Apply::Call(g.clone()))
+            }
             // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
             // it names a byte, not a count.
             "split" => match self.bump() {
@@ -789,6 +840,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     let pair = b.tuple(vec![zero, id]);
                     Ok(b.add(Op::Gather, vec![pair]))
                 }
+                Apply::Call(g) => Ok(b.graft(g, id)),
             }
         }
     }
@@ -961,22 +1013,66 @@ fn sort_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
     }
 }
 
+/// What a program may name without defining it, as it names `input`: words the host binds, which
+/// `call` reaches, and enums declared once for every program parsed in the scope. Both resolve at
+/// parse and erase, so a program parsed in a scope is the graph it would be had it written the
+/// declarations and the words' graphs itself.
+#[derive(Clone, Default)]
+pub struct Scope {
+    words: HashMap<String, Graph<NumOp>>,
+    variants: HashMap<String, (usize, String)>,
+    enums: HashMap<String, Vec<Option<Shape>>>,
+}
+
+impl Scope {
+    /// Bind `name` to `graph`: `x call name` grafts `graph`, its input `x`. A host kernel is the
+    /// graph of one `NumOp::Host` node over the input.
+    pub fn word(&mut self, name: &str, graph: Graph<NumOp>) -> Result<(), String> {
+        let mut cs = name.chars();
+        let ident = cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && cs.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ident {
+            return Err(format!("'{name}' is not a name `call` can reach"));
+        }
+        if self.words.contains_key(name) {
+            return Err(format!("duplicate word '{name}'"));
+        }
+        self.words.insert(name.to_string(), graph);
+        Ok(())
+    }
+
+    /// Declare an enum for every program parsed in this scope: `enum Name = V0 shape? | …`, as a
+    /// program writes it but without the `in`. Its names are unique across the scope and every
+    /// program parsed in it, as within one program. On an error the scope is unchanged.
+    pub fn declare(&mut self, src: &str) -> Result<(), String> {
+        let mut p = P::new(src, self)?;
+        p.whole(P::enum_decl)?;
+        let P { variants, enums, .. } = p;
+        self.variants = variants;
+        self.enums = enums;
+        Ok(())
+    }
+
+    /// The tag of variant `name`, and the enum that declares it.
+    pub fn variant(&self, name: &str) -> Option<(usize, &str)> {
+        self.variants.get(name).map(|(tag, e)| (*tag, e.as_str()))
+    }
+
+    /// The payload shape of each variant of enum `name`, in tag order (`None` where it declares none).
+    pub fn lanes(&self, name: &str) -> Option<&[Option<Shape>]> {
+        self.enums.get(name).map(|v| v.as_slice())
+    }
+}
+
 /// parse an ML-flavoured expression into a `Graph` (with `input` bound to the root).
 pub fn parse_ml(src: &str) -> Result<Graph<NumOp>, String> {
-    let (toks, starts) = lex(src)?;
-    let mut p = P {
-        toks,
-        i: 0,
-        src: src.chars().collect(),
-        starts,
-        seen: std::cell::Cell::new(0),
-        variants: HashMap::new(),
-        enums: HashMap::new(),
-    };
-    let e = p.expr().map_err(|e| format!("{}: {e}", p.at(p.seen.get())))?;
-    if p.i != p.toks.len() {
-        return Err(format!("{}: unexpected {:?}", p.at(p.i), p.toks[p.i]));
-    }
+    parse_ml_in(src, &Scope::default())
+}
+
+/// `parse_ml` in `scope`: the program may `call` its words and use its enums.
+pub fn parse_ml_in(src: &str, scope: &Scope) -> Result<Graph<NumOp>, String> {
+    let mut p = P::new(src, scope)?;
+    let e = p.whole(P::expr)?;
     let mut b = Builder::default();
     let input = b.input();
     let mut env = Env::new();
