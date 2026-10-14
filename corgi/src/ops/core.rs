@@ -304,9 +304,10 @@ pub enum Op<L> {
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
                     //        Total: a tag of n-1 or more goes to the last lane, so on a mask any
                     //        nonzero tag is "true", as `filter` reads masks.
-    Inject(usize, Vec<Shape>), // intro: X -> Sum{..} — the constant-tag Branch: the input fills lane
-                    //        `tag` of the declared sum shape (whose lane `tag` must be X); the other
-                    //        lanes are empty columns of their declared shapes.
+    Inject(usize, Vec<Option<Shape>>), // intro: X -> Sum{..} — the constant-tag Branch: the input
+                    //        fills lane `tag`, and the other lanes are empty columns of their declared
+                    //        shapes. Lane `tag` may be undeclared (`None`): its shape is then X's, as
+                    //        `Branch`'s lanes take theirs from the input; declared, it must be X.
     Unwrap,         // elim:  homogeneous Sum -> payload
     MapSum(Vec<(usize, Graph<L>)>), // map: closed bodies on chosen variants; unlisted variants
                     // pass through. The Vec breaks the type recursion, so no Box. A variadic
@@ -787,19 +788,29 @@ impl<L: OpLike> Op<L> {
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
             // payload column fills that lane, the others are zero-row columns of their declared
             // shapes. The unary dual of `tuple`.
-            Op::Inject(tag, shapes) => {
+            Op::Inject(tag, lanes) => {
                 let n = input.len();
-                if *tag >= shapes.len() {
-                    return Err(format!("Inject: tag {tag} out of range for arity {}", shapes.len()));
+                if *tag >= lanes.len() {
+                    return Err(format!("Inject: tag {tag} out of range for arity {}", lanes.len()));
                 }
-                if shapes.len() > 256 {
-                    return Err(format!("Inject: arity {} exceeds the u8 tag width", shapes.len()));
+                if lanes.len() > 256 {
+                    return Err(format!("Inject: arity {} exceeds the u8 tag width", lanes.len()));
                 }
-                if shapes[*tag] != shape_of_value(&input) {
-                    return Err(format!("Inject: lane {tag} is declared {}, got {}", shapes[*tag], shape_of_value(&input)));
+                if let Some(declared) = &lanes[*tag] {
+                    if *declared != shape_of_value(&input) {
+                        return Err(format!("Inject: lane {tag} is declared {declared}, got {}", shape_of_value(&input)));
+                    }
                 }
-                let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
-                variants[*tag] = input;
+                let mut payload = Some(input);
+                let variants = lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(k, lane)| match lane {
+                        _ if k == *tag => Ok(payload.take().expect("one payload")),
+                        Some(s) => Ok(Value::empty(s)),
+                        None => Err(format!("Inject: lane {k} has no shape; only the lane the payload fills takes its shape from it")),
+                    })
+                    .collect::<Result<Vec<Value>, String>>()?;
                 // a constant tag run: the assignment is two words, and the within-lane offset IS
                 // the row index — neither column is materialised (see `Tags::Const`).
                 Value::sum_tagged(Tags::Const(*tag, n), variants)

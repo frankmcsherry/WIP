@@ -548,3 +548,18 @@ fn closed_program_on_one_row_is_a_value() {
     let p = Program::compile_ml("enum Opt = None () | Some int in ([(1, \"a\"), (2, \"bc\")], 7 inject Some)").unwrap();
     assert_eq!(show(&p.run(Value::Unit(1))), "(List ends=[2] <([1, 2], List ends=[1, 3] <[97, 98, 99]>)>, Sum tags=[1] [()x0, [7]])");
 }
+
+/// `inject` into a variant whose payload shape the enum leaves open fills it with the payload's
+/// shape, so one `Option` serves every payload. The lanes it does not fill still need shapes.
+#[test]
+fn inject_fills_an_open_lane_with_its_payloads_shape() {
+    let both = Program::compile_ml("enum Option = None () | Some in (3 inject Some, \"dog\" inject Some)").unwrap();
+    assert_eq!(both.shape(&Shape::Unit).unwrap().to_string(), "({() | Int}, {() | List<Int>})");
+    assert_eq!(show(&both.run(Value::Unit(1))), "(Sum tags=[1] [()x0, [3]], Sum tags=[1] [()x0, List ends=[3] <[100, 111, 103]>])");
+    // matched by name and checked by ascription, whatever the payload
+    assert_eq!(run_ml("enum Option = None () | Some in input inject Some : Option match (None (_ -> 0), Some (x -> (x, 1) add))", &int(&[1, 2])), "[2, 3]");
+    // a declared lane is still checked, and the lanes not filled must be declared
+    assert_eq!(shape_err("enum O = N () | S int in \"dog\" inject S", &Shape::Unit), "Inject: lane 1 is declared Int, got List<Int>");
+    let none = Program::compile_ml("enum Option = None () | Some in () inject None").err().unwrap();
+    assert!(none.ends_with("inject None: enum 'Option' declares no payload shape for 'Some', whose empty lane needs one"), "{none}");
+}

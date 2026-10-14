@@ -21,7 +21,7 @@
 //!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
 //!          | 'map_variant' tag '(' lambda ')'
 //!          | 'match' '(' (tag '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
-//!          | 'inject' VARIANT                               -- sum construction (its enum fully shaped)
+//!          | 'inject' VARIANT                               -- sum construction (its other lanes shaped)
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
 //!          | 'split' STR                                    -- delimiter as a one-byte string
 //!          | 'call' IDENT                                   -- a word the host bound in the `Scope`
@@ -77,6 +77,7 @@
 //!       e match (0 (lo -> lo), 1 (hi -> (hi, 100) add))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100) add))
 //!       enum Opt = None () | Some int in xs inject Some  -- tag xs into Some; None is an empty unit lane
+//!       enum Option = None () | Some in (3 inject Some, "dog" inject Some)  -- Some takes its payload's shape
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
@@ -299,7 +300,7 @@ enum Apply {
     FoldScan(Pat, Box<E>), // (T, List<A>) -> (T, List<R>); body (acc, x) -> (new state, output R)
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
-    Inject(usize, Vec<Shape>),    // tag + the declared sum's lane shapes -> Op::Inject
+    Inject(usize, Vec<Option<Shape>>), // tag + the declared lane shapes (the filled one may be open) -> Op::Inject
     Head, // `head`: sugar for `(0, list) get` — the first element (an empty row errs)
     Call(Graph<NumOp>), // `call name`: the graph the scope binds to `name`, grafted onto the value
     Check(Pattern), // `: S`: the value has this shape (`_` a hole); typing fails otherwise
@@ -374,12 +375,19 @@ impl Enums {
         Ok(Pattern::Sum(vs.iter().map(|(_, s)| s.as_ref().map_or(Pattern::Any, Pattern::from)).collect()))
     }
 
-    /// the full lane shapes of enum `e` — an error if any variant left its payload undeclared.
-    fn lanes(&self, e: &str) -> Result<Vec<Shape>, String> {
+    /// the lane shapes of enum `e` for an `inject` into lane `tag`: that lane's as declared, if it
+    /// is, and every other lane's, which must be.
+    fn lanes(&self, e: &str, tag: usize) -> Result<Vec<Option<Shape>>, String> {
         let vs = self.decls.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
-        vs.iter()
-            .map(|(v, s)| s.clone().ok_or_else(|| format!("enum '{e}': variant '{v}' declares no payload shape")))
-            .collect()
+        for (k, (v, s)) in vs.iter().enumerate() {
+            if k != tag && s.is_none() {
+                let filled = &vs[tag].0;
+                return Err(format!(
+                    "inject {filled}: enum '{e}' declares no payload shape for '{v}', whose empty lane needs one"
+                ));
+            }
+        }
+        Ok(vs.iter().map(|(_, s)| s.clone()).collect())
     }
 }
 
@@ -475,7 +483,8 @@ impl<'a> P<'a> {
     }
 
     /// `enum Name = V0 shape? | V1 shape? | …`, into the tables. A payload shape is needed only
-    /// where the sum is BUILT by `inject` (every lane must then be declared); `branch Name` /
+    /// where the sum is BUILT by `inject`, and then only for the lanes it does not fill (they are
+    /// built empty at those shapes; the filled lane may take its payload's); `branch Name` /
     /// `match` / `map_variant` read just the tags.
     fn enum_decl(&mut self) -> Result<(), String> {
         if !self.is_kw("enum") {
@@ -705,12 +714,13 @@ impl<'a> P<'a> {
                 Ok(Apply::Match(arms))
             }
             // inject: construct a sum — `inject Variant`, the payload going to that variant's lane
-            // of its enum, whose every lane must declare a payload shape (the other lanes are built
-            // empty at those shapes). No numeric form: a sum is only ever built from a declaration.
+            // of its enum, whose every other lane must declare a payload shape (they are built empty
+            // at those shapes). The filled lane's shape, if the enum leaves it open, is the
+            // payload's. No numeric form: a sum is only ever built from a declaration.
             "inject" => {
                 let (tag, e) = self.variant()?;
                 let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
-                Ok(Apply::Inject(tag, self.enums.lanes(&e)?))
+                Ok(Apply::Inject(tag, self.enums.lanes(&e, tag)?))
             }
             // head: first element, sugar for `get 0` — checked (an empty row errs, carried in the err-mask).
             "head" => Ok(Apply::Head),
