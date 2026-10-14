@@ -134,39 +134,110 @@ impl Rounds {
     }
 }
 
-/// what a tuple pattern takes apart: a pattern of n fields, a product of exactly n fields (the unit,
-/// for none), each taken apart by its own pattern; a name or `_` takes anything.
+/// a shape with holes: what a tuple pattern takes apart, and what an ascription `: S` checks. A
+/// pattern of n fields wants a product of exactly n fields (the unit, for none), each matching its
+/// own pattern; `Int`, `Float`, `List`, `Sum` and `Ref` want what the shapes of those names are, at
+/// every level; `_` (a name, in a tuple pattern) takes anything.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Pattern {
     Any,
     Tuple(Vec<Pattern>),
+    Int,
+    Float,
+    List(Box<Pattern>),
+    Sum(Vec<Pattern>),
+    Ref(Box<Pattern>),
 }
 
 impl Pattern {
-    /// does `v` have this pattern's nesting? If not, which part of the pattern fails, and on what.
+    /// does `v` have this pattern's shape? If not, which part of the pattern fails, and on what.
     fn check(&self, v: &Value) -> Result<(), String> {
         self.mismatch(v).map_or(Ok(()), |(part, got)| {
             let at = if std::ptr::eq(part, self) { String::new() } else { format!("in the pattern {self}, ") };
-            Err(format!("{at}the pattern {part} takes apart {}, not {got}", part.wants()))
+            Err(format!("{at}the pattern {part} wants {}, not {got}", part.wants()))
         })
     }
 
+    /// the first part of the pattern `v` does not match, and the shape it met there. A column's
+    /// shape is its structure, so this reads no rows.
     fn mismatch(&self, v: &Value) -> Option<(&Pattern, Shape)> {
-        let Pattern::Tuple(ps) = self else { return None };
-        match v {
-            Value::Prod(fields) if fields.len() == ps.len() => ps.iter().zip(fields).find_map(|(p, f)| p.mismatch(f)),
-            Value::Unit(_) if ps.is_empty() => None,
-            other => Some((self, shape_of_value(other))),
-        }
+        let fits = match (self, v) {
+            (Pattern::Any, _) => return None,
+            (Pattern::Tuple(ps), Value::Prod(fields)) if fields.len() == ps.len() => {
+                return ps.iter().zip(fields).find_map(|(p, f)| p.mismatch(f));
+            }
+            (Pattern::Sum(ps), Value::Sum(_, lanes)) if lanes.len() == ps.len() => {
+                return ps.iter().zip(lanes).find_map(|(p, l)| p.mismatch(l));
+            }
+            (Pattern::List(p), Value::List(_, vals)) => return p.mismatch(vals),
+            (Pattern::Ref(p), Value::Ref(list, _)) => return p.mismatch(list),
+            (Pattern::Tuple(ps), Value::Unit(_)) => ps.is_empty(),
+            (Pattern::Int, Value::Prim(p)) => p.is_int(),
+            (Pattern::Float, Value::Prim(p)) => !p.is_int(),
+            _ => false,
+        };
+        (!fits).then(|| (self, shape_of_value(v)))
     }
 
-    /// what a tuple pattern takes apart, in words.
+    /// what the pattern wants, in words.
     fn wants(&self) -> String {
         match self {
             Pattern::Tuple(ps) if ps.is_empty() => "the unit".into(),
             Pattern::Tuple(ps) if ps.len() == 1 => "a product of 1 field".into(),
             Pattern::Tuple(ps) => format!("a product of {} fields", ps.len()),
+            Pattern::Sum(ps) => format!("a sum of {} lanes", ps.len()),
+            Pattern::Int => "an Int".into(),
+            Pattern::Float => "a Float".into(),
+            Pattern::List(_) => "a list".into(),
+            Pattern::Ref(_) => "a reference".into(),
             Pattern::Any => "anything".into(),
+        }
+    }
+
+    /// what both patterns want, or `None` where they want different things: a hole takes the
+    /// other side, and the rest must agree at every level.
+    pub(crate) fn meet(&self, other: &Pattern) -> Option<Pattern> {
+        let all = |a: &[Pattern], b: &[Pattern]| -> Option<Vec<Pattern>> {
+            (a.len() == b.len()).then(|| a.iter().zip(b).map(|(x, y)| x.meet(y)).collect()).flatten()
+        };
+        Some(match (self, other) {
+            (Pattern::Any, p) | (p, Pattern::Any) => p.clone(),
+            (Pattern::Tuple(a), Pattern::Tuple(b)) => Pattern::Tuple(all(a, b)?),
+            (Pattern::Sum(a), Pattern::Sum(b)) => Pattern::Sum(all(a, b)?),
+            (Pattern::List(a), Pattern::List(b)) => Pattern::List(Box::new(a.meet(b)?)),
+            (Pattern::Ref(a), Pattern::Ref(b)) => Pattern::Ref(Box::new(a.meet(b)?)),
+            (Pattern::Int, Pattern::Int) => Pattern::Int,
+            (Pattern::Float, Pattern::Float) => Pattern::Float,
+            _ => return None,
+        })
+    }
+
+    /// the shape this pattern names, if it has no holes.
+    pub fn whole(&self) -> Option<Shape> {
+        Some(match self {
+            Pattern::Any => return None,
+            Pattern::Tuple(ps) if ps.is_empty() => Shape::Unit,
+            Pattern::Tuple(ps) => Shape::Prod(ps.iter().map(Pattern::whole).collect::<Option<_>>()?),
+            Pattern::Sum(ps) => Shape::Sum(ps.iter().map(Pattern::whole).collect::<Option<_>>()?),
+            Pattern::Int => Shape::Int,
+            Pattern::Float => Shape::Float,
+            Pattern::List(p) => Shape::List(Box::new(p.whole()?)),
+            Pattern::Ref(p) => Shape::Ref(Box::new(p.whole()?)),
+        })
+    }
+}
+
+/// the pattern a shape is: the one wanting exactly that shape.
+impl From<&Shape> for Pattern {
+    fn from(s: &Shape) -> Pattern {
+        match s {
+            Shape::Int => Pattern::Int,
+            Shape::Float => Pattern::Float,
+            Shape::Unit => Pattern::Tuple(Vec::new()),
+            Shape::Prod(ss) => Pattern::Tuple(ss.iter().map(Pattern::from).collect()),
+            Shape::Sum(ss) => Pattern::Sum(ss.iter().map(Pattern::from).collect()),
+            Shape::List(s) => Pattern::List(Box::new(Pattern::from(&**s))),
+            Shape::Ref(s) => Pattern::Ref(Box::new(Pattern::from(&**s))),
         }
     }
 }
@@ -177,19 +248,34 @@ impl std::fmt::Debug for Pattern {
     }
 }
 
+/// a pattern as it is written: `(int, _)`, `List(float)`. A sum, which the surface names by its
+/// enum, shows its lanes as a shape does, `{int | ()}`.
 impl std::fmt::Display for Pattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list = |f: &mut std::fmt::Formatter<'_>, ps: &[Pattern], sep: &str| -> std::fmt::Result {
+            for (i, p) in ps.iter().enumerate() {
+                if i > 0 {
+                    write!(f, "{sep}")?;
+                }
+                write!(f, "{p}")?;
+            }
+            Ok(())
+        };
         match self {
             Pattern::Any => write!(f, "_"),
+            Pattern::Int => write!(f, "int"),
+            Pattern::Float => write!(f, "float"),
+            Pattern::List(p) => write!(f, "List({p})"),
+            Pattern::Ref(p) => write!(f, "Ref({p})"),
             Pattern::Tuple(ps) => {
                 write!(f, "(")?;
-                for (i, p) in ps.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{p}")?;
-                }
+                list(f, ps, ", ")?;
                 write!(f, ")")
+            }
+            Pattern::Sum(ps) => {
+                write!(f, "{{")?;
+                list(f, ps, " | ")?;
+                write!(f, "}}")
             }
         }
     }
@@ -210,9 +296,9 @@ pub enum Op<L> {
     // PROD — intro is the graph-structural `Tuple`. Products are transparent (fixed arity, no
     // witness column), so map is projection+rebuild and capture is `tuple` itself: no ops needed.
     Field(usize),   // elim:  (.., X_i, ..) -> X_i
-    Pattern(Pattern), // check: X -> X, where X has the pattern's nesting of products (see `Pattern`):
-                    //        what a tuple pattern takes apart, checked whole where it takes it apart.
-                    //        The pattern's names read through it.
+    Pattern(Pattern), // check: X -> X, where X has the pattern's shape (see `Pattern`): what a
+                    //        tuple pattern takes apart, checked whole where it takes it apart, and what
+                    //        an ascription `: S` says. The pattern's names read through it.
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, Int-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
