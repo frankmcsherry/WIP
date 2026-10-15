@@ -1,6 +1,6 @@
 //! Column builders the data-processing cases share: lists of `Int` tuples.
 
-use corgi::{Bounds, Value};
+use corgi::Value;
 
 /// a `List<(Int, .., Int)>` column of `N`-tuples (`N > 1`), one row per `Vec`.
 pub fn tuple_lists<const N: usize>(rows: &[Vec<[i64; N]>]) -> Value {
@@ -14,5 +14,5 @@ pub fn tuple_lists<const N: usize>(rows: &[Vec<[i64; N]>]) -> Value {
         }
         ends.push(fields[0].len());
     }
-    Value::List(Bounds::offsets(ends), Box::new(Value::Prod(fields.into_iter().map(Value::i64).collect())))
+    Value::List(ends.into(), Box::new(Value::Prod(fields.into_iter().map(Value::i64).collect())))
 }
