@@ -77,8 +77,11 @@ pub enum ArithOp {
     Bin(BinOp),            // (X, X) -> X   two Ints or two Floats
     BinImm(BinOp, Scalar), // X -> X   `x op c` with a constant `c` of x's kind. One pass over `x`,
                            // in place when it is uniquely owned; no column of `c` is built.
+    ImmBin(Scalar, BinOp), // X -> X   `c op x`: the constant on the left, for the ops where the
+                           // side matters (`(100, d) sub`); one pass, as `BinImm`.
     Bits(BitOp),           // (Int, Int) -> Int
     BitsImm(BitOp, i64),   // Int -> Int   `x op c`
+    ImmBits(i64, BitOp),   // Int -> Int   `c op x`, for `sub_b64`
     Shift(ShiftOp, u32),   // Int -> Int
     Neg,                   // X -> X   negate an Int (wrapping at the edge) or a Float
     ToFloat,               // Int -> Float   the nearest `f64`
@@ -228,18 +231,23 @@ fn bin_eval(op: BinOp, a: Prim, b: Prim) -> Result<Prim, String> {
     })
 }
 
-/// `x op c` for a constant `c` of `x`'s kind.
-fn imm_eval(op: BinOp, a: Prim, c: Scalar) -> Result<Prim, String> {
-    fn with<T: Copy>(f: impl Fn(T, T) -> T, c: T) -> impl Fn(T) -> T {
-        move |x| f(x, c)
-    }
+/// `x op c` for a constant `c` of `x`'s kind, or `c op x` when the constant is on the `left`.
+fn imm_eval(op: BinOp, a: Prim, c: Scalar, left: bool) -> Result<Prim, String> {
     fn int_imm(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
-        int_map(a, with(f, c))
+        int_map(a, move |x| f(x, c))
+    }
+    fn int_imm_left(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+        int_map(a, move |x| f(c, x))
     }
     fn float_imm(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
-        Prim::F64(map_into(a, with(f, k)))
+        Prim::F64(map_into(a, move |x| f(x, k)))
+    }
+    fn float_imm_left(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
+        Prim::F64(map_into(a, move |x| f(k, x)))
     }
     Ok(match (a, c) {
+        (Prim::F64(x), Scalar::Float(k)) if left => float_body!(op, float_imm_left(x, k)),
+        (a, Scalar::Int(c)) if left && a.is_int() => int_body!(op, int_imm_left(a, c)),
         (Prim::F64(x), Scalar::Float(k)) => float_body!(op, float_imm(x, k)),
         // by a power of two, `div` and `rem` are shifts: a negative dividend is biased by `c - 1`
         // first, so the quotient still rounds toward zero (and the remainder takes its sign).
@@ -269,14 +277,21 @@ fn bits_eval(op: BitOp, a: Prim, b: Prim) -> Result<Prim, String> {
     Ok(bit_body!(op, int_pairs(a, b)))
 }
 
-/// `x op c`, bitwise, for an integer leaf. A byte leaf against a byte constant `and`s, `or`s and
-/// `xor`s to bytes (`c and 223`, the case fold of text).
-fn bits_imm(op: BitOp, a: Prim, c: i64) -> Result<Prim, String> {
+/// `x op c`, bitwise, for an integer leaf, or `c op x` when the constant is on the `left`. A byte
+/// leaf against a byte constant `and`s, `or`s and `xor`s to bytes (`c and 223`, the case fold of
+/// text).
+fn bits_imm(op: BitOp, a: Prim, c: i64, left: bool) -> Result<Prim, String> {
     fn int_imm(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
         int_map(a, move |x| f(x, c))
     }
+    fn int_imm_left(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+        int_map(a, move |x| f(c, x))
+    }
     if !a.is_int() {
         return Err(format!("{op:?}: a Float"));
+    }
+    if left {
+        return Ok(bit_body!(op, int_imm_left(a, c)));
     }
     let a = match a {
         Prim::U8(x) if matches!(op, BitOp::And | BitOp::Or | BitOp::Xor) && (0..=255).contains(&c) => {
@@ -373,14 +388,16 @@ impl ArithOp {
                 assert_eq!(pa.len(), pb.len(), "binary arith: operands at different strata");
                 Value::Prim(bin_eval(*op, pa, pb)?)
             }
-            ArithOp::BinImm(op, c) => Value::Prim(imm_eval(*op, input.into_prim("arith with a constant")?, *c)?),
+            ArithOp::BinImm(op, c) => Value::Prim(imm_eval(*op, input.into_prim("arith with a constant")?, *c, false)?),
+            ArithOp::ImmBin(c, op) => Value::Prim(imm_eval(*op, input.into_prim("arith with a constant")?, *c, true)?),
             ArithOp::Bits(op) => {
                 let (a, b) = input.into_pair("bitwise")?;
                 let (pa, pb) = (a.into_prim("bitwise lhs")?, b.into_prim("bitwise rhs")?);
                 assert_eq!(pa.len(), pb.len(), "bitwise: operands at different strata");
                 Value::Prim(bits_eval(*op, pa, pb)?)
             }
-            ArithOp::BitsImm(op, c) => Value::Prim(bits_imm(*op, input.into_prim("bitwise with a constant")?, *c)?),
+            ArithOp::BitsImm(op, c) => Value::Prim(bits_imm(*op, input.into_prim("bitwise with a constant")?, *c, false)?),
+            ArithOp::ImmBits(c, op) => Value::Prim(bits_imm(*op, input.into_prim("bitwise with a constant")?, *c, true)?),
             ArithOp::Shift(op, k) => Value::Prim(shift_eval(*op, input.into_prim("shift")?, *k)?),
             ArithOp::Neg => Value::Prim(match input.into_prim("neg")? {
                 Prim::F64(v) => Prim::F64(map_into(v, |k| f64_key(-f64_of_key(k)))),

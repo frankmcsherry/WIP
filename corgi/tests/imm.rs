@@ -3,7 +3,8 @@
 //! and word op, the six comparisons and lane min/max against the same program evaluated as parsed
 //! (pair and literal column, no rewrite), on random columns of each storage (Int as bytes, Int as
 //! `i64`s, Float) and the constants at the edges of an Int, through the path that writes into an
-//! operand it owns; then where the rewrite fires, and where it must not.
+//! operand it owns, with the constant on either side; then where the rewrite fires, and where it
+//! must not.
 
 use corgi::{dce, eval_graph, immediates, parse_ml, Program, Value};
 
@@ -88,9 +89,11 @@ fn arithmetic_with_a_constant_matches_the_pair_form() {
         for op in ops {
             for c in constants(col) {
                 let xs = rows(col, 300, &mut rng);
-                let src = format!("(input, {c}) {op}");
-                assert_eq!(nodes_after(&src), 2, "{src}: not rewritten");
-                assert_eq!(run(&src, fresh(&xs)), run_pair(&src, fresh(&xs)), "{src} on {col:?}");
+                // the constant on either side
+                for src in [format!("(input, {c}) {op}"), format!("({c}, input) {op}")] {
+                    assert_eq!(nodes_after(&src), 2, "{src}: not rewritten");
+                    assert_eq!(run(&src, fresh(&xs)), run_pair(&src, fresh(&xs)), "{src} on {col:?}");
+                }
             }
         }
     }
@@ -121,16 +124,20 @@ fn pairs_with_a_literal_become_immediates() {
     for src in ["(input, 4) add", "(input, 4) sub", "(input, 4) rem", "(input, 4) div", "(input, 4) lt", "(input, 4) max", "(input, 4) sub_b64"] {
         assert_eq!(nodes_after(src), 2, "{src}");
     }
-    // on the left, where the order doesn't matter, and comparisons, which flip
-    for src in ["(4, input) add", "(4, input) mul", "(4, input) eq", "(4, input) min", "(4, input) lt", "(4, input) le", "(4, input) xor"] {
+    // on the left: where the order doesn't matter, comparisons, which flip, and the ops where it
+    // does, which keep the constant on the left
+    for src in [
+        "(4, input) add", "(4, input) mul", "(4, input) eq", "(4, input) min", "(4, input) lt", "(4, input) le", "(4, input) xor",
+        "(4, input) sub", "(4, input) div", "(4, input) rem", "(4, input) sub_b64", "(1.5, input) add", "(1.5, input) sub",
+    ] {
         assert_eq!(nodes_after(src), 2, "{src}");
     }
     // a list literal, for eq and ne, on either side
     for src in ["(input, \"ab\") eq", "(\"ab\", input) ne"] {
         assert_eq!(nodes_after(src), 2, "{src}");
     }
-    // stays a pair: order matters, float on the left, no literal, a list literal ordered
-    for src in ["(4, input) sub", "(4, input) rem", "(4, input) sub_b64", "(1.5, input) add", "(input, input) add", "(input, \"ab\") lt"] {
+    // stays a pair: no literal, a list literal ordered
+    for src in ["(input, input) add", "(input, \"ab\") lt"] {
         assert!(nodes_after(src) > 2, "{src}");
     }
     // (that it reaches into bodies is a unit test in optimize.rs, where bodies can be read)
@@ -145,6 +152,7 @@ fn the_rewrite_keeps_every_answer() {
         "(4, input) lt", "(4, input) le", "(4, input) min", "(4, input) max",
         "(4, input) xor", "(-8, input) and", "(3, input) mul_b64",
         "(input, 4) sub", "(input, 0) rem", "(input, 0) div",
+        "(100, input) sub", "(7, input) div", "(7, input) rem", "(4, input) sub_b64",
         "input iota map (x -> ((x, 3) mul, 7) add) fold_add",
     ] {
         assert_eq!(run(src, Value::i64(xs.clone())), run_pair(src, Value::i64(xs.clone())), "{src}");
