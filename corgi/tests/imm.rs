@@ -176,3 +176,30 @@ fn the_rewrite_keeps_every_answer() {
     let src = "let c = 4 in ((input, c) add, (c, input) sub)";
     assert_eq!(run(src, Value::i64(xs.clone())), run_pair(src, Value::i64(xs)), "{src}");
 }
+
+/// Division by a constant runs as a multiply-high, not a divide; it must give the divide's answer
+/// for every divisor, with every dividend, at the edges of an Int and around multiples of the
+/// divisor.
+#[test]
+fn division_by_a_constant_matches_the_pair_form() {
+    let mut rng = Rng(11);
+    let mut divisors: Vec<i64> = (-300..=300).collect();
+    for k in 2..63 {
+        divisors.extend([1i64 << k, (1i64 << k) - 1, (1i64 << k) + 1, -(1i64 << k), -(1i64 << k) + 1, -(1i64 << k) - 1]);
+    }
+    divisors.extend([1_000, 10_000, 1_000_000, 86_400, 146_097, 4_294_967_296, i64::MAX, i64::MAX - 1, i64::MIN, i64::MIN + 1, -1_000_000]);
+    divisors.extend((0..200).map(|_| rng.next() as i64));
+    for d in divisors {
+        let mut xs: Vec<i64> = (0..64).map(|_| rng.next() as i64).collect();
+        xs.extend((0..32).map(|_| (rng.next() % 2_000_001) as i64 - 1_000_000));
+        xs.extend([0, 1, -1, i64::MAX, i64::MIN, i64::MIN + 1, i64::MAX - 1]);
+        for k in [-3i64, -2, -1, 1, 2, 3] {
+            let m = d.wrapping_mul(k);
+            xs.extend([m, m.wrapping_add(1), m.wrapping_sub(1)]);
+        }
+        for op in ["div", "rem"] {
+            let src = format!("(input, {d}) {op}");
+            assert_eq!(run(&src, Value::i64(xs.clone())), run_pair(&src, Value::i64(xs.clone())), "{src}");
+        }
+    }
+}
