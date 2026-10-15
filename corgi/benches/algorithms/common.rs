@@ -1,6 +1,6 @@
 //! What every algorithm case shares: random inputs, column builders, timing, and the report line.
 
-use corgi::{dce, immediates, parse_ml, Bounds, Graph, NumOp, Program, Value};
+use corgi::{dce, immediates, parse_ml, Graph, NumOp, Program, Value};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -71,7 +71,7 @@ fn list_col<B, T: AsRef<[B]>>(rows: &[T], values: impl FnOnce(&[T]) -> Value) ->
         end += r.as_ref().len();
         ends.push(end);
     }
-    Value::List(Bounds::offsets(ends), Box::new(values(rows)))
+    Value::List(ends.into(), Box::new(values(rows)))
 }
 
 /// the graph a `Program` runs for `src`: constants as immediates, dead nodes dropped.

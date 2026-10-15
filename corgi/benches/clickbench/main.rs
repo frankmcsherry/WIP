@@ -9,7 +9,7 @@
 //! digits, `s` a string; `[..]` for a list of rows). The whole table is one row: each column is a
 //! one-row `List`. `--profile` (with `--features profile`) prints each query's time per op.
 
-use corgi::{Bounds, Program, Value};
+use corgi::{Program, Value};
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -51,7 +51,7 @@ const SIGN_FLIPPED: [&str; 6] = ["WatchID", "ClientIP", "UserID", "TraficSourceI
 
 /// a column as a one-row list: numbers as `List<Int>`, strings as `List<List<Int>>` (held as bytes).
 fn column(dir: &Path, name: &str) -> Value {
-    let one_row = |v: Value| Value::List(Bounds::offsets(vec![v.len()]), Box::new(v));
+    let one_row = |v: Value| Value::List(vec![v.len()].into(), Box::new(v));
     let numbers = dir.join(format!("{name}.u64"));
     if numbers.exists() {
         let flip = if SIGN_FLIPPED.contains(&name) { 1 << 63 } else { 0 };
@@ -59,7 +59,7 @@ fn column(dir: &Path, name: &str) -> Value {
     }
     let ends: Vec<usize> = read_u64s(&dir.join(format!("{name}.ends"))).into_iter().map(|e| e as usize).collect();
     let bytes = std::fs::read(dir.join(format!("{name}.bytes"))).unwrap();
-    one_row(Value::List(Bounds::offsets(ends), Box::new(Value::u8(bytes))))
+    one_row(Value::List(ends.into(), Box::new(Value::u8(bytes))))
 }
 
 /// a column's fields, in the canonical text form `prepare.py` writes DuckDB's answers in.

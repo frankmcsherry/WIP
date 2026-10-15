@@ -1,7 +1,7 @@
 //! Least-squares slope and intercept of each row's points, in `f64`.
 
 use crate::common::{run_case, Cfg, Rng};
-use corgi::{Bounds, Value};
+use corgi::Value;
 
 fn fit(pts: &[(f64, f64)]) -> (f64, f64) {
     if pts.is_empty() {
@@ -38,7 +38,7 @@ pub fn run(cfg: &Cfg) {
         }
         ends.push(xs.len());
     }
-    let input = Value::List(Bounds::offsets(ends), Box::new(Value::Prod(vec![Value::f64(xs), Value::f64(ys)])));
+    let input = Value::List(ends.into(), Box::new(Value::Prod(vec![Value::f64(xs), Value::f64(ys)])));
     let out: Vec<(f64, f64)> = rows.iter().map(|r| fit(r)).collect();
     let expected = Value::Prod(vec![
         Value::f64(out.iter().map(|o| o.0).collect()),
