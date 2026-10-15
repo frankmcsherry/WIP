@@ -68,9 +68,13 @@ Since 2026-10-03:
   q01 then reads them like q01b, which goes; on regenerated data q01 takes 18.9 ms against DuckDB's
   13.6 (1.39×). Existing data directories need `prepare.py` run again.
 
-The remaining gap is q01. It puts 1.2M rows into four groups: `group` sorts them, then moves the
-four summed columns into group order. DuckDB adds each row into its group's sums as it scans; corgi
-has no op for that (a scatter-add, a reduce by a small key).
+The remaining gap was q01. It puts 1.2M rows into four groups: `group` sorts them, then moves the
+four summed columns into group order. DuckDB adds each row into its group's sums as it scans. q01s
+does the same with `scatter_add`: each row's group is its two flag bytes as one number (or -1 when
+the date leaves it out), and one scatter totals every column by group, a unit field counting. At
+scale factor 1, on one thread: q01 173 ms, q01s 66 ms, DuckDB 94 ms. Of q01s's time, 30 ms reads the
+first byte of each one-character flag string; with the flags stored as bytes (#95) q01s takes 37 ms
+against DuckDB's 68.
 
 ## Which queries are here
 

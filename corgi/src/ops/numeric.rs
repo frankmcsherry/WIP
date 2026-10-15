@@ -86,6 +86,12 @@ pub enum ArithOp {
     Neg,                   // X -> X   negate an Int (wrapping at the edge) or a Float
     ToFloat,               // Int -> Float   the nearest `f64`
     Reduce(Red),           // List<X> -> X          per-row monoid reduction (sum/prod/min/max/all/any), X Int or Float
+    Scatter(Red),          // (List<Int>, List<X>) -> List<(Int, X)>   per row, one (id, total) per
+                           // distinct id, in id order: the monoid reduction of the values with that
+                           // id, in element order. X is a leaf, a unit or a product of these, reduced
+                           // field by field; a unit field's total counts the id's values. `fold_<r>`
+                           // is this with every id 0; `group` and a fold is this with ids the keys,
+                           // and no rows moved.
     Scan(Red),             // List<X> -> List<X>    per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
                            // general `FoldScan` re-evals the body per element (catastrophic on one long
@@ -444,6 +450,257 @@ fn reduce_floats(bounds: &crate::value::Bounds, ks: &[u64], r: Red) -> Result<Va
     Ok(Value::Prim(Prim::F64(Arc::new(out))))
 }
 
+/// `(ids, values) scatter_<r>`, row by row: one `(id, total)` pair per distinct id, in id order,
+/// `total` the reduction under `r` of the values with that id, in element order. A row's ids and
+/// values pair up by position (the longer list's extra elements dropped). The values are a leaf, a
+/// unit, or a product of these, reduced field by field; a unit field's total is the count of the
+/// id's values, whatever `r` is.
+///
+/// A row is reduced in two steps. First each element's id is numbered: the row's distinct ids get
+/// the numbers `0..g` in id order. Then each field is reduced into a table of `g` slots, one pass
+/// adding each value into the slot its number names. How the ids are numbered adapts to them:
+/// - ids spanning a range not much wider than the row: which ids in the range occur, then a running
+///   count over those (one sequential pass each, and a lookup per element);
+/// - ids spread wider, while their distinct count is small enough for a hash table that stays in
+///   cache: numbered by the table as first seen, then renumbered in id order;
+/// - otherwise: put in order by corgi's radix sort, each run of one id taking the next number.
+///
+/// A table of few slots is held `COPIES` times, consecutive elements adding into different copies,
+/// so that a run of one id is not a chain of adds each waiting on the last one's store; the copies
+/// are combined at the end. (A Float sum or product is not reassociated: it adds in element order,
+/// into one table.)
+fn scatter_rows(ib: &crate::value::Bounds, ids: &[i64], vb: &crate::value::Bounds, vals: Value, r: Red) -> Result<Value, String> {
+    let rows = ib.len();
+    if vb.len() != rows {
+        return Err(format!("scatter: {rows} rows of ids, {} rows of values", vb.len()));
+    }
+    let (fields, tuple) = match vals {
+        Value::Prod(fs) => (fs, true),
+        v => (vec![v], false),
+    };
+    for f in &fields {
+        match f {
+            Value::Prim(p) if !p.is_int() && matches!(r, Red::All | Red::Any) => {
+                return Err("scatter_all and scatter_any read a mask, which is an Int, not a Float".into());
+            }
+            Value::Prim(_) | Value::Unit(_) => {}
+            other => return Err(format!("scatter values: expected leaves, units, or a product of them, got {}", crate::shape::shape_of_value(other))),
+        }
+    }
+    let mut out_ids: Vec<i64> = Vec::new();
+    let mut outs: Vec<Vec<u64>> = vec![Vec::new(); fields.len()]; // an Int's i64 bits, or a Float's key
+    let mut ends = Vec::with_capacity(rows);
+    let mut scratch = Numbering::default();
+    for q in 0..rows {
+        let ((is, ie), (vs, ve)) = (ib.span(q), vb.span(q));
+        let len = (ie - is).min(ve - vs);
+        let g = scratch.number(&ids[is..is + len], &mut out_ids);
+        for (f, out) in fields.iter().zip(outs.iter_mut()) {
+            reduce_field(f, vs..vs + len, &scratch.slots, g, r, out, &mut scratch.table);
+        }
+        ends.push(out_ids.len());
+    }
+    let mut cols = Vec::with_capacity(fields.len());
+    for (f, out) in fields.iter().zip(outs) {
+        cols.push(match f {
+            Value::Prim(Prim::F64(_)) => Value::Prim(Prim::F64(Arc::new(out))),
+            Value::Prim(_) if matches!(r, Red::All | Red::Any) => Value::u8(out.into_iter().map(|x| x as u8).collect()),
+            _ => Value::i64(out.into_iter().map(|x| x as i64).collect()),
+        });
+    }
+    let vals = if tuple { Value::Prod(cols) } else { cols.pop().expect("one field") };
+    Ok(Value::List(ends.into(), Box::new(Value::Prod(vec![Value::i64(out_ids), vals]))))
+}
+
+/// The numbering step of a scatter, with buffers kept from row to row so a column of short rows
+/// allocates nothing per row.
+#[derive(Default)]
+struct Numbering {
+    slots: Vec<u32>, // each element's number
+    seen: Vec<bool>,
+    rank: Vec<u32>,
+    table: Vec<u64>, // a field's totals, before they are appended
+}
+
+impl Numbering {
+    /// number `ids`: their distinct values, in order, appended to `distinct`, and each element's
+    /// number (its id's position among them) in `self.slots`. Returns how many distinct ids.
+    fn number(&mut self, ids: &[i64], distinct: &mut Vec<i64>) -> usize {
+        self.slots.clear();
+        if ids.is_empty() {
+            return 0;
+        }
+        let (lo, hi) = ids.iter().fold((i64::MAX, i64::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        let span = hi as i128 - lo as i128 + 1;
+        if span <= (2 * ids.len() + 4096) as i128 {
+            self.by_range(ids, lo, span as usize, distinct)
+        } else if let Some(g) = self.by_hash(ids, distinct) {
+            g
+        } else {
+            self.by_sort(ids, distinct)
+        }
+    }
+
+    /// ids in a range `span` wide from `lo`: which occur, then a running count over those.
+    fn by_range(&mut self, ids: &[i64], lo: i64, span: usize, distinct: &mut Vec<i64>) -> usize {
+        self.seen.clear();
+        self.seen.resize(span, false);
+        for &id in ids {
+            self.seen[(id - lo) as usize] = true;
+        }
+        self.rank.clear();
+        let mut g = 0u32;
+        for (k, &s) in self.seen.iter().enumerate() {
+            self.rank.push(g);
+            if s {
+                distinct.push(lo + k as i64);
+                g += 1;
+            }
+        }
+        let rank = &self.rank;
+        self.slots.extend(ids.iter().map(|&id| rank[(id - lo) as usize]));
+        g as usize
+    }
+
+    /// ids spread wide: an open-addressing hash table numbers each as it is first seen, then the
+    /// numbers are put in id order. `None`, with nothing written, once the distinct ids outgrow a
+    /// table that stays in cache.
+    fn by_hash(&mut self, ids: &[i64], distinct: &mut Vec<i64>) -> Option<usize> {
+        const BITS: u32 = 17; // 128K entries: keys and numbers in about 1.5 MB
+        const LIMIT: usize = 1 << (BITS - 1); // at most half full
+        let mask = (1usize << BITS) - 1;
+        let mut keys = vec![0i64; 1 << BITS];
+        let mut nums = vec![u32::MAX; 1 << BITS];
+        let mut seen: Vec<i64> = Vec::new(); // the distinct ids, as first seen
+        for &id in ids {
+            let mut h = ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - BITS)) as usize;
+            let num = loop {
+                if nums[h] == u32::MAX {
+                    if seen.len() == LIMIT {
+                        self.slots.clear();
+                        return None;
+                    }
+                    keys[h] = id;
+                    nums[h] = seen.len() as u32;
+                    seen.push(id);
+                    break nums[h];
+                }
+                if keys[h] == id {
+                    break nums[h];
+                }
+                h = (h + 1) & mask;
+            };
+            self.slots.push(num);
+        }
+        // first-seen numbers to id-order numbers
+        let mut order: Vec<u32> = (0..seen.len() as u32).collect();
+        order.sort_unstable_by_key(|&k| seen[k as usize]);
+        let mut renumber = vec![0u32; seen.len()];
+        for (j, &k) in order.iter().enumerate() {
+            renumber[k as usize] = j as u32;
+            distinct.push(seen[k as usize]);
+        }
+        for s in self.slots.iter_mut() {
+            *s = renumber[*s as usize];
+        }
+        Some(seen.len())
+    }
+
+    /// ids spread wide and many: corgi's radix sort hands back the permutation and each sorted
+    /// position's run, one run per distinct id in id order; each element's number is its run.
+    fn by_sort(&mut self, ids: &[i64], distinct: &mut Vec<i64>) -> usize {
+        let (order, runs, sorted) = crate::ops::cmp::sort::sort_values(&[], &Value::i64(ids.to_vec()));
+        let sorted = sorted.as_i64("scatter ids").expect("sorted ids");
+        self.slots.resize(ids.len(), 0);
+        let mut g = 0;
+        for (j, (&k, &run)) in order.iter().zip(&runs).enumerate() {
+            if j == 0 || run != runs[j - 1] {
+                distinct.push(sorted[j]);
+                g += 1;
+            }
+            self.slots[k] = (g - 1) as u32;
+        }
+        g
+    }
+}
+
+/// one field's totals, `g` of them, appended to `out`: each element of `at` reduced under `r` into
+/// the slot `slots` names, in `table`. A unit field counts.
+fn reduce_field(f: &Value, at: std::ops::Range<usize>, slots: &[u32], g: usize, r: Red, out: &mut Vec<u64>, table: &mut Vec<u64>) {
+    match f {
+        Value::Unit(_) => reduce_ints(slots, g, |_| 1, Red::Add, table),
+        Value::Prim(Prim::I64(xs)) => {
+            let xs = &xs[at];
+            reduce_ints(slots, g, |k| xs[k], r, table)
+        }
+        Value::Prim(Prim::U8(xs)) => {
+            let xs = &xs[at];
+            reduce_ints(slots, g, |k| xs[k] as i64, r, table)
+        }
+        Value::Prim(Prim::F64(ks)) => {
+            let (unit, step) = float_monoid(r);
+            table.clear();
+            table.resize(g, unit);
+            for (&s, &k) in slots.iter().zip(&ks[at]) {
+                table[s as usize] = step(table[s as usize], k);
+            }
+        }
+        _ => unreachable!("scatter fields are checked"),
+    }
+    out.extend_from_slice(table);
+}
+
+/// a Float's monoid on keys: its unit key and its step (a sum or product decodes, operates and
+/// encodes; a least or greatest compares the keys).
+fn float_monoid(r: Red) -> (u64, fn(u64, u64) -> u64) {
+    match r {
+        Red::Add => (f64_key(0.0), |a, k| f64_key(f64_of_key(a) + f64_of_key(k))),
+        Red::Mul => (f64_key(1.0), |a, k| f64_key(f64_of_key(a) * f64_of_key(k))),
+        Red::Min => (u64::MAX, u64::min),
+        _ => (u64::MIN, u64::max),
+    }
+}
+
+/// integer values (element `k`'s is `value(k)`) reduced under `r` into `g` slots by `slots`, each
+/// monoid its own loop so its step inlines, the totals left in `acc` as `i64` bits. A table of at
+/// most `SMALL` slots is held `COPIES` times when the row is long enough to repay it.
+fn reduce_ints(slots: &[u32], g: usize, value: impl Fn(usize) -> i64 + Copy, r: Red, acc: &mut Vec<u64>) {
+    fn go(slots: &[u32], g: usize, value: impl Fn(usize) -> i64, unit: i64, step: impl Fn(i64, i64) -> i64, out: &mut Vec<u64>) {
+        const COPIES: usize = 8;
+        const SMALL: usize = 4096;
+        out.clear();
+        if g > 0 && g <= SMALL && slots.len() >= COPIES * g {
+            let mut acc = vec![unit; COPIES * g];
+            for (k, &s) in slots.iter().enumerate() {
+                let at = (k & (COPIES - 1)) * g + s as usize;
+                acc[at] = step(acc[at], value(k));
+            }
+            let (first, rest) = acc.split_at_mut(g);
+            for copy in rest.chunks_exact(g) {
+                for (a, &b) in first.iter_mut().zip(copy) {
+                    *a = step(*a, b);
+                }
+            }
+            out.extend(acc[..g].iter().map(|&x| x as u64));
+        } else {
+            out.resize(g, unit as u64);
+            for (k, &s) in slots.iter().enumerate() {
+                let a = &mut out[s as usize];
+                *a = step(*a as i64, value(k)) as u64;
+            }
+        }
+    }
+    let x = value;
+    match r {
+        Red::Add => go(slots, g, x, 0, i64::wrapping_add, acc),
+        Red::Mul => go(slots, g, x, 1, i64::wrapping_mul, acc),
+        Red::Min => go(slots, g, x, i64::MAX, i64::min, acc),
+        Red::Max => go(slots, g, x, i64::MIN, i64::max, acc),
+        Red::All => go(slots, g, x, 1, |a, x| a & (x != 0) as i64, acc),
+        Red::Any => go(slots, g, x, 0, |a, x| a | (x != 0) as i64, acc),
+    }
+}
+
 /// each row's inclusive prefix under `step`, written over `xs` in place, starting from `id` in every
 /// row. The recurrence is sequential within a row, so this is one pass over memory, not a
 /// vectorizable one.
@@ -494,6 +751,13 @@ impl ArithOp {
                     Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::F64(ks) => reduce_floats(&bounds, &ks, *r)?,
                 }
+            }
+            ArithOp::Scatter(r) => {
+                let (ids, vals) = input.into_pair("scatter")?;
+                let (ib, ids) = ids.into_list("scatter ids")?;
+                let (vb, vals) = vals.into_list("scatter values")?;
+                let ids = ids.as_i64("scatter ids")?;
+                scatter_rows(&ib, &ids, &vb, vals, *r)?
             }
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;

@@ -1,0 +1,8 @@
+# scatter_add: totals by id, with no rows moved. Each value is added into its id's total, and one
+# (id, total) pair per distinct id comes out, in id order. A product of values is totalled field by
+# field, and a unit field counts. Here the ids are x mod 3 for x in 0..8, and the values are
+# (a count, x, x squared): ids 0, 1, 2 have 3, 3 and 2 values.
+# n = 8
+# = List ends=[3] <([0, 1, 2], ([3, 3, 2], [9, 12, 7], [45, 66, 29]))>
+let xs = input iota in
+(xs map (x -> (x, 3) rem), xs map (x -> ((), x, (x, x) mul))) scatter_add

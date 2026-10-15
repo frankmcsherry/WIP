@@ -345,6 +345,11 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Over
   Floats a sum or product runs in row order, so it is the `fold` of `add` or `mul` bit for bit
   (`all`/`any` read masks, which are Ints).
+- **Keyed reductions** (`scatter_add`/`mul`/`min`/`max`/`all`/`any`) take `(ids, values)` and give
+  one `(id, total)` per distinct id, in id order: `group` followed by monoid folds, with no rows
+  moved. A unit field among the values counts. The kernel numbers each row's ids by a table over
+  their range, a hash table that stays in cache, or a sort, whichever their spread allows, then adds
+  each value into its number's slot. Prefer it to `group` when a program wants totals per key.
 
 ## Failure: lossy ops, and checked ones as words
 
