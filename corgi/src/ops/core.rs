@@ -612,20 +612,30 @@ impl<L: OpLike> Op<L> {
             Op::Hash => Value::i64(crate::value::i64s_of_words(crate::hash::hash(&input))),
 
             Op::Filter => {
-                let (bounds, pairs) = input.into_list("Filter")?;
-                let (mask, vals) = pairs.into_pair("Filter element")?;
+                // the kept values go back into the list's own box.
+                let (bounds, mut vals) = input.into_list_boxed("Filter")?;
+                let (mask, data) = std::mem::replace(&mut *vals, Value::Unit(0)).into_pair("Filter element")?;
                 let m = mask.as_mask("Filter mask")?;
                 let m = &m[..];
                 // the new row ends are a count of each row's kept elements, and the kept elements
-                // are taken as `compress` finds cheapest for how many there are.
-                let mut nb = Vec::with_capacity(bounds.len());
-                let (mut acc, mut start) = (0usize, 0usize);
-                for end in bounds.ends() {
-                    acc += m[start..end].iter().map(|&b| (b != 0) as usize).sum::<usize>();
-                    nb.push(acc);
-                    start = end;
-                }
-                Value::List(nb.into(), Box::new(compress(&vals, m, acc)))
+                // are taken as `compress` finds cheapest for how many there are. One row: its end
+                // is the kept count, and a one-row partition is a stride, so no vector.
+                let count = |s: &[u8]| s.iter().map(|&b| (b != 0) as usize).sum::<usize>();
+                let (nb, kept) = if bounds.len() == 1 {
+                    let k = count(m);
+                    (Bounds::Stride(k, 1), k)
+                } else {
+                    let mut nb = Vec::with_capacity(bounds.len());
+                    let (mut acc, mut start) = (0usize, 0usize);
+                    for end in bounds.ends() {
+                        acc += count(&m[start..end]);
+                        nb.push(acc);
+                        start = end;
+                    }
+                    (nb.into(), acc)
+                };
+                *vals = compress(&data, m, kept);
+                Value::List(nb, vals)
             }
 
             // row-wise append: row r's output is each list's row r elements in turn. A multi-source
@@ -823,8 +833,10 @@ impl<L: OpLike> Op<L> {
             }
 
             Op::MapList(body) => {
-                let (bounds, inner) = input.into_list("MapList")?;
-                Value::List(bounds, Box::new(try_eval_graph(body, inner)?))
+                // the body's result goes back into the list's own box: no new one per map.
+                let (bounds, mut vals) = input.into_list_boxed("MapList")?;
+                *vals = try_eval_graph(body, std::mem::replace(&mut *vals, Value::Unit(0)))?;
+                Value::List(bounds, vals)
             }
 
             // seeded left fold, vectorized across rows: round t runs the body once over every row

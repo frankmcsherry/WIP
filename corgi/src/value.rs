@@ -1107,8 +1107,14 @@ impl Value {
     }
 
     pub fn into_list(self, who: &str) -> Result<(Bounds, Value), String> {
+        self.into_list_boxed(who).map(|(bounds, vals)| (bounds, *vals))
+    }
+
+    /// [`Value::into_list`] with the values left in their box, for an op that puts its result back
+    /// into it.
+    pub(crate) fn into_list_boxed(self, who: &str) -> Result<(Bounds, Box<Value>), String> {
         match self {
-            Value::List(bounds, vals) => Ok((bounds, *vals)),
+            Value::List(bounds, vals) => Ok((bounds, vals)),
             other => Err(wrong(who, "a list", &other, |v| matches!(v, Value::List(..)))),
         }
     }
