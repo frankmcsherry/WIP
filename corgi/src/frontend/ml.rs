@@ -12,24 +12,28 @@
 //!
 //!   expr   = 'let' pat '=' expr 'in' expr
 //!          | 'enum' IDENT '=' IDENT shape? ('|' IDENT shape?)* 'in' expr  -- a compile-time table; names ERASE here
-//!   shape  = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
 //!          | pipe
-//!   pat    = IDENT | '_' | '(' (pat (',' pat)*)? ')'   -- irrefutable: names, wildcards, tuples
+//!   shape  = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
+//!          | '_'                                       -- a hole: any shape (not in a declaration)
+//!   pat    = (IDENT | '_' | '(' (pat (',' pat)*)? ')') (':' shape)?   -- irrefutable: names, wildcards, tuples
 //!   pipe   = atom apply*                               -- juxtaposition; chain ends before `in`
 //!   apply  = 'map' '(' lambda ')'
 //!          | ('fold' | 'scan') '(' lambda ')'                 -- (seed, list); lambda is (acc, x)
 //!          | 'map_variant' tag '(' lambda ')'
 //!          | 'match' '(' (tag '(' lambda ')')(',' …)* ')'   -- MapSum + Unwrap
-//!          | 'inject' VARIANT                               -- sum construction (its enum fully shaped)
+//!          | 'inject' VARIANT                               -- sum construction (its other lanes shaped)
 //!          | 'branch' (NUM | ENUM)                          -- lane count, literal or by enum name
 //!          | 'split' STR                                    -- delimiter as a one-byte string
 //!          | 'call' IDENT                                   -- a word the host bound in the `Scope`
 //!          | '.' NUM                                        -- projection
+//!          | ':' shape                                      -- ascription: the value has this shape
 //!          | IDENT NUM?
 //!   tag    = NUM | VARIANT                              -- a variant name resolves to its tag
 //!   VARIANT = IDENT | ENUM '::' IDENT                   -- `Foo::Bar` where two enums declare a `Bar`
 //!   lambda = pat '->' expr                              -- a tuple pattern destructures the parameter
 //!   atom   = '(' (expr (',' expr)*)? ')' | IDENT | LIT | STR   -- 'input' is the root; '(' … ')' is a tuple
+//!          | '[' (const (',' const)*)? ']'              -- a list literal: one constant list
+//!   const  = (NUM | LIT | STR | '(' (const (',' const)*)? ')' | '[' (const (',' const)*)? ']') (':' shape)?
 //!   LIT    = '-'? DIGITS                                        -- an Int
 //!          | '-'? DIGITS ('.' DIGITS)? (('e'|'E') [+-]? DIGITS)?  -- a Float, with a fraction or exponent
 //!
@@ -49,6 +53,20 @@
 //! An Int literal is an integer and a Float literal an `f64`; arithmetic takes its kind from its
 //! operands, so `(1.5, 2.5) add` is a float add and `(1, 2.5) add` a shape error.
 //!
+//! A list literal is a constant too, one list filled like any literal, as a string is: `"ab"` is
+//! `[97, 98]`, the same node holding the same value. Its elements are constants of one shape:
+//! numbers, strings, `()`, and tuples and lists of these (`[(0, "GET"), (1, "PUT")]`). An empty
+//! list takes its shape from the elements beside it (`[[1], []]`) or from an ascription
+//! (`[] : List(int)`). A list of computed values is not a literal: it is an `append` of enlisted
+//! columns, `(a enlist, b enlist, (a, b) add enlist) append`, one pass whatever its length.
+//!
+//! An ascription `: S` says a value has the shape `S`, as a stage (`xs : List(int)`) or on a
+//! pattern (`(acc : (int, int), x : int) -> …`), `_` being a hole and an enum naming its sum (a
+//! variant declared without a payload is a hole). It is a check, made when the program is typed:
+//! one `Op::Pattern`, which a tuple pattern's own nesting joins. It converts nothing and steers
+//! nothing; the one place it gives a shape instead of checking one is the empty list, which has
+//! none of its own.
+//!
 //! A program is parsed in a `Scope` (`parse_ml_in`; `parse_ml` is the empty one): names the host
 //! binds, as it binds `input`. `x call name` grafts the graph the host bound to `name` with `x` as
 //! its input — a host kernel is a graph of one node, and a word may also be written in corgi — and
@@ -59,13 +77,15 @@
 //!       e match (0 (lo -> lo), 1 (hi -> (hi, 100) add))   -- exhaustive ⇒ Unwrap types it
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100) add))
 //!       enum Opt = None () | Some int in xs inject Some  -- tag xs into Some; None is an empty unit lane
+//!       enum Option = None () | Some in (3 inject Some, "dog" inject Some)  -- Some takes its payload's shape
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
 use crate::ops::{CmpOp, NumOp, Op, Pattern};
 use crate::shape::Shape;
-use crate::value::Value;
+use crate::value::{Prim, Scalar, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ----- tokens ------------------------------------------------------------
 
@@ -79,6 +99,9 @@ enum Tok {
     Eq,
     Bar, // | — the variant separator in an `enum` declaration
     PathSep, // :: — between an enum and its variant, `Foo::Bar`
+    Colon, // : — before a shape, in an ascription
+    LBracket, // [ — a list literal
+    RBracket, // ]
     Ident(String),
     Num(u64),   // a non-negative integer: an op's parameter (`chunk 3`, `branch 2`), or an Int
     Lit(Value), // a constant no parameter can be: a negative Int (`-3`) or a Float (`0.7`)
@@ -153,6 +176,18 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
             ':' if cs.get(i + 1) == Some(&':') => {
                 i += 2;
                 Tok::PathSep
+            }
+            ':' => {
+                i += 1;
+                Tok::Colon
+            }
+            '[' => {
+                i += 1;
+                Tok::LBracket
+            }
+            ']' => {
+                i += 1;
+                Tok::RBracket
             }
             '"' => {
                 i += 1; // opening quote
@@ -247,12 +282,13 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
 
 // ----- AST ---------------------------------------------------------------
 
-/// an irrefutable pattern: a name, `_`, or a tuple of patterns. Refutable matching (a sum's lane)
-/// is `match`'s job, never a pattern's.
+/// an irrefutable pattern: a name, `_`, or a tuple of patterns, each perhaps ascribed a shape.
+/// Refutable matching (a sum's lane) is `match`'s job, never a pattern's.
 enum Pat {
     Name(String),
     Wild,
     Tuple(Vec<Pat>),
+    Typed(Box<Pat>, Pattern), // `p : S`: the pattern, and what it and its ascription want together
 }
 
 enum Apply {
@@ -264,9 +300,19 @@ enum Apply {
     FoldScan(Pat, Box<E>), // (T, List<A>) -> (T, List<R>); body (acc, x) -> (new state, output R)
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
-    Inject(usize, Vec<Shape>),    // tag + the declared sum's lane shapes -> Op::Inject
+    Inject(usize, Vec<Option<Shape>>), // tag + the declared lane shapes (the filled one may be open) -> Op::Inject
     Head, // `head`: sugar for `(0, list) get` — the first element (an empty row errs)
     Call(Graph<NumOp>), // `call name`: the graph the scope binds to `name`, grafted onto the value
+    Check(Pattern), // `: S`: the value has this shape (`_` a hole); typing fails otherwise
+}
+
+/// a constant in a list literal, before the literal's shape is known: an empty list's element
+/// shape may come from the elements beside it.
+enum Const {
+    Leaf(Scalar),
+    Tuple(Vec<Const>), // `()` is the unit
+    List(Vec<Const>),
+    Typed(Box<Const>, Pattern), // `c : S`
 }
 
 enum E {
@@ -322,12 +368,26 @@ impl Enums {
         Ok((tag, e.as_str()))
     }
 
-    /// the full lane shapes of enum `e` — an error if any variant left its payload undeclared.
-    fn lanes(&self, e: &str) -> Result<Vec<Shape>, String> {
+    /// enum `e` as a pattern: a sum of its lanes, where a variant declared without a payload shape
+    /// is a hole.
+    fn pattern(&self, e: &str) -> Result<Pattern, String> {
         let vs = self.decls.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
-        vs.iter()
-            .map(|(v, s)| s.clone().ok_or_else(|| format!("enum '{e}': variant '{v}' declares no payload shape")))
-            .collect()
+        Ok(Pattern::Sum(vs.iter().map(|(_, s)| s.as_ref().map_or(Pattern::Any, Pattern::from)).collect()))
+    }
+
+    /// the lane shapes of enum `e` for an `inject` into lane `tag`: that lane's as declared, if it
+    /// is, and every other lane's, which must be.
+    fn lanes(&self, e: &str, tag: usize) -> Result<Vec<Option<Shape>>, String> {
+        let vs = self.decls.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
+        for (k, (v, s)) in vs.iter().enumerate() {
+            if k != tag && s.is_none() {
+                let filled = &vs[tag].0;
+                return Err(format!(
+                    "inject {filled}: enum '{e}' declares no payload shape for '{v}', whose empty lane needs one"
+                ));
+            }
+        }
+        Ok(vs.iter().map(|(_, s)| s.clone()).collect())
     }
 }
 
@@ -423,7 +483,8 @@ impl<'a> P<'a> {
     }
 
     /// `enum Name = V0 shape? | V1 shape? | …`, into the tables. A payload shape is needed only
-    /// where the sum is BUILT by `inject` (every lane must then be declared); `branch Name` /
+    /// where the sum is BUILT by `inject`, and then only for the lanes it does not fill (they are
+    /// built empty at those shapes; the filled lane may take its payload's); `branch Name` /
     /// `match` / `map_variant` read just the tags.
     fn enum_decl(&mut self) -> Result<(), String> {
         if !self.is_kw("enum") {
@@ -445,8 +506,21 @@ impl<'a> P<'a> {
         position(&self.src, self.starts.get(k).copied().unwrap_or(self.src.len()))
     }
 
-    /// a binding pattern, used by `let` and lambda parameters alike.
+    /// a binding pattern, used by `let` and lambda parameters alike, perhaps ascribed a shape:
+    /// `(acc : (int, int), x : int)`. The ascription and the pattern's own nesting make one check.
     fn pat(&mut self) -> Result<Pat, String> {
+        let p = self.bare_pat()?;
+        if self.peek() != Some(&Tok::Colon) {
+            return Ok(p);
+        }
+        self.bump();
+        let s = self.shape_pattern()?;
+        let both = p.pattern().meet(&s).ok_or_else(|| format!("the pattern {} cannot be {s}", p.pattern()))?;
+        Ok(Pat::Typed(Box::new(p), both))
+    }
+
+    /// a pattern without its ascription.
+    fn bare_pat(&mut self) -> Result<Pat, String> {
         if self.peek() == Some(&Tok::LParen) {
             self.bump();
             // `()`, the tuple with no fields: the unit, which binds nothing
@@ -487,37 +561,47 @@ impl<'a> P<'a> {
         Ok((v, shape))
     }
 
-    /// a payload shape in an `enum` declaration:
-    ///   shape = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM
-    /// where ENUM names an earlier, fully-shaped enum (so sums nest, but never recursively).
+    /// a payload shape in an `enum` declaration: a shape with no holes, where an ENUM names an
+    /// earlier, fully-shaped enum (so sums nest, but never recursively).
     fn shape(&mut self) -> Result<Shape, String> {
+        let p = self.shape_pattern()?;
+        p.whole().ok_or_else(|| {
+            format!("the payload shape {p} has a hole: a `_`, or an enum variant with no declared payload")
+        })
+    }
+
+    /// a shape, perhaps with holes, as an ascription writes it:
+    ///   shape = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM | '_'
+    /// where ENUM names an enum, a variant declared without a payload shape being a hole.
+    fn shape_pattern(&mut self) -> Result<Pattern, String> {
         match self.bump() {
             Some(Tok::LParen) => {
                 if self.peek() == Some(&Tok::RParen) {
                     self.bump();
-                    return Ok(Shape::Unit);
+                    return Ok(Pattern::Tuple(Vec::new()));
                 }
-                let mut fields = vec![self.shape()?];
+                let mut fields = vec![self.shape_pattern()?];
                 while self.peek() == Some(&Tok::Comma) {
                     self.bump();
-                    fields.push(self.shape()?);
+                    fields.push(self.shape_pattern()?);
                 }
                 self.eat(&Tok::RParen)?;
-                Ok(Shape::Prod(fields))
+                Ok(Pattern::Tuple(fields))
             }
             Some(Tok::Ident(k)) => match k.as_str() {
-                "int" => Ok(Shape::Int),
-                "float" => Ok(Shape::Float),
+                "_" => Ok(Pattern::Any),
+                "int" => Ok(Pattern::Int),
+                "float" => Ok(Pattern::Float),
                 "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
                     Err(format!("'{k}' is retired: an integer is `int` (its width is storage), a float `float`"))
                 }
                 "List" => {
                     self.eat(&Tok::LParen)?;
-                    let inner = self.shape()?;
+                    let inner = self.shape_pattern()?;
                     self.eat(&Tok::RParen)?;
-                    Ok(Shape::List(Box::new(inner)))
+                    Ok(Pattern::List(Box::new(inner)))
                 }
-                e => self.enums.lanes(e).map(Shape::Sum),
+                e => self.enums.pattern(e),
             },
             other => Err(format!("expected a shape, found {other:?}")),
         }
@@ -555,11 +639,11 @@ impl<'a> P<'a> {
         Ok(e)
     }
 
-    /// whether the next token can begin a pipe stage — a `.N` projection, or any identifier
-    /// other than the chain-terminating `in`.
+    /// whether the next token can begin a pipe stage — a `.N` projection, an ascription `: S`, or
+    /// any identifier other than the chain-terminating `in`.
     fn starts_apply(&self) -> bool {
         match self.peek() {
-            Some(Tok::Dot) => true,
+            Some(Tok::Dot) | Some(Tok::Colon) => true,
             Some(Tok::Ident(k)) => k != "in",
             _ => false,
         }
@@ -570,6 +654,11 @@ impl<'a> P<'a> {
         if let Some(Tok::Dot) = self.peek() {
             self.bump();
             return Ok(Apply::Field(self.num()? as usize));
+        }
+        // `: S` after any value checks its shape.
+        if let Some(Tok::Colon) = self.peek() {
+            self.bump();
+            return Ok(Apply::Check(self.shape_pattern()?));
         }
         let name = self.ident()?;
         match name.as_str() {
@@ -625,12 +714,13 @@ impl<'a> P<'a> {
                 Ok(Apply::Match(arms))
             }
             // inject: construct a sum — `inject Variant`, the payload going to that variant's lane
-            // of its enum, whose every lane must declare a payload shape (the other lanes are built
-            // empty at those shapes). No numeric form: a sum is only ever built from a declaration.
+            // of its enum, whose every other lane must declare a payload shape (they are built empty
+            // at those shapes). The filled lane's shape, if the enum leaves it open, is the
+            // payload's. No numeric form: a sum is only ever built from a declaration.
             "inject" => {
                 let (tag, e) = self.variant()?;
                 let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
-                Ok(Apply::Inject(tag, self.enums.lanes(&e)?))
+                Ok(Apply::Inject(tag, self.enums.lanes(&e, tag)?))
             }
             // head: first element, sugar for `get 0` — checked (an empty row errs, carried in the err-mask).
             "head" => Ok(Apply::Head),
@@ -719,7 +809,62 @@ impl<'a> P<'a> {
                 let n = i64::try_from(n).map_err(|_| format!("{n} does not fit in an Int (an i64)"))?;
                 Ok(E::Lit(int_lit(n)))
             }
+            // a list literal: one constant list, built here
+            Some(Tok::LBracket) => {
+                let list = self.constant()?;
+                let p = list.pattern()?;
+                let shape = p.whole().ok_or_else(|| {
+                    format!("the list literal's shape {p} has a hole: an empty list takes its shape from the elements beside it, or from an ascription, as in [] : List(int)")
+                })?;
+                Ok(E::Lit(column(&[&list], &shape)))
+            }
             other => Err(format!("expected an expression, found {other:?}")),
+        }
+    }
+
+    /// a constant in a list literal, perhaps ascribed: a number, a string, `()`, or a tuple or
+    /// list of constants.
+    fn constant(&mut self) -> Result<Const, String> {
+        let c = match self.bump() {
+            Some(Tok::Num(n)) => {
+                Const::Leaf(Scalar::Int(i64::try_from(n).map_err(|_| format!("{n} does not fit in an Int (an i64)"))?))
+            }
+            Some(Tok::Lit(Value::Prim(p))) => Const::Leaf(Scalar::of(&p, 0)),
+            Some(Tok::Str(bytes)) => Const::List(bytes.into_iter().map(|b| Const::Leaf(Scalar::Int(b as i64))).collect()),
+            Some(Tok::LParen) => Const::Tuple(self.constants(Tok::RParen)?),
+            Some(Tok::LBracket) => Const::List(self.constants(Tok::RBracket)?),
+            other => {
+                return Err(format!(
+                    "a list literal holds constants (numbers, strings, `()`, and tuples and lists of these), not {other:?}; build a list of computed values with append, as in (a enlist, b enlist) append"
+                ))
+            }
+        };
+        if self.peek() != Some(&Tok::Colon) {
+            return Ok(c);
+        }
+        self.bump();
+        Ok(Const::Typed(Box::new(c), self.shape_pattern()?))
+    }
+
+    /// the constants up to the closing token, separated by commas (the opening one is read).
+    fn constants(&mut self, close: Tok) -> Result<Vec<Const>, String> {
+        let mut cs = Vec::new();
+        if self.peek() == Some(&close) {
+            self.bump();
+            return Ok(cs);
+        }
+        loop {
+            cs.push(self.constant()?);
+            match self.bump() {
+                Some(Tok::Comma) => {}
+                Some(t) if t == close => return Ok(cs),
+                other => {
+                    let close = if close == Tok::RBracket { ']' } else { ')' };
+                    return Err(format!(
+                        "expected ',' or '{close}' in a list literal, found {other:?}; a list literal holds constants, and a list of computed values is built with append, as in (a enlist, b enlist) append"
+                    ));
+                }
+            }
         }
     }
 }
@@ -733,22 +878,19 @@ type Env = HashMap<String, usize>;
 const ROOT: &str = " root";
 
 /// bind a pattern to a node: a name binds the node itself, `_` binds nothing, and a tuple pattern
-/// binds each sub-pattern to a `Field` projection of it.
+/// binds each sub-pattern to a `Field` projection of it. A pattern that wants anything of the
+/// value (a tuple pattern takes apart exactly its n fields, at every level, and an ascription
+/// wants its shape) is one check of the whole pattern, which its names read through; that check
+/// is returned.
 fn bind(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) -> Option<usize> {
-    match pat {
-        Pat::Name(x) => {
-            env.insert(x.clone(), id);
-            None
-        }
-        Pat::Wild => None,
-        // a pattern of n fields takes apart exactly n, at every level: one check of the whole
-        // pattern, which its names read through
-        Pat::Tuple(_) => {
-            let checked = b.add(Op::Pattern(pat.pattern()), vec![id]);
-            bind_fields(pat, checked, env, b);
-            Some(checked)
-        }
+    let p = pat.pattern();
+    if p == Pattern::Any {
+        bind_fields(pat, id, env, b);
+        return None;
     }
+    let checked = b.add(Op::Pattern(p), vec![id]);
+    bind_fields(pat, checked, env, b);
+    Some(checked)
 }
 
 /// bind a checked tuple pattern's names to its fields, and its sub-patterns' to theirs.
@@ -758,6 +900,7 @@ fn bind_fields(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
             env.insert(x.clone(), id);
         }
         Pat::Wild => {}
+        Pat::Typed(p, _) => bind_fields(p, id, env, b),
         Pat::Tuple(pats) => {
             for (i, sub) in pats.iter().enumerate() {
                 let fid = b.add(Op::Field(i), vec![id]);
@@ -768,12 +911,97 @@ fn bind_fields(pat: &Pat, id: usize, env: &mut Env, b: &mut Builder<NumOp>) {
 }
 
 impl Pat {
-    /// the nesting of products this pattern takes apart.
+    /// what this pattern wants of a value: the nesting of products it takes apart, and the
+    /// shapes it is ascribed.
     fn pattern(&self) -> Pattern {
         match self {
             Pat::Name(_) | Pat::Wild => Pattern::Any,
             Pat::Tuple(pats) => Pattern::Tuple(pats.iter().map(Pat::pattern).collect()),
+            Pat::Typed(_, p) => p.clone(),
         }
+    }
+}
+
+impl Const {
+    /// the constant without its ascriptions.
+    fn bare(&self) -> &Const {
+        match self {
+            Const::Typed(c, _) => c.bare(),
+            c => c,
+        }
+    }
+
+    /// the shape the constant's text fixes: an empty list's elements are a hole until the
+    /// elements beside it, or an ascription, fill it.
+    fn pattern(&self) -> Result<Pattern, String> {
+        Ok(match self {
+            Const::Leaf(Scalar::Int(_)) => Pattern::Int,
+            Const::Leaf(Scalar::Float(_)) => Pattern::Float,
+            Const::Tuple(cs) => Pattern::Tuple(cs.iter().map(Const::pattern).collect::<Result<_, _>>()?),
+            Const::List(cs) => {
+                let mut elems = Pattern::Any;
+                for c in cs {
+                    let p = c.pattern()?;
+                    elems = elems
+                        .meet(&p)
+                        .ok_or_else(|| format!("a list literal's elements differ in shape: {elems} and {p}"))?;
+                }
+                Pattern::List(Box::new(elems))
+            }
+            Const::Typed(c, s) => {
+                let p = c.pattern()?;
+                p.meet(s).ok_or_else(|| format!("a constant of shape {p} is not {s}"))?
+            }
+        })
+    }
+}
+
+/// the column of the constants `cs`, each of the whole shape `shape`. An Int column is held as
+/// bytes when every value is one, as an Int literal is, so `[97, 98]` is the value `"ab"` is.
+fn column(cs: &[&Const], shape: &Shape) -> Value {
+    let leaf = |c: &&Const| match c.bare() {
+        Const::Leaf(x) => *x,
+        _ => unreachable!("a constant of a leaf shape is a leaf"),
+    };
+    match shape {
+        Shape::Int => {
+            let xs: Vec<i64> = cs.iter().map(|c| match leaf(c) {
+                Scalar::Int(x) => x,
+                Scalar::Float(_) => unreachable!("an Int constant"),
+            }).collect();
+            match xs.iter().map(|&x| u8::try_from(x)).collect::<Result<Vec<u8>, _>>() {
+                Ok(bytes) => Value::u8(bytes),
+                Err(_) => Value::i64(xs),
+            }
+        }
+        Shape::Float => Value::Prim(Prim::F64(Arc::new(cs.iter().map(|c| match leaf(c) {
+            Scalar::Float(k) => k,
+            Scalar::Int(_) => unreachable!("a Float constant"),
+        }).collect()))),
+        Shape::Unit => Value::Unit(cs.len()),
+        Shape::Prod(fields) => Value::Prod(
+            fields
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let field: Vec<&Const> = cs.iter().map(|c| match c.bare() {
+                        Const::Tuple(fs) => &fs[i],
+                        _ => unreachable!("a constant of a product shape is a tuple"),
+                    }).collect();
+                    column(&field, s)
+                })
+                .collect(),
+        ),
+        Shape::List(elem) => {
+            let (mut items, mut ends) = (Vec::new(), Vec::with_capacity(cs.len()));
+            for c in cs {
+                let Const::List(xs) = c.bare() else { unreachable!("a constant of a list shape is a list") };
+                items.extend(xs);
+                ends.push(items.len());
+            }
+            Value::List(ends.into(), Box::new(column(&items, elem)))
+        }
+        Shape::Sum(_) | Shape::Ref(_) => unreachable!("no constant is a sum or a reference"),
     }
 }
 
@@ -882,6 +1110,8 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     Ok(b.add(Op::Gather, vec![pair]))
                 }
                 Apply::Call(g) => Ok(b.graft(g, id)),
+                Apply::Check(Pattern::Any) => Ok(id),
+                Apply::Check(p) => Ok(b.add(Op::Pattern(p.clone()), vec![id])),
             }
         }
     }

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::shape::{shape_of_value, Shape};
+use crate::shape::{one_field_of, shape_of_value, Shape, ONE_FIELD};
 use crate::value::Value;
 
 /// A kernel over columns. `eval` receives a column of shape `input()` with at least one row, and
@@ -59,7 +59,8 @@ impl HostOp {
         }
         let got = shape_of_value(&input);
         if &got != k.input() {
-            return Err(format!("{}: expected input {}, got {}", k.name(), k.input(), got));
+            let note = if one_field_of(&got, k.input()) { ONE_FIELD } else { "" };
+            return Err(format!("{}: expected input {}, got {}{note}", k.name(), k.input(), got));
         }
         let n = input.len();
         if n == 0 {

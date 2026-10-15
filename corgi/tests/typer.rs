@@ -72,7 +72,7 @@ fn find_mismatched_elements_errs() {
 fn judge_rejects_unrepresentable_parameters() {
     // parameters eval cannot represent must die in the typer, not at runtime: sum arities beyond
     // the u8 tag column.
-    assert!(shape_of(&one(Inject(0, vec![Shape::Int; 300])), &Shape::Int).is_err());
+    assert!(shape_of(&one(Inject(0, vec![Some(Shape::Int); 300])), &Shape::Int).is_err());
     assert!(shape_of(&one(Branch(300)), &Shape::Prod(vec![Shape::Int, Shape::Int])).is_err());
 }
 

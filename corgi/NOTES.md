@@ -491,9 +491,10 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   `enum Name = V0 | V1 in …` is a parse-time table (variant-name → (tag, arity)); names erase at parse and the core stays positional.
   Two enums may declare the same variant name; a use of it then names its enum, `Foo::Bar` (nothing is typed while parsing, so the
   name must pick the tag by itself), and an unqualified use of a shared name is a parse error that lists the choices.
-  Use sites: `inject V` (the tag AND the whole sum's lane shapes off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
-  Payload shapes: `enum Node = Lit int | Add (int, int) | Str List(int) | Wrap Other in …` — a variant may omit its shape unless the
-  enum is ever `inject`ed (then every lane needs one, so the other lanes can be built as EMPTY columns of their shapes). Shapes nest by
+  Use sites: `inject V` (the tag AND the other lanes' shapes off the declaration), `map_variant V`, named `match` arms, `branch Name` (arity by enum name).
+  Payload shapes: `enum Node = Lit int | Add (int, int) | Str List(int) | Wrap Other in …` — a variant may omit its shape unless
+  another variant is `inject`ed (the lanes `inject` does not fill are built as EMPTY columns of their shapes; the lane it fills, if
+  left open, takes its payload's, so `enum Option = None () | Some` serves `3 inject Some` and `"dog" inject Some`). Shapes nest by
   naming an earlier enum; no recursion (μ-types are the backlog item below). There is no `⊥`: every Sum lane, in values and in shapes,
   is concrete, so `shape::join` is gone and every merge (`Unwrap`/`Select`/`Find`/`Append`/fold state) is an equality check.
   Companions landed with it: lambda parameters take `let`-style tuple patterns (`map ((lo, hi) -> …)`), and constant operands are literals (`(x, 1) sub`; the core's `And`/`Shr`/`Gt` immediate kernels are ops with a parameter, `x shr 3`; `shr` later retired for `shr_b64` and `div`).

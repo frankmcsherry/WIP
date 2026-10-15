@@ -7,7 +7,7 @@ use crate::engine::{
     unwrap_leaves, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
-use crate::shape::{same, shape_of_value, Shape};
+use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
 use crate::value::{Bounds, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
@@ -134,39 +134,114 @@ impl Rounds {
     }
 }
 
-/// what a tuple pattern takes apart: a pattern of n fields, a product of exactly n fields (the unit,
-/// for none), each taken apart by its own pattern; a name or `_` takes anything.
+/// a shape with holes: what a tuple pattern takes apart, and what an ascription `: S` checks. A
+/// pattern of n fields wants a product of exactly n fields (the unit, for none), each matching its
+/// own pattern; `Int`, `Float`, `List`, `Sum` and `Ref` want what the shapes of those names are, at
+/// every level; `_` (a name, in a tuple pattern) takes anything.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Pattern {
     Any,
     Tuple(Vec<Pattern>),
+    Int,
+    Float,
+    List(Box<Pattern>),
+    Sum(Vec<Pattern>),
+    Ref(Box<Pattern>),
 }
 
 impl Pattern {
-    /// does `v` have this pattern's nesting? If not, which part of the pattern fails, and on what.
+    /// does `v` have this pattern's shape? If not, which part of the pattern fails, and on what.
     fn check(&self, v: &Value) -> Result<(), String> {
         self.mismatch(v).map_or(Ok(()), |(part, got)| {
             let at = if std::ptr::eq(part, self) { String::new() } else { format!("in the pattern {self}, ") };
-            Err(format!("{at}the pattern {part} takes apart {}, not {got}", part.wants()))
+            let note = match got {
+                Value::Prod(fields) if fields.len() == 1 && part.mismatch(&fields[0]).is_none() => ONE_FIELD,
+                _ => "",
+            };
+            Err(format!("{at}the pattern {part} wants {}, not {}{note}", part.wants(), shape_of_value(got)))
         })
     }
 
-    fn mismatch(&self, v: &Value) -> Option<(&Pattern, Shape)> {
-        let Pattern::Tuple(ps) = self else { return None };
-        match v {
-            Value::Prod(fields) if fields.len() == ps.len() => ps.iter().zip(fields).find_map(|(p, f)| p.mismatch(f)),
-            Value::Unit(_) if ps.is_empty() => None,
-            other => Some((self, shape_of_value(other))),
-        }
+    /// the first part of the pattern `v` does not match, and the value it met there. A column's
+    /// shape is its structure, so this reads no rows.
+    fn mismatch<'v>(&self, v: &'v Value) -> Option<(&Pattern, &'v Value)> {
+        let fits = match (self, v) {
+            (Pattern::Any, _) => return None,
+            (Pattern::Tuple(ps), Value::Prod(fields)) if fields.len() == ps.len() => {
+                return ps.iter().zip(fields).find_map(|(p, f)| p.mismatch(f));
+            }
+            (Pattern::Sum(ps), Value::Sum(_, lanes)) if lanes.len() == ps.len() => {
+                return ps.iter().zip(lanes).find_map(|(p, l)| p.mismatch(l));
+            }
+            (Pattern::List(p), Value::List(_, vals)) => return p.mismatch(vals),
+            (Pattern::Ref(p), Value::Ref(list, _)) => return p.mismatch(list),
+            (Pattern::Tuple(ps), Value::Unit(_)) => ps.is_empty(),
+            (Pattern::Int, Value::Prim(p)) => p.is_int(),
+            (Pattern::Float, Value::Prim(p)) => !p.is_int(),
+            _ => false,
+        };
+        (!fits).then_some((self, v))
     }
 
-    /// what a tuple pattern takes apart, in words.
+    /// what the pattern wants, in words.
     fn wants(&self) -> String {
         match self {
             Pattern::Tuple(ps) if ps.is_empty() => "the unit".into(),
             Pattern::Tuple(ps) if ps.len() == 1 => "a product of 1 field".into(),
             Pattern::Tuple(ps) => format!("a product of {} fields", ps.len()),
+            Pattern::Sum(ps) => format!("a sum of {} lanes", ps.len()),
+            Pattern::Int => "an Int".into(),
+            Pattern::Float => "a Float".into(),
+            Pattern::List(_) => "a list".into(),
+            Pattern::Ref(_) => "a reference".into(),
             Pattern::Any => "anything".into(),
+        }
+    }
+
+    /// what both patterns want, or `None` where they want different things: a hole takes the
+    /// other side, and the rest must agree at every level.
+    pub(crate) fn meet(&self, other: &Pattern) -> Option<Pattern> {
+        let all = |a: &[Pattern], b: &[Pattern]| -> Option<Vec<Pattern>> {
+            (a.len() == b.len()).then(|| a.iter().zip(b).map(|(x, y)| x.meet(y)).collect()).flatten()
+        };
+        Some(match (self, other) {
+            (Pattern::Any, p) | (p, Pattern::Any) => p.clone(),
+            (Pattern::Tuple(a), Pattern::Tuple(b)) => Pattern::Tuple(all(a, b)?),
+            (Pattern::Sum(a), Pattern::Sum(b)) => Pattern::Sum(all(a, b)?),
+            (Pattern::List(a), Pattern::List(b)) => Pattern::List(Box::new(a.meet(b)?)),
+            (Pattern::Ref(a), Pattern::Ref(b)) => Pattern::Ref(Box::new(a.meet(b)?)),
+            (Pattern::Int, Pattern::Int) => Pattern::Int,
+            (Pattern::Float, Pattern::Float) => Pattern::Float,
+            _ => return None,
+        })
+    }
+
+    /// the shape this pattern names, if it has no holes.
+    pub fn whole(&self) -> Option<Shape> {
+        Some(match self {
+            Pattern::Any => return None,
+            Pattern::Tuple(ps) if ps.is_empty() => Shape::Unit,
+            Pattern::Tuple(ps) => Shape::Prod(ps.iter().map(Pattern::whole).collect::<Option<_>>()?),
+            Pattern::Sum(ps) => Shape::Sum(ps.iter().map(Pattern::whole).collect::<Option<_>>()?),
+            Pattern::Int => Shape::Int,
+            Pattern::Float => Shape::Float,
+            Pattern::List(p) => Shape::List(Box::new(p.whole()?)),
+            Pattern::Ref(p) => Shape::Ref(Box::new(p.whole()?)),
+        })
+    }
+}
+
+/// the pattern a shape is: the one wanting exactly that shape.
+impl From<&Shape> for Pattern {
+    fn from(s: &Shape) -> Pattern {
+        match s {
+            Shape::Int => Pattern::Int,
+            Shape::Float => Pattern::Float,
+            Shape::Unit => Pattern::Tuple(Vec::new()),
+            Shape::Prod(ss) => Pattern::Tuple(ss.iter().map(Pattern::from).collect()),
+            Shape::Sum(ss) => Pattern::Sum(ss.iter().map(Pattern::from).collect()),
+            Shape::List(s) => Pattern::List(Box::new(Pattern::from(&**s))),
+            Shape::Ref(s) => Pattern::Ref(Box::new(Pattern::from(&**s))),
         }
     }
 }
@@ -177,19 +252,34 @@ impl std::fmt::Debug for Pattern {
     }
 }
 
+/// a pattern as it is written: `(int, _)`, `List(float)`. A sum, which the surface names by its
+/// enum, shows its lanes as a shape does, `{int | ()}`.
 impl std::fmt::Display for Pattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list = |f: &mut std::fmt::Formatter<'_>, ps: &[Pattern], sep: &str| -> std::fmt::Result {
+            for (i, p) in ps.iter().enumerate() {
+                if i > 0 {
+                    write!(f, "{sep}")?;
+                }
+                write!(f, "{p}")?;
+            }
+            Ok(())
+        };
         match self {
             Pattern::Any => write!(f, "_"),
+            Pattern::Int => write!(f, "int"),
+            Pattern::Float => write!(f, "float"),
+            Pattern::List(p) => write!(f, "List({p})"),
+            Pattern::Ref(p) => write!(f, "Ref({p})"),
             Pattern::Tuple(ps) => {
                 write!(f, "(")?;
-                for (i, p) in ps.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{p}")?;
-                }
+                list(f, ps, ", ")?;
                 write!(f, ")")
+            }
+            Pattern::Sum(ps) => {
+                write!(f, "{{")?;
+                list(f, ps, " | ")?;
+                write!(f, "}}")
             }
         }
     }
@@ -210,17 +300,18 @@ pub enum Op<L> {
     // PROD — intro is the graph-structural `Tuple`. Products are transparent (fixed arity, no
     // witness column), so map is projection+rebuild and capture is `tuple` itself: no ops needed.
     Field(usize),   // elim:  (.., X_i, ..) -> X_i
-    Pattern(Pattern), // check: X -> X, where X has the pattern's nesting of products (see `Pattern`):
-                    //        what a tuple pattern takes apart, checked whole where it takes it apart.
-                    //        The pattern's names read through it.
+    Pattern(Pattern), // check: X -> X, where X has the pattern's shape (see `Pattern`): what a
+                    //        tuple pattern takes apart, checked whole where it takes it apart, and what
+                    //        an ascription `: S` says. The pattern's names read through it.
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, Int-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
                     //        Total: a tag of n-1 or more goes to the last lane, so on a mask any
                     //        nonzero tag is "true", as `filter` reads masks.
-    Inject(usize, Vec<Shape>), // intro: X -> Sum{..} — the constant-tag Branch: the input fills lane
-                    //        `tag` of the declared sum shape (whose lane `tag` must be X); the other
-                    //        lanes are empty columns of their declared shapes.
+    Inject(usize, Vec<Option<Shape>>), // intro: X -> Sum{..} — the constant-tag Branch: the input
+                    //        fills lane `tag`, and the other lanes are empty columns of their declared
+                    //        shapes. Lane `tag` may be undeclared (`None`): its shape is then X's, as
+                    //        `Branch`'s lanes take theirs from the input; declared, it must be X.
     Unwrap,         // elim:  homogeneous Sum -> payload
     MapSum(Vec<(usize, Graph<L>)>), // map: closed bodies on chosen variants; unlisted variants
                     // pass through. The Vec breaks the type recursion, so no Box. A variadic
@@ -303,8 +394,9 @@ pub enum Op<L> {
                     // favour Select. Shape-generic: it IS `gather_lanes([else, then], mask, identity)`.
 
     // the List monoid + measure (both 1:1 on the SEQ — cardinality stays inside the list).
-    Append,         // (List<X>, List<X>) -> List<X>   row-wise concat: row i = a[i] ++ b[i] (the ⊕ of
-                    // the list monoid, [] its unit). Same-shape elements, as in Zip.
+    Append,         // (List<X>, List<X>, ..) -> List<X>  row-wise concat: row i = a[i] ++ b[i] ++ .. (the
+                    // ⊕ of the list monoid, [] its unit), over one or more lists. Same-shape elements,
+                    // as in Zip.
     Len,            // List<X> -> Int                  each row's element count, read straight off the
                     // bounds (O(1) — the count the structure already holds, not a fold over the row).
     Cut,            // List<(Int-mask, X)> -> List<List<X>>  cut each row into pieces: a piece starts
@@ -536,39 +628,62 @@ impl<L: OpLike> Op<L> {
                 Value::List(nb.into(), Box::new(compress(&vals, m, acc)))
             }
 
-            // row-wise append: row r's output is a's row r elements followed by b's. A multi-source
-            // gather over the two value columns ([a, b]) reuses the engine's `gather_lanes`, so it
-            // works for any element shape X (leaf / product / list / sum).
+            // row-wise append: row r's output is each list's row r elements in turn. A multi-source
+            // gather over the value columns reuses the engine's `gather_lanes`, so it works for any
+            // element shape X (leaf / product / list / sum). A list of computed values is this over
+            // enlisted columns: `(a enlist, b enlist, c enlist) append`, one pass.
             Op::Append => {
-                let (a, b) = input.into_pair("Append")?;
-                let (ab, av) = a.into_list("Append lhs")?;
-                let (bb, bv) = b.into_list("Append rhs")?;
-                same(&shape_of_value(&av), &shape_of_value(&bv)).map_err(|e| format!("Append: {e}"))?;
-                // both are SEQ columns, hence equal row count by the product invariant (defensive).
-                assert_eq!(ab.len(), bb.len(), "Append: row count mismatch");
-                // leaves: each row's two runs copied in turn, with no index per element
-                let (av, bv) = match (av, bv) {
-                    (Value::Prim(pa), Value::Prim(pb)) => {
-                        let (pa, pb) = Prim::meet(pa, pb);
-                        let (vals, ends) = pa.append_rows(&ab, &pb, &bb);
-                        return Ok(Value::List(ends.into(), Box::new(Value::Prim(vals))));
-                    }
-                    other => other,
-                };
-                let cap = av.len() + bv.len();
-                let mut nb = Vec::with_capacity(ab.len());
-                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
-                let (mut acc, mut sa, mut sb) = (0usize, 0usize, 0usize);
-                for r in 0..ab.len() {
-                    let (ea, eb) = (ab.end(r), bb.end(r));
-                    for p in sa..ea { tags.push(0); off.push(p); } // a's row-r elements ...
-                    for p in sb..eb { tags.push(1); off.push(p); } // ... then b's
-                    acc += (ea - sa) + (eb - sb);
-                    nb.push(acc);
-                    sa = ea;
-                    sb = eb;
+                let mut parts = Vec::new();
+                for c in input.into_prod("Append")? {
+                    parts.push(c.into_list("Append operand")?);
                 }
-                Value::List(nb.into(), Box::new(gather_lanes(&[Some(&av), Some(&bv)], &tags, &off)))
+                let Some((_, first)) = parts.first() else {
+                    return Err("Append expects a nonempty product of lists".into());
+                };
+                let shape = shape_of_value(first);
+                for (_, v) in &parts[1..] {
+                    same(&shape, &shape_of_value(v)).map_err(|e| format!("Append: {e}"))?;
+                }
+                if parts.len() == 1 {
+                    let (b, v) = parts.pop().unwrap();
+                    return Ok(Value::List(b, Box::new(v)));
+                }
+                // all SEQ columns, hence equal row count by the product invariant (defensive).
+                let rows = parts[0].0.len();
+                assert!(parts.iter().all(|(b, _)| b.len() == rows), "Append: row count mismatch");
+                // leaves: each row's runs copied in turn, with no index per element, at the widest
+                // storage among them
+                let leaves: Option<Vec<&Prim>> =
+                    parts.iter().map(|(_, v)| if let Value::Prim(p) = v { Some(p) } else { None }).collect();
+                if let Some(leaves) = leaves {
+                    let wide = leaves.iter().any(|p| p.bits() != leaves[0].bits());
+                    let prims: Vec<Prim> = leaves.iter().map(|p| if wide { p.widen() } else { (*p).clone() }).collect();
+                    let (vals, bounds) = match &prims[..] {
+                        [a, b] => {
+                            let (vals, ends) = a.append_rows(&parts[0].0, b, &parts[1].0);
+                            (vals, ends.into())
+                        }
+                        _ => {
+                            let runs: Vec<(&Bounds, &Prim)> = parts.iter().map(|(b, _)| b).zip(&prims).collect();
+                            prims[0].append_rows_n(&runs)
+                        }
+                    };
+                    return Ok(Value::List(bounds, Box::new(Value::Prim(vals))));
+                }
+                let cap = parts.iter().map(|(_, v)| v.len()).sum();
+                let mut nb = Vec::with_capacity(rows);
+                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+                let mut starts = vec![0usize; parts.len()];
+                for r in 0..rows {
+                    for (k, (b, _)) in parts.iter().enumerate() {
+                        let e = b.end(r);
+                        for p in starts[k]..e { tags.push(k); off.push(p); } // list k's row-r elements
+                        starts[k] = e;
+                    }
+                    nb.push(tags.len());
+                }
+                let srcs: Vec<Option<&Value>> = parts.iter().map(|(_, v)| Some(v)).collect();
+                Value::List(nb.into(), Box::new(gather_lanes(&srcs, &tags, &off)))
             }
 
             // each row's length, read off the bounds in one pass (no per-element work).
@@ -677,19 +792,31 @@ impl<L: OpLike> Op<L> {
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
             // payload column fills that lane, the others are zero-row columns of their declared
             // shapes. The unary dual of `tuple`.
-            Op::Inject(tag, shapes) => {
+            Op::Inject(tag, lanes) => {
                 let n = input.len();
-                if *tag >= shapes.len() {
-                    return Err(format!("Inject: tag {tag} out of range for arity {}", shapes.len()));
+                if *tag >= lanes.len() {
+                    return Err(format!("Inject: tag {tag} out of range for arity {}", lanes.len()));
                 }
-                if shapes.len() > 256 {
-                    return Err(format!("Inject: arity {} exceeds the u8 tag width", shapes.len()));
+                if lanes.len() > 256 {
+                    return Err(format!("Inject: arity {} exceeds the u8 tag width", lanes.len()));
                 }
-                if shapes[*tag] != shape_of_value(&input) {
-                    return Err(format!("Inject: lane {tag} is declared {}, got {}", shapes[*tag], shape_of_value(&input)));
+                if let Some(declared) = &lanes[*tag] {
+                    let got = shape_of_value(&input);
+                    if *declared != got {
+                        let note = if one_field_of(&got, declared) { ONE_FIELD } else { "" };
+                        return Err(format!("Inject: lane {tag} is declared {declared}, got {got}{note}"));
+                    }
                 }
-                let mut variants: Vec<Value> = shapes.iter().map(Value::empty).collect();
-                variants[*tag] = input;
+                let mut payload = Some(input);
+                let variants = lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(k, lane)| match lane {
+                        _ if k == *tag => Ok(payload.take().expect("one payload")),
+                        Some(s) => Ok(Value::empty(s)),
+                        None => Err(format!("Inject: lane {k} has no shape; only the lane the payload fills takes its shape from it")),
+                    })
+                    .collect::<Result<Vec<Value>, String>>()?;
                 // a constant tag run: the assignment is two words, and the within-lane offset IS
                 // the row index — neither column is materialised (see `Tags::Const`).
                 Value::sum_tagged(Tags::Const(*tag, n), variants)

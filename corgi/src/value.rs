@@ -449,6 +449,48 @@ macro_rules! prim {
                 }
             }
 
+            /// row by row, each part's row in turn (by its bounds), and the rows' bounds:
+            /// [`Prim::append_rows`] for any number of parts, all at this leaf's storage. Parts of
+            /// one width per row (each an enlisted column, as a list of computed values is) make
+            /// rows of one width, read and written with no bounds per row.
+            pub(crate) fn append_rows_n(&self, parts: &[(&Bounds, &Prim)]) -> (Prim, Bounds) {
+                match self {
+                    $( Prim::$V(_) => {
+                        let vals: Vec<&[$t]> = parts
+                            .iter()
+                            .map(|(_, p)| match p {
+                                Prim::$V(v) => &v[..],
+                                _ => unreachable!("append_rows_n: one storage"),
+                            })
+                            .collect();
+                        let rows = parts[0].0.len();
+                        let mut out = Vec::with_capacity(vals.iter().map(|v| v.len()).sum());
+                        if let Some(widths) = parts.iter().map(|(b, _)| b.strided()).collect::<Option<Vec<usize>>>() {
+                            for r in 0..rows {
+                                for (v, &k) in vals.iter().zip(&widths) {
+                                    match k {
+                                        1 => out.push(v[r]),
+                                        k => out.extend_from_slice(&v[r * k..(r + 1) * k]),
+                                    }
+                                }
+                            }
+                            return (Prim::$V(Arc::new(out)), Bounds::Stride(widths.iter().sum(), rows));
+                        }
+                        let mut ends = Vec::with_capacity(rows);
+                        let mut starts = vec![0; parts.len()];
+                        for r in 0..rows {
+                            for (k, (b, _)) in parts.iter().enumerate() {
+                                let e = b.end(r);
+                                out.extend_from_slice(&vals[k][starts[k]..e]);
+                                starts[k] = e;
+                            }
+                            ends.push(out.len());
+                        }
+                        (Prim::$V(Arc::new(out)), ends.into())
+                    } )+
+                }
+            }
+
             /// row by row, this leaf's row (by `tb`) where `pick` is nonzero and `other`'s (by `eb`)
             /// where it is zero, and where each row now ends. Both at one storage.
             pub(crate) fn blend_rows(&self, tb: &Bounds, other: &Prim, eb: &Bounds, pick: &[u8]) -> (Prim, Vec<usize>) {
@@ -1020,6 +1062,17 @@ fn truncate_arc<T: Clone>(v: &mut Arc<Vec<T>>, n: usize) {
 /// a `Sum` taken apart: its lane assignment and its lanes.
 pub type SumParts = (Tags, Vec<Value>);
 
+/// the shape error for an operand `got` that `who` cannot take, where `wanted` says what it takes and
+/// `fits` whether a value is that. A one-field tuple holding what was wanted is noted as one: the
+/// trap of writing `(e)` for `e`, as parentheses build a tuple wherever they appear.
+fn wrong(who: &str, wanted: &str, got: &Value, fits: fn(&Value) -> bool) -> String {
+    let note = match got {
+        Value::Prod(fields) if fields.len() == 1 && fits(&fields[0]) => crate::shape::ONE_FIELD,
+        _ => "",
+    };
+    format!("{who}: expected {wanted}, got {}{note}", shape_of_value(got))
+}
+
 // input accessors: destructure a `Value` to the shape an op expects; a mismatch is the shape ERROR
 // the typer reports (an op's eval is `shape_of` when run on zero rows). `into_*` consume `self` and
 // move the buffers out.
@@ -1031,7 +1084,7 @@ impl Value {
                 let a = cols.pop().unwrap();
                 Ok((a, b))
             }
-            other => Err(format!("{who}: expected a pair, got {}", shape_of_value(&other))),
+            other => Err(wrong(who, "a pair", &other, |v| matches!(v, Value::Prod(c) if c.len() == 2))),
         }
     }
 
@@ -1045,7 +1098,7 @@ impl Value {
     pub fn into_list(self, who: &str) -> Result<(Bounds, Value), String> {
         match self {
             Value::List(bounds, vals) => Ok((bounds, *vals)),
-            other => Err(format!("{who}: expected a list, got {}", shape_of_value(&other))),
+            other => Err(wrong(who, "a list", &other, |v| matches!(v, Value::List(..)))),
         }
     }
 
@@ -1059,14 +1112,14 @@ impl Value {
                 let (bounds, vals) = referenced(list);
                 Ok((Rows::Named(bounds, rows), vals))
             }
-            other => Err(format!("{who}: expected a list (or a referenced list), got {}", shape_of_value(other))),
+            other => Err(wrong(who, "a list (or a referenced list)", other, |v| matches!(v, Value::List(..) | Value::Ref(..)))),
         }
     }
 
     pub fn into_sum(self, who: &str) -> Result<SumParts, String> {
         match self {
             Value::Sum(tags, variants) => Ok((tags, variants)),
-            other => Err(format!("{who}: expected a sum, got {}", shape_of_value(&other))),
+            other => Err(wrong(who, "a sum", &other, |v| matches!(v, Value::Sum(..)))),
         }
     }
 
@@ -1082,7 +1135,7 @@ impl Value {
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(&xs[..])),
             Value::Prim(Prim::U8(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| x as i64).collect())),
-            other => Err(format!("{who}: expected Int, got {}", shape_of_value(other))),
+            other => Err(wrong(who, "Int", other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
         }
     }
 
@@ -1092,7 +1145,7 @@ impl Value {
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Arc::try_unwrap(xs).unwrap_or_else(|a| (*a).clone())),
             Value::Prim(Prim::U8(xs)) => Ok(xs.iter().map(|&x| x as i64).collect()),
-            other => Err(format!("{who}: expected Int, got {}", shape_of_value(&other))),
+            other => Err(wrong(who, "Int", &other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
         }
     }
 
@@ -1108,7 +1161,7 @@ impl Value {
         match self {
             Value::Prim(Prim::U8(xs)) => Ok(Cow::Borrowed(&xs[..])),
             Value::Prim(Prim::I64(xs)) => Ok(Cow::Owned(xs.iter().map(|&x| (x != 0) as u8).collect())),
-            other => Err(format!("{who}: expected an Int mask, got {}", shape_of_value(other))),
+            other => Err(wrong(who, "an Int mask", other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
         }
     }
 
@@ -1117,7 +1170,7 @@ impl Value {
     pub(crate) fn as_u8(&self, who: &str) -> Result<&[u8], String> {
         match self {
             Value::Prim(Prim::U8(xs)) => Ok(&xs[..]),
-            other => Err(format!("{who}: expected Int bytes, got {}", shape_of_value(other))),
+            other => Err(wrong(who, "Int bytes", other, |v| matches!(v, Value::Prim(Prim::U8(_))))),
         }
     }
 
@@ -1125,14 +1178,14 @@ impl Value {
     pub fn as_f64(&self, who: &str) -> Result<Vec<f64>, String> {
         match self {
             Value::Prim(Prim::F64(ks)) => Ok(ks.iter().map(|&k| f64_of_key(k)).collect()),
-            other => Err(format!("{who}: expected Float, got {}", shape_of_value(other))),
+            other => Err(wrong(who, "Float", other, |v| matches!(v, Value::Prim(Prim::F64(_))))),
         }
     }
 
     pub(crate) fn into_prim(self, who: &str) -> Result<Prim, String> {
         match self {
             Value::Prim(p) => Ok(p),
-            other => Err(format!("{who}: expected a leaf, got {}", shape_of_value(&other))),
+            other => Err(wrong(who, "a leaf", &other, |v| matches!(v, Value::Prim(_)))),
         }
     }
 }

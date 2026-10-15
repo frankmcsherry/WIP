@@ -25,7 +25,20 @@ pub enum Shape {
 
 /// the one shape two merging operands must share: their common shape, or the type error.
 pub(crate) fn same(a: &Shape, b: &Shape) -> Result<Shape, String> {
-    if a == b { Ok(a.clone()) } else { Err(format!("shapes differ: {a} vs {b}")) }
+    if a == b {
+        return Ok(a.clone());
+    }
+    let note = if one_field_of(a, b) || one_field_of(b, a) { ONE_FIELD } else { "" };
+    Err(format!("shapes differ: {a} vs {b}{note}"))
+}
+
+/// the note on a shape error whose operand is a one-field tuple of what was wanted: the trap of
+/// writing `(e)` for `e`, as parentheses build a tuple wherever they appear.
+pub(crate) const ONE_FIELD: &str = " (a one-field tuple: parentheses build a tuple, so `(e)` is not `e`)";
+
+/// is `got` a one-field tuple of exactly `want`?
+pub(crate) fn one_field_of(got: &Shape, want: &Shape) -> bool {
+    matches!(got, Shape::Prod(fields) if fields.len() == 1 && fields[0] == *want)
 }
 
 /// the structural shape of a concrete value.

@@ -172,10 +172,13 @@ fn is_inverse(outer: &Op<NumOp>, inner: &Op<NumOp>) -> bool {
     use Op::*;
     match (outer, inner) {
         (Zip, Transpose) | (Transpose, Zip) | (Weave, Unweave) | (Unweave, Weave) => true,
-        // `unwrap(inject x) = x`, the Sum-side pair. Only when every declared lane has one shape:
-        // otherwise `Unwrap` is a shape ERROR on this sum, and cancelling would turn a program the
-        // typer rejects into one it accepts.
-        (Unwrap, Inject(_, shapes)) => shapes.windows(2).all(|w| w[0] == w[1]),
+        // `unwrap(inject x) = x`, the Sum-side pair. Only when every lane has one shape: otherwise
+        // `Unwrap` is a shape ERROR on this sum, and cancelling would turn a program the typer
+        // rejects into one it accepts. A lane taking its shape from the payload is known only then,
+        // so it agrees with the others only when there are none.
+        (Unwrap, Inject(_, lanes)) => {
+            lanes.len() == 1 || (lanes.iter().all(Option::is_some) && lanes.windows(2).all(|w| w[0] == w[1]))
+        }
         _ => false,
     }
 }

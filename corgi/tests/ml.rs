@@ -459,3 +459,120 @@ fn all_and_any_of_written_conditions() {
     assert_eq!(run_ml("input map (w -> ((w len, 0) gt) all)", &input), run_ml("input map (w -> (w len, 0) gt)", &input));
     assert!(Program::compile_ml("input map (w -> w all)").is_err());
 }
+
+/// shape errors from typing `src` against `input`'s shape.
+fn shape_err(src: &str, input: &Shape) -> String {
+    Program::compile_ml(src).expect("parse error").shape(input).expect_err("typed")
+}
+
+/// A list literal of constants is one constant, as a string is: `"ab"` and `[97, 98]` build the
+/// same graph, a single `Lit` filled to its scope's length.
+#[test]
+fn list_literal_is_one_constant() {
+    assert_eq!(parse_ml("[97, 98, 99]").unwrap(), parse_ml("\"abc\"").unwrap());
+    assert_eq!(parse_ml("[1, 2, 300]").unwrap().node_count(), 2); // the input, and the literal
+    assert_eq!(run_ml("[1, 2, 300]", &int(&[5, 6])), "List ends=[3, 6] <[1, 2, 300, 1, 2, 300]>");
+    // tuples, strings, negative numbers, floats, the unit, and lists, nested
+    assert_eq!(
+        run_ml("[(0, \"GET\", -1, 1.5, ()), (1, \"PUT\", 2, -0.5, ())]", &int(&[7])),
+        "List ends=[2] <([0, 1], List ends=[3, 6] <[71, 69, 84, 80, 85, 84]>, [-1, 2], [1.5, -0.5], ()x2)>",
+    );
+    assert_eq!(run_ml("[[1, 2], [], [3]]", &int(&[7])), "List ends=[3] <List ends=[2, 2, 3] <[1, 2, 3]>>");
+    // in a lambda, the literal is as long as the lambda's parameter
+    assert_eq!(run_ml("input iota map (i -> ([10, 20], i enlist) append)", &int(&[2])), "List ends=[2] <List ends=[3, 6] <[10, 20, 0, 10, 20, 1]>>");
+}
+
+/// `[]` takes its shape from an ascription, or from the elements beside it; with neither it is an
+/// error, as is an element that is not a constant.
+#[test]
+fn empty_list_literal_needs_its_shape() {
+    assert_eq!(run_ml("[] : List((int, int))", &int(&[7, 8])), "List ends=[0, 0] <([], [])>");
+    assert_eq!(Program::compile_ml("[] : List((int, int))").unwrap().shape(&Shape::Int).unwrap().to_string(), "List<(Int, Int)>");
+    assert_eq!(run_ml("[([], 1), ([2], 3)]", &int(&[7])), "List ends=[2] <(List ends=[0, 1] <[2]>, [1, 3])>");
+    assert_eq!(run_ml("[[] : List(int)]", &int(&[7])), "List ends=[1] <List ends=[0] <[]>>");
+    let err = |src: &str| Program::compile_ml(src).err().unwrap_or_else(|| panic!("{src} parsed"));
+    for hole in ["[]", "[[]]", "[] : List(_)"] {
+        assert!(err(hole).contains("has a hole"), "{hole}: {}", err(hole));
+    }
+    assert!(err("[1, 2.5]").ends_with("a list literal's elements differ in shape: int and float"));
+    assert!(err("[1] : List(float)").ends_with("a constant of shape List(int) is not List(float)"));
+    for computed in ["[input]", "[(1, 2) add]"] {
+        assert!(err(computed).contains("(a enlist, b enlist) append"), "{computed}: {}", err(computed));
+    }
+}
+
+/// `: S` checks a value's shape, as a stage and on a pattern; `_` is a hole. A failed check is a
+/// shape error when the program is typed.
+#[test]
+fn ascriptions_check_shapes() {
+    let input = Value::Prod(vec![int(&[1, 2]), Value::List(vec![1, 3].into(), Box::new(int(&[4, 5, 6])))]);
+    let shape = Shape::Prod(vec![Shape::Int, Shape::List(Box::new(Shape::Int))]);
+    let typed = "let (k : int, vs : List(int)) = input in (k, vs fold_add : int) add : int";
+    assert_eq!(Program::compile_ml(typed).unwrap().shape(&shape).unwrap(), Shape::Int);
+    assert_eq!(run_ml(typed, &input), "[5, 13]");
+    assert_eq!(run_ml("input : (int, List(_)) .1 len", &input), "[1, 2]");
+    // the fold's signature, written out
+    assert_eq!(run_ml("((0, 0), input.1) fold ((acc : (int, int), x : int) -> ((acc.0, x) add, (acc.1, 1) add))", &input), "([4, 11], [1, 2])");
+    assert_eq!(shape_err("input .1 : List(float)", &shape), "in the pattern List(float), the pattern float wants a Float, not Int");
+    assert_eq!(shape_err("let (k, vs) : (int, int) = input in k", &shape), "in the pattern (int, int), the pattern int wants an Int, not List<Int>");
+    assert!(Program::compile_ml("let (k, vs) : (int, int, int) = input in k").is_err()); // the pattern itself has 2 fields
+    // an enum whose variants declare no payloads is a sum of holes
+    let tagged = "enum Opt = None | Some in (input.0, input.0) branch Opt : Opt";
+    assert_eq!(run_ml(tagged, &input), run_ml("(input.0, input.0) branch 2", &input));
+    assert_eq!(shape_err("enum Opt = None | Some | Many in (input.0, input.0) branch 2 : Opt", &shape), "the pattern {_ | _ | _} wants a sum of 3 lanes, not {Int | Int}");
+}
+
+/// `append` takes one or more lists, so a list of computed values is one append of enlisted
+/// columns, as long as each row has its elements.
+#[test]
+fn append_takes_any_number_of_lists() {
+    let input = Value::Prod(vec![int(&[1, 2]), int(&[300, 4])]);
+    let three = "let (a, b) = input in (a enlist, b enlist, (a, b) add enlist) append";
+    assert_eq!(run_ml(three, &input), "List ends=[3, 6] <[1, 300, 301, 2, 4, 6]>");
+    // the same as the pairs it replaces
+    let pairs = "let (a, b) = input in ((a enlist, b enlist) append, (a, b) add enlist) append";
+    assert_eq!(run_ml(three, &input), run_ml(pairs, &input));
+    // elements that are not leaves, and a single list
+    assert_eq!(
+        run_ml("let (a, b) = input in ((a, b) enlist, (b, a) enlist, ((a, b) add, 0) enlist) append", &input),
+        "List ends=[3, 6] <([1, 300, 301, 2, 4, 6], [300, 1, 0, 4, 2, 0])>",
+    );
+    assert_eq!(run_ml("let (a, b) = input in (a iota) append", &input), run_ml("input.0 iota", &input));
+    // lists held at different storages meet at the wider
+    assert_eq!(run_ml("(\"ab\", 300 enlist, input.0 enlist) append", &input), "List ends=[4, 8] <[97, 98, 300, 1, 97, 98, 300, 2]>");
+}
+
+/// A closed program evaluated on one unit row is a constant: how a host can write a value in corgi.
+#[test]
+fn closed_program_on_one_row_is_a_value() {
+    let p = Program::compile_ml("enum Opt = None () | Some int in ([(1, \"a\"), (2, \"bc\")], 7 inject Some)").unwrap();
+    assert_eq!(show(&p.run(Value::Unit(1))), "(List ends=[2] <([1, 2], List ends=[1, 3] <[97, 98, 99]>)>, Sum tags=[1] [()x0, [7]])");
+}
+
+/// `inject` into a variant whose payload shape the enum leaves open fills it with the payload's
+/// shape, so one `Option` serves every payload. The lanes it does not fill still need shapes.
+#[test]
+fn inject_fills_an_open_lane_with_its_payloads_shape() {
+    let both = Program::compile_ml("enum Option = None () | Some in (3 inject Some, \"dog\" inject Some)").unwrap();
+    assert_eq!(both.shape(&Shape::Unit).unwrap().to_string(), "({() | Int}, {() | List<Int>})");
+    assert_eq!(show(&both.run(Value::Unit(1))), "(Sum tags=[1] [()x0, [3]], Sum tags=[1] [()x0, List ends=[3] <[100, 111, 103]>])");
+    // matched by name and checked by ascription, whatever the payload
+    assert_eq!(run_ml("enum Option = None () | Some in input inject Some : Option match (None (_ -> 0), Some (x -> (x, 1) add))", &int(&[1, 2])), "[2, 3]");
+    // a declared lane is still checked, and the lanes not filled must be declared
+    assert_eq!(shape_err("enum O = N () | S int in \"dog\" inject S", &Shape::Unit), "Inject: lane 1 is declared Int, got List<Int>");
+    let none = Program::compile_ml("enum Option = None () | Some in () inject None").err().unwrap();
+    assert!(none.ends_with("inject None: enum 'Option' declares no payload shape for 'Some', whose empty lane needs one"), "{none}");
+}
+
+/// Parentheses build a tuple, so `(e)` where `e` was meant is a one-field tuple; a shape error on
+/// one that holds what was wanted says so.
+#[test]
+fn shape_errors_note_a_one_field_tuple() {
+    let note = "(a one-field tuple: parentheses build a tuple, so `(e)` is not `e`)";
+    for src in ["(([] : List(int)), [1]) append", "((input), 2) add", "((input), input) min", "(input) : int"] {
+        let err = shape_err(src, &Shape::Int);
+        assert!(err.ends_with(note), "{src}: {err}");
+    }
+    // a one-field tuple of something else is no such slip
+    assert_eq!(shape_err("(input) fold_add", &Shape::Int), "reduce: expected a list, got (Int)");
+}

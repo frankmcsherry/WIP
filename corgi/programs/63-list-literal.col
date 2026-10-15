@@ -1,0 +1,10 @@
+# list literals: a list of constants is one literal, filled to every row as a string is ("ab" is
+# [97, 98]), and an empty one takes its shape from an ascription. A list of computed values is an
+# `append` of enlisted columns, any number of them, in one pass: here [x, 10x, x*x] for each x.
+# n = 3
+# = (List ends=[2] <List ends=[3, 6] <[71, 69, 84, 80, 85, 84]>>, List ends=[3] <List ends=[3, 6, 9] <[0, 0, 0, 1, 10, 1, 2, 20, 4]>>, List ends=[0] <[]>)
+let xs = input iota in
+( ["GET", "PUT"]
+, xs map (x -> (x enlist, (x, 10) mul enlist, (x, x) mul enlist) append)
+, [] : List(int)
+)
