@@ -15,6 +15,7 @@ use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
+use crate::pool::{collect, leaf, take, Buf, Pooled};
 use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value};
 use std::sync::Arc;
 
@@ -96,7 +97,7 @@ pub enum ArithOp {
 /// Both lanes are read before the store, so EITHER side is a valid destination (Sub included:
 /// `f` is `x - y` regardless of where it lands). `get_mut` (not `make_mut`) tests uniqueness
 /// without cloning, so a shared LHS falls through to a unique RHS; only when both are shared do we allocate.
-fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) -> T) -> Arc<Vec<T>> {
+fn bin_into<T: Pooled>(mut a: Arc<Buf<T>>, mut b: Arc<Buf<T>>, f: impl Fn(T, T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for (x, &y) in dst.iter_mut().zip(b.iter()) { *x = f(*x, y); }
         a
@@ -104,28 +105,28 @@ fn bin_into<T: Copy>(mut a: Arc<Vec<T>>, mut b: Arc<Vec<T>>, f: impl Fn(T, T) ->
         for (&x, y) in a.iter().zip(dst.iter_mut()) { *y = f(x, *y); }
         b
     } else {
-        Arc::new(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect())
+        leaf(collect(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y))))
     }
 }
 
 /// apply a unary lane op `f` in place when the operand is uniquely owned, else fresh. (A binary op
 /// against a constant is this with the constant captured.)
-fn map_into<T: Copy>(mut a: Arc<Vec<T>>, f: impl Fn(T) -> T) -> Arc<Vec<T>> {
+fn map_into<T: Pooled>(mut a: Arc<Buf<T>>, f: impl Fn(T) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut a) {
         for x in dst.iter_mut() { *x = f(*x); }
         a
     } else {
-        Arc::new(a.iter().map(|&x| f(x)).collect())
+        leaf(collect(a.iter().map(|&x| f(x))))
     }
 }
 
 /// `f(own, other)` lane by lane, into `own`'s buffer when it is uniquely held, else fresh.
-fn zip_into<T: Copy, U: Copy>(mut own: Arc<Vec<T>>, other: &[U], f: impl Fn(T, U) -> T) -> Arc<Vec<T>> {
+fn zip_into<T: Pooled, U: Copy>(mut own: Arc<Buf<T>>, other: &[U], f: impl Fn(T, U) -> T) -> Arc<Buf<T>> {
     if let Some(dst) = Arc::get_mut(&mut own) {
         for (x, &y) in dst.iter_mut().zip(other) { *x = f(*x, y); }
         own
     } else {
-        Arc::new(own.iter().zip(other).map(|(&x, &y)| f(x, y)).collect())
+        leaf(collect(own.iter().zip(other).map(|(&x, &y)| f(x, y))))
     }
 }
 
@@ -138,7 +139,7 @@ fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
         (Prim::I64(x), Prim::U8(y)) => Prim::I64(zip_into(x, &y, |p, q: u8| f(p, q as i64))),
         (Prim::U8(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: u8| f(p as i64, q))),
         (Prim::U8(x), Prim::U8(y)) => {
-            Prim::I64(Arc::new(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)).collect()))
+            Prim::I64(leaf(collect(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)))))
         }
         _ => unreachable!("int_pairs: integer leaves, checked by the caller"),
     }
@@ -149,7 +150,7 @@ fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
 fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
     match a {
         Prim::I64(x) => Prim::I64(map_into(x, f)),
-        Prim::U8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
+        Prim::U8(x) => Prim::I64(leaf(collect(x.iter().map(|&p| f(p as i64))))),
         Prim::F64(_) => unreachable!("int_map: an integer leaf, checked by the caller"),
     }
 }
@@ -212,7 +213,7 @@ macro_rules! byte_bits {
 }
 
 /// `x op c` over bytes, in place when `x` is uniquely owned.
-fn byte_imm(x: Arc<Vec<u8>>, c: u8, f: impl Fn(u8, u8) -> u8) -> Arc<Vec<u8>> {
+fn byte_imm(x: Arc<Buf<u8>>, c: u8, f: impl Fn(u8, u8) -> u8) -> Arc<Buf<u8>> {
     map_into(x, move |x| f(x, c))
 }
 
@@ -315,10 +316,10 @@ fn imm_eval(op: BinOp, a: Prim, c: Scalar, left: bool) -> Result<Prim, String> {
     fn int_imm_left(a: Prim, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
         int_map(a, move |x| f(c, x))
     }
-    fn float_imm(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
+    fn float_imm(a: Arc<Buf<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
         Prim::F64(map_into(a, move |x| f(x, k)))
     }
-    fn float_imm_left(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
+    fn float_imm_left(a: Arc<Buf<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
         Prim::F64(map_into(a, move |x| f(k, x)))
     }
     Ok(match (a, c) {
@@ -412,14 +413,16 @@ fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: 
 }
 
 /// `f` of each row's slice of `xs`; a stride's rows are its fixed-size chunks.
-fn per_row<T, R>(bounds: &crate::value::Bounds, xs: &[T], f: impl FnMut(&[T]) -> R) -> Vec<R> {
+fn per_row<T, R: Pooled>(bounds: &crate::value::Bounds, xs: &[T], f: impl FnMut(&[T]) -> R) -> Vec<R> {
+    let mut out = take(bounds.len());
     match bounds {
-        crate::value::Bounds::Stride(k, _) if *k > 0 => xs.chunks_exact(*k).map(f).collect(),
+        crate::value::Bounds::Stride(k, _) if *k > 0 => out.extend(xs.chunks_exact(*k).map(f)),
         _ => {
             let mut start = 0;
-            bounds.ends().map(|end| { let row = &xs[start..end]; start = end; row }).map(f).collect()
+            out.extend(bounds.ends().map(|end| { let row = &xs[start..end]; start = end; row }).map(f))
         }
     }
+    out
 }
 
 /// each row's reduction of Floats, held as their order keys. A sum is the fold of `add` from 0.0 in
@@ -441,7 +444,7 @@ fn reduce_floats(bounds: &crate::value::Bounds, ks: &[u64], r: Red) -> Result<Va
         Red::Max => rows.map(|s| s.iter().copied().max().unwrap_or(zero)).collect(),
         Red::All | Red::Any => return Err("fold_all and fold_any read a mask, which is an Int, not a Float".into()),
     };
-    Ok(Value::Prim(Prim::F64(Arc::new(out))))
+    Ok(Value::Prim(Prim::F64(leaf(out))))
 }
 
 /// each row's inclusive prefix under `step`, written over `xs` in place, starting from `id` in every
@@ -496,36 +499,46 @@ impl ArithOp {
                 }
             }
             ArithOp::Scan(r) => {
-                let (bounds, vals) = input.into_list("scan")?;
-                let out = match vals.into_prim("scan values")? {
+                // the inclusive prefix is written in place: into the list's own box, and into its
+                // leaf's own buffer when that is uniquely held (a shared one is copied first, a
+                // byte one widened).
+                let (bounds, mut vals) = input.into_list_boxed("scan")?;
+                *vals = match std::mem::replace(&mut *vals, Value::Unit(0)).into_prim("scan values")? {
                     // Floats as their keys: a running sum or product decodes, adds in row order and
                     // encodes; a running least or greatest compares the keys.
-                    Prim::F64(ks) => {
-                        let mut ks = Arc::unwrap_or_clone(ks);
+                    Prim::F64(mut ks) => {
+                        let k = Arc::make_mut(&mut ks);
                         let float = |f: fn(f64, f64) -> f64| move |a: u64, k: u64| f64_key(f(f64_of_key(a), f64_of_key(k)));
                         match r {
-                            Red::Add => prefix_rows(&bounds, &mut ks, f64_key(0.0), float(|a, x| a + x)),
-                            Red::Mul => prefix_rows(&bounds, &mut ks, f64_key(1.0), float(|a, x| a * x)),
-                            Red::Min => prefix_rows(&bounds, &mut ks, u64::MAX, u64::min),
-                            Red::Max => prefix_rows(&bounds, &mut ks, u64::MIN, u64::max),
+                            Red::Add => prefix_rows(&bounds, k, f64_key(0.0), float(|a, x| a + x)),
+                            Red::Mul => prefix_rows(&bounds, k, f64_key(1.0), float(|a, x| a * x)),
+                            Red::Min => prefix_rows(&bounds, k, u64::MAX, u64::min),
+                            Red::Max => prefix_rows(&bounds, k, u64::MIN, u64::max),
                             Red::All | Red::Any => return Err("scan_all and scan_any read a mask, which is an Int, not a Float".into()),
                         }
-                        Value::Prim(Prim::F64(Arc::new(ks)))
+                        Value::Prim(Prim::F64(ks))
                     }
                     ints => {
-                        let mut xs = Value::Prim(ints).into_i64("scan values")?; // owned: the prefix is written in place
+                        let mut xs = match ints {
+                            Prim::I64(xs) => xs,
+                            bytes => match bytes.widen() {
+                                Prim::I64(xs) => xs,
+                                _ => unreachable!("an integer leaf widens to i64"),
+                            },
+                        };
+                        let x = Arc::make_mut(&mut xs);
                         match r {
-                            Red::Add => prefix_rows(&bounds, &mut xs, 0, i64::wrapping_add),
-                            Red::Mul => prefix_rows(&bounds, &mut xs, 1, i64::wrapping_mul),
-                            Red::Min => prefix_rows(&bounds, &mut xs, i64::MAX, i64::min),
-                            Red::Max => prefix_rows(&bounds, &mut xs, i64::MIN, i64::max),
-                            Red::All => prefix_rows(&bounds, &mut xs, 1, |a, x| a & (x != 0) as i64), // all nonzero so far
-                            Red::Any => prefix_rows(&bounds, &mut xs, 0, |a, x| a | (x != 0) as i64), // any nonzero so far
+                            Red::Add => prefix_rows(&bounds, x, 0, i64::wrapping_add),
+                            Red::Mul => prefix_rows(&bounds, x, 1, i64::wrapping_mul),
+                            Red::Min => prefix_rows(&bounds, x, i64::MAX, i64::min),
+                            Red::Max => prefix_rows(&bounds, x, i64::MIN, i64::max),
+                            Red::All => prefix_rows(&bounds, x, 1, |a, x| a & (x != 0) as i64), // all nonzero so far
+                            Red::Any => prefix_rows(&bounds, x, 0, |a, x| a | (x != 0) as i64), // any nonzero so far
                         }
-                        if matches!(r, Red::All | Red::Any) { Value::u8(xs.iter().map(|&x| x as u8).collect()) } else { Value::i64(xs) }
+                        if matches!(r, Red::All | Red::Any) { Value::u8(collect(xs.iter().map(|&x| x as u8))) } else { Value::Prim(Prim::I64(xs)) }
                     }
                 };
-                Value::List(bounds, Box::new(out))
+                Value::List(bounds, vals)
             }
         })
     }

@@ -6,8 +6,8 @@
 //! well-typed program, so it must be a value, not a crash.
 
 
+use crate::pool::leaf;
 use crate::value::{Bounds, Prim, Tags, Value};
-use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TextOp {
@@ -63,7 +63,7 @@ fn parse_rows<T: Copy + Into<i64>>(ends: &Bounds, xs: &[T]) -> Value {
             let tags = tags.unwrap_or_default();
             let mut count = [0usize; 2];
             let off = tags.iter().map(|&t| { let p = count[t as usize]; count[t as usize] += 1; p }).collect();
-            Tags::column(Prim::U8(Arc::new(tags)), off)
+            Tags::column(Prim::U8(leaf(tags)), off)
         }
     };
     Value::sum_tagged(assignment, vec![Value::i64(oks), Value::Unit(errs)])
