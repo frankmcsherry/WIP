@@ -345,17 +345,16 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Over
   Floats a sum or product runs in row order, so it is the `fold` of `add` or `mul` bit for bit
   (`all`/`any` read masks, which are Ints).
-- **Keyed reductions** take `(keys, values)` and give one `(key, total)` per distinct key: `group`
-  followed by monoid folds, with no rows moved. Two families, each with one order:
-  `int_scatter_<op>` for Int keys, in key order, and `hash_scatter_<op>` for keys of any shape, in
-  the order of their hashes (keys sharing a hash, in key order), keys copied out. Both number each
-  row's distinct keys and add each value into its number's slot. `hash_scatter` hashes the keys,
-  numbers the hashes by hash tables (partitioned when they are many), and checks each key against
-  the first key with its number, in place (not leaves: a leaf's hash is exact); a row where two keys
-  share a hash is numbered by sorting it. `int_scatter` is `hash_scatter` and then a sort of each
-  row's pairs, except where every row's keys span a narrow range: a table over the range numbers
-  them in key order. Prefer them to `group` when a program wants totals per key; `hash_scatter` is
-  the consolidation of `(data, diff)` pairs.
+- **Keyed reductions**, `scatter_<op>`, take `(keys, values)` and give one `(key, total)` per
+  distinct key: `group` followed by monoid folds, with no rows moved. The pairs' order is not
+  promised (the same input gives the same order), so a program that wants key order sorts them, and
+  `sort` costs one pass when they came out in it. Each row's distinct keys are numbered and each
+  value added into its number's slot. Int keys spanning a narrow range in every row are numbered by
+  a table over the range, which gives key order. Other keys are hashed, the hashes numbered by hash
+  tables (partitioned when they are many) as first seen, and each key checked against the first key
+  with its number, in place (not leaves: a leaf's hash is exact); a row where two keys share a hash
+  is numbered by sorting its keys. Prefer `scatter` to `group` when a program wants totals per key;
+  it is the consolidation of `(data, diff)` pairs.
 
 ## Failure: lossy ops, and checked ones as words
 

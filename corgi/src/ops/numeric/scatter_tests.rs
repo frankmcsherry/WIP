@@ -1,5 +1,5 @@
-//! `hash_scatter` where keys share hashes: the hash cut to two bits, so most distinct keys collide,
-//! and the rows that collide are numbered by sorting them by (hash, key).
+//! `scatter` by hashes where keys share them: the hash cut to two bits, so most distinct keys
+//! collide, and the rows that collide are numbered by sorting their keys.
 
 use super::*;
 use crate::frontend::Program;
@@ -23,22 +23,10 @@ fn keys_that_share_a_hash_are_told_apart() {
     let keys = strings(&words);
     let kb: Bounds = vec![500, 500, 505].into();
     let vals = Value::i64((0..505).map(|k| (k % 9) as i64 - 4).collect());
-    let got = hash_scatter_rows(&kb, &keys, &kb, Value::Prod(vec![Value::u8(vec![1; 505]), vals.clone()]), Red::Add, &short, false).unwrap();
-    // the same totals as `group` and the folds, once put in key order
+    let got = scatter_by_hash(&kb, &keys, &kb, Value::Prod(vec![Value::u8(vec![1; 505]), vals.clone()]), Red::Add, &short, false).unwrap();
+    // the same totals as `group` and the folds
     let input = Value::Prod(vec![Value::List(kb.clone(), Box::new(keys.clone())), Value::List(kb.clone(), Box::new(vals))]);
     let grouped = Program::compile_ml("let (k, v) = input in (k, v) zip group map ((k, vs) -> (k, (vs len, vs fold_add)))").unwrap().run(input);
-    let sorted = Program::compile_ml("input sort").unwrap().run(got.clone());
+    let sorted = Program::compile_ml("input sort").unwrap().run(got);
     assert_eq!(crate::show(&sorted), crate::show(&grouped));
-    // and in the order of the cut-short hashes, keys that share one in key order
-    let Value::List(ends, pairs) = got else { panic!("a list") };
-    let Value::Prod(cols) = *pairs else { panic!("pairs") };
-    let hs = short(&cols[0]);
-    let mut start = 0;
-    for end in ends.ends() {
-        for k in start + 1..end {
-            let order = (hs[k - 1], crate::ops::cmp::order::compare_at(&cols[0], k - 1, &cols[0], k));
-            assert!(order.0 < hs[k] || (order.0 == hs[k] && order.1 == std::cmp::Ordering::Less), "row order at {k}");
-        }
-        start = end;
-    }
 }

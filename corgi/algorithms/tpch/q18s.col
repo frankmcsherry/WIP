@@ -1,5 +1,5 @@
 # TPC-H Q18, in integers: the hundred most expensive orders whose line items total more than 300
-# units, each order's quantity summed by `int_scatter_add` instead of `group`.
+# units, each order's quantity summed by `scatter_add` instead of `group`.
 # (The customer table only names each order's customer, which `o_custkey` already does.)
 # sql: SELECT c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) FROM customer, orders, lineitem
 # sql:   WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300)
@@ -9,7 +9,7 @@
 # output: [u,u,u,u,u]
 let (okey, ocust, odate, oprice, lkey, qty) = input in
 # The orders of more than 300 units, (key, units), sorted by key.
-let big = (lkey, qty) int_scatter_add map ((k, q) -> ((q, 300) gt, (k, q))) filter sort in
+let big = (lkey, qty) scatter_add map ((k, q) -> ((q, 300) gt, (k, q))) filter sort in
 # Each order looked up among them.
 let found = (okey, big map ((k, _) -> k)) find in
 let orders = (found, ((okey, ocust) zip, (odate, oprice) zip) zip) zip

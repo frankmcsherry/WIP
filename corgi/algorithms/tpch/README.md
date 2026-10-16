@@ -71,28 +71,19 @@ Since 2026-10-03:
 
 The remaining gap was q01. It puts 1.2M rows into four groups: `group` sorts them, then moves the
 four summed columns into group order. DuckDB adds each row into its group's sums as it scans. q01s
-does the same with `int_scatter_add`: each row's group is its two flag bytes as one number (or -1 when
+does the same with `scatter_add`: each row's group is its two flag bytes as one number (or -1 when
 the date leaves it out), and one scatter totals every column by group, a 1 per row counting them. At
-scale factor 1, on one thread: q01 173 ms, q01s 66 ms, DuckDB 94 ms. Of q01s's time, 30 ms reads the
+scale factor 1, on one thread: q01 173 ms, q01s 67 ms, DuckDB 94 ms. Of q01s's time, 30 ms reads the
 first byte of each one-character flag string; with the flags stored as bytes (#95) q01s takes 37 ms
 against DuckDB's 68.
 
 q18 is TPC-H's large aggregation: every order's line-item quantities summed, 6M rows into 1.5M
-orders at scale factor 1, before the orders over 300 units are kept. Each version differs only in
-that sum. On one thread at scale factor 1:
-
-| version | the sum by | ms |
-|---|---|---|
-| q18 | `group`, then `fold_add` | 51 |
-| q18s | `int_scatter_add` | 27 |
-| q18h | `hash_scatter_add` | 96 |
-| DuckDB | | 94 |
-
-Line items are stored in order-key order, and numbering the keys by value keeps that order: each line
-item adds into the slot after the last one's, and the sort in `group` is cheap on it. Hash order sends
-consecutive line items to unrelated slots. Of q18h's time, numbering the 1.5M hashes takes 57 ms,
-recording each number's first position 14, and the sums 11. Data directories made before q18 need
-`prepare.py` run again, for `o_totalprice` and q18's answers.
+orders at scale factor 1, before the orders over 300 units are kept. On one thread at scale factor
+1, q18 sums them with `group` in 52 ms, q18s with `scatter_add` in 27, and DuckDB takes 94. The
+order keys are Ints in a narrow range, so `scatter_add` numbers them by a table over the range, and
+as the line items are stored in order-key order, each one adds into the slot after the last one's.
+Numbered by their hashes instead, as keys that are not Ints are, the same sums take 75 ms. Data
+directories made before q18 need `prepare.py` run again, for `o_totalprice` and q18's answers.
 
 ## Which queries are here
 

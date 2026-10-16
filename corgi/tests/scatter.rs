@@ -1,9 +1,9 @@
-//! The keyed reductions. `int_scatter_<op>`: per row, one `(key, total)` pair per distinct Int key,
-//! in key order; `hash_scatter_<op>`: the same for keys of any shape, in the order of their hashes.
-//! These check them against a direct reference on random rows whose keys take each of the
-//! numberings (a range, one hash table, partitioned tables), against `group` and a fold, and on
-//! the cases the definitions name: element order, units that count, products, empty rows, and the
-//! errors. Rows where two keys share a hash are checked in the crate, where a hash can be cut short.
+//! The keyed reductions, `scatter_<op>`: per row, one `(key, total)` pair per distinct key, in an
+//! order not promised, so each check sorts the pairs. These check them against a direct reference
+//! on random rows whose keys take each of the numberings (a range, one hash table, partitioned
+//! tables), against `group` and a fold for keys of many shapes, and on the cases the definition
+//! names: element order, products, empty rows, and the errors. Rows where two keys share a hash are
+//! checked in the crate, where a hash can be cut short.
 
 use corgi::{show, Program, Value};
 use std::collections::BTreeMap;
@@ -55,7 +55,7 @@ fn reference(op: &str, ends: &[usize], ids: &[i64], vals: &[i64]) -> (Vec<usize>
 }
 
 #[test]
-fn int_scatter_matches_a_direct_reduction() {
+fn scatter_matches_a_direct_reduction() {
     let mut rng = Rng(0x2545F4914F6CDD1D);
     for trial in 0..120 {
         let (mut ends, mut ids, mut vals) = (Vec::new(), Vec::new(), Vec::new());
@@ -79,12 +79,12 @@ fn int_scatter_matches_a_direct_reduction() {
             let (we, wi, wv) = reference(op, &ends, &ids, &vals);
             let wv = if op == "any" { Value::u8(wv.iter().map(|&x| x as u8).collect()) } else { Value::i64(wv) };
             let want = list(&we, Value::Prod(vec![Value::i64(wi), wv]));
-            assert_eq!(run(&format!("input int_scatter_{op}"), input.clone()), want, "trial {trial}, int_scatter_{op}");
+            assert_eq!(run(&format!("input scatter_{op} sort"), input.clone()), want, "trial {trial}, scatter_{op}");
         }
     }
 }
 
-/// many distinct keys spread wide: numbered by partitioned hash tables, then put in key order.
+/// many distinct keys spread wide: numbered by partitioned hash tables.
 #[test]
 fn many_spread_keys_are_numbered_by_partitions() {
     let mut rng = Rng(7);
@@ -94,19 +94,19 @@ fn many_spread_keys_are_numbered_by_partitions() {
     let ends = [ids.len()];
     let (we, wi, wv) = reference("add", &ends, &ids, &vals);
     let input = Value::Prod(vec![list(&ends, Value::i64(ids)), list(&ends, Value::i64(vals))]);
-    assert_eq!(run("input int_scatter_add", input), list(&we, Value::Prod(vec![Value::i64(wi), Value::i64(wv)])));
+    assert_eq!(run("input scatter_add sort", input), list(&we, Value::Prod(vec![Value::i64(wi), Value::i64(wv)])));
 }
 
-/// `int_scatter_add` gives what `group` and `fold_add` give, without moving the rows.
+/// `scatter_add` gives what `group` and `fold_add` give, without moving the rows.
 #[test]
-fn int_scatter_add_is_group_then_fold() {
+fn scatter_add_is_group_then_fold() {
     let mut rng = Rng(11);
     for keys in [10u64, 3000, 1 << 40] {
         let ids: Vec<i64> = (0..20_000).map(|_| (rng.below(keys) as i64) - 5).collect();
         let vals: Vec<i64> = (0..20_000).map(|_| rng.below(100) as i64).collect();
         let input = Value::Prod(vec![list(&[20_000], Value::i64(ids)), list(&[20_000], Value::i64(vals))]);
         assert_eq!(
-            show(&run("let (i, v) = input in (i, v) int_scatter_add", input.clone())),
+            show(&run("let (i, v) = input in (i, v) scatter_add sort", input.clone())),
             show(&run("let (i, v) = input in (i, v) zip group map ((k, vs) -> (k, vs fold_add))", input)),
             "{keys} keys",
         );
@@ -114,27 +114,27 @@ fn int_scatter_add_is_group_then_fold() {
 }
 
 #[test]
-fn int_scatter_as_defined() {
+fn scatter_as_defined() {
     let ids = list(&[5, 5, 8], Value::i64(vec![3, -1, 3, 0, -1, 7, 7, 7]));
     let ints = list(&[5, 5, 8], Value::i64(vec![10, 20, 30, 40, 50, 1, 2, 3]));
-    // one pair per distinct id, in id order; an empty row has none
-    assert_eq!(show(&run("input int_scatter_add", Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [70, 40, 40, 6])>");
-    assert_eq!(show(&run("input int_scatter_min", Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [20, 40, 10, 1])>");
+    // one pair per distinct id; an empty row has none
+    assert_eq!(show(&run("input scatter_add sort", Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [70, 40, 40, 6])>");
+    assert_eq!(show(&run("input scatter_min sort", Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [20, 40, 10, 1])>");
     // a product's fields are reduced each on its own; adding ones counts
-    let src = "let (i, v) = input in (i, v map (x -> (x, (x, 2) mul))) int_scatter_max";
+    let src = "let (i, v) = input in (i, v map (x -> (x, (x, 2) mul))) scatter_max sort";
     assert_eq!(show(&run(src, Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], ([50, 40, 30, 3], [100, 80, 60, 6]))>");
-    let src = "let (i, v) = input in (i, v map (_ -> 1)) int_scatter_add";
+    let src = "let (i, v) = input in (i, v map (_ -> 1)) scatter_add sort";
     assert_eq!(show(&run(src, Value::Prod(vec![ids.clone(), ints]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [2, 1, 2, 3])>");
     // a Float sum adds in element order: 1e16, then -1e16, then 1.0 is 1.0, not 0.0
     let floats = list(&[5, 5, 8], Value::f64(vec![1e16, 0.5, -1e16, 2.0, 0.25, 1.0, 1.0, 1.0]));
-    let sums = run("input int_scatter_add", Value::Prod(vec![ids.clone(), floats]));
+    let sums = run("input scatter_add sort", Value::Prod(vec![ids.clone(), floats]));
     let ids3 = list(&[3], Value::i64(vec![3, 3, 3]));
-    assert_eq!(show(&run("input int_scatter_add", Value::Prod(vec![ids3, list(&[3], Value::f64(vec![1e16, -1e16, 1.0]))]))), "List ends=[1] <([3], [1.0])>");
+    assert_eq!(show(&run("input scatter_add sort", Value::Prod(vec![ids3, list(&[3], Value::f64(vec![1e16, -1e16, 1.0]))]))), "List ends=[1] <([3], [1.0])>");
     assert_eq!(show(&sums), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [0.75, 2.0, 0.0, 3.0])>");
     // the ids and values pair up by position; the longer list's extra elements are dropped
     let short = list(&[2, 2, 2], Value::i64(vec![5, 5]));
     let long = list(&[3, 3, 4], Value::i64(vec![1, 2, 3, 4]));
-    assert_eq!(show(&run("input int_scatter_add", Value::Prod(vec![short, long]))), "List ends=[1, 1, 1] <([5], [3])>");
+    assert_eq!(show(&run("input scatter_add sort", Value::Prod(vec![short, long]))), "List ends=[1, 1, 1] <([5], [3])>");
 }
 
 #[test]
@@ -142,17 +142,14 @@ fn keyed_reduction_errors() {
     let ids = list(&[2], Value::i64(vec![0, 1]));
     let err = |src: &str, v: Value| Program::compile_ml(src).unwrap().shape(&corgi::shape_of_value(&v)).unwrap_err();
     let floats = Value::Prod(vec![ids.clone(), list(&[2], Value::f64(vec![1.0, 2.0]))]);
-    assert!(err("input int_scatter_any", floats.clone()).contains("a mask"));
-    assert!(err("input hash_scatter_any", floats).contains("a mask"));
+    assert!(err("input scatter_any", floats).contains("a mask"));
     let lists = Value::Prod(vec![ids, list(&[2], list(&[1, 2], Value::i64(vec![1, 2])))]);
-    assert!(err("input int_scatter_add", lists.clone()).contains("expected leaves or a product of them"));
-    assert!(err("input hash_scatter_add", lists).contains("expected leaves or a product of them"));
+    assert!(err("input scatter_add", lists).contains("expected leaves or a product of them"));
 }
 
-/// keys of many shapes, each reduced as `group` and `fold_add` reduce them (in key order once
-/// sorted), and coming out in the order of their hashes.
+/// keys of many shapes, each reduced as `group` and `fold_add` reduce them.
 #[test]
-fn hash_scatter_add_is_group_then_fold_in_hash_order() {
+fn keys_of_any_shape() {
     let mut rng = Rng(23);
     let n = 3000;
     let small: Vec<i64> = (0..n).map(|_| rng.below(40) as i64 - 20).collect();
@@ -177,16 +174,11 @@ fn hash_scatter_add_is_group_then_fold_in_hash_order() {
     ];
     for (name, keys) in shapes {
         let input = Value::Prod(vec![list(&[n], keys), list(&[n], Value::i64(diffs.clone()))]);
-        let scattered = run("let (k, d) = input in (k, d) hash_scatter_add", input.clone());
         assert_eq!(
-            show(&run("input sort", scattered.clone())),
+            show(&run("let (k, d) = input in (k, d) scatter_add sort", input.clone())),
             show(&run("let (k, d) = input in (k, d) zip group map ((k, ds) -> (k, ds fold_add))", input)),
             "{name}",
         );
-        let hashes = run("input map ((k, _) -> k hash)", scattered);
-        let Value::List(_, hs) = hashes else { panic!("a list") };
-        let hs: Vec<u64> = hs.as_i64("hashes").unwrap().iter().map(|&h| h as u64).collect();
-        assert!(hs.windows(2).all(|w| w[0] < w[1]), "{name}: not in hash order");
     }
 }
 
@@ -203,7 +195,7 @@ fn many_distinct_strings_are_numbered_by_partitions() {
     }
     let input = Value::Prod(vec![list(&[n], Value::List(ends.into(), Box::new(Value::u8(bytes)))), list(&[n], Value::i64(vec![1; n]))]);
     assert_eq!(
-        show(&run("let (k, d) = input in (k, d) hash_scatter_add sort", input.clone())),
+        show(&run("let (k, d) = input in (k, d) scatter_add sort", input.clone())),
         show(&run("let (k, d) = input in (k, d) zip group map ((k, ds) -> (k, ds fold_add))", input)),
     );
 }

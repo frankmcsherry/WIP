@@ -1,9 +1,10 @@
 # Counts of values in 0..1000 over 8 equal-width buckets (125 wide). Input a `List<Int>` per row.
 # Output a `List<Int>` of 8 counts per row.
 #
-# Bucket each value and add a one into its bucket with `int_scatter_add`. A bucket no value reaches
-# would be missing from the result, so each row also adds a zero into each of the eight.
+# Bucket each value and add a one into its bucket with `scatter_add`, then `sort` the (bucket, count)
+# pairs into bucket order. A bucket no value reaches would be missing from the result, so each row
+# also adds a zero into each of the eight.
 let buckets = input map (v -> (v, 125) div) in
 let ids = (buckets, 8 iota) append in
 let ones = (buckets map (_ -> 1), 8 iota map (_ -> 0)) append in
-(ids, ones) int_scatter_add map ((_, n) -> n)
+(ids, ones) scatter_add sort map ((_, n) -> n)
