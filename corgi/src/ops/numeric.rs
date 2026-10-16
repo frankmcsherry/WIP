@@ -505,16 +505,32 @@ impl Fields {
 /// key, in key order, `total` the reduction under `r` of the key's values in element order. A row's
 /// keys and values pair up by position (the longer list's extra elements dropped).
 ///
-/// Each row's distinct keys are numbered `0..g` in key order, then each field is reduced into `g`
-/// slots, one pass each, adding each value into its key's slot. Keys spanning a range not much wider
-/// than the row are numbered by a table over the range: which keys occur, then a running count over
-/// those. Keys spread wider are numbered by hash tables (see [`Numbering`]) and the distinct keys
-/// then put in key order, which sorts `g` keys rather than the row. An Int key is its own id, so the
-/// numbering is exact with no comparison of keys.
-fn int_scatter_rows(kb: &crate::value::Bounds, keys: &[i64], vb: &crate::value::Bounds, vals: Value, r: Red) -> Result<Value, String> {
+/// This is `hash_scatter` and then a sort of each row's pairs by key, except where every row's keys
+/// span a range not much wider than the row. There a table over the range numbers each row's keys
+/// in key order (which keys occur, then a running count over those), and each field is reduced into
+/// the numbered slots, one pass each.
+fn int_scatter_rows(kb: &crate::value::Bounds, keys: &Value, vb: &crate::value::Bounds, vals: Value, r: Red) -> Result<Value, String> {
     let rows = kb.len();
     if vb.len() != rows {
         return Err(format!("int_scatter: {rows} rows of keys, {} rows of values", vb.len()));
+    }
+    let ints = keys.as_i64("int_scatter keys")?;
+    let at: Vec<(usize, usize, usize)> = (0..rows)
+        .map(|q| {
+            let ((ks, ke), (vs, ve)) = (kb.span(q), vb.span(q));
+            (ks, vs, (ke - ks).min(ve - vs))
+        })
+        .collect();
+    // each row's least key and the width of the range its keys span
+    let ranges: Vec<(i64, i128)> = at
+        .iter()
+        .map(|&(ks, _, len)| {
+            let (lo, hi) = ints[ks..ks + len].iter().fold((i64::MAX, i64::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+            (lo, if len == 0 { 0 } else { hi as i128 - lo as i128 + 1 })
+        })
+        .collect();
+    if at.iter().zip(&ranges).any(|(&(_, _, len), &(_, width))| width > (2 * len + 4096) as i128) {
+        return Ok(by_key(hash_scatter_rows(kb, keys, vb, vals, r, &crate::hash::hash, true)?));
     }
     let fields = Fields::new(vals, r, "int_scatter")?;
     let mut out_keys: Vec<i64> = Vec::new();
@@ -522,14 +538,22 @@ fn int_scatter_rows(kb: &crate::value::Bounds, keys: &[i64], vb: &crate::value::
     let mut ends = Vec::with_capacity(rows);
     let mut num = Numbering::default();
     let mut table = Vec::new();
-    for q in 0..rows {
-        let ((ks, ke), (vs, ve)) = (kb.span(q), vb.span(q));
-        let len = (ke - ks).min(ve - vs);
-        let g = num.ints(&keys[ks..ks + len], &mut out_keys);
+    for (&(ks, vs, len), &(lo, width)) in at.iter().zip(&ranges) {
+        let g = num.by_range(&ints[ks..ks + len], lo, width as usize, &mut out_keys);
         fields.reduce(vs..vs + len, &num.slots, g, r, &mut outs, &mut table);
         ends.push(out_keys.len());
     }
     Ok(fields.finish(ends, Value::i64(out_keys), outs, r))
+}
+
+/// each row's `(key, total)` pairs, sorted by key.
+fn by_key(pairs: Value) -> Value {
+    let Value::List(ends, kv) = pairs else { unreachable!("a list of pairs") };
+    let Value::Prod(mut kv) = *kv else { unreachable!("pairs") };
+    let totals = kv.pop().expect("totals");
+    let labels = if ends.len() == 1 { Vec::new() } else { crate::ops::cmp::order::segment_labels(&ends) };
+    let (perm, _, keys) = crate::ops::cmp::sort::sort_values(&labels, &kv[0]);
+    Value::List(ends, Box::new(Value::Prod(vec![keys, crate::engine::gather(&totals, &perm)])))
 }
 
 /// `(keys, values) hash_scatter_<r>`, row by row, for keys of any shape: one `(key, total)` pair per
@@ -641,41 +665,6 @@ struct Numbering {
 }
 
 impl Numbering {
-    /// number Int keys in key order, appending the distinct keys to `distinct`. Keys spanning a range
-    /// not much wider than the row get a table over the range; keys spread wider are mixed by an
-    /// odd multiplier (a bijection on words, so still exact and still one id per key), numbered by
-    /// [`Numbering::words`], and the distinct keys then sorted into key order.
-    fn ints(&mut self, keys: &[i64], distinct: &mut Vec<i64>) -> usize {
-        const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
-        if keys.is_empty() {
-            self.slots.clear();
-            return 0;
-        }
-        let (lo, hi) = keys.iter().fold((i64::MAX, i64::MIN), |(l, h), &x| (l.min(x), h.max(x)));
-        let span = hi as i128 - lo as i128 + 1;
-        if span <= (2 * keys.len() + 4096) as i128 {
-            return self.by_range(keys, lo, span as usize, distinct);
-        }
-        let mixed: Vec<u64> = keys.iter().map(|&k| (k as u64).wrapping_mul(MIX)).collect();
-        let g = self.words(&mixed);
-        // each number's key: any element with that number has it
-        let mut key_of = vec![0i64; g];
-        for (&s, &k) in self.slots.iter().zip(keys) {
-            key_of[s as usize] = k;
-        }
-        let mut by_key: Vec<u32> = (0..g as u32).collect();
-        by_key.sort_unstable_by_key(|&s| key_of[s as usize]);
-        let mut renumber = vec![0u32; g];
-        for (j, &s) in by_key.iter().enumerate() {
-            renumber[s as usize] = j as u32;
-            distinct.push(key_of[s as usize]);
-        }
-        for s in self.slots.iter_mut() {
-            *s = renumber[*s as usize];
-        }
-        g
-    }
-
     /// keys in a range `span` wide from `lo`: which occur, then a running count over those.
     fn by_range(&mut self, keys: &[i64], lo: i64, span: usize, distinct: &mut Vec<i64>) -> usize {
         self.seen.clear();
@@ -953,7 +942,6 @@ impl ArithOp {
                 let (keys, vals) = input.into_pair("int_scatter")?;
                 let (kb, keys) = keys.into_list("int_scatter keys")?;
                 let (vb, vals) = vals.into_list("int_scatter values")?;
-                let keys = keys.as_i64("int_scatter keys")?;
                 int_scatter_rows(&kb, &keys, &vb, vals, *r)?
             }
             ArithOp::HashScatter(r) => {

@@ -349,13 +349,13 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   followed by monoid folds, with no rows moved. Two families, each with one order:
   `int_scatter_<op>` for Int keys, in key order, and `hash_scatter_<op>` for keys of any shape, in
   the order of their hashes (keys sharing a hash, in key order), keys copied out. Both number each
-  row's distinct keys and add each value into its number's slot. Int keys are their own ids: a
-  table over their range when it is narrow, hash tables (partitioned when the keys are many) and a
-  sort of just the distinct keys when it is wide. Other keys are hashed, numbered by the same
-  tables, and then checked against the first key with each number, in place (not leaves: a leaf's
-  hash is exact); a row where two keys share a hash is numbered by sorting it. Prefer them to
-  `group` when a program wants totals per key; `hash_scatter` is the consolidation of
-  `(data, diff)` pairs.
+  row's distinct keys and add each value into its number's slot. `hash_scatter` hashes the keys,
+  numbers the hashes by hash tables (partitioned when they are many), and checks each key against
+  the first key with its number, in place (not leaves: a leaf's hash is exact); a row where two keys
+  share a hash is numbered by sorting it. `int_scatter` is `hash_scatter` and then a sort of each
+  row's pairs, except where every row's keys span a narrow range: a table over the range numbers
+  them in key order. Prefer them to `group` when a program wants totals per key; `hash_scatter` is
+  the consolidation of `(data, diff)` pairs.
 
 ## Failure: lossy ops, and checked ones as words
 
