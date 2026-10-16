@@ -353,7 +353,8 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   are their own ids: a table over their range when it is narrow, hash tables (partitioned when the
   keys are many) and a sort of just the distinct keys when it is wide. Other keys are hashed,
   numbered by the same tables, and then checked against the first key with each number, in
-  place; a row where two keys share a hash is numbered by sorting it. Prefer them to `group` when a
+  place (not leaves: a leaf's hash is exact); a row where two keys share a hash is numbered by
+  sorting it. Prefer them to `group` when a
   program wants totals per key; `hash_scatter` is the consolidation of `(data, diff)` pairs.
 
 ## Failure: lossy ops, and checked ones as words

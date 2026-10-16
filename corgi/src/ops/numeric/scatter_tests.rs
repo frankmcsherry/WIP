@@ -23,7 +23,7 @@ fn keys_that_share_a_hash_are_told_apart() {
     let keys = strings(&words);
     let kb: Bounds = vec![500, 500, 505].into();
     let vals = Value::i64((0..505).map(|k| (k % 9) as i64 - 4).collect());
-    let got = hash_scatter_rows(&kb, &keys, &kb, Value::Prod(vec![Value::Unit(505), vals.clone()]), Red::Add, &short).unwrap();
+    let got = hash_scatter_rows(&kb, &keys, &kb, Value::Prod(vec![Value::Unit(505), vals.clone()]), Red::Add, &short, false).unwrap();
     // the same totals as `group` and the folds, once put in key order
     let input = Value::Prod(vec![Value::List(kb.clone(), Box::new(keys.clone())), Value::List(kb.clone(), Box::new(vals))]);
     let grouped = Program::compile_ml("let (k, v) = input in (k, v) zip group map ((k, vs) -> (k, (vs len, vs fold_add)))").unwrap().run(input);

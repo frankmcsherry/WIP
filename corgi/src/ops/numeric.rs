@@ -542,8 +542,9 @@ fn int_scatter_rows(kb: &crate::value::Bounds, keys: &[i64], vb: &crate::value::
 /// tables (see [`Numbering`]). Then every key is compared with the first key that got its number,
 /// in place: when all agree, no two distinct keys share a hash and the numbering is exact. When some
 /// disagree, the row is numbered by sorting its keys by `(hash, key)` instead. Each field is then
-/// reduced into `g` slots, one pass each.
-fn hash_scatter_rows(kb: &crate::value::Bounds, keys: &Value, vb: &crate::value::Bounds, vals: Value, r: Red, hash: &dyn Fn(&Value) -> Vec<u64>) -> Result<Value, String> {
+/// reduced into `g` slots, one pass each. `exact` says that equal hashes mean equal keys, so no key
+/// need be compared: corgi's hash of a leaf mixes its word by a bijection.
+fn hash_scatter_rows(kb: &crate::value::Bounds, keys: &Value, vb: &crate::value::Bounds, vals: Value, r: Red, hash: &dyn Fn(&Value) -> Vec<u64>, exact: bool) -> Result<Value, String> {
     let rows = kb.len();
     if vb.len() != rows {
         return Err(format!("hash_scatter: {rows} rows of keys, {} rows of values", vb.len()));
@@ -570,7 +571,7 @@ fn hash_scatter_rows(kb: &crate::value::Bounds, keys: &Value, vb: &crate::value:
         }
         let firsts = &kept[start..];
         let slots = &num.slots;
-        let g = if equal_to_firsts(keys, ks, len, &|k| firsts[slots[k] as usize]) {
+        let g = if exact || equal_to_firsts(keys, ks, len, &|k| firsts[slots[k] as usize]) {
             g
         } else {
             // two distinct keys share a hash: number the row by sorting its keys by (hash, key), the
@@ -961,7 +962,8 @@ impl ArithOp {
                 let (keys, vals) = input.into_pair("hash_scatter")?;
                 let (kb, keys) = keys.into_list("hash_scatter keys")?;
                 let (vb, vals) = vals.into_list("hash_scatter values")?;
-                hash_scatter_rows(&kb, &keys, &vb, vals, *r, &crate::hash::hash)?
+                let exact = matches!(keys, Value::Prim(_));
+                hash_scatter_rows(&kb, &keys, &vb, vals, *r, &crate::hash::hash, exact)?
             }
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
