@@ -120,9 +120,11 @@ fn int_scatter_as_defined() {
     // one pair per distinct id, in id order; an empty row has none
     assert_eq!(show(&run("input int_scatter_add", Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [70, 40, 40, 6])>");
     assert_eq!(show(&run("input int_scatter_min", Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [20, 40, 10, 1])>");
-    // a unit field counts, and a product's fields are reduced each on its own
-    let src = "let (i, v) = input in (i, v map (x -> ((), x, (x, 2) mul))) int_scatter_max";
-    assert_eq!(show(&run(src, Value::Prod(vec![ids.clone(), ints]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], ([2, 1, 2, 3], [50, 40, 30, 3], [100, 80, 60, 6]))>");
+    // a product's fields are reduced each on its own; adding ones counts
+    let src = "let (i, v) = input in (i, v map (x -> (x, (x, 2) mul))) int_scatter_max";
+    assert_eq!(show(&run(src, Value::Prod(vec![ids.clone(), ints.clone()]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], ([50, 40, 30, 3], [100, 80, 60, 6]))>");
+    let src = "let (i, v) = input in (i, v map (_ -> 1)) int_scatter_add";
+    assert_eq!(show(&run(src, Value::Prod(vec![ids.clone(), ints]))), "List ends=[3, 3, 4] <([-1, 0, 3, 7], [2, 1, 2, 3])>");
     // a Float sum adds in element order: 1e16, then -1e16, then 1.0 is 1.0, not 0.0
     let floats = list(&[5, 5, 8], Value::f64(vec![1e16, 0.5, -1e16, 2.0, 0.25, 1.0, 1.0, 1.0]));
     let sums = run("input int_scatter_add", Value::Prod(vec![ids.clone(), floats]));
@@ -143,8 +145,8 @@ fn keyed_reduction_errors() {
     assert!(err("input int_scatter_any", floats.clone()).contains("a mask"));
     assert!(err("input hash_scatter_any", floats).contains("a mask"));
     let lists = Value::Prod(vec![ids, list(&[2], list(&[1, 2], Value::i64(vec![1, 2])))]);
-    assert!(err("input int_scatter_add", lists.clone()).contains("expected leaves, units, or a product of them"));
-    assert!(err("input hash_scatter_add", lists).contains("expected leaves, units, or a product of them"));
+    assert!(err("input int_scatter_add", lists.clone()).contains("expected leaves or a product of them"));
+    assert!(err("input hash_scatter_add", lists).contains("expected leaves or a product of them"));
 }
 
 /// keys of many shapes, each reduced as `group` and `fold_add` reduce them (in key order once

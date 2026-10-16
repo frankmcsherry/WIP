@@ -1,8 +1,8 @@
 # int_scatter_add: totals by Int key, with no rows moved. Each value is added into its key's total,
 # and one (key, total) pair per distinct key comes out, in key order. A product of values is totalled
-# field by field, and a unit field counts. Here the keys are x mod 3 for x in 0..8, and the values
-# are (a count, x, x squared): keys 0, 1, 2 have 3, 3 and 2 values.
+# field by field. Here the keys are x mod 3 for x in 0..8, and the values are (1, x, x squared), so
+# the first total counts: keys 0, 1, 2 have 3, 3 and 2 values.
 # n = 8
 # = List ends=[3] <([0, 1, 2], ([3, 3, 2], [9, 12, 7], [45, 66, 29]))>
 let xs = input iota in
-(xs map (x -> (x, 3) rem), xs map (x -> ((), x, (x, x) mul))) int_scatter_add
+(xs map (x -> (x, 3) rem), xs map (x -> (1, x, (x, x) mul))) int_scatter_add

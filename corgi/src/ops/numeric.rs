@@ -88,9 +88,8 @@ pub enum ArithOp {
     Reduce(Red),           // List<X> -> X          per-row monoid reduction (sum/prod/min/max/all/any), X Int or Float
     IntScatter(Red),       // (List<Int>, List<X>) -> List<(Int, X)>   per row, one (key, total) per
                            // distinct Int key, in key order: the monoid reduction of the key's values,
-                           // in element order. X is a leaf, a unit or a product of these, reduced field
-                           // by field; a unit field's total counts the key's values. `group` and a
-                           // fold, with no rows moved.
+                           // in element order. X is a leaf or a product of leaves, reduced field by
+                           // field. `group` and a fold, with no rows moved.
     HashScatter(Red),      // (List<K>, List<X>) -> List<(K, X)>   the same for keys of any shape, in the
                            // order of the keys' hashes (keys that share a hash, in key order)
     Scan(Red),             // List<X> -> List<X>    per-row inclusive monoid PREFIX scan. The monoid
@@ -454,7 +453,7 @@ fn reduce_floats(bounds: &crate::value::Bounds, ks: &[u64], r: Red) -> Result<Va
 #[cfg(test)]
 mod scatter_tests;
 
-/// The values of a keyed reduction: a leaf, a unit, or a product of these, reduced field by field.
+/// The values of a keyed reduction: a leaf, or a product of leaves, reduced field by field.
 struct Fields {
     fields: Vec<Value>,
     tuple: bool,
@@ -471,9 +470,9 @@ impl Fields {
                 Value::Prim(p) if !p.is_int() && matches!(r, Red::All | Red::Any) => {
                     return Err(format!("{who}: `all` and `any` read a mask, which is an Int, not a Float"));
                 }
-                Value::Prim(_) | Value::Unit(_) => {}
+                Value::Prim(_) => {}
                 other => {
-                    return Err(format!("{who} values: expected leaves, units, or a product of them, got {}", crate::shape::shape_of_value(other)));
+                    return Err(format!("{who} values: expected leaves or a product of them, got {}", crate::shape::shape_of_value(other)));
                 }
             }
         }
@@ -824,10 +823,9 @@ impl ProbeTable {
 }
 
 /// one field's totals, `g` of them, appended to `out`: each element of `at` reduced under `r` into
-/// the slot `slots` names, in `table`. A unit field counts.
+/// the slot `slots` names, in `table`.
 fn reduce_field(f: &Value, at: std::ops::Range<usize>, slots: &[u32], g: usize, r: Red, out: &mut Vec<u64>, table: &mut Vec<u64>) {
     match f {
-        Value::Unit(_) => reduce_ints(slots, g, |_| 1, Red::Add, table),
         Value::Prim(Prim::I64(xs)) => {
             let xs = &xs[at];
             reduce_ints(slots, g, |k| xs[k], r, table)

@@ -144,9 +144,9 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "fold_max" => ArithOp::Reduce(Red::Max).into(),
         "fold_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)
         "fold_any" => ArithOp::Reduce(Red::Any).into(), // 1 iff any element nonzero (mask OR)
-        // the keyed reductions: (keys, values) -> one (key, total) per distinct key, a unit field
-        // among the values counting. `int_scatter_<binop>` for Int keys, in key order;
-        // `hash_scatter_<binop>` for keys of any shape, in the order of their hashes.
+        // the keyed reductions: (keys, values) -> one (key, total) per distinct key.
+        // `int_scatter_<binop>` for Int keys, in key order; `hash_scatter_<binop>` for keys of any
+        // shape, in the order of their hashes.
         "int_scatter_add" => ArithOp::IntScatter(Red::Add).into(),
         "int_scatter_mul" => ArithOp::IntScatter(Red::Mul).into(),
         "int_scatter_min" => ArithOp::IntScatter(Red::Min).into(),
