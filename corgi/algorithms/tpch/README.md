@@ -1,9 +1,9 @@
 # TPC-H joins in corgi
 
-TPC-H's join queries Q3, Q5, Q10, Q12, Q14 and Q19, and Q1 and Q6 without joins, written in corgi
-and checked against DuckDB. Some programs have a second or third version: the same query written
-another way, to compare formulations. Each `qNN.col` names the SQL it answers, the columns it
-reads (from several tables), and its output's kinds. Every table is one row: each column is a
+TPC-H's join queries Q3, Q5, Q10, Q12, Q14, Q18 and Q19, and Q1 and Q6 without joins, written in
+corgi and checked against DuckDB. Some programs have a second or third version: the same query
+written another way, to compare formulations. Each `qNN.col` names the SQL it answers, the columns
+it reads (from several tables), and its output's kinds. Every table is one row: each column is a
 one-row list.
 
     python3 benches/tpch/prepare.py DIR 0.2      # DuckDB's tpch extension; needs duckdb and numpy
@@ -76,13 +76,30 @@ scale factor 1, on one thread: q01 173 ms, q01s 66 ms, DuckDB 94 ms. Of q01s's t
 first byte of each one-character flag string; with the flags stored as bytes (#95) q01s takes 37 ms
 against DuckDB's 68.
 
+q18 is TPC-H's large aggregation: every order's line-item quantities summed, 6M rows into 1.5M
+orders at scale factor 1, before the orders over 300 units are kept. Each version differs only in
+that sum. On one thread at scale factor 1:
+
+| version | the sum by | ms |
+|---|---|---|
+| q18 | `group`, then `fold_add` | 51 |
+| q18s | `int_scatter_add` | 27 |
+| q18h | `hash_scatter_add` | 96 |
+| DuckDB | | 94 |
+
+Line items are stored in order-key order, and numbering the keys by value keeps that order: each line
+item adds into the slot after the last one's, and the sort in `group` is cheap on it. Hash order sends
+consecutive line items to unrelated slots. Of q18h's time, numbering the 1.5M hashes takes 57 ms,
+recording each number's first position 14, and the sums 11. Data directories made before q18 need
+`prepare.py` run again, for `o_totalprice` and q18's answers.
+
 ## Which queries are here
 
-Eight of TPC-H's 22: those that are joins on keys, a group, and arithmetic. The others need a
+Nine of TPC-H's 22: those that are joins on keys, a group, and arithmetic. The others need a
 query planner's work rather than an engine's: correlated subqueries (q02, q17, q20), EXISTS and
 NOT EXISTS (q04, q21, q22), an outer join (q13), or `LIKE '%…%'` (q09, q13, q16), which corgi leaves
-to the host. Translating them by hand would measure the translation more than corgi. q07, q08, q11,
-q15 and q18 are direct enough to add if wanted; q11 needs the `partsupp` table in `prepare.py`.
+to the host. Translating them by hand would measure the translation more than corgi. q07, q08, q11
+and q15 are direct enough to add if wanted; q11 needs the `partsupp` table in `prepare.py`.
 
 ## What the joins argue for
 
