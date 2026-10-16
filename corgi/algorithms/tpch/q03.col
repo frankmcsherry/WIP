@@ -1,6 +1,6 @@
 # TPC-H Q3, in integers: the ten unshipped orders of BUILDING customers with the most revenue.
 # Joined the way a probe would: each line item looks its order up in the sorted orders, then the
-# matches are grouped by order.
+# matches' revenue is summed by order.
 # sql: SELECT l_orderkey, sum(l_extendedprice * (100 - l_discount)) AS revenue, o_orderdate, o_shippriority
 # sql:   FROM customer, orders, lineitem WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey
 # sql:   AND l_orderkey = o_orderkey AND o_orderdate < 9204 AND l_shipdate > 9204
@@ -22,6 +22,6 @@ let at = (lines map ((k, _) -> k), orders map ((k, _, _) -> k)) find in
 let matched = (at, lines) zip map (((lo, hi), (_, rev)) -> ((hi, lo) gt, (lo, rev))) filter in
 let joined = (matched map ((lo, _) -> lo), orders) gather in
 # Revenue per order; the ten largest (ties: earlier order date, then order key).
-let per = (joined, matched map ((_, rev) -> rev)) zip group
-    map (((k, dt, pr), revs) -> let r = revs fold_add in (r neg, dt, k, pr, r)) sort_limit 10 in
+let per = (joined, matched map ((_, rev) -> rev)) scatter_add
+    map (((k, dt, pr), r) -> (r neg, dt, k, pr, r)) sort_limit 10 in
 per map ((_, dt, k, pr, r) -> (k, r, dt, pr))

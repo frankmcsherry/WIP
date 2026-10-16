@@ -36,7 +36,7 @@ let sat = (lmatch map ((_, s, _) -> s), supps map ((k, _) -> k)) find in
 let snats = (sat map ((lo, _) -> lo), supps) gather map ((_, n) -> n) in
 let same = ((lnat, snats) zip, lmatch map ((_, _, r) -> r)) zip map (((a, b), r) -> ((a, b) eq, (a, r))) filter in
 # Revenue per nation, named, largest first.
-let per = same group map ((n, rs) -> (n, rs fold_add)) in
+let per = same transpose scatter_add in
 let nat = (per map ((n, _) -> n), akeys) find in
 let names = (nat map ((lo, _) -> lo), anations) gather map ((_, name) -> name) in
 (names, per map ((_, r) -> r)) zip map ((name, r) -> (r neg, name, r)) sort map ((_, name, r) -> (name, r))

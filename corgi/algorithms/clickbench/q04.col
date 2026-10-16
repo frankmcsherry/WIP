@@ -2,4 +2,4 @@
 # sql: SELECT COUNT(DISTINCT UserID) FROM hits
 # columns: UserID
 # output: u
-input dedup len
+(input, input map (_ -> 1)) scatter_add len

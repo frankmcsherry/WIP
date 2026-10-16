@@ -29,11 +29,14 @@ last column is corgi's time divided by Rust's.
 | days_from_civil | days since 1970 and weekday (Hinnant) | 5.4 | 2.6 | 2.1 |
 | gcd | Euclid, as a fold over a fixed round count | 339 | 32.0 | 10.6 |
 | group_aggregate | GROUP BY key: count, sum, max | 360 | 255 | 1.4 |
+| group_aggregate_scatter | the same by `scatter_add` and `scatter_max` | 162 | 247 | 0.65 |
 | histogram | 8-bucket counts, as an outer product | 488 | 26.2 | 18.6 |
 | histogram_sorted | the same by sorting the bucket ids | 270 | 26.6 | 10.2 |
+| histogram_scatter | the same by `scatter_add` | 122 | 26.7 | 4.6 |
 | horner | polynomial at x | 39.9 | 5.4 | 7.4 |
 | interval_merge | merge overlapping intervals | 343 | 133 | 2.6 |
 | interval_merge_cut | the same, merged intervals cut at their marks | 248 | 134 | 1.8 |
+| interval_merge_scatter | the same, each one's ends by `scatter_min` and `scatter_max` | 293 | 130 | 2.3 |
 | ipv4_parse | dotted quad to `{Int \| ()}` | 75.3 | 15.3 | 4.9 |
 | itoa | a non-negative Int's decimal digits | 194 | 23.9 | 8.1 |
 | jaccard_sets | \|A∩B\| / \|A∪B\| of two lists as sets | 542 | 569 | 1.0 |
@@ -48,6 +51,7 @@ last column is corgi's time divided by Rust's.
 | median_percentile | median and 90th percentile | 170 | 78.2 | 2.2 |
 | mode | most frequent value | 335 | 116 | 2.9 |
 | mode_cut | the same as runs cut from the sorted values | 342 | 116 | 2.9 |
+| mode_scatter | the same, counted by `scatter_add` | 146 | 114 | 1.3 |
 | moving_average | sums of every 4-wide window | 238 | 27.4 | 8.7 |
 | moving_average_prefix | the same from prefix sums | 107 | 27.9 | 3.8 |
 | normalize_whitespace | lowercase, collapse and trim spaces | 122 | 112 | 1.1 |
@@ -69,6 +73,9 @@ last column is corgi's time divided by Rust's.
 | trigram_similarity | pg_trgm similarity of two strings | 1247 | 270 | 4.6 |
 | two_sum | does a pair sum to the target | 301 | 334 | 0.9 |
 | word_topk | the three most frequent words | 663 | 295 | 2.2 |
+| word_topk_scatter | the same, counted by `scatter_add` | 615 | 291 | 2.1 |
+
+The `_scatter` rows were measured 2026-10-16, on the branch that adds them, the same way.
 
 The rows near 1× (jaccard_sets, two_sum, group_aggregate, normalize_whitespace) are measured
 against Rust that hashes or allocates. Rust written for the small key domain would be several times
@@ -86,6 +93,7 @@ same number of values. Ratios to Rust, best of three processes, 2026-10-12:
 | program | today's lists | 32× longer | 1024× longer |
 |---|---|---|---|
 | group_aggregate | 1.40 | 0.90 | 0.99 |
+| group_aggregate_scatter | 0.65 | 0.38 | 0.34 |
 | histogram | 17 | 46 | 44 |
 | histogram_sorted | 10 | 12 | 11 |
 | jaccard_sets | 0.96 | 0.79 | 0.70 |
@@ -94,6 +102,7 @@ same number of values. Ratios to Rust, best of three processes, 2026-10-12:
 | linear_regression | 13 | 9.17 | 43 |
 | median_percentile | 2.14 | 1.55 | 0.98 |
 | mode | 2.83 | 2.19 | 2.50 |
+| mode_scatter | 1.29 | 0.43 | 0.47 |
 | moving_average | 8.36 | 51 | 53 |
 | moving_average_prefix | 3.79 | 14 | 18 |
 | sessionize | 15 | 15 | 17 |
@@ -270,7 +279,10 @@ longest first, so the running rows are a prefix of the state and no round gather
       needles it is one merge. Applies to jaccard_sets, two_sum, histogram_sorted, and
       trigram_similarity (Find 452, 36%).
     - `group` whose value lists are only `len`'d, or summed when they are ones, is a count per key:
-      mode SortBy 213 (61%), word_topk SortBy 465 (71%).
+      mode SortBy 213 (61%), word_topk SortBy 465 (71%). Counted by `scatter_add`, mode_scatter
+      takes 146 against mode's 325; word_topk_scatter 615 against 641, its sort of the counted words
+      remaining. Any `group` whose values only meet monoid folds is a keyed reduction: interval_merge
+      (`fold_min`, `fold_max`) 293 against 337 written with them.
     - A foldscan output field that copies the input element is projected back out (interval_merge).
     - query_param extracts every pair's value though only the first match is used.
 14. **Sort, then take k, is top-k.** top_k spends 168 of 188 in SortBy to read three values;
@@ -283,7 +295,8 @@ longest first, so the running rows are a prefix of the state and no round gather
 16. **Counting over a small domain is a bincount.**
     - histogram, `(xs, 8 iota) cap_list map ((xs, k) -> xs map (x == k) fold_add)`, copies the list
       8 times: CapList 386 (80%).
-    - group_aggregate's keys are below 8, so a counting sort would serve.
+    - group_aggregate's keys are below 8, so a counting sort would serve. `scatter`'s table over a
+      narrow range is that count: group_aggregate_scatter takes 162 against 351, 0.65× Rust.
 
 ### Not a rewrite
 

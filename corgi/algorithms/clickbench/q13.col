@@ -3,6 +3,7 @@
 # sql:   ORDER BY u DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase UserID
 # output: [s,u]
-let ranked = input zip map ((s, u) -> ((s len, 0) gt, (s ref, u))) filter hash_group
-    map ((s, us) -> (us dedup len neg, s)) sort_limit 10 in
+# Each distinct (phrase, user) once, then the users counted by phrase.
+let pairs = input zip map ((s, u) -> ((s len, 0) gt, ((s ref, u), 1))) filter transpose scatter_add in
+let ranked = pairs map (((s, _), _) -> (s, 1)) transpose scatter_add map ((s, d) -> (d neg, s)) sort_limit 10 in
 ranked map ((d, s) -> (s clone, d neg))

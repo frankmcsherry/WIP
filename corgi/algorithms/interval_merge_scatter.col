@@ -1,0 +1,15 @@
+# interval_merge, each merged interval's least start and greatest end by `scatter_min` and
+# `scatter_max`. Merge overlapping or touching half-open intervals. Input a `List<(lo, hi)>` per row,
+# in any order. Output the merged intervals, sorted, as a `List<(lo, hi)>`.
+#
+# Sort by start, then sweep: an interval starts a new merged interval when it begins past the
+# furthest end of everything before it. Number the merged intervals by counting those starts, and
+# take the least start and the greatest end under each number.
+let sorted = input sort in
+let marks = ((0, 0), sorted) foldscan (((seen, reach), (lo, hi)) ->
+    let start = ((seen, 0) eq, (lo, reach) gt) max in
+    ((1, (reach, hi) max), (start, (lo, hi)))) .1 in
+let ids = marks map ((start, _) -> start) scan_add in
+let los = (ids, marks map ((_, (lo, _)) -> lo)) scatter_min sort in
+let his = (ids, marks map ((_, (_, hi)) -> hi)) scatter_max sort in
+(los, his) zip map (((_, lo), (_, hi)) -> (lo, hi))

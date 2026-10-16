@@ -22,5 +22,6 @@ pub fn run(cfg: &Cfg) {
     let expected = Value::i64(rows.iter().map(|r| mode(r)).collect());
     let rust = || rows.iter().map(|r| mode(r)).collect::<Vec<_>>();
     run_case(cfg, "mode", "0-32 values in 0..16", include_str!("../../algorithms/mode.col"), input.clone(), expected.clone(), rust);
-    run_case(cfg, "mode_cut", "0-32 values in 0..16", include_str!("../../algorithms/mode_cut.col"), input, expected, rust);
+    run_case(cfg, "mode_cut", "0-32 values in 0..16", include_str!("../../algorithms/mode_cut.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "mode_scatter", "0-32 values in 0..16", include_str!("../../algorithms/mode_scatter.col"), input, expected, rust);
 }

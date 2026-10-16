@@ -6,7 +6,7 @@
 # HAVING scaled to 1/100 (one partition of the hundred). Sorting on the negated average puts the
 # largest first.
 let (counter, url) = input in
-let ranked = (counter, url) zip map ((c, u) -> ((u len, 0) gt, (c, u len))) filter group
-    map ((c, ls) -> let n = ls len in ((n, 1000) gt, (c, (ls fold_add to_float, n to_float) div, n))) filter
+let ranked = (counter, url) zip map ((c, u) -> ((u len, 0) gt, (c, (1, u len)))) filter transpose scatter_add
+    map ((c, (n, l)) -> ((n, 1000) gt, (c, (l to_float, n to_float) div, n))) filter
     map ((c, l, n) -> (l neg, c, l, n)) sort_limit 25 in
 ranked map ((_, c, l, n) -> (c, l, n))

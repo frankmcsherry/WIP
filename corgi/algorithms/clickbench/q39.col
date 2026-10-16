@@ -7,7 +7,7 @@
 # output: [i,u,u,s,s,u]
 let views = input zip map ((c, d, r, t, e, a, f, u) ->
     let s = (((e, 0) eq, (a, 0) eq) all, f, "") select in
-    (((c, 62) eq, (d, 15887) ge, (d, 15917) le, (r, 0) eq) all, ((t, e, a, s, u) ref, ()))) filter in
-let ranked = views hash_group map (((t, e, a, s, u), rows) -> (rows len neg, t, e, a, s, u)) sort_limit 1010 in
+    (((c, 62) eq, (d, 15887) ge, (d, 15917) le, (r, 0) eq) all, ((t, e, a, s, u) ref, 1))) filter in
+let ranked = views transpose scatter_add map (((t, e, a, s, u), n) -> (n neg, t, e, a, s, u)) sort_limit 1010 in
 ((1000, (ranked len, 1010) min) range, ranked) gather
     map ((d, t, e, a, s, u) -> (t, e, a, s clone, u clone, d neg))

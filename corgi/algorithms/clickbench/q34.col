@@ -3,5 +3,5 @@
 # columns: URL
 # output: [u,s,u]
 # GROUP BY 1, URL groups by URL alone: the 1 is the same in every row.
-let ranked = input map (u -> (u, ())) hash_group map ((u, rows) -> (rows len neg, u)) sort_limit 10 in
-ranked map ((d, u) -> (1, u clone, d neg))
+let ranked = (input, input map (_ -> 1)) scatter_add map ((u, n) -> (n neg, u)) sort_limit 10 in
+ranked map ((d, u) -> (1, u, d neg))

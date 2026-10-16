@@ -1,0 +1,7 @@
+# group_aggregate by keyed reductions: the count and sum under one `scatter_add`, the max under one
+# `scatter_max`, each sorted into key order and then paired up. Input a `List<(key, value)>` per
+# row. Output, per distinct key in increasing order, `(key, count, sum, max)`.
+let ks = input map ((k, _) -> k) in
+let sums = (ks, input map ((_, v) -> (1, v))) scatter_add sort in
+let maxes = (ks, input map ((_, v) -> v)) scatter_max sort in
+(sums, maxes) zip map (((k, (n, s)), (_, m)) -> (k, n, s, m))

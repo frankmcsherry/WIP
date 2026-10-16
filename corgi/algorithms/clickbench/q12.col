@@ -3,6 +3,6 @@
 # sql:   ORDER BY c DESC, SearchPhrase LIMIT 10
 # columns: SearchPhrase
 # output: [s,u]
-let ranked = input map (s -> ((s len, 0) gt, (s ref, ()))) filter hash_group
-    map ((s, rows) -> (rows len neg, s)) sort_limit 10 in
+let ranked = input map (s -> ((s len, 0) gt, (s ref, 1))) filter transpose scatter_add
+    map ((s, n) -> (n neg, s)) sort_limit 10 in
 ranked map ((d, s) -> (s clone, d neg))

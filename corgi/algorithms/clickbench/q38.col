@@ -5,7 +5,7 @@
 # columns: CounterID EventDate IsRefresh IsLink IsDownload URL
 # output: [s,u]
 let views = input zip map ((c, d, r, l, w, u) ->
-    (((c, 62) eq, (d, 15887) ge, (d, 15917) le, (r, 0) eq, (l, 0) ne, (w, 0) eq) all, (u ref, ()))) filter in
-let ranked = views hash_group map ((u, rows) -> (rows len neg, u)) sort_limit 1010 in
+    (((c, 62) eq, (d, 15887) ge, (d, 15917) le, (r, 0) eq, (l, 0) ne, (w, 0) eq) all, (u ref, 1))) filter in
+let ranked = views transpose scatter_add map ((u, n) -> (n neg, u)) sort_limit 1010 in
 ((1000, (ranked len, 1010) min) range, ranked) gather
     map ((d, u) -> (u clone, d neg))

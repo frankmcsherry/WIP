@@ -26,9 +26,9 @@ The filter has to come first. A table is one row, so a checked `gather` with one
 fails the whole table.
 
 Q3 is written three ways:
-- **q03:** probe from the large side into the sorted small side, then `group`.
+- **q03:** probe from the large side into the sorted small side, then `scatter_add` by order.
 - **q03b:** each order finds its range in the sorted lineitems, and `slices` + `fold_add` sum the
-  range. No `group` is needed, but sorting the large side is 57% of its time.
+  range. No sum by key is needed, but sorting the large side is 57% of its time.
 - **q03c:** q03b without that sort, since lineitem is stored in order-key order. It is the
   fastest, 0.82× DuckDB's single-thread time.
 
@@ -46,7 +46,7 @@ thread. The last column is from one `--profile` run.
 |---|---|---|---|---|---|
 | q01 | group by two flags, 6 aggregates | 34.05 | 18.76 | 1.82 | `group`'s sort 50%, the filter 35% |
 | q01b | q01 with the flags as bytes, not strings | 25.45 | 18.98 | 1.34 | the sort 46%, reading the flags as bytes 22% |
-| q03 | 3-way: lineitems probe sorted orders, then group | 6.36 | 6.27 | 1.01 | filters 40%, `find` 32% |
+| q03 | 3-way: lineitems probe sorted orders, then sum by order | 6.36 | 6.27 | 1.01 | filters 40%, `find` 32% |
 | q03b | q03 the other way: orders probe sorted lineitems (find + slices) | 11.96 | 5.67 | 2.11 | sorting lineitem 57% |
 | q03c | q03b without the lineitem sort (stored in key order) | 4.86 | 5.91 | 0.82 | filters 49%, `find` 20% |
 | q05 | 6-way join chain, group by nation | 5.16 | 6.31 | 0.82 | `find` 47%, filters 24% |
@@ -84,6 +84,10 @@ order keys are Ints in a narrow range, so `scatter_add` numbers them by a table 
 as the line items are stored in order-key order, each one adds into the slot after the last one's.
 Numbered by their hashes instead, as keys that are not Ints are, the same sums take 80 ms. Data
 directories made before q18 need `prepare.py` run again, for `o_totalprice` and q18's answers.
+
+q03, q05, q10 and q12 sum by key with `scatter_add` too. Their sums come after joins and filters
+have cut the rows to tens of thousands, so the change is small: at scale factor 1, q03 33.8 → 33.4
+ms, q05 30.6 → 30.3, q10 32.0 → 30.9, q12 35.6 → 35.1.
 
 ## Which queries are here
 
