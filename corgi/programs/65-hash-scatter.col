@@ -1,0 +1,7 @@
+# hash_scatter_add: totals by key of any shape, with no rows moved. Here the keys are the strings
+# "even" and "odd", and each value is (a count, x) for x in 0..9. One (key, total) pair per distinct
+# key comes out, in the order of the keys' hashes; `sort` puts them in key order to show them.
+# n = 9
+# = List ends=[2] <(List ends=[4, 7] <[101, 118, 101, 110, 111, 100, 100]>, ([5, 4], [20, 16]))>
+let xs = input iota in
+(xs map (x -> (((x, 2) rem, 0) eq, "even", "odd") select), xs map (x -> ((), x))) hash_scatter_add sort

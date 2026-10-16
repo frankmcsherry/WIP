@@ -345,11 +345,16 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   paths for the associative case — prefer them; `Fold`/`FoldScan` are for non-monoid bodies. Over
   Floats a sum or product runs in row order, so it is the `fold` of `add` or `mul` bit for bit
   (`all`/`any` read masks, which are Ints).
-- **Keyed reductions** (`scatter_add`/`mul`/`min`/`max`/`all`/`any`) take `(ids, values)` and give
-  one `(id, total)` per distinct id, in id order: `group` followed by monoid folds, with no rows
-  moved. A unit field among the values counts. The kernel numbers each row's ids by a table over
-  their range, a hash table that stays in cache, or a sort, whichever their spread allows, then adds
-  each value into its number's slot. Prefer it to `group` when a program wants totals per key.
+- **Keyed reductions** take `(keys, values)` and give one `(key, total)` per distinct key: `group`
+  followed by monoid folds, with no rows moved. A unit field among the values counts. Two families,
+  each with one order: `int_scatter_<op>` for Int keys, in key order, and `hash_scatter_<op>` for
+  keys of any shape, in the order of their hashes (keys sharing a hash, in key order), keys copied
+  out. Both number each row's distinct keys and add each value into its number's slot. Int keys
+  are their own ids: a table over their range when it is narrow, hash tables (partitioned when the
+  keys are many) and a sort of just the distinct keys when it is wide. Other keys are hashed,
+  numbered by the same tables, and then checked against the first key with each number, in
+  place; a row where two keys share a hash is numbered by sorting it. Prefer them to `group` when a
+  program wants totals per key; `hash_scatter` is the consolidation of `(data, diff)` pairs.
 
 ## Failure: lossy ops, and checked ones as words
 

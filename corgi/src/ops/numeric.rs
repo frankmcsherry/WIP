@@ -86,12 +86,13 @@ pub enum ArithOp {
     Neg,                   // X -> X   negate an Int (wrapping at the edge) or a Float
     ToFloat,               // Int -> Float   the nearest `f64`
     Reduce(Red),           // List<X> -> X          per-row monoid reduction (sum/prod/min/max/all/any), X Int or Float
-    Scatter(Red),          // (List<Int>, List<X>) -> List<(Int, X)>   per row, one (id, total) per
-                           // distinct id, in id order: the monoid reduction of the values with that
-                           // id, in element order. X is a leaf, a unit or a product of these, reduced
-                           // field by field; a unit field's total counts the id's values. `fold_<r>`
-                           // is this with every id 0; `group` and a fold is this with ids the keys,
-                           // and no rows moved.
+    IntScatter(Red),       // (List<Int>, List<X>) -> List<(Int, X)>   per row, one (key, total) per
+                           // distinct Int key, in key order: the monoid reduction of the key's values,
+                           // in element order. X is a leaf, a unit or a product of these, reduced field
+                           // by field; a unit field's total counts the key's values. `group` and a
+                           // fold, with no rows moved.
+    HashScatter(Red),      // (List<K>, List<X>) -> List<(K, X)>   the same for keys of any shape, in the
+                           // order of the keys' hashes (keys that share a hash, in key order)
     Scan(Red),             // List<X> -> List<X>    per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
                            // general `FoldScan` re-evals the body per element (catastrophic on one long
@@ -450,177 +451,374 @@ fn reduce_floats(bounds: &crate::value::Bounds, ks: &[u64], r: Red) -> Result<Va
     Ok(Value::Prim(Prim::F64(Arc::new(out))))
 }
 
-/// `(ids, values) scatter_<r>`, row by row: one `(id, total)` pair per distinct id, in id order,
-/// `total` the reduction under `r` of the values with that id, in element order. A row's ids and
-/// values pair up by position (the longer list's extra elements dropped). The values are a leaf, a
-/// unit, or a product of these, reduced field by field; a unit field's total is the count of the
-/// id's values, whatever `r` is.
-///
-/// A row is reduced in two steps. First each element's id is numbered: the row's distinct ids get
-/// the numbers `0..g` in id order. Then each field is reduced into a table of `g` slots, one pass
-/// adding each value into the slot its number names. How the ids are numbered adapts to them:
-/// - ids spanning a range not much wider than the row: which ids in the range occur, then a running
-///   count over those (one sequential pass each, and a lookup per element);
-/// - ids spread wider, while their distinct count is small enough for a hash table that stays in
-///   cache: numbered by the table as first seen, then renumbered in id order;
-/// - otherwise: put in order by corgi's radix sort, each run of one id taking the next number.
-///
-/// A table of few slots is held `COPIES` times, consecutive elements adding into different copies,
-/// so that a run of one id is not a chain of adds each waiting on the last one's store; the copies
-/// are combined at the end. (A Float sum or product is not reassociated: it adds in element order,
-/// into one table.)
-fn scatter_rows(ib: &crate::value::Bounds, ids: &[i64], vb: &crate::value::Bounds, vals: Value, r: Red) -> Result<Value, String> {
-    let rows = ib.len();
-    if vb.len() != rows {
-        return Err(format!("scatter: {rows} rows of ids, {} rows of values", vb.len()));
-    }
-    let (fields, tuple) = match vals {
-        Value::Prod(fs) => (fs, true),
-        v => (vec![v], false),
-    };
-    for f in &fields {
-        match f {
-            Value::Prim(p) if !p.is_int() && matches!(r, Red::All | Red::Any) => {
-                return Err("scatter_all and scatter_any read a mask, which is an Int, not a Float".into());
-            }
-            Value::Prim(_) | Value::Unit(_) => {}
-            other => return Err(format!("scatter values: expected leaves, units, or a product of them, got {}", crate::shape::shape_of_value(other))),
-        }
-    }
-    let mut out_ids: Vec<i64> = Vec::new();
-    let mut outs: Vec<Vec<u64>> = vec![Vec::new(); fields.len()]; // an Int's i64 bits, or a Float's key
-    let mut ends = Vec::with_capacity(rows);
-    let mut scratch = Numbering::default();
-    for q in 0..rows {
-        let ((is, ie), (vs, ve)) = (ib.span(q), vb.span(q));
-        let len = (ie - is).min(ve - vs);
-        let g = scratch.number(&ids[is..is + len], &mut out_ids);
-        for (f, out) in fields.iter().zip(outs.iter_mut()) {
-            reduce_field(f, vs..vs + len, &scratch.slots, g, r, out, &mut scratch.table);
-        }
-        ends.push(out_ids.len());
-    }
-    let mut cols = Vec::with_capacity(fields.len());
-    for (f, out) in fields.iter().zip(outs) {
-        cols.push(match f {
-            Value::Prim(Prim::F64(_)) => Value::Prim(Prim::F64(Arc::new(out))),
-            Value::Prim(_) if matches!(r, Red::All | Red::Any) => Value::u8(out.into_iter().map(|x| x as u8).collect()),
-            _ => Value::i64(out.into_iter().map(|x| x as i64).collect()),
-        });
-    }
-    let vals = if tuple { Value::Prod(cols) } else { cols.pop().expect("one field") };
-    Ok(Value::List(ends.into(), Box::new(Value::Prod(vec![Value::i64(out_ids), vals]))))
+#[cfg(test)]
+mod scatter_tests;
+
+/// The values of a keyed reduction: a leaf, a unit, or a product of these, reduced field by field.
+struct Fields {
+    fields: Vec<Value>,
+    tuple: bool,
 }
 
-/// The numbering step of a scatter, with buffers kept from row to row so a column of short rows
+impl Fields {
+    fn new(vals: Value, r: Red, who: &str) -> Result<Fields, String> {
+        let (fields, tuple) = match vals {
+            Value::Prod(fs) => (fs, true),
+            v => (vec![v], false),
+        };
+        for f in &fields {
+            match f {
+                Value::Prim(p) if !p.is_int() && matches!(r, Red::All | Red::Any) => {
+                    return Err(format!("{who}: `all` and `any` read a mask, which is an Int, not a Float"));
+                }
+                Value::Prim(_) | Value::Unit(_) => {}
+                other => {
+                    return Err(format!("{who} values: expected leaves, units, or a product of them, got {}", crate::shape::shape_of_value(other)));
+                }
+            }
+        }
+        Ok(Fields { fields, tuple })
+    }
+
+    /// each field's totals, by number, appended to `outs`.
+    fn reduce(&self, at: std::ops::Range<usize>, slots: &[u32], g: usize, r: Red, outs: &mut [Vec<u64>], table: &mut Vec<u64>) {
+        for (f, out) in self.fields.iter().zip(outs.iter_mut()) {
+            reduce_field(f, at.clone(), slots, g, r, out, table);
+        }
+    }
+
+    /// the result: each row's `(key, total)` pairs.
+    fn finish(self, ends: Vec<usize>, keys: Value, outs: Vec<Vec<u64>>, r: Red) -> Value {
+        let mut cols = Vec::with_capacity(self.fields.len());
+        for (f, out) in self.fields.iter().zip(outs) {
+            cols.push(match f {
+                Value::Prim(Prim::F64(_)) => Value::Prim(Prim::F64(Arc::new(out))),
+                Value::Prim(_) if matches!(r, Red::All | Red::Any) => Value::u8(out.into_iter().map(|x| x as u8).collect()),
+                _ => Value::i64(out.into_iter().map(|x| x as i64).collect()),
+            });
+        }
+        let vals = if self.tuple { Value::Prod(cols) } else { cols.pop().expect("one field") };
+        Value::List(ends.into(), Box::new(Value::Prod(vec![keys, vals])))
+    }
+}
+
+/// `(keys, values) int_scatter_<r>`, row by row, for Int keys: one `(key, total)` pair per distinct
+/// key, in key order, `total` the reduction under `r` of the key's values in element order. A row's
+/// keys and values pair up by position (the longer list's extra elements dropped).
+///
+/// Each row's distinct keys are numbered `0..g` in key order, then each field is reduced into `g`
+/// slots, one pass each, adding each value into its key's slot. Keys spanning a range not much wider
+/// than the row are numbered by a table over the range: which keys occur, then a running count over
+/// those. Keys spread wider are numbered by hash tables (see [`Numbering`]) and the distinct keys
+/// then put in key order, which sorts `g` keys rather than the row. An Int key is its own id, so the
+/// numbering is exact with no comparison of keys.
+fn int_scatter_rows(kb: &crate::value::Bounds, keys: &[i64], vb: &crate::value::Bounds, vals: Value, r: Red) -> Result<Value, String> {
+    let rows = kb.len();
+    if vb.len() != rows {
+        return Err(format!("int_scatter: {rows} rows of keys, {} rows of values", vb.len()));
+    }
+    let fields = Fields::new(vals, r, "int_scatter")?;
+    let mut out_keys: Vec<i64> = Vec::new();
+    let mut outs: Vec<Vec<u64>> = vec![Vec::new(); fields.fields.len()];
+    let mut ends = Vec::with_capacity(rows);
+    let mut num = Numbering::default();
+    let mut table = Vec::new();
+    for q in 0..rows {
+        let ((ks, ke), (vs, ve)) = (kb.span(q), vb.span(q));
+        let len = (ke - ks).min(ve - vs);
+        let g = num.ints(&keys[ks..ks + len], &mut out_keys);
+        fields.reduce(vs..vs + len, &num.slots, g, r, &mut outs, &mut table);
+        ends.push(out_keys.len());
+    }
+    Ok(fields.finish(ends, Value::i64(out_keys), outs, r))
+}
+
+/// `(keys, values) hash_scatter_<r>`, row by row, for keys of any shape: one `(key, total)` pair per
+/// distinct key, in the order of the keys' hashes (as unsigned words; keys that share a hash, in key
+/// order), `total` the reduction under `r` of the key's values in element order. A row's keys and
+/// values pair up by position (the longer list's extra elements dropped). The keys come out copied.
+///
+/// Each key is hashed, and the row's distinct hashes are numbered `0..g` in hash order by hash
+/// tables (see [`Numbering`]). Then every key is compared with the first key that got its number,
+/// in place: when all agree, no two distinct keys share a hash and the numbering is exact. When some
+/// disagree, the row is numbered by sorting its keys by `(hash, key)` instead. Each field is then
+/// reduced into `g` slots, one pass each.
+fn hash_scatter_rows(kb: &crate::value::Bounds, keys: &Value, vb: &crate::value::Bounds, vals: Value, r: Red, hash: &dyn Fn(&Value) -> Vec<u64>) -> Result<Value, String> {
+    let rows = kb.len();
+    if vb.len() != rows {
+        return Err(format!("hash_scatter: {rows} rows of keys, {} rows of values", vb.len()));
+    }
+    let fields = Fields::new(vals, r, "hash_scatter")?;
+    let hashes = hash(keys);
+    let mut kept: Vec<usize> = Vec::new(); // the position of each distinct key, in output order
+    let mut outs: Vec<Vec<u64>> = vec![Vec::new(); fields.fields.len()];
+    let mut ends = Vec::with_capacity(rows);
+    let mut num = Numbering::default();
+    let mut table = Vec::new();
+    for q in 0..rows {
+        let ((ks, ke), (vs, ve)) = (kb.span(q), vb.span(q));
+        let len = (ke - ks).min(ve - vs);
+        let row = &hashes[ks..ks + len];
+        let g = num.words(row);
+        // the first position with each number, and whether every key equals its number's first
+        let start = kept.len();
+        kept.resize(start + g, usize::MAX);
+        for (k, &s) in num.slots.iter().enumerate() {
+            if kept[start + s as usize] == usize::MAX {
+                kept[start + s as usize] = ks + k;
+            }
+        }
+        let firsts = &kept[start..];
+        let slots = &num.slots;
+        let g = if equal_to_firsts(keys, ks, len, &|k| firsts[slots[k] as usize]) {
+            g
+        } else {
+            // two distinct keys share a hash: number the row by sorting its keys by (hash, key), the
+            // hash's top bit flipped so the signed order of the words is their unsigned order
+            kept.truncate(start);
+            let at: Vec<usize> = (ks..ks + len).collect();
+            let words = Value::i64(row.iter().map(|&h| (h ^ (1 << 63)) as i64).collect());
+            let pairs = Value::Prod(vec![words, crate::engine::gather(keys, &at)]);
+            let (order, runs, _) = crate::ops::cmp::sort::sort_values(&[], &pairs);
+            let mut g = 0;
+            for (j, (&k, &run)) in order.iter().zip(&runs).enumerate() {
+                if j == 0 || run != runs[j - 1] {
+                    kept.push(ks + k);
+                    g += 1;
+                }
+                num.slots[k] = (g - 1) as u32;
+            }
+            g
+        };
+        fields.reduce(vs..vs + len, &num.slots, g, r, &mut outs, &mut table);
+        ends.push(kept.len());
+    }
+    Ok(fields.finish(ends, crate::engine::gather(keys, &kept), outs, r))
+}
+
+/// whether each of the `len` keys from position `ks` equals the key at `first(k)` (`k` counted from
+/// `ks`), compared in place: leaves by value, products field by field, lists of leaves by length then
+/// elements. Other shapes go to the general comparator.
+fn equal_to_firsts(keys: &Value, ks: usize, len: usize, first: &dyn Fn(usize) -> usize) -> bool {
+    match keys {
+        Value::Prim(Prim::I64(xs)) => (0..len).all(|k| xs[ks + k] == xs[first(k)]),
+        Value::Prim(Prim::U8(xs)) => (0..len).all(|k| xs[ks + k] == xs[first(k)]),
+        Value::Prim(Prim::F64(xs)) => (0..len).all(|k| xs[ks + k] == xs[first(k)]),
+        Value::Unit(_) => true,
+        Value::Prod(fields) => fields.iter().all(|f| equal_to_firsts(f, ks, len, first)),
+        Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
+            fn same<T: PartialEq>(v: &[T], a: (usize, usize), b: (usize, usize)) -> bool {
+                a.1 - a.0 == b.1 - b.0 && v[a.0..a.1] == v[b.0..b.1]
+            }
+            let span = |k: usize| (bounds.span(ks + k), bounds.span(first(k)));
+            match &**vals {
+                Value::Prim(Prim::U8(v)) => (0..len).all(|k| { let (a, b) = span(k); same(v, a, b) }),
+                Value::Prim(Prim::I64(v)) => (0..len).all(|k| { let (a, b) = span(k); same(v, a, b) }),
+                Value::Prim(Prim::F64(v)) => (0..len).all(|k| { let (a, b) = span(k); same(v, a, b) }),
+                _ => unreachable!("a list of leaves"),
+            }
+        }
+        other => {
+            let at: Vec<usize> = (ks..ks + len).collect();
+            let reps: Vec<usize> = (0..len).map(first).collect();
+            crate::ops::cmp::order::compare_idx(other, other, &at, &reps).iter().all(|&c| c == 0)
+        }
+    }
+}
+
+/// The numbering step of a keyed reduction: a row's distinct ids numbered `0..g` in ascending order,
+/// each element's number in `slots`. The buffers are kept from row to row, so a column of short rows
 /// allocates nothing per row.
 #[derive(Default)]
 struct Numbering {
-    slots: Vec<u32>, // each element's number
+    slots: Vec<u32>,
     seen: Vec<bool>,
     rank: Vec<u32>,
-    table: Vec<u64>, // a field's totals, before they are appended
+    table: ProbeTable,
+    order: Vec<u32>,
+    parted: Vec<u64>,
+    local: Vec<u32>,
 }
 
 impl Numbering {
-    /// number `ids`: their distinct values, in order, appended to `distinct`, and each element's
-    /// number (its id's position among them) in `self.slots`. Returns how many distinct ids.
-    fn number(&mut self, ids: &[i64], distinct: &mut Vec<i64>) -> usize {
-        self.slots.clear();
-        if ids.is_empty() {
+    /// number Int keys in key order, appending the distinct keys to `distinct`. Keys spanning a range
+    /// not much wider than the row get a table over the range; keys spread wider are mixed by an
+    /// odd multiplier (a bijection on words, so still exact and still one id per key), numbered by
+    /// [`Numbering::words`], and the distinct keys then sorted into key order.
+    fn ints(&mut self, keys: &[i64], distinct: &mut Vec<i64>) -> usize {
+        const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+        if keys.is_empty() {
+            self.slots.clear();
             return 0;
         }
-        let (lo, hi) = ids.iter().fold((i64::MAX, i64::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        let (lo, hi) = keys.iter().fold((i64::MAX, i64::MIN), |(l, h), &x| (l.min(x), h.max(x)));
         let span = hi as i128 - lo as i128 + 1;
-        if span <= (2 * ids.len() + 4096) as i128 {
-            self.by_range(ids, lo, span as usize, distinct)
-        } else if let Some(g) = self.by_hash(ids, distinct) {
-            g
-        } else {
-            self.by_sort(ids, distinct)
+        if span <= (2 * keys.len() + 4096) as i128 {
+            return self.by_range(keys, lo, span as usize, distinct);
         }
-    }
-
-    /// ids in a range `span` wide from `lo`: which occur, then a running count over those.
-    fn by_range(&mut self, ids: &[i64], lo: i64, span: usize, distinct: &mut Vec<i64>) -> usize {
-        self.seen.clear();
-        self.seen.resize(span, false);
-        for &id in ids {
-            self.seen[(id - lo) as usize] = true;
+        let mixed: Vec<u64> = keys.iter().map(|&k| (k as u64).wrapping_mul(MIX)).collect();
+        let g = self.words(&mixed);
+        // each number's key: any element with that number has it
+        let mut key_of = vec![0i64; g];
+        for (&s, &k) in self.slots.iter().zip(keys) {
+            key_of[s as usize] = k;
         }
-        self.rank.clear();
-        let mut g = 0u32;
-        for (k, &s) in self.seen.iter().enumerate() {
-            self.rank.push(g);
-            if s {
-                distinct.push(lo + k as i64);
-                g += 1;
-            }
-        }
-        let rank = &self.rank;
-        self.slots.extend(ids.iter().map(|&id| rank[(id - lo) as usize]));
-        g as usize
-    }
-
-    /// ids spread wide: an open-addressing hash table numbers each as it is first seen, then the
-    /// numbers are put in id order. `None`, with nothing written, once the distinct ids outgrow a
-    /// table that stays in cache.
-    fn by_hash(&mut self, ids: &[i64], distinct: &mut Vec<i64>) -> Option<usize> {
-        const BITS: u32 = 17; // 128K entries: keys and numbers in about 1.5 MB
-        const LIMIT: usize = 1 << (BITS - 1); // at most half full
-        let mask = (1usize << BITS) - 1;
-        let mut keys = vec![0i64; 1 << BITS];
-        let mut nums = vec![u32::MAX; 1 << BITS];
-        let mut seen: Vec<i64> = Vec::new(); // the distinct ids, as first seen
-        for &id in ids {
-            let mut h = ((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - BITS)) as usize;
-            let num = loop {
-                if nums[h] == u32::MAX {
-                    if seen.len() == LIMIT {
-                        self.slots.clear();
-                        return None;
-                    }
-                    keys[h] = id;
-                    nums[h] = seen.len() as u32;
-                    seen.push(id);
-                    break nums[h];
-                }
-                if keys[h] == id {
-                    break nums[h];
-                }
-                h = (h + 1) & mask;
-            };
-            self.slots.push(num);
-        }
-        // first-seen numbers to id-order numbers
-        let mut order: Vec<u32> = (0..seen.len() as u32).collect();
-        order.sort_unstable_by_key(|&k| seen[k as usize]);
-        let mut renumber = vec![0u32; seen.len()];
-        for (j, &k) in order.iter().enumerate() {
-            renumber[k as usize] = j as u32;
-            distinct.push(seen[k as usize]);
+        let mut by_key: Vec<u32> = (0..g as u32).collect();
+        by_key.sort_unstable_by_key(|&s| key_of[s as usize]);
+        let mut renumber = vec![0u32; g];
+        for (j, &s) in by_key.iter().enumerate() {
+            renumber[s as usize] = j as u32;
+            distinct.push(key_of[s as usize]);
         }
         for s in self.slots.iter_mut() {
             *s = renumber[*s as usize];
         }
-        Some(seen.len())
+        g
     }
 
-    /// ids spread wide and many: corgi's radix sort hands back the permutation and each sorted
-    /// position's run, one run per distinct id in id order; each element's number is its run.
-    fn by_sort(&mut self, ids: &[i64], distinct: &mut Vec<i64>) -> usize {
-        let (order, runs, sorted) = crate::ops::cmp::sort::sort_values(&[], &Value::i64(ids.to_vec()));
-        let sorted = sorted.as_i64("scatter ids").expect("sorted ids");
-        self.slots.resize(ids.len(), 0);
-        let mut g = 0;
-        for (j, (&k, &run)) in order.iter().zip(&runs).enumerate() {
-            if j == 0 || run != runs[j - 1] {
-                distinct.push(sorted[j]);
+    /// keys in a range `span` wide from `lo`: which occur, then a running count over those.
+    fn by_range(&mut self, keys: &[i64], lo: i64, span: usize, distinct: &mut Vec<i64>) -> usize {
+        self.seen.clear();
+        self.seen.resize(span, false);
+        for &k in keys {
+            self.seen[(k - lo) as usize] = true;
+        }
+        self.rank.clear();
+        let mut g = 0u32;
+        for (j, &s) in self.seen.iter().enumerate() {
+            self.rank.push(g);
+            if s {
+                distinct.push(lo + j as i64);
                 g += 1;
             }
-            self.slots[k] = (g - 1) as u32;
+        }
+        let rank = &self.rank;
+        self.slots.clear();
+        self.slots.extend(keys.iter().map(|&k| rank[(k - lo) as usize]));
+        g as usize
+    }
+
+    /// number 64-bit words in ascending (unsigned) order. While the distinct words fit a hash table
+    /// that stays in cache, one table numbers them as first seen; a row longer than that whose sample
+    /// of 4096 words holds many distinct ones, or whose table fills, is partitioned by the words' top
+    /// bits instead (a counting pass that keeps the order across partitions, the words themselves laid
+    /// out in partition order), and each partition is numbered by its own table.
+    fn words(&mut self, words: &[u64]) -> usize {
+        const ONE_TABLE: u32 = 17; // 128K entries, about 1.5 MB with their numbers
+        let n = words.len();
+        self.slots.clear();
+        self.slots.resize(n, 0);
+        if n == 0 {
+            return 0;
+        }
+        if n <= 1 << (ONE_TABLE - 1) {
+            let bits = (2 * n).next_power_of_two().trailing_zeros().max(4);
+            return self.table.number(words, bits, 0, &mut self.slots).expect("a table twice the row");
+        }
+        let step = n / 4096;
+        let mut sample: Vec<u64> = words.iter().step_by(step).copied().collect();
+        sample.sort_unstable();
+        sample.dedup();
+        if sample.len() <= 1024 {
+            if let Some(g) = self.table.number(words, ONE_TABLE, 0, &mut self.slots) {
+                return g;
+            }
+        }
+        // partitions of about 16K words, each numbered by a table twice its size
+        let bits = (n / 16384).next_power_of_two().trailing_zeros().clamp(1, 16);
+        let part = |w: u64| (w >> (64 - bits)) as usize;
+        let mut starts = vec![0usize; (1 << bits) + 1];
+        for &w in words {
+            starts[part(w) + 1] += 1;
+        }
+        for p in 0..1 << bits {
+            starts[p + 1] += starts[p];
+        }
+        let mut fill = starts.clone();
+        self.order.resize(n, 0);
+        self.parted.resize(n, 0);
+        for (k, &w) in words.iter().enumerate() {
+            let at = &mut fill[part(w)];
+            self.order[*at] = k as u32;
+            self.parted[*at] = w;
+            *at += 1;
+        }
+        let biggest = starts.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        let table_bits = (2 * biggest).next_power_of_two().trailing_zeros().max(4);
+        self.local.resize(n, 0);
+        let mut g = 0;
+        for w in starts.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            g += self.table.number(&self.parted[lo..hi], table_bits, g, &mut self.local[lo..hi]).expect("a table twice the partition");
+        }
+        for (&k, &s) in self.order.iter().zip(&self.local) {
+            self.slots[k as usize] = s;
         }
         g
+    }
+}
+
+/// An open-addressing table from a word to its number, reused across rows and partitions.
+#[derive(Default)]
+struct ProbeTable {
+    keys: Vec<u64>,
+    nums: Vec<u32>,
+    used: Vec<usize>, // the entries filled, to clear them
+    seen: Vec<u64>,   // the distinct words, as first seen
+}
+
+impl ProbeTable {
+    /// number `words`, writing `base + rank` (each word's rank among the distinct ones, ascending)
+    /// to `out`, using a table of `2^bits` entries. `None`, with the table cleared, when the distinct
+    /// words would fill more than half of it.
+    fn number(&mut self, words: &[u64], bits: u32, base: usize, out: &mut [u32]) -> Option<usize> {
+        let size = 1usize << bits;
+        if self.keys.len() < size {
+            self.keys.resize(size, 0);
+            self.nums.resize(size, u32::MAX);
+        }
+        let (mask, limit) = (size - 1, size / 2);
+        for (j, &w) in words.iter().enumerate() {
+            let mut i = (w.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
+            out[j] = loop {
+                if self.nums[i] == u32::MAX {
+                    if self.seen.len() == limit {
+                        self.clear();
+                        return None;
+                    }
+                    self.keys[i] = w;
+                    self.nums[i] = self.seen.len() as u32;
+                    self.used.push(i);
+                    self.seen.push(w);
+                    break self.nums[i];
+                }
+                if self.keys[i] == w {
+                    break self.nums[i];
+                }
+                i = (i + 1) & mask;
+            };
+        }
+        // first-seen numbers to ranks in ascending order
+        let mut order: Vec<u32> = (0..self.seen.len() as u32).collect();
+        order.sort_unstable_by_key(|&j| self.seen[j as usize]);
+        let mut rank = vec![0u32; self.seen.len()];
+        for (r, &j) in order.iter().enumerate() {
+            rank[j as usize] = (base + r) as u32;
+        }
+        for n in out[..words.len()].iter_mut() {
+            *n = rank[*n as usize];
+        }
+        let g = self.seen.len();
+        self.clear();
+        Some(g)
+    }
+
+    fn clear(&mut self) {
+        for &i in &self.used {
+            self.nums[i] = u32::MAX;
+        }
+        self.used.clear();
+        self.seen.clear();
     }
 }
 
@@ -752,12 +950,18 @@ impl ArithOp {
                     Prim::F64(ks) => reduce_floats(&bounds, &ks, *r)?,
                 }
             }
-            ArithOp::Scatter(r) => {
-                let (ids, vals) = input.into_pair("scatter")?;
-                let (ib, ids) = ids.into_list("scatter ids")?;
-                let (vb, vals) = vals.into_list("scatter values")?;
-                let ids = ids.as_i64("scatter ids")?;
-                scatter_rows(&ib, &ids, &vb, vals, *r)?
+            ArithOp::IntScatter(r) => {
+                let (keys, vals) = input.into_pair("int_scatter")?;
+                let (kb, keys) = keys.into_list("int_scatter keys")?;
+                let (vb, vals) = vals.into_list("int_scatter values")?;
+                let keys = keys.as_i64("int_scatter keys")?;
+                int_scatter_rows(&kb, &keys, &vb, vals, *r)?
+            }
+            ArithOp::HashScatter(r) => {
+                let (keys, vals) = input.into_pair("hash_scatter")?;
+                let (kb, keys) = keys.into_list("hash_scatter keys")?;
+                let (vb, vals) = vals.into_list("hash_scatter values")?;
+                hash_scatter_rows(&kb, &keys, &vb, vals, *r, &crate::hash::hash)?
             }
             ArithOp::Scan(r) => {
                 let (bounds, vals) = input.into_list("scan")?;
