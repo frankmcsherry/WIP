@@ -33,7 +33,8 @@ Q3 is written three ways:
   fastest, 0.82× DuckDB's single-thread time.
 
 Which side to sort is a plan decision. Corgi can't express it today: it doesn't know a column is
-sorted, and `sort` is no cheaper on sorted input.
+sorted, and `sort` is cheaper only on input whose leading field strictly ascends, which the line
+items, several to an order, do not.
 
 ## Measured
 
