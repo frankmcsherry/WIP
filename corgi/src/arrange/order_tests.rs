@@ -70,3 +70,28 @@ fn group_bounds_runs() {
     // the runs of a column with repeats.
     assert_eq!(group_bounds(&Value::i64(vec![10, 10, 20, 20, 20, 30])), vec![2, 5, 6]);
 }
+
+/// Interleaved source pairs must retain their row order after grouping: otherwise contiguous
+/// requests lose the dense comparison path. Use sizes beyond the small-sort threshold.
+#[test]
+fn pair_grouping_preserves_contiguous_spans() {
+    for n in [0, 1, 16, 64, 257, 4096] {
+        let pairs: Vec<_> = (0..n).map(|i| {
+            let (column, row) = (i % 4, i / 4);
+            ((column, row + 7), (column + 4, row + 19))
+        }).collect();
+        let order = super::pair_order(&pairs);
+        let mut seen = vec![false; n];
+        for &i in &order { assert!(!seen[i]); seen[i] = true; }
+        assert!(seen.into_iter().all(|present| present));
+        for adjacent in order.windows(2) {
+            let (a, b) = (pairs[adjacent[0]], pairs[adjacent[1]]);
+            assert!((a.0.0, a.1.0) <= (b.0.0, b.1.0));
+            if (a.0.0, a.1.0) == (b.0.0, b.1.0) {
+                assert_eq!((b.0.1, b.1.1), (a.0.1 + 1, a.1.1 + 1));
+            }
+        }
+        let single: Vec<_> = (0..n).map(|i| ((1, i + 3), (0, i + 11))).collect();
+        assert_eq!(super::pair_order(&single), (0..n).collect::<Vec<_>>());
+    }
+}
