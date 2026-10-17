@@ -137,6 +137,15 @@ fn singleton_list_spans_reject_integer_float_mix() {
 }
 
 #[test]
+fn mixed_integer_leaf_survey_keeps_full_integer_order() {
+    let bytes = Value::u8(vec![0, 1, 2, 2, 255]);
+    let ints = Value::i64(vec![-1, 1, 2, 256, i64::MAX]);
+    for (a, b) in [(&bytes, &ints), (&ints, &bytes)] {
+        assert_eq!(survey_groups(a, b), naive_groups(a, b));
+    }
+}
+
+#[test]
 fn groups_are_maximal_and_equal() {
     let mut rng = Rng(5);
     let (a, b) = two_sorted(&mut rng, 400, 300, 3);

@@ -193,12 +193,19 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
 /// A leaf level: one width dispatch, then the merge over every open class with the keys read
 /// through the index.
 fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
-    let (pa, pb) = Prim::meet_ref(pa, pb);
+    assert_eq!(pa.is_int(), pb.is_int(), "an integer leaf meets a float leaf");
+    // A nested level may read only selected elements of a large source column. Meet integer
+    // storage at each selected read, rather than widening the entire byte column.
+    match (pa, pb) {
+        (Prim::U8(a), Prim::I64(b)) => { merge(|j| a[ia.row(j)] as i64, |j| b[ib.row(j)], open, tree); return; }
+        (Prim::I64(a), Prim::U8(b)) => { merge(|j| a[ia.row(j)], |j| b[ib.row(j)] as i64, open, tree); return; }
+        _ => {}
+    }
     macro_rules! go {
         ($($V:ident),*) => {
-            match (&*pa, &*pb) {
+            match (pa, pb) {
                 $( (Prim::$V(va), Prim::$V(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree), )*
-                _ => unreachable!("meet brings both to one storage"),
+                _ => unreachable!("integer storage dispatched above; floats match"),
             }
         };
     }
