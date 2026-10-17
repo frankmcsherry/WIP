@@ -4,6 +4,9 @@
 # columns: MobilePhone MobilePhoneModel UserID
 # output: [u,s,u]
 let (phone, model, user) = input in
-let ranked = (phone, (model, user) zip) zip map ((p, (m, u)) -> ((m len, 0) gt, ((p, m), u))) filter group
-    map (((p, m), us) -> (us dedup len neg, p, m)) sort_limit 10 in
+# Each distinct (phone, model, user) once, then the users counted by (phone, model).
+let pairs = (phone, (model, user) zip) zip map ((p, (m, u)) -> ((m len, 0) gt, (((p, m), u), 1))) filter
+    transpose scatter_add in
+let ranked = pairs map (((k, _), _) -> (k, 1)) transpose scatter_add
+    map (((p, m), d) -> (d neg, p, m)) sort_limit 10 in
 ranked map ((d, p, m) -> (p, m, d neg))

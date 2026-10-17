@@ -1,0 +1,9 @@
+# mode, counting by `scatter_add`: the most frequent value of each row (the smallest of those tied).
+# Input a `List<Int>`. Output an `Int`; an empty row gives 0.
+let xs = input in
+# Count each value: add a one into its total, and sort the totals into value order.
+let counts = (xs, xs map (_ -> 1)) scatter_add sort in
+let top = counts map ((_, c) -> c) fold_max in
+# The counts are in value order, so the first with the top count is the smallest value.
+let winners = (top, counts) cap_list map ((top, (v, c)) -> ((c, top) eq, v)) filter in
+winners head

@@ -386,10 +386,8 @@ fn family_c(n: usize, reps: u32) {
     });
     row("C2 fold_max", n, c, r, "1 SIMD pass");
 
-    // C3 group_by + sum — 256 buckets (key = x & 255). corgi: sort-based group; rust: sort-by-key + segment sum.
-    let g = compile(
-        "let g = input map (x -> (x and 255, x)) group in g map ((k, vs) -> (k, vs fold_add))",
-    );
+    // C3 group_by + sum — 256 buckets (key = x & 255). corgi: a keyed reduction; rust: direct bucket accum.
+    let g = compile("(input map (x -> x and 255), input) scatter_add");
     let c = corgi_t(&g, &li, reps);
     let r = rust_t(reps, || {
         let s = black_box(&src);
@@ -404,7 +402,7 @@ fn family_c(n: usize, reps: u32) {
         n,
         c,
         r,
-        "sort-based group vs direct bucket accum",
+        "scatter_add vs direct bucket accum",
     );
 
     // C4 scan — inclusive prefix sum. Sequential within the row; rust is a tight cumsum loop.

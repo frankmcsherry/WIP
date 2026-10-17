@@ -22,4 +22,4 @@ let lines = ((lkey, lmode) zip, ((lcommit, lreceipt) zip, lship) zip) zip
 # Each line item's order priority, by looking its order up.
 let at = (lines map ((k, _) -> k), orders map ((k, _) -> k)) find in
 let high = (at map ((lo, _) -> lo), orders) gather map ((_, h) -> h) in
-(lines map ((_, m) -> m), high) zip group map ((m, hs) -> let h = hs fold_add in (m, h, (hs len, h) sub))
+(lines map ((_, m) -> m), high map (h -> (1, h))) scatter_add sort map ((m, (n, h)) -> (m, h, (n, h) sub))

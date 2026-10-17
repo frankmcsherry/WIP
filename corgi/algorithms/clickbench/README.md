@@ -27,97 +27,94 @@ checks corgi's answers against DuckDB's, then times both.
 
 ## Measured
 
-Measured 2026-10-12 at master `6275a5d` on an M4 mini, one partition (`hits_0`, 1M rows). Times are
-the best of three processes, in ms. DuckDB holds the table in memory and runs on one thread; its
+Measured 2026-10-16 on an M4 mini, on the branch that writes the GROUP BY queries with `scatter`
+(after #103), one partition (`hits_0`, 1M rows). Times are the best of three processes, in ms. DuckDB holds the table in memory and runs on one thread; its
 per-query overhead is about 0.1 ms. The last column is from one `--profile` run: each op kind's
 share of the query's time.
 
 | query | corgi | DuckDB 1 thread | × | what dominates |
 |---|---|---|---|---|
 | q00 | 0.00 | 0.09 | 0 | Nothing to do: the row count is in the bounds. |
-| q01 | 0.08 | 0.39 | 0.21 | Ahead: one compare pass and a sum. |
-| q02 | 0.13 | 0.40 | 0.33 | Ahead: two sums. |
-| q03 | 0.75 | 0.73 | 1.03 | Approximated in method (no integer wider than i64): the div and rem by 2^32 are 79%. |
-| q04 | 16.41 | 3.52 | 4.66 | COUNT(DISTINCT UserID): sorting 1M 64-bit ids is 90%, against DuckDB's hash set. |
-| q05 | 28.48 | 5.77 | 4.94 | `hash_group` on search phrases: sorting the hashes 52%, the exactness check 28%, hashing 15%. |
+| q01 | 0.08 | 0.40 | 0.20 | Ahead: one compare pass and a sum. |
+| q02 | 0.14 | 0.40 | 0.35 | Ahead: two sums. |
+| q03 | 0.80 | 0.74 | 1.08 | Approximated in method (no integer wider than i64): the div and rem by 2^32 are 79%. |
+| q04 | 5.55 | 3.44 | 1.61 | COUNT(DISTINCT UserID) as `scatter_add`, then `len`: numbering the 80K distinct ids about 40%, summing the ones about 30%. |
+| q05 | 14.18 | 6.10 | 2.32 | `scatter_add` on search phrases, then `len`: the exactness check about 45%, hashing 27%. |
 | q06 | 0.22 | 0.63 | 0.35 | Ahead: a min and a max. |
-| q07 | 0.52 | 0.54 | 0.96 | At parity: the filter keeps 1.4% of rows. |
-| q08 | 29.68 | 4.93 | 6.02 | Distinct users per region: sorting (region, user) is 89%. |
-| q09 | 32.18 | 13.75 | 2.34 | As q08. |
-| q10 | 2.01 | 1.73 | 1.16 | Near: `group` on the 2% of rows with a phone model (44%), and the filter (30%). |
-| q11 | 2.06 | 1.80 | 1.14 | As q10. |
-| q12 | 4.75 | 3.05 | 1.56 | `hash_group` on the 69K non-empty phrases: hashing 32%, sorting 20%, the exactness check 17%. |
-| q13 | 5.79 | 3.99 | 1.45 | As q12. |
-| q14 | 5.26 | 3.48 | 1.51 | As q12. |
-| q15 | 17.30 | 5.37 | 3.22 | Integer key, 80K distinct: sorting 1M ids is 84%. |
-| q16 | 41.70 | 9.95 | 4.19 | `hash_group` on (user, phrase): sorting the hashes 44%, the exactness check 36%, hashing 14%. |
-| q17 | 42.64 | 9.89 | 4.31 | As q16. |
-| q18 | 45.68 | 23.51 | 1.94 | As q16, with the minute in the key. |
+| q07 | 0.48 | 0.54 | 0.89 | Ahead: the filter keeps 1.4% of rows (71%). |
+| q08 | 9.02 | 5.09 | 1.77 | Distinct users per region, as two `scatter_add`s: on the 1M (region, user) pairs, hashing, numbering and the exactness check about a quarter each. |
+| q09 | 11.22 | 13.77 | 0.81 | Ahead: as q08, with the sums by a third `scatter_add`. |
+| q10 | 1.29 | 1.69 | 0.76 | Ahead: the filter 36%, `len` 29%, the two scatters 22%. |
+| q11 | 1.39 | 1.94 | 0.72 | As q10. |
+| q12 | 3.91 | 3.22 | 1.21 | `scatter_add` on the 69K non-empty phrases, by reference (66%): hashing them is 35%. |
+| q13 | 5.75 | 4.52 | 1.27 | As q12, as two `scatter_add`s. |
+| q14 | 4.30 | 3.52 | 1.22 | As q12. |
+| q15 | 5.90 | 5.40 | 1.09 | Integer key, 80K distinct: numbering about 40%, summing about 30%. |
+| q16 | 19.54 | 10.19 | 1.92 | `scatter_add` on (user, phrase), 98K distinct: hashing and the exactness check a third each, numbering and copying the keys out 13% each. |
+| q17 | 20.82 | 9.96 | 2.09 | As q16. |
+| q18 | 32.51 | 22.44 | 1.45 | As q16, with the minute in the key: 387K distinct, the exactness check a third, numbering 27%. |
 | q19 | 0.42 | 0.12 | 3.50 | DuckDB skips row groups by min/max; corgi's filter scans all 1M rows (79%). |
-| q20 | 192.41 | 36.96 | 5.21 | Approximated in method (no substring search): `split` 40%, `gather` 25%. |
-| q21 | 193.79 | 5.52 | 35.11 | As q20; DuckDB runs LIKE only on the rows that pass the cheap predicate. |
-| q22 | 299.22 | 17.61 | 16.99 | As q20, with two splits. |
-| q23 | 198.37 | 37.18 | 5.34 | As q20; three columns for SELECT *. |
-| q24 | 5.71 | 1.87 | 3.05 | Filtering 1M (time, phrase) pairs is 84%; `sort_limit` 8%. q24r carries the phrases by reference: 1.77 ms, 0.95×. |
-| q25 | 6.41 | 1.61 | 3.98 | As q24. |
-| q26 | 5.73 | 1.88 | 3.05 | As q24. |
-| q27 | 6.09 | 6.41 | 0.95 | At parity: integer key, few groups. |
-| q28 | 645.50 | 459.91 | 1.40 | Approximated in method (no regex): the byte logic's filters 29%, `hash_group`'s sort 17%, MIN by `sort_limit 1` 13%. |
-| q29 | 17.26 | 3.19 | 5.41 | Ninety passes, each a map then a sum, against DuckDB's one. |
-| q30 | 2.56 | 3.16 | 0.81 | Ahead: small after the filter. |
-| q31 | 2.37 | 3.70 | 0.64 | As q30. |
-| q32 | 26.52 | 39.15 | 0.68 | Ahead: a radix sort on two integer columns beats a hash table at one group per row. |
-| q33 | 88.13 | 27.55 | 3.20 | `hash_group` on 1M URLs (88 MB): hashing 43%, the exactness check 35%, sorting 16%. |
-| q34 | 88.41 | 31.19 | 2.83 | As q33. |
-| q35 | 22.90 | 7.84 | 2.92 | Grouping four columns where one decides the rest: the sort is 79%. |
-| q36 | 34.04 | 14.18 | 2.40 | `hash_group` on the 377K URLs that pass: hashing 52%. |
-| q37 | 26.38 | 8.32 | 3.17 | `hash_group` on Titles: hashing 42%, the exactness check 28%. |
-| q38 | 3.99 | 2.75 | 1.45 | Few rows survive; hashing 28%, `sort_limit` 17%. |
-| q39 | 81.78 | 29.34 | 2.79 | `hash_group` on 5-tuples with two strings: hashing 47%, the exactness check 17%, `select` 13%. |
-| q40 | 2.40 | 1.55 | 1.55 | Predicate chain, then a small group. |
-| q41 | 2.23 | 2.49 | 0.90 | As q40. |
-| q42 | 4.26 | 2.99 | 1.42 | Predicate chain, then a small group. |
+| q20 | 196.78 | 36.91 | 5.33 | Approximated in method (no substring search): `split` 40%, `gather` 25%. |
+| q21 | 199.07 | 5.70 | 34.92 | As q20; DuckDB runs LIKE only on the rows that pass the cheap predicate. |
+| q22 | 291.99 | 17.39 | 16.79 | As q20, with two splits. |
+| q23 | 200.55 | 37.07 | 5.41 | As q20; three columns for SELECT *. |
+| q24 | 5.43 | 2.08 | 2.61 | Filtering 1M (time, phrase) pairs is 84%; `sort_limit` 8%. q24r carries the phrases by reference: 1.87 ms, 1.02×. |
+| q25 | 6.29 | 1.57 | 4.01 | As q24. |
+| q26 | 5.82 | 1.86 | 3.13 | As q24. |
+| q27 | 3.28 | 6.84 | 0.48 | Ahead: integer key, few groups; `scatter_add` 44%, the filters 33%. |
+| q28 | 651.34 | 461.84 | 1.41 | Approximated in method (no regex): the byte logic's filters 29%, `hash_group`'s sort 17%, MIN by `sort_limit 1` 13%. |
+| q29 | 17.85 | 3.44 | 5.19 | Ninety passes, each a map then a sum, against DuckDB's one. |
+| q30 | 2.01 | 3.27 | 0.61 | Ahead: small after the filter. |
+| q31 | 3.23 | 3.87 | 0.83 | As q30, about one group per row: `sort_limit` 29%. |
+| q32 | 36.49 | 40.19 | 0.91 | Ahead: 1M groups of one row each. `scatter_add` about half, `sort_limit` about half (see 3 below). |
+| q33 | 105.80 | 28.26 | 3.74 | `scatter_add` on 1M URLs (88 MB), 275K distinct: copying the keys out 41%, hashing 38%, the exactness check 12%. |
+| q34 | 106.26 | 28.51 | 3.73 | As q33. |
+| q35 | 13.64 | 7.76 | 1.76 | Grouping four columns where one decides the rest, 68K distinct: the exactness check 37%, hashing 30%, numbering 18%. |
+| q36 | 31.22 | 13.50 | 2.31 | `scatter_add` on the 377K URLs that pass, by reference: hashing 60%, the exactness check 20%. |
+| q37 | 19.12 | 8.45 | 2.26 | `scatter_add` on Titles: hashing 63%, the exactness check 25%. |
+| q38 | 3.99 | 2.83 | 1.41 | Few rows survive; hashing 42%, `sort_limit` 19%. |
+| q39 | 78.92 | 29.66 | 2.66 | `scatter_add` on 5-tuples with two strings: hashing 52%, the exactness check 16%, `select` 12%. |
+| q40 | 1.98 | 1.64 | 1.21 | Predicate chain, then a small group. |
+| q41 | 1.79 | 2.52 | 0.71 | As q40. |
+| q42 | 2.67 | 2.96 | 0.90 | Predicate chain, then a small group. |
 
-Geometric mean over q01–q42: 2.1× DuckDB on one thread (5.3× on 2026-10-03). In total, corgi takes
-2.2 s and DuckDB 0.84 s; q28 is 0.65 s of corgi's.
+Geometric mean over q01–q42: 1.6× DuckDB on one thread (2.1× on 2026-10-12, 5.3× on 2026-10-03). In
+total, corgi takes 2.1 s and DuckDB 0.84 s; q28 is 0.65 s of corgi's.
 
 | query shape | queries | corgi / DuckDB |
 |---|---|---|
-| scans, whole-table aggregates | q01–q03, q06 | 0.21–1.03× |
-| integer GROUP BY, about one group per row | q32 | 0.68× |
-| small groups after a selective filter | q07, q10, q11, q27, q30, q31 | 0.64–1.16× |
-| predicate chains, then a small group | q40–q42 | 0.90–1.55× |
-| string GROUP BY, by `hash_group` | q05, q12–q14, q16–q18, q33, q34, q36–q39 | 1.45–4.9× |
-| integer GROUP BY, COUNT DISTINCT | q04, q08, q09, q15, q35 | 2.3–6.0× |
-| ORDER BY … LIMIT after filtering strings | q24–q26 | 3.1–4.0× (0.95× with references, q24r) |
+| scans, whole-table aggregates | q01–q03, q06 | 0.20–1.08× |
+| integer GROUP BY, about one group per row | q32 | 0.91× |
+| small groups after a selective filter | q07, q10, q11, q27, q30, q31 | 0.48–0.89× |
+| predicate chains, then a small group | q40–q42 | 0.71–1.21× |
+| string GROUP BY | q05, q12–q14, q16–q18, q33, q34, q36–q39 | 1.21–3.7× |
+| integer GROUP BY, COUNT DISTINCT | q04, q08, q09, q15, q35 | 0.81–1.8× |
+| ORDER BY … LIMIT after filtering strings | q24–q26 | 2.6–4.0× (1.0× with references, q24r) |
 | point lookup | q19 | 3.5× |
-| ninety SUMs | q29 | 5.4× |
-| substring search (LIKE), by split and compare | q20–q23 | 5.2–35× |
+| ninety SUMs | q29 | 5.2× |
+| substring search (LIKE), by split and compare | q20–q23 | 5.3–35× |
 
 ## What the queries argue for
 
-1. **Grouping on strings: done, by hash.** `hash_group` sorts 64-bit hashes rather than the
-   strings, hands keys back by reference, and checks the groups are exact (rows whose keys share a
-   hash are grouped by sorting the keys). Where a filter comes first, the key goes through it by
-   reference (`k ref`). q33 went from 1.6 s to 88 ms. It pays where keys are many or long; for a few
-   distinct short keys, sorting them costs less than hashing every row, so q10, q11 and TPC-H q01
-   and q12 keep `group` (q10 and q01 measured 1.24× and 1.7× slower with `hash_group`). What
-   remains in these queries:
-   - **The hash.** On URL keys it is about half the time. `foldhash`'s `quality` variant, pinned,
-     measured 0.76 of master's time over the fourteen `hash_group` queries (q33 92 → 59 ms) with the
-     same quality as rapidhash; whether to take the dependency is undecided. The `fast` variant
-     fails avalanche on short keys and is not a candidate; ahash's output depends on the CPU.
-   - **The exactness check** (`adjacent` on the keys in hash order), 17–36%: it reads each key from
-     a random place.
-   - **Sorting the hashes**, 16–52%: a radix sort over all 64 bits, where grouping needs only equal
-     hashes together.
-2. **Integer GROUP BY and COUNT DISTINCT on many keys** (q04, q08, q09, q15, q35): sorting 1M
-   64-bit keys is 79–90% of each. DuckDB uses a hash table. The same sort is the largest part of the
-   short-key `hash_group` queries (q05, q16–q18), so a faster grouping of 64-bit keys would serve
-   about nine queries.
+1. **Grouping is `scatter`.** Every GROUP BY whose aggregates are counts, sums, mins and maxes is a
+   `scatter_<op>`: totals by key, no rows moved. COUNT(DISTINCT) is two of them, one making the
+   (group, value) pairs distinct and one counting those by group. Written with `group` and
+   `hash_group` before, the 28 queries that changed now take 0.69× the time (geometric mean; q08
+   30 → 9.0 ms, q15 17 → 5.9). What remains in them:
+   - **The hash.** corgi's structural hash, the stable id of a value, takes a multiply per byte. A
+     hash of byte lists that reads eight bytes at a time, tried in `scatter` alone: q33 took 78 ms
+     against 106, q36 20 against 31, q37 12 against 19, q39 54 against 79.
+   - **Copying string keys out.** `scatter` copies each distinct key, and `gather` copies a list of
+     bytes an element at a time: in q33 and q34, 41%. Open PR #96 copies rows as ranges.
+   - **The exactness check**, a third of q05, q16 and q18: each key is compared with its number's
+     first occurrence, which lies anywhere in the column.
+2. **One group per row** (q31, q32). `scatter_add` numbers q32's 1M distinct (WatchID, ClientIP)
+   keys in about the time `group` took (20 against about 21 ms). What grew is `sort_limit`.
 3. **Top-k is `sort_limit`.** It sorts the order's levels one at a time and keeps, after each, only
-   the first k and the ties at the k-th. What remains in q24–q26 is filtering the strings before it;
-   q24r carries them by reference and is at parity. Open PR #96 (list rows move as ranges of
+   the first k and the ties at the k-th. When the first level is all ties, as q32's counts are
+   (every one 1), every row survives into the next: 18 ms for ten of 1M rows, against 6.7 when
+   `group` handed them over sorted by key, and DuckDB's 2.3. In q24–q26, what remains is filtering
+   the strings before it; q24r carries them by reference. Open PR #96 (list rows move as ranges of
    elements) takes q24–q26 to 1.2–2.4 ms.
 4. **Substring search is left to the host.** corgi has no substring-search word, and adding one is
    not planned: a host that needs LIKE can provide it. q20–q23 keep split-and-compare as a record
@@ -129,4 +126,4 @@ Geometric mean over q01–q42: 2.1× DuckDB on one thread (5.3× on 2026-10-03).
    into the sum that consumes it, or rewriting `sum(x + k)` as `sum + k · count`, would remove them.
 
 The corgi side is ahead on scans and whole-table aggregates, on small groups after a selective
-filter, and on one group per row with integer keys (q32), where radix sort beats DuckDB's hash table.
+filter, and on one group per row with integer keys (q32).

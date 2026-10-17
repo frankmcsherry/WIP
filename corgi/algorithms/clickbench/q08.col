@@ -3,5 +3,7 @@
 # columns: RegionID UserID
 # output: [u,u]
 let (region, user) = input in
-let ranked = (region, user) zip group map ((r, us) -> (us dedup len neg, r)) sort_limit 10 in
+# Each distinct (region, user) once, then the users counted by region.
+let pairs = ((region, user) zip, region map (_ -> 1)) scatter_add in
+let ranked = pairs map (((r, _), _) -> (r, 1)) transpose scatter_add map ((r, d) -> (d neg, r)) sort_limit 10 in
 ranked map ((d, r) -> (r, d neg))

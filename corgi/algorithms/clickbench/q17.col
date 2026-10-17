@@ -4,5 +4,4 @@
 # columns: UserID SearchPhrase
 # output: [i,s,u]
 # Without ORDER BY the SQL's ten rows are any ten; the deterministic version takes the first ten keys.
-input zip map ((u, s) -> ((u, s), ())) hash_group map (((u, s), rows) -> (u, s, rows len)) sort_limit 10
-    map ((u, s, c) -> (u, s clone, c))
+input zip map ((u, s) -> ((u, s), 1)) transpose scatter_add map (((u, s), c) -> (u, s, c)) sort_limit 10

@@ -5,6 +5,6 @@
 # columns: CounterID EventDate DontCountHits IsRefresh Title
 # output: [s,u]
 let views = input zip map ((c, d, x, r, k) ->
-    (((c, 62) eq, (d, 15887) ge, (d, 15917) le, (x, 0) eq, (r, 0) eq, (k len, 0) gt) all, (k ref, ()))) filter in
-let ranked = views hash_group map ((k, rows) -> (rows len neg, k)) sort_limit 10 in
+    (((c, 62) eq, (d, 15887) ge, (d, 15917) le, (x, 0) eq, (r, 0) eq, (k len, 0) gt) all, (k ref, 1))) filter in
+let ranked = views transpose scatter_add map ((k, n) -> (n neg, k)) sort_limit 10 in
 ranked map ((d, k) -> (k clone, d neg))

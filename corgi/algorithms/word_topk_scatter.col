@@ -1,0 +1,9 @@
+# word_topk, counting by `scatter_add`: the three most frequent words of a text (ties: the smaller
+# word), with their counts.
+# Input a `List<Int>` of bytes, words separated by single spaces. Output a `List<(List<Int>, Int)>`.
+let words = input split " " map (w -> ((w len, 0) gt, w)) filter in
+let counts = (words, words map (_ -> 1)) scatter_add in
+# most frequent first: sort on (-count, word).
+let ranked = counts map ((w, c) -> (c neg, w, c)) sort in
+let k = (ranked len, 3) min in
+((0, k) range, ranked) gather map ((_, w, c) -> (w, c))

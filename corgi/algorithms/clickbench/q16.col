@@ -3,6 +3,6 @@
 # sql:   ORDER BY c DESC, UserID, SearchPhrase LIMIT 10
 # columns: UserID SearchPhrase
 # output: [i,s,u]
-let ranked = input zip map ((u, s) -> ((u, s), ())) hash_group
-    map (((u, s), rows) -> (rows len neg, u, s)) sort_limit 10 in
-ranked map ((d, u, s) -> (u, s clone, d neg))
+let ranked = input zip map ((u, s) -> ((u, s), 1)) transpose scatter_add
+    map (((u, s), n) -> (n neg, u, s)) sort_limit 10 in
+ranked map ((d, u, s) -> (u, s, d neg))
