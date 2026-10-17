@@ -46,7 +46,7 @@ pub use value::{show, Bounds, Scalar, Tags, Value};
 /// to rows. Thin public wrappers over the internal `engine`/`ops::cmp::order` machinery. Added
 /// for the dd-corgi backend spike (Route B: cursor-less corgi arrangement).
 pub mod arrange {
-    use crate::value::{Bounds, Value};
+    use crate::value::{Bounds, Prim, Value};
     use std::cmp::Ordering;
 
     /// A row borrowed from a pool of columns, as `(column, row)`.
@@ -66,6 +66,25 @@ pub mod arrange {
             Value::Prod(fs) if fs.len() == 1 => leaf_slice(&fs[0]),
             _ => None,
         }
+    }
+
+    /// Prepare borrowed comparison lanes for a column made of native `i64` leaves, nested
+    /// products and units. Lanes follow structural field order; units contribute no lanes.
+    ///
+    /// Returns `None` for any other storage or shape, including integers held as bytes. Unlike
+    /// [`leaf_slice`], this never widens or materializes payload to test whether it can be borrowed.
+    /// Only the small vector of lane descriptors is allocated, once for the whole column.
+    pub fn borrowed_int_lanes(v: &Value) -> Option<Vec<&[i64]>> {
+        fn walk<'a>(v: &'a Value, lanes: &mut Vec<&'a [i64]>) -> bool {
+            match v {
+                Value::Prim(Prim::I64(xs)) => { lanes.push(xs); true }
+                Value::Prod(fields) => fields.iter().all(|field| walk(field, lanes)),
+                Value::Unit(_) => true,
+                _ => false,
+            }
+        }
+        let mut lanes = Vec::new();
+        walk(v, &mut lanes).then_some(lanes)
     }
 
     /// Select/reorder rows of a single columnar `Value` by index.
