@@ -110,6 +110,33 @@ fn groups_agree_with_the_scalar_walk_on_random_shapes() {
 }
 
 #[test]
+fn singleton_list_spans_compare_mixed_integer_storage() {
+    let bytes = Value::u8(vec![1, 2, 9, 1, 3, 9, 2, 4, 9]);
+    let ints = Value::i64(vec![1, 2, 7, 1, 256, 7, 2, -1, 7]);
+    for (a, b) in [(&bytes, &ints), (&ints, &bytes), (&bytes, &bytes), (&ints, &ints)] {
+        for (left, right) in [((0, 3), (0, 3)), ((3, 6), (3, 6)), ((6, 9), (6, 9)), ((0, 2), (0, 3))] {
+            let want = (left.0 + 1..left.1).map(|i| a.as_i64("test").unwrap()[i])
+                .cmp((right.0 + 1..right.1).map(|i| b.as_i64("test").unwrap()[i]));
+            assert_eq!(cmp_spans(a, b, left, right, 1), Some(want));
+        }
+    }
+    // All first elements agree across inputs, but singleton equal-prefix classes leave
+    // differently sized suffixes to decide. Both surveys must match the scalar oracle.
+    let a = Value::List(Bounds::Stride(3, 3), Box::new(bytes));
+    let b = Value::List(Bounds::Stride(3, 3), Box::new(ints));
+    let (_, _, a) = sort_values(&[], &a);
+    let (_, _, b) = sort_values(&[], &b);
+    assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b));
+    assert_eq!(survey_groups(&b, &a), naive_groups(&b, &a));
+}
+
+#[test]
+#[should_panic(expected = "an integer leaf meets a float leaf")]
+fn singleton_list_spans_reject_integer_float_mix() {
+    cmp_spans(&Value::u8(vec![1]), &Value::f64(vec![1.0]), (0, 1), (0, 1), 0);
+}
+
+#[test]
 fn groups_are_maximal_and_equal() {
     let mut rng = Rng(5);
     let (a, b) = two_sorted(&mut rng, 400, 300, 3);

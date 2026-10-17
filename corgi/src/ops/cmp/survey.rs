@@ -209,12 +209,20 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
 /// are leaves: one slice comparison. `None` for any other element shape.
 fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize, usize), from: usize) -> Option<std::cmp::Ordering> {
     let (Value::Prim(pa), Value::Prim(pb)) = (va, vb) else { return None };
-    let (pa, pb) = Prim::meet_ref(pa, pb);
+    assert_eq!(pa.is_int(), pb.is_int(), "an integer leaf meets a float leaf");
+    // This helper runs once per singleton class, not once per column. Meeting mixed integer
+    // storage here copied the entire byte column for every pair of list rows. Widen only the
+    // bytes of the two spans as the slice comparison reads them.
+    match (pa, pb) {
+        (Prim::U8(x), Prim::I64(y)) => return Some(x[sa + from..ea].iter().map(|&v| v as i64).cmp(y[sb + from..eb].iter().copied())),
+        (Prim::I64(x), Prim::U8(y)) => return Some(x[sa + from..ea].iter().copied().cmp(y[sb + from..eb].iter().map(|&v| v as i64))),
+        _ => {}
+    }
     macro_rules! go {
         ($($V:ident),*) => {
-            match (&*pa, &*pb) {
+            match (pa, pb) {
                 $( (Prim::$V(x), Prim::$V(y)) => Some(x[sa + from..ea].cmp(&y[sb + from..eb])), )*
-                _ => unreachable!("meet brings both to one storage"),
+                _ => unreachable!("integer storage dispatched above; floats match"),
             }
         };
     }
