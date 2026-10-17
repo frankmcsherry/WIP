@@ -59,7 +59,7 @@ pub mod arrange {
     /// to look at values they only read.
     pub fn leaf_slice(v: &Value) -> Option<std::borrow::Cow<'_, [i64]>> {
         match v {
-            Value::Prim(_) => v.as_i64("leaf_slice").ok(),
+            Value::Prim(p) if p.is_int() => v.as_i64("leaf_slice").ok(),
             Value::Prod(fs) if fs.len() == 1 => leaf_slice(&fs[0]),
             _ => None,
         }
