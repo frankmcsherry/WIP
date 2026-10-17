@@ -1,0 +1,607 @@
+{
+  "boundary": "Scalar compare_at control, equal values, System allocator, 100000-row columns. Three alternating before/after runs, eleven timings each; separate allocation pass. Mixed byte/i64 probe has 1000 comparisons into the 100000-row columns.",
+  "base_revision": "41e873124a850772a9c4f7df88be94e3163512ef",
+  "patch": "corgi-scalar-compare.patch",
+  "checkout": "/Users/mcsherry/Projects/corgi-ddir-audit",
+  "binary_sha256": {
+    "before": "0f312ba880643d8f9db873a9305b3216b0d51bcc77b2d1443c393e8c0975c7a6",
+    "after": "672e6aa9c829c3488b3594095717124c914d6b0d4fcceeb94fdb99a242496319"
+  },
+  "runs": {
+    "before": [
+      [
+        {
+          "shape": "int",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 27.36,
+          "allocation_calls": 100000,
+          "samples_ns": [
+            3929708,
+            3435167,
+            3036791,
+            3027792,
+            3013334,
+            2735958,
+            2673250,
+            2493916,
+            2494000,
+            2422667,
+            2305959
+          ]
+        },
+        {
+          "shape": "pair",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 66.96,
+          "allocation_calls": 500000,
+          "samples_ns": [
+            7528250,
+            6989209,
+            6733083,
+            6736917,
+            6676459,
+            6667667,
+            6696125,
+            6715042,
+            6650167,
+            6603917,
+            6621666
+          ]
+        },
+        {
+          "shape": "list_pair8",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 228.71,
+          "allocation_calls": 1200000,
+          "samples_ns": [
+            22870500,
+            22883500,
+            22917125,
+            22814041,
+            22662000,
+            22722875,
+            22617625,
+            22815625,
+            22968875,
+            23139708,
+            23102750
+          ]
+        },
+        {
+          "shape": "sum",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 87.98,
+          "allocation_calls": 600000,
+          "samples_ns": [
+            8831209,
+            8775416,
+            8807500,
+            8798041,
+            8797958,
+            8799583,
+            8783833,
+            8789958,
+            8805083,
+            8780750,
+            8783166
+          ]
+        },
+        {
+          "shape": "byte_vs_i64",
+          "comparisons": 1000,
+          "median_ns_per_comparison": 10485.42,
+          "allocation_calls": 3000,
+          "samples_ns": [
+            10443542,
+            10456625,
+            10414458,
+            10240083,
+            10282625,
+            10497584,
+            10485416,
+            10524750,
+            10593416,
+            10556916,
+            10595334
+          ]
+        }
+      ],
+      [
+        {
+          "shape": "int",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 15.42,
+          "allocation_calls": 100000,
+          "samples_ns": [
+            1578250,
+            1582791,
+            1539625,
+            1547458,
+            1540042,
+            1536375,
+            1537792,
+            1543541,
+            1542208,
+            1541083,
+            1541625
+          ]
+        },
+        {
+          "shape": "pair",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 68.61,
+          "allocation_calls": 500000,
+          "samples_ns": [
+            6861334,
+            6862916,
+            6872583,
+            6862542,
+            6887875,
+            6877167,
+            6826334,
+            6812459,
+            6795541,
+            6814250,
+            6797833
+          ]
+        },
+        {
+          "shape": "list_pair8",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 238.69,
+          "allocation_calls": 1200000,
+          "samples_ns": [
+            23858250,
+            23727125,
+            23683458,
+            23712834,
+            23677166,
+            23868833,
+            23911541,
+            23915792,
+            24030042,
+            24183334,
+            24110167
+          ]
+        },
+        {
+          "shape": "sum",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 88.24,
+          "allocation_calls": 600000,
+          "samples_ns": [
+            9028042,
+            8992959,
+            8983000,
+            8823625,
+            8969000,
+            8846208,
+            8790583,
+            8794917,
+            8815291,
+            8788750,
+            8811208
+          ]
+        },
+        {
+          "shape": "byte_vs_i64",
+          "comparisons": 1000,
+          "median_ns_per_comparison": 10287.67,
+          "allocation_calls": 3000,
+          "samples_ns": [
+            10412250,
+            10094041,
+            10117250,
+            10122333,
+            10203500,
+            10271125,
+            10301333,
+            10287667,
+            10295459,
+            10323875,
+            10298333
+          ]
+        }
+      ],
+      [
+        {
+          "shape": "int",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 15.79,
+          "allocation_calls": 100000,
+          "samples_ns": [
+            1579666,
+            1572416,
+            1580833,
+            1585417,
+            1586292,
+            1578750,
+            1581833,
+            1576875,
+            1579125,
+            1562750,
+            1558084
+          ]
+        },
+        {
+          "shape": "pair",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 71.62,
+          "allocation_calls": 500000,
+          "samples_ns": [
+            6755958,
+            6742667,
+            6775625,
+            6839041,
+            7124750,
+            7162250,
+            7171167,
+            7208750,
+            7175000,
+            7196042,
+            7191417
+          ]
+        },
+        {
+          "shape": "list_pair8",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 253.64,
+          "allocation_calls": 1200000,
+          "samples_ns": [
+            25357875,
+            25420875,
+            25432584,
+            25393584,
+            25389209,
+            25376458,
+            25359417,
+            25363709,
+            25299750,
+            24355459,
+            23334958
+          ]
+        },
+        {
+          "shape": "sum",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 88.95,
+          "allocation_calls": 600000,
+          "samples_ns": [
+            8886666,
+            8918375,
+            8883042,
+            8891375,
+            8894583,
+            8918083,
+            8913333,
+            8903042,
+            8888791,
+            8919875,
+            8888875
+          ]
+        },
+        {
+          "shape": "byte_vs_i64",
+          "comparisons": 1000,
+          "median_ns_per_comparison": 10200.0,
+          "allocation_calls": 3000,
+          "samples_ns": [
+            10154583,
+            10113208,
+            10200375,
+            10177875,
+            10200000,
+            10244291,
+            10251541,
+            10126167,
+            10274125,
+            10240041,
+            10104834
+          ]
+        }
+      ]
+    ],
+    "after": [
+      [
+        {
+          "shape": "int",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 6.15,
+          "allocation_calls": 0,
+          "samples_ns": [
+            661625,
+            661542,
+            661625,
+            661500,
+            661417,
+            615250,
+            555667,
+            558834,
+            558167,
+            555750,
+            556250
+          ]
+        },
+        {
+          "shape": "pair",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 12.96,
+          "allocation_calls": 0,
+          "samples_ns": [
+            1503000,
+            1452333,
+            1293208,
+            1296041,
+            1303459,
+            1439333,
+            1306208,
+            1293250,
+            1210208,
+            1150792,
+            1150916
+          ]
+        },
+        {
+          "shape": "list_pair8",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 60.25,
+          "allocation_calls": 0,
+          "samples_ns": [
+            7648750,
+            7154958,
+            6501583,
+            6242875,
+            5888750,
+            5960958,
+            5976750,
+            6025125,
+            5984291,
+            5967292,
+            6297792
+          ]
+        },
+        {
+          "shape": "sum",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 4.4,
+          "allocation_calls": 0,
+          "samples_ns": [
+            477750,
+            491333,
+            438500,
+            438833,
+            447625,
+            432667,
+            448083,
+            436666,
+            437208,
+            440209,
+            441166
+          ]
+        },
+        {
+          "shape": "byte_vs_i64",
+          "comparisons": 1000,
+          "median_ns_per_comparison": 2.25,
+          "allocation_calls": 0,
+          "samples_ns": [
+            2250,
+            2250,
+            2250,
+            2250,
+            2208,
+            2250,
+            2250,
+            2250,
+            2250,
+            2458,
+            2458
+          ]
+        }
+      ],
+      [
+        {
+          "shape": "int",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 2.47,
+          "allocation_calls": 0,
+          "samples_ns": [
+            247291,
+            236083,
+            247250,
+            233833,
+            247291,
+            233834,
+            247334,
+            233834,
+            247291,
+            233875,
+            247333
+          ]
+        },
+        {
+          "shape": "pair",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 6.54,
+          "allocation_calls": 0,
+          "samples_ns": [
+            658084,
+            651500,
+            647500,
+            654250,
+            654417,
+            650959,
+            655458,
+            654292,
+            649125,
+            653541,
+            654208
+          ]
+        },
+        {
+          "shape": "list_pair8",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 61.21,
+          "allocation_calls": 0,
+          "samples_ns": [
+            6117958,
+            6231334,
+            6131292,
+            6114667,
+            6121041,
+            6129792,
+            6120333,
+            6106416,
+            6095917,
+            6162250,
+            6145833
+          ]
+        },
+        {
+          "shape": "sum",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 4.51,
+          "allocation_calls": 0,
+          "samples_ns": [
+            510708,
+            506417,
+            506000,
+            505500,
+            505208,
+            441667,
+            443542,
+            441125,
+            441167,
+            440959,
+            451500
+          ]
+        },
+        {
+          "shape": "byte_vs_i64",
+          "comparisons": 1000,
+          "median_ns_per_comparison": 2.46,
+          "allocation_calls": 0,
+          "samples_ns": [
+            2458,
+            2500,
+            2458,
+            2458,
+            2458,
+            2500,
+            2500,
+            2458,
+            2458,
+            2459,
+            2459
+          ]
+        }
+      ],
+      [
+        {
+          "shape": "int",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 2.27,
+          "allocation_calls": 0,
+          "samples_ns": [
+            244792,
+            248208,
+            254125,
+            249042,
+            226541,
+            226500,
+            226458,
+            226458,
+            241833,
+            226500,
+            226500
+          ]
+        },
+        {
+          "shape": "pair",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 6.45,
+          "allocation_calls": 0,
+          "samples_ns": [
+            643250,
+            683083,
+            621166,
+            644042,
+            644959,
+            657959,
+            634792,
+            649541,
+            657000,
+            641500,
+            644792
+          ]
+        },
+        {
+          "shape": "list_pair8",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 61.19,
+          "allocation_calls": 0,
+          "samples_ns": [
+            6145041,
+            6098417,
+            5839042,
+            6002500,
+            6141834,
+            6118541,
+            6134792,
+            5977750,
+            6103167,
+            6299958,
+            6283792
+          ]
+        },
+        {
+          "shape": "sum",
+          "comparisons": 100000,
+          "median_ns_per_comparison": 4.3,
+          "allocation_calls": 0,
+          "samples_ns": [
+            432708,
+            437958,
+            436541,
+            449542,
+            414916,
+            407750,
+            410875,
+            430208,
+            430334,
+            423583,
+            432750
+          ]
+        },
+        {
+          "shape": "byte_vs_i64",
+          "comparisons": 1000,
+          "median_ns_per_comparison": 2.46,
+          "allocation_calls": 0,
+          "samples_ns": [
+            2500,
+            2500,
+            2500,
+            2459,
+            2417,
+            2458,
+            2458,
+            2458,
+            2500,
+            2458,
+            2458
+          ]
+        }
+      ]
+    ]
+  },
+  "attribution_correction": {
+    "branch": "origin/corgi-scalar-compare",
+    "commit": "2e4acfa2ed4134be5baf4dd583163c9bc0a5b8d0",
+    "date": "2026-09-03",
+    "merged_into_current_master": false,
+    "in_ddir_pin": false,
+    "port_applies_to_current_master": true,
+    "port_updates": "Signed/mixed-width integers, floats, lexicographic lists and references"
+  }
+}

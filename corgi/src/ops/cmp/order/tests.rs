@@ -64,6 +64,8 @@ fn agree_cmp(a: &Value, b: &Value) {
     let got = compare_cols(a, b);
     let want: Vec<i8> = (0..a.len()).map(|i| compare2(a, i, b, i) as i8).collect();
     assert_eq!(got, want);
+    let scalar: Vec<i8> = (0..a.len()).map(|i| compare_at(a, i, b, i) as i8).collect();
+    assert_eq!(scalar, want, "scalar and bulk comparisons disagree");
     // asked only for equality, the same pairs are equal
     let eq: Vec<bool> = equal_cols(a, b).iter().map(|&o| o == 0).collect();
     assert_eq!(eq, want.iter().map(|&o| o == 0).collect::<Vec<_>>(), "equal_cols");
@@ -145,6 +147,24 @@ fn compare_idx_cross_pairs() {
     let got = compare_idx(&la, &lb, ja, jb);
     let want: Vec<i8> = ja.iter().zip(jb).map(|(&i, &j)| compare2(&la, i, &lb, j) as i8).collect();
     assert_eq!(got, want);
+}
+
+#[test]
+fn compare_at_cross_storage_float_keys_and_references() {
+    use std::sync::Arc;
+    let bytes = Value::u8(vec![0, 1, 127, 255]);
+    let ints = Value::i64(vec![-1, 0, 1, 127, 255, 256, i64::MIN, i64::MAX]);
+    let floats = Value::f64(vec![f64::NAN, -f64::NAN, -0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY]);
+    let lists = Value::List(vec![0, 1, 3, 4].into(), Box::new(Value::i64(vec![-1, -1, 0, 2])));
+    let refs = Value::Ref(Arc::new(lists.clone()), Arc::new(vec![3, 0, 2, 1]));
+    for (a, b) in [(&bytes, &ints), (&ints, &bytes), (&floats, &floats), (&lists, &refs), (&refs, &lists)] {
+        for i in 0..a.len() {
+            for j in 0..b.len() {
+                let bulk = compare_idx(a, b, &[i], &[j])[0].cmp(&0);
+                assert_eq!(compare_at(a, i, b, j), bulk, "rows {i}/{j}");
+            }
+        }
+    }
 }
 
 #[test]

@@ -11,12 +11,39 @@ pub(crate) use labels::*;
 
 /// Scalar structural compare: row `i` of `a` vs row `j` of `b` (same shape). The merge/search
 /// scalar form of [`compare_idx`]; exposed (via `crate::arrange`) for using corgi columns as a
-/// differential-dataflow arrangement substrate.
+/// differential-dataflow arrangement substrate. Reads only the two named rows, without setting
+/// up a bulk comparison or widening whole columns when integer storage widths differ.
 pub(crate) fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
-    match compare_idx(a, b, &[i], &[j])[0] {
-        s if s < 0 => Ordering::Less,
-        0 => Ordering::Equal,
-        _ => Ordering::Greater,
+    match (a, b) {
+        (Value::Prim(pa), Value::Prim(pb)) => match (pa, pb) {
+            (Prim::U8(a), Prim::U8(b)) => a[i].cmp(&b[j]),
+            (Prim::I64(a), Prim::I64(b)) => a[i].cmp(&b[j]),
+            (Prim::F64(a), Prim::F64(b)) => a[i].cmp(&b[j]), // stored total-order keys
+            (Prim::U8(a), Prim::I64(b)) => (a[i] as i64).cmp(&b[j]),
+            (Prim::I64(a), Prim::U8(b)) => a[i].cmp(&(b[j] as i64)),
+            _ => panic!("compare_at: an integer meets a float"),
+        },
+        (Value::Prod(a), Value::Prod(b)) => {
+            assert_eq!(a.len(), b.len(), "compare_at: product arity");
+            a.iter().zip(b).map(|(a, b)| compare_at(a, i, b, j))
+                .find(|order| !order.is_eq()).unwrap_or(Ordering::Equal)
+        }
+        (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
+            let (ab, av) = a.rows_of("compare_at").expect("a list");
+            let (bb, bv) = b.rows_of("compare_at").expect("a list");
+            let ((s0, e0), (s1, e1)) = (ab.span(i), bb.span(j));
+            for k in 0..(e0 - s0).min(e1 - s1) {
+                let order = compare_at(av, s0 + k, bv, s1 + k);
+                if !order.is_eq() { return order; }
+            }
+            (e0 - s0).cmp(&(e1 - s1))
+        }
+        (Value::Sum(at, av), Value::Sum(bt, bv)) => {
+            let (t0, t1) = (at.tag_at(i), bt.tag_at(j));
+            t0.cmp(&t1).then_with(|| compare_at(&av[t0], at.offset_at(i), &bv[t1], bt.offset_at(j)))
+        }
+        (Value::Unit(_), Value::Unit(_)) => Ordering::Equal,
+        _ => panic!("compare_at: shape mismatch"),
     }
 }
 
