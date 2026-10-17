@@ -749,28 +749,34 @@ macro_rules! prim {
             /// (`-1`/`0`/`+1`, as `Ordering as i8`). Reads through the indices, so gather-bound and
             /// scalar on NEON; the dense column-vs-column compare is [`Prim::rel`].
             pub(crate) fn cmp_idx(&self, ia: &[usize], ib: &[usize], other: &Prim) -> Vec<i8> {
-                let (a, b) = Prim::meet_ref(self, other);
-                match (&*a, &*b) {
+                match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) =>
                         ia.iter().zip(ib).map(|(&i, &j)| (a[i] > b[j]) as i8 - (a[i] < b[j]) as i8).collect(), )+
-                    _ => unreachable!("meet brings both to one storage"),
+                    (Prim::U8(a), Prim::I64(b)) => ia.iter().zip(ib)
+                        .map(|(&i, &j)| (a[i] as i64).cmp(&b[j]) as i8).collect(),
+                    (Prim::I64(a), Prim::U8(b)) => ia.iter().zip(ib)
+                        .map(|(&i, &j)| a[i].cmp(&(b[j] as i64)) as i8).collect(),
+                    _ => panic!("cmp_idx: an integer meets a float"),
                 }
             }
 
-            /// structural order of DENSE pairs: `out[k]` = sign of `self[k]` vs `other[k + skew]`,
-            /// for `n` pairs. The implicit-index leaf compare — `skew` 0 is the diagonal (row i vs
-            /// row i) and `skew` 1 the adjacent (row k vs row k+1). Both sides are read
+            /// structural order of DENSE pairs: `out[k]` = sign of `self[left+k]` vs `other[right+k]`,
+            /// for `n` pairs. The implicit-index leaf compare — starts 0/0 give the diagonal,
+            /// starts 0/1 the adjacent pairs, and arbitrary starts two spans. Both sides are read
             /// sequentially, so this vectorizes where [`Prim::cmp_idx`] is two gathers per lane.
-            pub(crate) fn cmp_dense(&self, other: &Prim, n: usize, skew: usize) -> Vec<i8> {
-                let (a, b) = Prim::meet_ref(self, other);
-                match (&*a, &*b) {
+            pub(crate) fn cmp_dense(&self, other: &Prim, n: usize, left: usize, right: usize) -> Vec<i8> {
+                match (self, other) {
                     $( (Prim::$V(a), Prim::$V(b)) => (0..n)
                         .map(|k| {
-                            let (x, y) = (a[k], b[k + skew]);
+                            let (x, y) = (a[left + k], b[right + k]);
                             (x > y) as i8 - (x < y) as i8
                         })
                         .collect(), )+
-                    _ => unreachable!("meet brings both to one storage"),
+                    (Prim::U8(a), Prim::I64(b)) => (0..n)
+                        .map(|k| (a[left + k] as i64).cmp(&b[right + k]) as i8).collect(),
+                    (Prim::I64(a), Prim::U8(b)) => (0..n)
+                        .map(|k| a[left + k].cmp(&(b[right + k] as i64)) as i8).collect(),
+                    _ => panic!("cmp_dense: an integer meets a float"),
                 }
             }
 

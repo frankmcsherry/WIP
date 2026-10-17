@@ -79,13 +79,14 @@ mod compare {
         Explicit(&'a [usize], &'a [usize]),
         Diagonal(usize), // (i, i) for i in 0..n
         Adjacent(usize), // (k, k+1) for k in 0..n — `n` is the PAIR count, one less than the rows
+        Ranges(usize, usize, usize), // two contiguous spans: left start, right start, pair count
     }
 
     impl Pairs<'_> {
         pub(crate) fn len(&self) -> usize {
             match self {
                 Pairs::Explicit(ia, _) => ia.len(),
-                Pairs::Diagonal(n) | Pairs::Adjacent(n) => *n,
+                Pairs::Diagonal(n) | Pairs::Adjacent(n) | Pairs::Ranges(_, _, n) => *n,
             }
         }
         #[inline]
@@ -93,6 +94,7 @@ mod compare {
             match self {
                 Pairs::Explicit(ia, _) => ia[k],
                 Pairs::Diagonal(_) | Pairs::Adjacent(_) => k,
+                Pairs::Ranges(start, _, _) => start + k,
             }
         }
         #[inline]
@@ -101,6 +103,7 @@ mod compare {
                 Pairs::Explicit(_, ib) => ib[k],
                 Pairs::Diagonal(_) => k,
                 Pairs::Adjacent(_) => k + 1,
+                Pairs::Ranges(_, start, _) => start + k,
             }
         }
     }
@@ -120,8 +123,9 @@ mod compare {
             // gathers per lane and does not.
             (Value::Prim(pa), Value::Prim(pb)) => match pairs {
                 Pairs::Explicit(ia, ib) => pa.cmp_idx(ia, ib, pb),
-                Pairs::Diagonal(n) => pa.cmp_dense(pb, n, 0),
-                Pairs::Adjacent(n) => pa.cmp_dense(pb, n, 1),
+                Pairs::Diagonal(n) => pa.cmp_dense(pb, n, 0, 0),
+                Pairs::Adjacent(n) => pa.cmp_dense(pb, n, 0, 1),
+                Pairs::Ranges(a, b, n) => pa.cmp_dense(pb, n, a, b),
             },
 
             // single-field product: the field's order IS the order — skip the fold + tie vec.
@@ -300,6 +304,17 @@ mod compare {
     /// equals row `i` of `b` — `Rel`'s `eq` and `ne`.
     pub fn equal_cols(a: &Value, b: &Value) -> Vec<i8> {
         compare_in(a, b, Pairs::Diagonal(a.len()), true)
+    }
+
+    /// Indexed equality: zero exactly when the named rows agree. Nonzero signs are unspecified.
+    pub fn equal_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
+        assert_eq!(ia.len(), ib.len(), "equal_idx: pair count");
+        compare_in(a, b, Pairs::Explicit(ia, ib), true)
+    }
+
+    /// Equality of contiguous spans, retaining dense leaf loops without materializing indices.
+    pub fn equal_ranges(a: &Value, b: &Value, left: usize, right: usize, len: usize) -> Vec<i8> {
+        compare_in(a, b, Pairs::Ranges(left, right, len), true)
     }
 
     /// the adjacent case, asked only for equality: `out[k]` is zero exactly when row `k` of `v`

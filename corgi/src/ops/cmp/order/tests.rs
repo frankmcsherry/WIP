@@ -148,6 +148,32 @@ fn compare_idx_cross_pairs() {
 }
 
 #[test]
+fn borrowed_pair_equality_across_columns_and_storage() {
+    use std::sync::Arc;
+    use crate::arrange::equal_pairs;
+    let lists = Value::List(vec![0, 1, 3, 4].into(), Box::new(Value::i64(vec![1, 1, 2, -3])));
+    let refs = Value::Ref(Arc::new(lists.clone()), Arc::new(vec![3, 0, 2, 1]));
+    let other = Value::List(vec![0, 1, 4, 5].into(), Box::new(Value::u8(vec![1, 1, 2, 3, 3])));
+    let columns = [&lists, &refs, &other];
+    let rows = [vec![vec![], vec![1], vec![1, 2], vec![-3]],
+                vec![vec![-3], vec![], vec![1, 2], vec![1]],
+                vec![vec![], vec![1], vec![1, 2, 3], vec![3]]];
+    let pairs: Vec<_> = (0..4).flat_map(|i| (0..4).flat_map(move |j|
+        (0..3).flat_map(move |a| (0..3).map(move |b| ((a, i), (b, j)))))).collect();
+    let expected: Vec<_> = pairs.iter().map(|&((a, i), (b, j))| rows[a][i] == rows[b][j]).collect();
+    assert_eq!(equal_pairs(&columns, &pairs), expected);
+    assert!(equal_pairs(&[], &[]).is_empty());
+
+    let bytes = Value::u8(vec![0, 1, 127, 255]);
+    let ints = Value::i64(vec![-1, 1, 127, i64::MAX]);
+    let pairs = [((0, 0), (1, 0)), ((1, 1), (0, 1)), ((0, 2), (1, 2)), ((1, 3), (0, 3))];
+    assert_eq!(equal_pairs(&[&bytes, &ints], &pairs), [false, true, true, false]);
+    assert_eq!(compare_idx(&bytes, &ints, &[0, 1, 2, 3], &[0, 1, 2, 3]), [1, 0, 0, -1]);
+    assert_eq!(equal_ranges(&bytes, &ints, 1, 1, 3).iter().map(|&x| x == 0).collect::<Vec<_>>(), [true, true, false]);
+    assert_eq!(equal_ranges(&ints, &bytes, 0, 1, 2).iter().map(|&x| x == 0).collect::<Vec<_>>(), [false, false]);
+}
+
+#[test]
 fn compare_cols_sum_at_scale() {
     // many tagged rows; the bulk path must match the (here O(n²)) scalar reference.
     let n = 300usize;
