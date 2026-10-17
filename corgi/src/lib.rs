@@ -75,8 +75,8 @@ pub mod arrange {
     pub fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize]) -> Value {
         crate::engine::gather_lanes(srcs, tags, off)
     }
-    /// Structural compare of row `i` of `a` vs row `j` of `b` (same shape). Build a sort by
-    /// `indices.sort_by(|&i,&j| compare_at(kv, i, kv, j))`; merge two sorted batches with it.
+    /// Structural comparison of one isolated row pair (same shape). For batches, prefer
+    /// [`equal_pairs`], [`sort_blocks`] or [`survey_groups`] to calls per row.
     pub fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
         crate::ops::cmp::order::compare_at(a, i, b, j)
     }
@@ -88,8 +88,7 @@ pub mod arrange {
     /// structural descent; payload columns are neither gathered nor converted to rows. This lets
     /// a host compare a whole window of keys or output candidates without scalar calls per key.
     pub fn equal_pairs(columns: &[&Value], pairs: &[(RowRef, RowRef)]) -> Vec<bool> {
-        let mut order: Vec<usize> = (0..pairs.len()).collect();
-        order.sort_unstable_by_key(|&i| (pairs[i].0.0, pairs[i].1.0));
+        let order = pair_order(pairs);
         let mut result = vec![false; pairs.len()];
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for group in order.chunk_by(|&a, &b| (pairs[a].0.0, pairs[a].1.0) == (pairs[b].0.0, pairs[b].1.0)) {
@@ -108,6 +107,17 @@ pub mod arrange {
             for (&i, sign) in group.iter().zip(equal) { result[i] = sign == 0; }
         }
         result
+    }
+
+    /// Group requests by source columns, retaining request order within each group. Already
+    /// grouped requests, including the single-column-pair case, need no sort.
+    fn pair_order(pairs: &[(RowRef, RowRef)]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..pairs.len()).collect();
+        let columns = |i: usize| (pairs[i].0.0, pairs[i].1.0);
+        if order.windows(2).any(|w| columns(w[0]) > columns(w[1])) {
+            order.sort_unstable_by_key(|&i| (pairs[i].0.0, pairs[i].1.0, i));
+        }
+        order
     }
 
     /// Multi-record argsort: the permutation that sorts *all* of `v`'s rows by structural order, in
