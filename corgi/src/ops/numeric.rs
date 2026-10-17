@@ -573,7 +573,7 @@ fn scatter_by_hash(kb: &crate::value::Bounds, keys: &Value, vb: &crate::value::B
         let ((ks, ke), (vs, ve)) = (kb.span(q), vb.span(q));
         let len = (ke - ks).min(ve - vs);
         let row = &hashes[ks..ks + len];
-        let g = num.words(row);
+        let g = num.words(row, HashTable::CACHED);
         // the first position with each number, and whether every key equals its number's first
         let start = kept.len();
         kept.resize(start + g, usize::MAX);
@@ -645,10 +645,7 @@ struct Numbering {
     slots: Vec<u32>,
     seen: Vec<bool>,
     rank: Vec<u32>,
-    table: ProbeTable,
-    order: Vec<u32>,
-    parted: Vec<u64>,
-    local: Vec<u32>,
+    table: HashTable,
 }
 
 impl Numbering {
@@ -674,113 +671,170 @@ impl Numbering {
         g as usize
     }
 
-    /// number 64-bit words. While the distinct words fit a hash table that stays in cache, one table
-    /// numbers them as first seen; a row longer than that whose sample of 4096 words holds many
-    /// distinct ones, or whose table fills, is partitioned by the words' top bits instead (a counting
-    /// pass, the words themselves laid out in partition order), and each partition is numbered by its
-    /// own table, as first seen, after the partitions before it.
-    fn words(&mut self, words: &[u64]) -> usize {
-        const ONE_TABLE: u32 = 17; // 128K entries, about 1.5 MB with their numbers
+    /// number 64-bit words as first seen, by one table that grows as it fills. Should the table
+    /// outgrow `2^cap` entries (`HashTable::CACHED`, but for tests), or nearly every word still be
+    /// new when it first grows, the words not yet numbered, and those in the table, are put in
+    /// parts by their top bits (a counting pass, the words themselves laid out in part order), and
+    /// each part is numbered by a table of its own, starting from the words of that part already
+    /// numbered. The numbers are written back in place. (Each part has a table sized from its
+    /// count: filled part by part, one table of unknown final size would overfill its first
+    /// stretches.)
+    fn words(&mut self, words: &[u64], cap: u32) -> usize {
         let n = words.len();
         self.slots.clear();
         self.slots.resize(n, 0);
-        if n == 0 {
-            return 0;
+        self.table.empty((2 * n).next_power_of_two().trailing_zeros().clamp(4, 17).min(cap), 0);
+        let k = self.table.number(words, &mut self.slots, cap);
+        if k == n {
+            return self.table.len;
         }
-        if n <= 1 << (ONE_TABLE - 1) {
-            let bits = (2 * n).next_power_of_two().trailing_zeros().max(4);
-            return self.table.number(words, bits, 0, &mut self.slots).expect("a table twice the row");
-        }
-        let step = n / 4096;
-        let mut sample: Vec<u64> = words.iter().step_by(step).copied().collect();
-        sample.sort_unstable();
-        sample.dedup();
-        if sample.len() <= 1024 {
-            if let Some(g) = self.table.number(words, ONE_TABLE, 0, &mut self.slots) {
-                return g;
+        // the words in the table, with their numbers, and the rest, with their positions, in parts
+        // of about 16K words by their top bits
+        let held = self.table.held();
+        let rest: Vec<(u64, u32)> = words[k..].iter().zip(k as u32..).map(|(&w, j)| (w, j)).collect();
+        let bits = ((held.len() + rest.len()) / 16384).next_power_of_two().trailing_zeros().clamp(1, 16);
+        let part = |&(w, _): &(u64, u32)| (w >> (64 - bits)) as usize;
+        let (held_parts, held_at) = by_part(&held, 1 << bits, part);
+        let (rest_parts, rest_at) = by_part(&rest, 1 << bits, part);
+        let mut next = held.len() as u32;
+        for p in 0..1 << bits {
+            let (held, rest) = (&held_parts[held_at[p]..held_at[p + 1]], &rest_parts[rest_at[p]..rest_at[p + 1]]);
+            self.table.empty((2 * (held.len() + rest.len())).next_power_of_two().trailing_zeros().max(4), bits);
+            for &(w, num) in held {
+                self.table.place(w, num);
+            }
+            for &(w, at) in rest {
+                let num = self.table.place(w, next);
+                next += (num == next) as u32;
+                self.slots[at as usize] = num;
             }
         }
-        // partitions of about 16K words, each numbered by a table twice its size
-        let bits = (n / 16384).next_power_of_two().trailing_zeros().clamp(1, 16);
-        let part = |w: u64| (w >> (64 - bits)) as usize;
-        let mut starts = vec![0usize; (1 << bits) + 1];
-        for &w in words {
-            starts[part(w) + 1] += 1;
-        }
-        for p in 0..1 << bits {
-            starts[p + 1] += starts[p];
-        }
-        let mut fill = starts.clone();
-        self.order.resize(n, 0);
-        self.parted.resize(n, 0);
-        for (k, &w) in words.iter().enumerate() {
-            let at = &mut fill[part(w)];
-            self.order[*at] = k as u32;
-            self.parted[*at] = w;
-            *at += 1;
-        }
-        let biggest = starts.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
-        let table_bits = (2 * biggest).next_power_of_two().trailing_zeros().max(4);
-        self.local.resize(n, 0);
-        let mut g = 0;
-        for w in starts.windows(2) {
-            let (lo, hi) = (w[0], w[1]);
-            g += self.table.number(&self.parted[lo..hi], table_bits, g, &mut self.local[lo..hi]).expect("a table twice the partition");
-        }
-        for (&k, &s) in self.order.iter().zip(&self.local) {
-            self.slots[k as usize] = s;
-        }
-        g
+        next as usize
     }
 }
 
-/// An open-addressing table from a word to its number, reused across rows and partitions.
+/// `items` in `parts`, by counting: laid out part after part, in their order within a part, and
+/// where each part starts.
+fn by_part<T: Copy + Default>(items: &[T], parts: usize, part: impl Fn(&T) -> usize) -> (Vec<T>, Vec<usize>) {
+    let mut at = vec![0usize; parts + 1];
+    for x in items {
+        at[part(x) + 1] += 1;
+    }
+    for p in 0..parts {
+        at[p + 1] += at[p];
+    }
+    let mut fill = at.clone();
+    let mut out = vec![T::default(); items.len()];
+    for x in items {
+        let f = &mut fill[part(x)];
+        out[*f] = *x;
+        *f += 1;
+    }
+    (out, at)
+}
+
+/// An open-addressing table from a word to its number, its first-seen rank, reused across rows and
+/// parts. A word's home is its top bits (after those every word in the table shares), so growing
+/// the table, which puts its words back in table order, writes about in order of their homes.
 #[derive(Default)]
-struct ProbeTable {
-    keys: Vec<u64>,
-    nums: Vec<u32>,
-    used: Vec<usize>, // the entries filled, to clear them
+struct HashTable {
+    words: Vec<u64>,
+    nums: Vec<u32>, // `EMPTY` where no word is
+    bits: u32,
+    skip: u32, // top bits every word shares, which are no part of a home
+    len: usize,
 }
 
-impl ProbeTable {
-    /// number `words` as first seen, from `base`, into `out`, using a table of `2^bits` entries.
-    /// `None`, with the table cleared, when the distinct words would fill more than half of it.
-    fn number(&mut self, words: &[u64], bits: u32, base: usize, out: &mut [u32]) -> Option<usize> {
+impl HashTable {
+    const EMPTY: u32 = u32::MAX;
+    /// the most bits a table has while it should stay in cache: 1M entries, about 12 MB.
+    const CACHED: u32 = 20;
+
+    /// `2^bits` empty entries, for words that share their top `skip` bits.
+    fn empty(&mut self, bits: u32, skip: u32) {
         let size = 1usize << bits;
-        if self.keys.len() < size {
-            self.keys.resize(size, 0);
-            self.nums.resize(size, u32::MAX);
+        if self.words.len() < size {
+            self.words.resize(size, 0);
+            self.nums.resize(size, Self::EMPTY);
         }
-        let (mask, limit) = (size - 1, size / 2);
-        for (j, &w) in words.iter().enumerate() {
-            let mut i = (w.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
-            out[j] = loop {
-                if self.nums[i] == u32::MAX {
-                    if self.used.len() == limit {
-                        self.clear();
-                        return None;
-                    }
-                    self.keys[i] = w;
-                    self.nums[i] = (base + self.used.len()) as u32;
-                    self.used.push(i);
-                    break self.nums[i];
-                }
-                if self.keys[i] == w {
-                    break self.nums[i];
-                }
-                i = (i + 1) & mask;
-            };
-        }
-        let g = self.used.len();
-        self.clear();
-        Some(g)
+        self.nums[..size].fill(Self::EMPTY);
+        self.bits = bits;
+        self.skip = skip;
+        self.len = 0;
     }
 
-    fn clear(&mut self) {
-        for &i in &self.used {
-            self.nums[i] = u32::MAX;
+    /// number `words` as first seen into `out`, until the table would grow past `2^cap` entries:
+    /// how many words were numbered. The table doubles when more than three eighths full; at
+    /// `2^cap` entries it fills to half. Between those checks, no word needs one: each adds at most
+    /// one entry.
+    fn number(&mut self, words: &[u64], out: &mut [u32], cap: u32) -> usize {
+        let mut k = 0;
+        while k < words.len() {
+            let half = (1usize << self.bits) / 2;
+            if 4 * self.len > 3 * half && self.bits < cap {
+                // nearly every word so far new, and words enough left to fill the cache: parts
+                if 10 * self.len > 9 * k && words.len() - k > 1 << (cap - 1) {
+                    return k;
+                }
+                self.grow();
+                continue;
+            }
+            if self.len == half {
+                return k;
+            }
+            let end = (k + half - self.len).min(words.len());
+            let (mask, skip, shift) = ((1usize << self.bits) - 1, self.skip, 64 - self.bits);
+            let mut len = self.len;
+            for (o, &w) in out[k..end].iter_mut().zip(&words[k..end]) {
+                let mut i = ((w << skip) >> shift) as usize;
+                *o = loop {
+                    if self.nums[i] == Self::EMPTY {
+                        self.words[i] = w;
+                        self.nums[i] = len as u32;
+                        len += 1;
+                        break len as u32 - 1;
+                    }
+                    if self.words[i] == w {
+                        break self.nums[i];
+                    }
+                    i = (i + 1) & mask;
+                };
+            }
+            self.len = len;
+            k = end;
         }
-        self.used.clear();
+        words.len()
+    }
+
+    /// twice the entries, the words put back in table order.
+    fn grow(&mut self) {
+        let held = self.held();
+        self.empty(self.bits + 1, self.skip);
+        for (w, n) in held {
+            self.place(w, n);
+        }
+    }
+
+    /// the words in the table, with their numbers, in table order.
+    fn held(&self) -> Vec<(u64, u32)> {
+        (0..1usize << self.bits).filter(|&i| self.nums[i] != Self::EMPTY).map(|i| (self.words[i], self.nums[i])).collect()
+    }
+
+    /// `w`'s number, or `fresh` with `w` put in the first empty slot from its home.
+    #[inline]
+    fn place(&mut self, w: u64, fresh: u32) -> u32 {
+        let mask = (1usize << self.bits) - 1;
+        let mut i = ((w << self.skip) >> (64 - self.bits)) as usize;
+        while self.nums[i] != Self::EMPTY {
+            if self.words[i] == w {
+                return self.nums[i];
+            }
+            i = (i + 1) & mask;
+        }
+        self.words[i] = w;
+        self.nums[i] = fresh;
+        self.len += 1;
+        fresh
     }
 }
 

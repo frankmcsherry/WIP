@@ -1,9 +1,9 @@
 //! The keyed reductions, `scatter_<op>`: per row, one `(key, total)` pair per distinct key, in an
 //! order not promised, so each check sorts the pairs. These check them against a direct reference
-//! on random rows whose keys take each of the numberings (a range, one hash table, partitioned
-//! tables), against `group` and a fold for keys of many shapes, and on the cases the definition
-//! names: element order, products, empty rows, and the errors. Rows where two keys share a hash are
-//! checked in the crate, where a hash can be cut short.
+//! on random rows whose keys take each of the numberings (a range, a hash table), against `group`
+//! and a fold for keys of many shapes, and on the cases the definition names: element order,
+//! products, empty rows, and the errors. Rows where two keys share a hash, and numbering in parts,
+//! are checked in the crate, where a hash can be cut short and the table kept small.
 
 use corgi::{show, Program, Value};
 use std::collections::BTreeMap;
@@ -84,9 +84,9 @@ fn scatter_matches_a_direct_reduction() {
     }
 }
 
-/// many distinct keys spread wide: numbered by partitioned hash tables.
+/// many distinct keys spread wide, numbered by a table that grows as it fills.
 #[test]
-fn many_spread_keys_are_numbered_by_partitions() {
+fn many_spread_keys() {
     let mut rng = Rng(7);
     let pool: Vec<i64> = (0..80_000).map(|_| rng.below(u64::MAX) as i64 / 2).collect();
     let ids: Vec<i64> = (0..200_000).map(|_| pool[rng.below(80_000) as usize]).collect();
@@ -182,9 +182,9 @@ fn keys_of_any_shape() {
     }
 }
 
-/// many distinct strings: numbered by partitioned tables.
+/// many distinct strings.
 #[test]
-fn many_distinct_strings_are_numbered_by_partitions() {
+fn many_distinct_strings() {
     let mut rng = Rng(29);
     let n = 200_000;
     let words: Vec<String> = (0..n).map(|_| format!("key-{}", rng.below(90_000))).collect();

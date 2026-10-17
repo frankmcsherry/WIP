@@ -82,7 +82,7 @@ orders at scale factor 1, before the orders over 300 units are kept. On one thre
 1, q18 sums them with `group` in 52 ms, q18s with `scatter_add` in 27, and DuckDB takes 94. The
 order keys are Ints in a narrow range, so `scatter_add` numbers them by a table over the range, and
 as the line items are stored in order-key order, each one adds into the slot after the last one's.
-Numbered by their hashes instead, as keys that are not Ints are, the same sums take 75 ms. Data
+Numbered by their hashes instead, as keys that are not Ints are, the same sums take 80 ms. Data
 directories made before q18 need `prepare.py` run again, for `o_totalprice` and q18's answers.
 
 ## Which queries are here

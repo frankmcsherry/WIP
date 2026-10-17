@@ -30,3 +30,28 @@ fn keys_that_share_a_hash_are_told_apart() {
     let sorted = Program::compile_ml("input sort").unwrap().run(got);
     assert_eq!(crate::show(&sorted), crate::show(&grouped));
 }
+
+/// words numbered with the table's limit cut to 64 entries, so the words past the first 32
+/// distinct are numbered in parts: equal words get equal numbers, and the numbers are `0..g`.
+#[test]
+fn numbering_in_parts_matches_one_table() {
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let pool: Vec<u64> = (0..3000).map(|_| next()).collect();
+    let words: Vec<u64> = (0..20_000).map(|_| pool[(next() % 3000) as usize]).collect();
+    let mut num = Numbering::default();
+    let g = num.words(&words, 6);
+    assert!(num.table.skip > 0, "numbered in parts");
+    let mut first: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for (&w, &s) in words.iter().zip(&num.slots) {
+        assert_eq!(*first.entry(w).or_insert(s), s, "one number per word");
+    }
+    let mut nums: Vec<u32> = first.values().copied().collect();
+    nums.sort_unstable();
+    assert_eq!(nums, (0..g as u32).collect::<Vec<_>>(), "the numbers are 0..g, one per word");
+}

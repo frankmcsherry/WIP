@@ -350,8 +350,9 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   promised (the same input gives the same order), so a program that wants key order sorts them, and
   `sort` costs one pass when they came out in it. Each row's distinct keys are numbered and each
   value added into its number's slot. Int keys spanning a narrow range in every row are numbered by
-  a table over the range, which gives key order. Other keys are hashed, the hashes numbered by hash
-  tables (partitioned when they are many) as first seen, and each key checked against the first key
+  a table over the range, which gives key order. Other keys are hashed, and the hashes numbered as
+  first seen by one table that grows as it fills; once it outgrows the cache, the rest are numbered
+  in parts by their top bits, each by a table of its own. Each key is checked against the first key
   with its number, in place (not leaves: a leaf's hash is exact); a row where two keys share a hash
   is numbered by sorting its keys. Prefer `scatter` to `group` when a program wants totals per key;
   it is the consolidation of `(data, diff)` pairs.
