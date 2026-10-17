@@ -71,6 +71,33 @@ fn group_bounds_runs() {
     assert_eq!(group_bounds(&Value::i64(vec![10, 10, 20, 20, 20, 30])), vec![2, 5, 6]);
 }
 
+#[test]
+fn native_integer_lanes_borrow_only_wide_integer_products() {
+    use super::borrowed_int_lanes;
+    let a = Value::i64(vec![1, 2, 3]);
+    let b = Value::i64(vec![4, 5, 6]);
+    let nested = Value::Prod(vec![a.clone(), Value::Prod(vec![Value::Unit(3), b.clone()])]);
+    let lanes = borrowed_int_lanes(&nested).unwrap();
+    assert_eq!(lanes, vec![&[1, 2, 3][..], &[4, 5, 6][..]]);
+    assert_eq!(lanes[0].as_ptr(), a.as_i64("test").unwrap().as_ptr());
+    assert_eq!(lanes[1].as_ptr(), b.as_i64("test").unwrap().as_ptr());
+    assert_eq!(borrowed_int_lanes(&Value::Prod(vec![a.clone()])).unwrap(), vec![&[1, 2, 3][..]]);
+    assert_eq!(borrowed_int_lanes(&Value::Unit(3)), Some(vec![]));
+    assert_eq!(borrowed_int_lanes(&Value::Prod(vec![])), Some(vec![]));
+    assert_eq!(borrowed_int_lanes(&Value::i64(vec![])), Some(vec![&[][..]]));
+
+    let narrow = Value::u8(vec![1, 2, 3]);
+    let list = Value::List(Bounds::Stride(1, 3), Box::new(a.clone()));
+    for rejected in [
+        narrow.clone(), Value::f64(vec![1.0, 2.0, 3.0]), list.clone(),
+        crate::engine::take_ref(list), Value::sum(vec![0; 3], vec![a.clone()]),
+        Value::Prod(vec![a.clone(), narrow.clone()]),
+        Value::Prod(vec![narrow, a]),
+    ] {
+        assert!(borrowed_int_lanes(&rejected).is_none());
+    }
+}
+
 /// Interleaved source pairs must retain their row order after grouping: otherwise contiguous
 /// requests lose the dense comparison path. Use sizes beyond the small-sort threshold.
 #[test]
