@@ -1,9 +1,9 @@
 # TPC-H joins in corgi
 
-TPC-H's join queries Q3, Q5, Q10, Q12, Q14 and Q19, and Q1 and Q6 without joins, written in corgi
-and checked against DuckDB. Some programs have a second or third version: the same query written
-another way, to compare formulations. Each `qNN.col` names the SQL it answers, the columns it
-reads (from several tables), and its output's kinds. Every table is one row: each column is a
+TPC-H's join queries Q3, Q5, Q10, Q12, Q14, Q18 and Q19, and Q1 and Q6 without joins, written in
+corgi and checked against DuckDB. Some programs have a second or third version: the same query
+written another way, to compare formulations. Each `qNN.col` names the SQL it answers, the columns
+it reads (from several tables), and its output's kinds. Every table is one row: each column is a
 one-row list.
 
     python3 benches/tpch/prepare.py DIR 0.2      # DuckDB's tpch extension; needs duckdb and numpy
@@ -33,7 +33,8 @@ Q3 is written three ways:
   fastest, 0.82× DuckDB's single-thread time.
 
 Which side to sort is a plan decision. Corgi can't express it today: it doesn't know a column is
-sorted, and `sort` is no cheaper on sorted input.
+sorted, and `sort` is cheaper only on input whose leading field strictly ascends, which the line
+items, several to an order, do not.
 
 ## Measured
 
@@ -68,17 +69,29 @@ Since 2026-10-03:
   q01 then reads them like q01b, which goes; on regenerated data q01 takes 18.9 ms against DuckDB's
   13.6 (1.39×). Existing data directories need `prepare.py` run again.
 
-The remaining gap is q01. It puts 1.2M rows into four groups: `group` sorts them, then moves the
-four summed columns into group order. DuckDB adds each row into its group's sums as it scans; corgi
-has no op for that (a scatter-add, a reduce by a small key).
+The remaining gap was q01. It puts 1.2M rows into four groups: `group` sorts them, then moves the
+four summed columns into group order. DuckDB adds each row into its group's sums as it scans. q01s
+does the same with `scatter_add`: each row's group is its two flag bytes as one number (or -1 when
+the date leaves it out), and one scatter totals every column by group, a 1 per row counting them. At
+scale factor 1, on one thread: q01 173 ms, q01s 67 ms, DuckDB 94 ms. Of q01s's time, 30 ms reads the
+first byte of each one-character flag string; with the flags stored as bytes (#95) q01s takes 37 ms
+against DuckDB's 68.
+
+q18 is TPC-H's large aggregation: every order's line-item quantities summed, 6M rows into 1.5M
+orders at scale factor 1, before the orders over 300 units are kept. On one thread at scale factor
+1, q18 sums them with `group` in 52 ms, q18s with `scatter_add` in 27, and DuckDB takes 94. The
+order keys are Ints in a narrow range, so `scatter_add` numbers them by a table over the range, and
+as the line items are stored in order-key order, each one adds into the slot after the last one's.
+Numbered by their hashes instead, as keys that are not Ints are, the same sums take 80 ms. Data
+directories made before q18 need `prepare.py` run again, for `o_totalprice` and q18's answers.
 
 ## Which queries are here
 
-Eight of TPC-H's 22: those that are joins on keys, a group, and arithmetic. The others need a
+Nine of TPC-H's 22: those that are joins on keys, a group, and arithmetic. The others need a
 query planner's work rather than an engine's: correlated subqueries (q02, q17, q20), EXISTS and
 NOT EXISTS (q04, q21, q22), an outer join (q13), or `LIKE '%…%'` (q09, q13, q16), which corgi leaves
-to the host. Translating them by hand would measure the translation more than corgi. q07, q08, q11,
-q15 and q18 are direct enough to add if wanted; q11 needs the `partsupp` table in `prepare.py`.
+to the host. Translating them by hand would measure the translation more than corgi. q07, q08, q11
+and q15 are direct enough to add if wanted; q11 needs the `partsupp` table in `prepare.py`.
 
 ## What the joins argue for
 
