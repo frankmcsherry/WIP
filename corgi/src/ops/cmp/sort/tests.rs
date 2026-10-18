@@ -170,6 +170,19 @@ fn subsets_in_any_order_sort_without_a_gather() {
 }
 
 #[test]
+fn uniform_structured_lists_sort_sparse_and_repeated_rows() {
+    for width in [0, 1, 2, 8] {
+        let column = Value::List(Bounds::Stride(width, 7), Box::new(Value::Prod(vec![
+            Value::i64((0..width * 7).map(|i| (i % 5) as i64).collect()),
+            Value::i64((0..width * 7).map(|i| ((i * 3) % 7) as i64).collect()),
+        ])));
+        let rows = [6, 1, 1, 2, 0, 2, 5];
+        check(&column, &[], &rows);
+        check(&column, &[3, 3, 3, 17, 17, 17, 17], &rows);
+    }
+}
+
+#[test]
 fn emitted_columns_are_the_sorted_data_at_scale() {
     let n = 5000usize;
     let mut rng = Rng(7);
