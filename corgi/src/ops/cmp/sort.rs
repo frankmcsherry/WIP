@@ -420,17 +420,19 @@ fn sort_list(
         if leaf.is_some() {
             sort_keys(&mut keys, &mut labels_j, &mut rows, scratch);
         } else {
-            // distinct rows have distinct elements, and `slot` takes each element back to its
-            // row once the elements are sorted.
             elem.clear();
             elem.extend(rows.iter().map(|&r| bounds.span(r).0 + pos));
-            reach(&mut slot, vals.len());
-            for (&e, &r) in elem.iter().zip(&rows) {
-                slot[e] = r;
-            }
-            sort_indexed(vals, &mut labels_j, &mut elem, Emit::Index, scratch);
-            for (r, &e) in rows.iter_mut().zip(&elem) {
-                *r = slot[e];
+            if let Some(stride) = bounds.strided() {
+                // The partition already supplies the inverse. In particular, a sparse sort
+                // need not allocate a map as large as the entire element column.
+                sort_indexed(vals, &mut labels_j, &mut elem, Emit::Index, scratch);
+                for (r, &e) in rows.iter_mut().zip(&elem) { *r = e / stride; }
+            } else {
+                // Distinct rows have distinct elements; map each sorted element to its row.
+                reach(&mut slot, vals.len());
+                for (&e, &r) in elem.iter().zip(&rows) { slot[e] = r; }
+                sort_indexed(vals, &mut labels_j, &mut elem, Emit::Index, scratch);
+                for (r, &e) in rows.iter_mut().zip(&elem) { *r = slot[e]; }
             }
         }
         for (&q, &r) in going.iter().zip(&rows) {
