@@ -148,6 +148,49 @@ fn compare_idx_cross_pairs() {
 }
 
 #[test]
+fn public_indexed_comparison_across_storage() {
+    use std::sync::Arc;
+    use crate::arrange::{compare_idx, equal_idx};
+    let lists = Value::List(vec![0, 1, 3, 4].into(), Box::new(Value::i64(vec![1, 1, 2, -3])));
+    let refs = Value::Ref(Arc::new(lists.clone()), Arc::new(vec![3, 0, 2, 1]));
+    let other = Value::List(vec![0, 1, 4, 5].into(), Box::new(Value::u8(vec![1, 1, 2, 3, 3])));
+    let columns = [&lists, &refs, &other];
+    let rows = [vec![vec![], vec![1i64], vec![1, 2], vec![-3]],
+                vec![vec![-3], vec![], vec![1, 2], vec![1]],
+                vec![vec![], vec![1], vec![1, 2, 3], vec![3]]];
+    let ia: Vec<_> = (0..4).flat_map(|i| [i; 4]).collect();
+    let ib: Vec<_> = (0..4).cycle().take(16).collect();
+    for (x, a) in columns.iter().enumerate() { for (y, b) in columns.iter().enumerate() {
+        let expected: Vec<_> = ia.iter().zip(&ib).map(|(&i, &j)| rows[x][i].cmp(&rows[y][j]) as i8).collect();
+        assert_eq!(compare_idx(a, b, &ia, &ib), expected);
+        assert_eq!(equal_idx(a, b, &ia, &ib).iter().map(|&s| s == 0).collect::<Vec<_>>(),
+                   expected.iter().map(|&s| s == 0).collect::<Vec<_>>());
+        assert!(equal_idx(a, b, &[], &[]).is_empty());
+        assert!(compare_idx(a, b, &[], &[]).is_empty());
+    }}
+
+    let bytes = Value::u8(vec![0, 1, 127, 255]);
+    let ints = Value::i64(vec![-1, 1, 127, i64::MAX]);
+    assert_eq!(compare_idx(&bytes, &ints, &[0, 1, 2, 3], &[0, 1, 2, 3]), [1, 0, 0, -1]);
+    assert_eq!(compare_cols(&bytes, &ints), [1, 0, 0, -1]);
+    assert_eq!(compare_cols(&ints, &bytes), [-1, 0, 0, 1]);
+    assert_eq!(equal_idx(&ints, &bytes, &[1, 2, 3], &[1, 2, 3]).iter()
+        .map(|&s| s == 0).collect::<Vec<_>>(), [true, true, false]);
+}
+
+#[test]
+#[should_panic(expected = "compare_idx: pair count")]
+fn public_indexed_comparison_requires_matching_index_counts() {
+    crate::arrange::compare_idx(&Value::Unit(1), &Value::Unit(1), &[0], &[]);
+}
+
+#[test]
+#[should_panic(expected = "equal_idx: pair count")]
+fn indexed_equality_requires_matching_index_counts() {
+    crate::arrange::equal_idx(&Value::Unit(1), &Value::Unit(1), &[0], &[]);
+}
+
+#[test]
 fn compare_cols_sum_at_scale() {
     // many tagged rows; the bulk path must match the (here O(n²)) scalar reference.
     let n = 300usize;

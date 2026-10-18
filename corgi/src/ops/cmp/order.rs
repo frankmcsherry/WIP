@@ -302,6 +302,12 @@ mod compare {
         compare_in(a, b, Pairs::Diagonal(a.len()), true)
     }
 
+    /// Indexed equality: zero exactly when the named rows agree. Nonzero signs are unspecified.
+    pub fn equal_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
+        assert_eq!(ia.len(), ib.len(), "equal_idx: pair count");
+        compare_in(a, b, Pairs::Explicit(ia, ib), true)
+    }
+
     /// the adjacent case, asked only for equality: `out[k]` is zero exactly when row `k` of `v`
     /// equals row `k+1` — the run boundaries of a sorted column ([`super::group_bounds`]), and the
     /// shape a `windows(2)` scan has.

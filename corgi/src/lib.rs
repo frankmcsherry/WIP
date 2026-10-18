@@ -72,10 +72,23 @@ pub mod arrange {
     pub fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize]) -> Value {
         crate::engine::gather_lanes(srcs, tags, off)
     }
-    /// Structural compare of row `i` of `a` vs row `j` of `b` (same shape). Build a sort by
-    /// `indices.sort_by(|&i,&j| compare_at(kv, i, kv, j))`; merge two sorted batches with it.
+    /// Structural comparison of one isolated row pair (same shape). For batches, prefer
+    /// [`compare_idx`], [`equal_idx`], [`sort_blocks`] or [`survey_groups`] to calls per row.
     pub fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
         crate::ops::cmp::order::compare_at(a, i, b, j)
+    }
+
+    /// Structural order of indexed row pairs from columns of the same shape. Result `k` is
+    /// -1, 0 or 1 for row `ia[k]` of `a` versus row `ib[k]` of `b`. Index counts must agree.
+    pub fn compare_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
+        assert_eq!(ia.len(), ib.len(), "compare_idx: pair count");
+        crate::ops::cmp::order::compare_idx(a, b, ia, ib)
+    }
+
+    /// Indexed equality with the same inputs as [`compare_idx`]. Zero means equal; nonzero
+    /// signs are unspecified. Lists of different lengths need no element comparisons.
+    pub fn equal_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
+        crate::ops::cmp::order::equal_idx(a, b, ia, ib)
     }
 
     /// Multi-record argsort: the permutation that sorts *all* of `v`'s rows by structural order, in
