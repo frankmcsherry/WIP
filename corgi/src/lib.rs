@@ -49,9 +49,6 @@ pub mod arrange {
     use crate::value::{Bounds, Value};
     use std::cmp::Ordering;
 
-    /// A row borrowed from a pool of columns, as `(column, row)`.
-    pub type RowRef = (usize, usize);
-
     /// A column's integers as `i64`s, if it is an integer leaf — peeling single-field products,
     /// which order identically to the field they wrap. `None` for any other shape: whether a
     /// column is a bare integer is a question about its shape, never its storage.
@@ -76,48 +73,22 @@ pub mod arrange {
         crate::engine::gather_lanes(srcs, tags, off)
     }
     /// Structural comparison of one isolated row pair (same shape). For batches, prefer
-    /// [`equal_pairs`], [`sort_blocks`] or [`survey_groups`] to calls per row.
+    /// [`compare_idx`], [`equal_idx`], [`sort_blocks`] or [`survey_groups`] to calls per row.
     pub fn compare_at(a: &Value, i: usize, b: &Value, j: usize) -> Ordering {
         crate::ops::cmp::order::compare_at(a, i, b, j)
     }
 
-    /// Equality of row pairs borrowed from several columns. Each coordinate is `(column, row)`;
-    /// each pair must have matching logical shapes. Results follow the order of `pairs`.
-    ///
-    /// Only coordinate indices are regrouped, by source-column pair. Each group uses one bulk
-    /// structural descent; payload columns are neither gathered nor converted to rows. This lets
-    /// a host compare a whole window of keys or output candidates without scalar calls per key.
-    pub fn equal_pairs(columns: &[&Value], pairs: &[(RowRef, RowRef)]) -> Vec<bool> {
-        let order = pair_order(pairs);
-        let mut result = vec![false; pairs.len()];
-        let (mut left, mut right) = (Vec::new(), Vec::new());
-        for group in order.chunk_by(|&a, &b| (pairs[a].0.0, pairs[a].1.0) == (pairs[b].0.0, pairs[b].1.0)) {
-            let (a, b) = (pairs[group[0]].0.0, pairs[group[0]].1.0);
-            left.clear();
-            right.clear();
-            let (lo, ro) = (pairs[group[0]].0.1, pairs[group[0]].1.1);
-            let dense = group.iter().enumerate().all(|(offset, &i)| pairs[i].0.1 == lo + offset && pairs[i].1.1 == ro + offset);
-            let equal = if dense {
-                crate::ops::cmp::order::equal_ranges(columns[a], columns[b], lo, ro, group.len())
-            } else {
-                left.extend(group.iter().map(|&i| pairs[i].0.1));
-                right.extend(group.iter().map(|&i| pairs[i].1.1));
-                crate::ops::cmp::order::equal_idx(columns[a], columns[b], &left, &right)
-            };
-            for (&i, sign) in group.iter().zip(equal) { result[i] = sign == 0; }
-        }
-        result
+    /// Structural order of indexed row pairs from columns of the same shape. Result `k` is
+    /// -1, 0 or 1 for row `ia[k]` of `a` versus row `ib[k]` of `b`. Index counts must agree.
+    pub fn compare_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
+        assert_eq!(ia.len(), ib.len(), "compare_idx: pair count");
+        crate::ops::cmp::order::compare_idx(a, b, ia, ib)
     }
 
-    /// Group requests by source columns, retaining request order within each group. Already
-    /// grouped requests, including the single-column-pair case, need no sort.
-    fn pair_order(pairs: &[(RowRef, RowRef)]) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..pairs.len()).collect();
-        let columns = |i: usize| (pairs[i].0.0, pairs[i].1.0);
-        if order.windows(2).any(|w| columns(w[0]) > columns(w[1])) {
-            order.sort_unstable_by_key(|&i| (pairs[i].0.0, pairs[i].1.0, i));
-        }
-        order
+    /// Indexed equality with the same inputs as [`compare_idx`]. Zero means equal; nonzero
+    /// signs are unspecified. Lists of different lengths need no element comparisons.
+    pub fn equal_idx(a: &Value, b: &Value, ia: &[usize], ib: &[usize]) -> Vec<i8> {
+        crate::ops::cmp::order::equal_idx(a, b, ia, ib)
     }
 
     /// Multi-record argsort: the permutation that sorts *all* of `v`'s rows by structural order, in
