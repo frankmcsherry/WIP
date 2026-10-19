@@ -17,6 +17,18 @@ fn integers_are_equal_across_storages() {
     assert_ne!(Value::i64(vec![0]), Value::f64(vec![0.0]));
 }
 
+/// `Value::int` holds integers as bytes when every one fits (an empty column too), else as `i64`s,
+/// and either is the value `Value::i64` of the same integers is.
+#[test]
+fn int_picks_the_narrowest_storage() {
+    let bytes = |v: &Value| matches!(v, Value::Prim(Prim::U8(_)));
+    for (xs, narrow) in [(vec![0, 7, 255], true), (vec![], true), (vec![0, 256], false), (vec![-1, 3], false)] {
+        let v = Value::int(xs.clone());
+        assert_eq!(bytes(&v), narrow, "{xs:?}");
+        assert_eq!(v, Value::i64(xs));
+    }
+}
+
 /// Two integer leaves at different storages meet at `i64`; one storage meets as it is.
 #[test]
 fn meet_widens_bytes() {

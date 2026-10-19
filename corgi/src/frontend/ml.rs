@@ -116,15 +116,6 @@ fn position(cs: &[char], at: usize) -> String {
     format!("{line}:{col}")
 }
 
-/// an Int constant, held as a byte when it is one (so a byte column meeting it stays bytes, as text
-/// meeting `40` does) and as an `i64` otherwise.
-fn int_lit(n: i64) -> Value {
-    match u8::try_from(n) {
-        Ok(b) => Value::u8(vec![b]),
-        Err(_) => Value::i64(vec![n]),
-    }
-}
-
 /// the tokens of `s`, and the char offset where each begins. `#` starts a comment to end of line.
 fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
     let cs: Vec<char> = s.chars().collect();
@@ -258,7 +249,7 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
                     Tok::Lit(Value::f64(vec![x]))
                 } else if text.starts_with('-') {
                     let n: i64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
-                    Tok::Lit(int_lit(n))
+                    Tok::Lit(Value::int(vec![n]))
                 } else {
                     let n: u64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
                     Tok::Num(n)
@@ -807,7 +798,7 @@ impl<'a> P<'a> {
             Some(&Tok::Num(n)) => {
                 self.bump();
                 let n = i64::try_from(n).map_err(|_| format!("{n} does not fit in an Int (an i64)"))?;
-                Ok(E::Lit(int_lit(n)))
+                Ok(E::Lit(Value::int(vec![n])))
             }
             // a list literal: one constant list, built here
             Some(Tok::LBracket) => {
@@ -957,23 +948,17 @@ impl Const {
 }
 
 /// the column of the constants `cs`, each of the whole shape `shape`. An Int column is held as
-/// bytes when every value is one, as an Int literal is, so `[97, 98]` is the value `"ab"` is.
+/// [`Value::int`] holds it, as an Int literal is, so `[97, 98]` is the value `"ab"` is.
 fn column(cs: &[&Const], shape: &Shape) -> Value {
     let leaf = |c: &&Const| match c.bare() {
         Const::Leaf(x) => *x,
         _ => unreachable!("a constant of a leaf shape is a leaf"),
     };
     match shape {
-        Shape::Int => {
-            let xs: Vec<i64> = cs.iter().map(|c| match leaf(c) {
-                Scalar::Int(x) => x,
-                Scalar::Float(_) => unreachable!("an Int constant"),
-            }).collect();
-            match xs.iter().map(|&x| u8::try_from(x)).collect::<Result<Vec<u8>, _>>() {
-                Ok(bytes) => Value::u8(bytes),
-                Err(_) => Value::i64(xs),
-            }
-        }
+        Shape::Int => Value::int(cs.iter().map(|c| match leaf(c) {
+            Scalar::Int(x) => x,
+            Scalar::Float(_) => unreachable!("an Int constant"),
+        }).collect()),
         Shape::Float => Value::Prim(Prim::F64(Arc::new(cs.iter().map(|c| match leaf(c) {
             Scalar::Float(k) => k,
             Scalar::Int(_) => unreachable!("a Float constant"),
@@ -1105,7 +1090,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
                 // row reads the zero of the element's shape, as `get` does.
                 Apply::Head => {
-                    let zero = b.add(Op::Lit(int_lit(0)), vec![id]);
+                    let zero = b.add(Op::Lit(Value::int(vec![0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
                     Ok(b.add(Op::Gather, vec![pair]))
                 }
@@ -1149,7 +1134,7 @@ fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> R
         b.add(op, vec![pair])
     }
     fn lit(b: &mut Builder<NumOp>, n: i64, like: usize) -> usize {
-        b.add(Op::Lit(int_lit(n)), vec![like])
+        b.add(Op::Lit(Value::int(vec![n])), vec![like])
     }
     // `i` outside `0 .. n`
     fn outside(b: &mut Builder<NumOp>, i: usize, n: usize) -> usize {

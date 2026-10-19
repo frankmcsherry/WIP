@@ -278,8 +278,9 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   bitwise ops, each defined on the integer's low 64 bits read back as an `i64`; they will keep their
   meaning when plain arithmetic becomes exact. There is no integer shift: dividing by a power of
   two is `div` (run as a shift), so the word's logical shift and integer division can't be
-  mistaken for each other. Text, masks and sum tags are held as bytes, every
-  other integer as `i64`. A reduction of an empty row reads the zero of an integer: `fold_min` and
+  mistaken for each other. Text, masks and sum tags are held as bytes, as are integers brought in
+  with `Value::int` (constants, parsed or fed data) when every one fits; every other integer is
+  held as `i64`. A reduction of an empty row reads the zero of an integer: `fold_min` and
   `fold_max` give 0 (not an identity, which unbounded integers would not have), and a program that
   wants another default tests `len` and `select`s it.
 - **Float semantics are TOTAL-ORDER, not IEEE (deliberate).** A `Float` is an `f64`, stored as its
