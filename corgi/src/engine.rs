@@ -202,27 +202,12 @@ pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
     match v {
         Value::Prim(p) => Value::Prim(p.gather(idx)),
         Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather(c, idx)).collect()),
-        // rows of one length: so are the rows taken, and each one's elements are where arithmetic says
-        Value::List(Bounds::Stride(k, _), vals) => {
-            let taken = match &**vals {
-                // leaves: a block of k per row, copied
-                Value::Prim(p) => Value::Prim(p.gather_blocks(idx, *k)),
-                vals => gather(vals, &idx.iter().flat_map(|&i| i * k..(i + 1) * k).collect::<Vec<_>>()),
-            };
-            Value::List(Bounds::Stride(*k, idx.len()), Box::new(taken))
+        // rows of one length of leaves: a block of k per row, copied
+        Value::List(Bounds::Stride(k, _), vals) if matches!(**vals, Value::Prim(_)) => {
+            let Value::Prim(p) = &**vals else { unreachable!() };
+            Value::List(Bounds::Stride(*k, idx.len()), Box::new(Value::Prim(p.gather_blocks(idx, *k))))
         }
-        Value::List(bounds, vals) => {
-            let mut elem = Vec::new();
-            let mut nb = Vec::with_capacity(idx.len());
-            let mut acc = 0;
-            for &i in idx {
-                let (s, e) = row_span(bounds, i);
-                elem.extend(s..e);
-                acc += e - s;
-                nb.push(acc);
-            }
-            Value::List(nb.into(), Box::new(gather(vals, &elem)))
-        }
+        Value::List(bounds, vals) => list_rows(&[(bounds, vals)], idx.iter().map(|&i| (0, i, i + 1))),
         Value::Sum(tags, variants) => {
             // one tag throughout: the selected rows are lane `t`'s rows at exactly `idx` (a `Const`
             // assignment's offset IS the row index), so this is one lane gather and no witness work.
@@ -336,6 +321,145 @@ pub(crate) fn compress(v: &Value, mask: &[u8], kept: usize) -> Value {
     dense(v, mask, &at)
 }
 
+/// rows of lists, each pick `(t, s, e)` naming rows `s..e` of `lists[t]`, as one list. Rows in a
+/// range are a range of their list's elements, and consecutive picks of one list make one longer
+/// range, copied whole.
+fn list_rows(lists: &[(&Bounds, &Value)], picks: impl Iterator<Item = (usize, usize, usize)>) -> Value {
+    let (mut ends, mut acc, mut spans) = (Vec::new(), 0, Vec::new());
+    for (t, s, e) in picks {
+        let (a, z) = elems(lists[t].0, s, e);
+        extend_ends(&mut ends, &mut acc, lists[t].0, s, e, a, z);
+        push_span(&mut spans, t, a, z);
+    }
+    let vals: Vec<&Value> = lists.iter().map(|l| l.1).collect();
+    Value::List(ends.into(), Box::new(take_spans(&vals, &spans)))
+}
+
+/// the elements of rows `s..e` of a list, as a range.
+#[inline]
+fn elems(b: &Bounds, s: usize, e: usize) -> (usize, usize) {
+    match e - s {
+        0 => (0, 0),
+        1 => row_span(b, s),
+        _ => (row_span(b, s).0, row_span(b, e - 1).1),
+    }
+}
+
+/// the ends of rows `s..e` of `b`, whose elements are `a..z`, moved to follow the `acc` elements
+/// already taken; `acc` then counts these too.
+#[inline]
+fn extend_ends(ends: &mut Vec<usize>, acc: &mut usize, b: &Bounds, s: usize, e: usize, a: usize, z: usize) {
+    if e == s + 1 {
+        ends.push(*acc + z - a);
+    } else {
+        match b {
+            Bounds::Offsets(src) => ends.extend(src[s..e].iter().map(|&x| x - a + *acc)),
+            Bounds::Stride(k, _) => ends.extend((1..=e - s).map(|i| *acc + i * k)),
+        }
+    }
+    *acc += z - a;
+}
+
+/// the rows of each span as one position per row, prepared once for whichever fields of a product
+/// need them.
+struct Positions<'a> {
+    spans: &'a [(usize, usize, usize)],
+    /// each row's source, for several sources.
+    tags: Option<Vec<usize>>,
+    /// each row's position in its source.
+    off: Option<Vec<usize>>,
+}
+
+impl<'a> Positions<'a> {
+    fn new(spans: &'a [(usize, usize, usize)]) -> Self {
+        Positions { spans, tags: None, off: None }
+    }
+
+    /// `srcs`' rows at the positions, gathered.
+    fn gather(&mut self, srcs: &[&Value]) -> Value {
+        let spans = self.spans;
+        let off = self.off.get_or_insert_with(|| spans.iter().flat_map(|&(_, s, e)| s..e).collect());
+        match srcs {
+            [one] => gather(one, off),
+            _ => {
+                let tags = self.tags.get_or_insert_with(|| spans.iter().flat_map(|&(t, s, e)| std::iter::repeat_n(t, e - s)).collect());
+                gather_lanes(&srcs.iter().map(|s| Some(*s)).collect::<Vec<_>>(), tags, off)
+            }
+        }
+    }
+}
+
+/// append the span `(t, s, e)`, rows `s..e` of source `t`, to `spans`: it extends the last span when
+/// it continues it, and an empty span adds nothing.
+pub(crate) fn push_span(spans: &mut Vec<(usize, usize, usize)>, t: usize, s: usize, e: usize) {
+    match spans.last_mut() {
+        _ if s == e => {}
+        Some((lt, _, le)) if *lt == t && *le == s => *le = e,
+        _ => spans.push((t, s, e)),
+    }
+}
+
+/// the rows of each span `(t, s, e)`, rows `s..e` of `srcs[t]`, in turn: [`copy_spans`] where it
+/// applies, and otherwise the rows' positions, gathered.
+pub(crate) fn take_spans(srcs: &[&Value], spans: &[(usize, usize, usize)]) -> Value {
+    take(srcs, spans, &mut Positions::new(spans))
+}
+
+/// [`take_spans`], with the positions that fields falling back to them share.
+fn take(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positions) -> Value {
+    copy_spans(srcs, spans, at).unwrap_or_else(|| at.gather(srcs))
+}
+
+/// the rows of each span, copied a range at a time. A range of a list's rows is a range of its
+/// elements, so the copy stays a range of copies at every level below. `None` where it doesn't: a
+/// sum's lanes, or references into different arenas. A product's fields decide one by one, so a
+/// field that falls back to positions leaves the others' copies in place.
+fn copy_spans(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positions) -> Option<Value> {
+    match srcs[0] {
+        Value::Prim(_) => {
+            let mut ps: Vec<Prim> = srcs.iter().map(|v| match v {
+                Value::Prim(p) => p.clone(),
+                _ => panic!("copy_spans: shape mismatch"),
+            }).collect();
+            if ps.iter().any(|p| p.bits() != ps[0].bits()) {
+                ps = ps.iter().map(Prim::widen).collect();
+            }
+            Some(Value::Prim(Prim::copy_spans(&ps.iter().collect::<Vec<_>>(), spans)))
+        }
+        Value::Prod(c0) => {
+            let mut taken = Vec::with_capacity(c0.len());
+            for f in 0..c0.len() {
+                let fields: Vec<&Value> = srcs.iter().map(|v| match v {
+                    Value::Prod(c) => &c[f],
+                    _ => panic!("copy_spans: shape mismatch"),
+                }).collect();
+                taken.push(take(&fields, spans, at));
+            }
+            Some(Value::Prod(taken))
+        }
+        Value::Unit(_) => Some(Value::Unit(spans.iter().map(|&(_, s, e)| e - s).sum())),
+        Value::List(..) => {
+            let lists: Vec<(&Bounds, &Value)> = srcs.iter().map(|v| match v {
+                Value::List(b, vals) => (b, &**vals),
+                _ => panic!("copy_spans: shape mismatch"),
+            }).collect();
+            Some(list_rows(&lists, spans.iter().copied()))
+        }
+        Value::Ref(list, _) => {
+            let rows: Vec<&[usize]> = srcs.iter().map(|v| match v {
+                Value::Ref(l, rows) if Arc::ptr_eq(l, list) => Some(&rows[..]),
+                _ => None,
+            }).collect::<Option<_>>()?;
+            let mut out = Vec::with_capacity(spans.iter().map(|&(_, s, e)| e - s).sum());
+            for &(t, s, e) in spans {
+                out.extend_from_slice(&rows[t][s..e]);
+            }
+            Some(Value::Ref(list.clone(), Arc::new(out)))
+        }
+        Value::Sum(..) => None,
+    }
+}
+
 /// `Unwrap` for lanes made of leaves (a leaf, or products of leaves): each row read from its lane
 /// with the sum's own `u8` discriminants, in place, rather than widened into a `usize` column first.
 /// `None` when a lane holds a list, sum, reference or unit, which take [`gather_lanes`].
@@ -405,28 +529,11 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 .collect(),
         ),
         Value::List(..) => {
-            // each output row is a source row's span; expand to element-level (source, pos) pairs.
-            let lists: Vec<(&Bounds, &Value)> = filled
-                .iter()
-                .map(|v| match v {
-                    Value::List(b, vv) => (b, &**vv),
-                    _ => panic!("gather_lanes: shape mismatch"),
-                })
-                .collect();
-            let mut nb = Vec::with_capacity(tags.len());
-            let (mut etags, mut eoff) = (Vec::new(), Vec::new());
-            let mut acc = 0;
-            for (&t, &o) in tags.iter().zip(off) {
-                let (s, e) = row_span(lists[t].0, o);
-                for p in s..e {
-                    etags.push(t);
-                    eoff.push(p);
-                }
-                acc += e - s;
-                nb.push(acc);
-            }
-            let vals: Vec<Option<&Value>> = lists.iter().map(|l| Some(l.1)).collect();
-            Value::List(nb.into(), Box::new(gather_lanes(&vals, &etags, &eoff)))
+            let lists: Vec<(&Bounds, &Value)> = filled.iter().map(|v| match v {
+                Value::List(b, vals) => (b, &**vals),
+                _ => panic!("gather_lanes: shape mismatch"),
+            }).collect();
+            list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (t, o, o + 1)))
         }
         Value::Sum(..) => {
             // pick each output row's tagged payload: build the output tag column, then per output-tag
@@ -527,8 +634,8 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
 ///
 /// A FIXED-WIDTH level blends LANE-WISE: one pass reading both sides at the same position, which is
 /// a select instruction. A VARIABLE-WIDTH level (a `List` row is a span, a `Sum` row is a lane
-/// position) has no constant slot to blend into, so it falls back to the two-source [`gather_lanes`],
-/// except a list of leaves, whose rows are copied a run at a time. The split is per LEVEL, not per
+/// position) has no constant slot to blend into: a list's rows are copied a range at a time, and a
+/// sum or reference falls back to the two-source [`gather_lanes`]. The split is per LEVEL, not per
 /// value:
 /// a product blends each leaf field directly and only gathers the fields that need it.
 pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
@@ -538,13 +645,9 @@ pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
             Value::Prod(ts.into_iter().zip(es).map(|(t, e)| blend(mask, t, e)).collect())
         }
         (Value::Unit(_), Value::Unit(_)) => Value::Unit(mask.len()),
-        // lists of leaves: each row's run copied from the side the mask picks, with no index per
-        // element
-        (Value::List(tb, tv), Value::List(eb, ev)) if matches!((&*tv, &*ev), (Value::Prim(_), Value::Prim(_))) => {
-            let (Value::Prim(t), Value::Prim(e)) = (*tv, *ev) else { unreachable!() };
-            let (t, e) = Prim::meet(t, e);
-            let (vals, ends) = t.blend_rows(&tb, &e, &eb, mask);
-            Value::List(ends.into(), Box::new(Value::Prim(vals)))
+        // lists: each row from the side the mask picks, consecutive rows from one side a range
+        (Value::List(tb, tv), Value::List(eb, ev)) => {
+            list_rows(&[(&eb, &ev), (&tb, &tv)], mask.iter().enumerate().map(|(i, &m)| ((m != 0) as usize, i, i + 1)))
         }
         // row `i` from lane `mask[i] != 0`, at its own position — the offsets are the identity.
         (t, e) => {
