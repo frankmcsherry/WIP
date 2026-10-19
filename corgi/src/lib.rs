@@ -46,8 +46,17 @@ pub use value::{show, Bounds, Scalar, Tags, Value};
 /// to rows. Thin public wrappers over the internal `engine`/`ops::cmp::order` machinery. Added
 /// for the dd-corgi backend spike (Route B: cursor-less corgi arrangement).
 pub mod arrange {
-    use crate::value::{Bounds, Value};
+    use crate::value::{Bounds, Prim, Value};
     use std::cmp::Ordering;
+
+    /// Borrow a leaf held as native `i64`s. Returns `None` for narrow storage and every
+    /// other shape, including products. This storage probe never allocates or widens values.
+    pub fn borrowed_i64(v: &Value) -> Option<&[i64]> {
+        match v {
+            Value::Prim(Prim::I64(xs)) => Some(xs.as_slice()),
+            _ => None,
+        }
+    }
 
     /// A column's integers as `i64`s, if it is an integer leaf — peeling single-field products,
     /// which order identically to the field they wrap. `None` for any other shape: whether a

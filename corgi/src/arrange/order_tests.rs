@@ -70,3 +70,21 @@ fn group_bounds_runs() {
     // the runs of a column with repeats.
     assert_eq!(group_bounds(&Value::i64(vec![10, 10, 20, 20, 20, 30])), vec![2, 5, 6]);
 }
+
+#[test]
+fn borrowed_i64_preserves_storage_and_rejects_other_shapes() {
+    use super::borrowed_i64;
+    let wide = Value::i64(vec![1, 2, 3]);
+    let borrowed = borrowed_i64(&wide).unwrap();
+    assert_eq!(borrowed, &[1, 2, 3]);
+    assert_eq!(borrowed.as_ptr(), wide.as_i64("test").unwrap().as_ptr());
+    assert_eq!(borrowed_i64(&Value::i64(vec![])), Some(&[][..]));
+    let list = Value::List(Bounds::Stride(1, 3), Box::new(wide.clone()));
+    for other in [
+        Value::u8(vec![1, 2, 3]), Value::f64(vec![1.0, 2.0, 3.0]), Value::Unit(3),
+        Value::Prod(vec![wide.clone()]), Value::Prod(vec![]),
+        Value::sum(vec![0; 3], vec![wide]), list.clone(), crate::engine::take_ref(list),
+    ] {
+        assert!(borrowed_i64(&other).is_none());
+    }
+}
