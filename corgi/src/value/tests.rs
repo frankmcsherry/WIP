@@ -22,7 +22,7 @@ fn integers_are_equal_across_storages() {
 #[test]
 fn int_picks_the_narrowest_storage() {
     let bytes = |v: &Value| matches!(v, Value::Prim(Prim::U8(_)));
-    for (xs, narrow) in [(vec![0, 7, 255], true), (vec![], true), (vec![0, 256], false), (vec![-1, 3], false)] {
+    for (xs, narrow) in [(vec![0, 7, 255], true), (vec![], true), (vec![0, 256, 3], false), (vec![-1, 3], false)] {
         let v = Value::int(xs.clone());
         assert_eq!(bytes(&v), narrow, "{xs:?}");
         assert_eq!(v, Value::i64(xs));

@@ -249,7 +249,7 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
                     Tok::Lit(Value::f64(vec![x]))
                 } else if text.starts_with('-') {
                     let n: i64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
-                    Tok::Lit(Value::int(vec![n]))
+                    Tok::Lit(Value::int([n]))
                 } else {
                     let n: u64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
                     Tok::Num(n)
@@ -798,7 +798,7 @@ impl<'a> P<'a> {
             Some(&Tok::Num(n)) => {
                 self.bump();
                 let n = i64::try_from(n).map_err(|_| format!("{n} does not fit in an Int (an i64)"))?;
-                Ok(E::Lit(Value::int(vec![n])))
+                Ok(E::Lit(Value::int([n])))
             }
             // a list literal: one constant list, built here
             Some(Tok::LBracket) => {
@@ -958,7 +958,7 @@ fn column(cs: &[&Const], shape: &Shape) -> Value {
         Shape::Int => Value::int(cs.iter().map(|c| match leaf(c) {
             Scalar::Int(x) => x,
             Scalar::Float(_) => unreachable!("an Int constant"),
-        }).collect()),
+        })),
         Shape::Float => Value::Prim(Prim::F64(Arc::new(cs.iter().map(|c| match leaf(c) {
             Scalar::Float(k) => k,
             Scalar::Int(_) => unreachable!("a Float constant"),
@@ -1090,7 +1090,7 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
                 // row reads the zero of the element's shape, as `get` does.
                 Apply::Head => {
-                    let zero = b.add(Op::Lit(Value::int(vec![0])), vec![id]);
+                    let zero = b.add(Op::Lit(Value::int([0])), vec![id]);
                     let pair = b.tuple(vec![zero, id]);
                     Ok(b.add(Op::Gather, vec![pair]))
                 }
@@ -1134,7 +1134,7 @@ fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> R
         b.add(op, vec![pair])
     }
     fn lit(b: &mut Builder<NumOp>, n: i64, like: usize) -> usize {
-        b.add(Op::Lit(Value::int(vec![n])), vec![like])
+        b.add(Op::Lit(Value::int([n])), vec![like])
     }
     // `i` outside `0 .. n`
     fn outside(b: &mut Builder<NumOp>, i: usize, n: usize) -> usize {
