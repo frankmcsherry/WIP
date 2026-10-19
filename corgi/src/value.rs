@@ -960,6 +960,29 @@ fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
 
 impl Value {
     /// leaf-column constructors — the funnel results pass through, so the representation lives in one place.
+    /// Integers at the narrowest storage that holds them: bytes when every value is from 0 to 255
+    /// (an empty column included, so it never widens a byte column it meets), else `i64`s. The
+    /// constructor for integers from outside a program (constants, parsed text, fed rows), whose
+    /// caller has no reason to pick a storage: storage is not type, and an integer is equal and
+    /// hashes alike at either width. Values go straight into bytes; the first that does not fit
+    /// widens those before it, once, and the rest go into `i64`s.
+    pub fn int(xs: impl IntoIterator<Item = i64>) -> Value {
+        let mut xs = xs.into_iter();
+        let mut bytes = Vec::with_capacity(xs.size_hint().0);
+        while let Some(x) = xs.next() {
+            match u8::try_from(x) {
+                Ok(b) => bytes.push(b),
+                Err(_) => {
+                    let mut wide = Vec::with_capacity(bytes.capacity());
+                    wide.extend(bytes.iter().map(|&b| b as i64));
+                    wide.push(x);
+                    wide.extend(xs);
+                    return Value::i64(wide);
+                }
+            }
+        }
+        Value::u8(bytes)
+    }
     /// Integers held as bytes (each from 0 to 255): text, masks, tags.
     pub fn u8(xs: Vec<u8>) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
     /// Integers held as `i64`s.
