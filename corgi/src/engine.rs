@@ -360,13 +360,31 @@ fn extend_ends(ends: &mut Vec<usize>, acc: &mut usize, b: &Bounds, s: usize, e: 
     *acc += z - a;
 }
 
-/// the rows of each span, one position per row, gathered.
-fn positions(srcs: &[&Value], spans: &[(usize, usize, usize)]) -> Value {
-    match srcs {
-        [one] => gather(one, &spans.iter().flat_map(|&(_, s, e)| s..e).collect::<Vec<_>>()),
-        _ => {
-            let (tags, off): (Vec<usize>, Vec<usize>) = spans.iter().flat_map(|&(t, s, e)| (s..e).map(move |p| (t, p))).unzip();
-            gather_lanes(&srcs.iter().map(|s| Some(*s)).collect::<Vec<_>>(), &tags, &off)
+/// the rows of each span as one position per row, prepared once for whichever fields of a product
+/// need them.
+struct Positions<'a> {
+    spans: &'a [(usize, usize, usize)],
+    /// each row's source, for several sources.
+    tags: Option<Vec<usize>>,
+    /// each row's position in its source.
+    off: Option<Vec<usize>>,
+}
+
+impl<'a> Positions<'a> {
+    fn new(spans: &'a [(usize, usize, usize)]) -> Self {
+        Positions { spans, tags: None, off: None }
+    }
+
+    /// `srcs`' rows at the positions, gathered.
+    fn gather(&mut self, srcs: &[&Value]) -> Value {
+        let spans = self.spans;
+        let off = self.off.get_or_insert_with(|| spans.iter().flat_map(|&(_, s, e)| s..e).collect());
+        match srcs {
+            [one] => gather(one, off),
+            _ => {
+                let tags = self.tags.get_or_insert_with(|| spans.iter().flat_map(|&(t, s, e)| std::iter::repeat_n(t, e - s)).collect());
+                gather_lanes(&srcs.iter().map(|s| Some(*s)).collect::<Vec<_>>(), tags, off)
+            }
         }
     }
 }
@@ -384,13 +402,19 @@ pub(crate) fn push_span(spans: &mut Vec<(usize, usize, usize)>, t: usize, s: usi
 /// the rows of each span `(t, s, e)`, rows `s..e` of `srcs[t]`, in turn: [`copy_spans`] where it
 /// applies, and otherwise the rows' positions, gathered.
 pub(crate) fn take_spans(srcs: &[&Value], spans: &[(usize, usize, usize)]) -> Value {
-    copy_spans(srcs, spans).unwrap_or_else(|| positions(srcs, spans))
+    take(srcs, spans, &mut Positions::new(spans))
+}
+
+/// [`take_spans`], with the positions that fields falling back to them share.
+fn take(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positions) -> Value {
+    copy_spans(srcs, spans, at).unwrap_or_else(|| at.gather(srcs))
 }
 
 /// the rows of each span, copied a range at a time. A range of a list's rows is a range of its
 /// elements, so the copy stays a range of copies at every level below. `None` where it doesn't: a
-/// sum's lanes, or references into different arenas.
-fn copy_spans(srcs: &[&Value], spans: &[(usize, usize, usize)]) -> Option<Value> {
+/// sum's lanes, or references into different arenas. A product's fields decide one by one, so a
+/// field that falls back to positions leaves the others' copies in place.
+fn copy_spans(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positions) -> Option<Value> {
     match srcs[0] {
         Value::Prim(_) => {
             let mut ps: Vec<Prim> = srcs.iter().map(|v| match v {
@@ -402,16 +426,17 @@ fn copy_spans(srcs: &[&Value], spans: &[(usize, usize, usize)]) -> Option<Value>
             }
             Some(Value::Prim(Prim::copy_spans(&ps.iter().collect::<Vec<_>>(), spans)))
         }
-        Value::Prod(c0) => (0..c0.len())
-            .map(|f| {
+        Value::Prod(c0) => {
+            let mut taken = Vec::with_capacity(c0.len());
+            for f in 0..c0.len() {
                 let fields: Vec<&Value> = srcs.iter().map(|v| match v {
                     Value::Prod(c) => &c[f],
                     _ => panic!("copy_spans: shape mismatch"),
                 }).collect();
-                copy_spans(&fields, spans)
-            })
-            .collect::<Option<_>>()
-            .map(Value::Prod),
+                taken.push(take(&fields, spans, at));
+            }
+            Some(Value::Prod(taken))
+        }
         Value::Unit(_) => Some(Value::Unit(spans.iter().map(|&(_, s, e)| e - s).sum())),
         Value::List(..) => {
             let lists: Vec<(&Bounds, &Value)> = srcs.iter().map(|v| match v {
