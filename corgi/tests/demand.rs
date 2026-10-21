@@ -126,6 +126,109 @@ fn transform_prunes_add_before_projecting_its_input() {
     );
 }
 
+fn computed_pair() -> corgi::Graph<NumOp> {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let first = builder.add(Op::Field(0), vec![input]);
+    let second = builder.add(Op::Field(1), vec![input]);
+    let one = builder.add(Op::Lit(Value::i64(vec![1])), vec![input]);
+    let pair = builder.tuple(vec![second, one]);
+    let add = builder.add(ArithOp::Bin(BinOp::Add), vec![pair]);
+    let output = builder.tuple(vec![first, add]);
+    builder.finish(output)
+}
+
+#[test]
+fn transform_prunes_add_behind_field_of_tuple() {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let pair = builder.graft(&computed_pair(), input);
+    let selected = builder.add(Op::Field(0), vec![pair]);
+    let graph = builder.finish(selected);
+    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
+    let transformed = demand_transform(&graph, &shape, &Shape::Int).unwrap();
+    let projection = transformed.input_projection.unwrap();
+    assert_eq!(shape_of(&projection, &shape).unwrap(), Shape::Prod(vec![Shape::Int, Shape::Unit]));
+    assert!(transformed.graph.node_count() < graph.node_count());
+    let input = Value::Prod(vec![Value::i64(vec![2, 3]), Value::i64(vec![4, 5])]);
+    assert_eq!(eval_graph(&graph, input.clone()), eval_graph(&transformed.graph, eval_graph(&projection, input)));
+}
+
+#[test]
+fn transform_prunes_add_inside_list_map() {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let output = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
+    let graph = builder.finish(output);
+    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
+    let target = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])));
+    let transformed = demand_transform(&graph, &shape, &target).unwrap();
+    let projection = transformed.input_projection.unwrap();
+    assert_eq!(shape_of(&projection, &shape).unwrap(), target);
+    let input = Value::List(
+        Bounds::offsets(vec![2, 3]),
+        Box::new(Value::Prod(vec![Value::i64(vec![1, 2, 3]), Value::i64(vec![4, 5, 6])])),
+    );
+    let mut builder = Builder::<NumOp>::default();
+    let root = builder.input();
+    let projected = builder.add(Op::Project(target), vec![root]);
+    let projector = builder.finish(projected);
+    assert_eq!(
+        eval_graph(&projector, eval_graph(&graph, input.clone())),
+        eval_graph(&transformed.graph, eval_graph(&projection, input)),
+    );
+}
+
+#[test]
+fn transform_prunes_add_inside_sum_map() {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let output = builder.add(Op::MapSum(vec![(0, computed_pair())]), vec![input]);
+    let graph = builder.finish(output);
+    let shape = Shape::Sum(vec![Shape::Prod(vec![Shape::Int, Shape::Int]), Shape::Int]);
+    let target = Shape::Sum(vec![Shape::Prod(vec![Shape::Int, Shape::Unit]), Shape::Unit]);
+    let transformed = demand_transform(&graph, &shape, &target).unwrap();
+    let projection = transformed.input_projection.unwrap();
+    assert_eq!(shape_of(&projection, &shape).unwrap(), target);
+    let input = Value::sum(
+        vec![0, 1, 0],
+        vec![
+            Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![4, 5])]),
+            Value::i64(vec![6]),
+        ],
+    );
+    let mut builder = Builder::<NumOp>::default();
+    let root = builder.input();
+    let projected = builder.add(Op::Project(target), vec![root]);
+    let projector = builder.finish(projected);
+    assert_eq!(
+        eval_graph(&projector, eval_graph(&graph, input.clone())),
+        eval_graph(&transformed.graph, eval_graph(&projection, input)),
+    );
+}
+
+#[test]
+fn transform_does_not_duplicate_a_shared_map() {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let mapped = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
+    let output = builder.tuple(vec![mapped, mapped]);
+    let graph = builder.finish(output);
+    let element = Shape::Prod(vec![Shape::Int, Shape::Int]);
+    let list = Shape::List(Box::new(element.clone()));
+    let projected_list = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])));
+    let target = Shape::Prod(vec![list.clone(), projected_list.clone()]);
+    let transformed = demand_transform(&graph, &list, &target).unwrap();
+    assert!(transformed.input_projection.is_none());
+
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let mapped = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
+    let projected = builder.add(Op::Project(projected_list), vec![mapped]);
+    let output = builder.tuple(vec![mapped, projected]);
+    assert_eq!(transformed.graph, builder.finish(output));
+}
+
 #[test]
 fn transform_preserves_a_shared_add_with_an_observed_use() {
     let mut builder = Builder::<NumOp>::default();

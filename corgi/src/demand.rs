@@ -17,8 +17,9 @@
 //! The route toward syntactic minimality is an exact backward rule for each operation, followed by union at shared nodes.
 //! No rule inspects row data or infers algebraic identities.
 //! This pass does not yet claim a minimal demand under all Corgi operations.
-//! `demand_transform` additionally prunes tuple lanes erased by a requested output projection before extracting input demand.
+//! `demand_transform` additionally prunes tuple lanes erased by a requested output projection, including through fields and list and sum map bodies, before extracting input demand.
 //! It rewires consumers and removes unreachable nodes, leaving shared producers in place when another consumer still needs them.
+//! A shared map stays intact because specializing one use could duplicate its retained work.
 
 use crate::graph::{shape_of, Builder, Graph, Node, NodeKind, OpLike};
 use crate::ops::{NumOp, Op, Pattern};
@@ -174,7 +175,7 @@ pub struct DemandTransform {
     pub input_projection: Option<Graph<NumOp>>,
 }
 
-/// Remove computations behind tuple lanes erased by `output_projection`, then extract input demand.
+/// Remove computations behind output lanes erased by `output_projection`, then extract input demand.
 ///
 /// For every valid input `x`, the result satisfies `Project(output_projection)(graph(x)) = result.graph(result.input_projection(x))`.
 /// An absent input projection means that `result.graph` accepts the original input unchanged.
@@ -184,6 +185,12 @@ pub fn demand_transform(
     input: &Shape,
     output_projection: &Shape,
 ) -> Result<DemandTransform, String> {
+    let rewritten = prune_graph(graph, input, output_projection)?;
+    let input_projection = demand_projection(&rewritten, input)?;
+    Ok(DemandTransform { graph: rewritten, input_projection })
+}
+
+fn prune_graph(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape) -> Result<Graph<NumOp>, String> {
     let shapes = graph_shapes(graph, input)?;
     let output = shapes.get(graph.output).ok_or("graph has no output")?;
     let projected = NumOp::Core(Op::Project(output_projection.clone())).eval(Value::empty(output))?;
@@ -197,7 +204,11 @@ pub fn demand_transform(
         .ok_or("graph has no input")?;
 
     let mut follows_input = Vec::with_capacity(graph.nodes.len());
+    let mut uses = vec![0usize; graph.nodes.len()];
     for node in &graph.nodes {
+        for &edge in &node.inputs {
+            uses[edge] += 1;
+        }
         follows_input.push(match &node.kind {
             NodeKind::Input => true,
             NodeKind::Tuple => node.inputs.first().is_some_and(|&i| follows_input[i]),
@@ -208,7 +219,7 @@ pub fn demand_transform(
     let mut nodes = graph.nodes.clone();
     let unit = nodes.len();
     nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![input_node] });
-    let result = prune_output(&mut nodes, &shapes, &follows_input, unit, graph.output, output_projection);
+    let result = prune_output(&mut nodes, &shapes, &follows_input, &uses, unit, graph.output, output_projection)?;
     let mut rewritten = dce(&Graph { nodes, output: result });
     // DCE can remove the formal input of a constant graph; keep it for input-demand extraction.
     if !rewritten.nodes.iter().any(|node| matches!(node.kind, NodeKind::Input)) {
@@ -223,26 +234,33 @@ pub fn demand_transform(
     if shape_of(&rewritten, input).as_ref() != Ok(output_projection) {
         return Err("rewritten graph does not produce the requested shape".into());
     }
-    let input_projection = demand_projection(&rewritten, input)?;
-    Ok(DemandTransform { graph: rewritten, input_projection })
+    Ok(rewritten)
 }
 
-/// Rewrite a projected tuple field only at its consumer; DCE removes a producer if no other use remains.
+/// Rewrite a projected value only at its consumer; DCE removes a producer if no other use remains.
 fn prune_output(
     nodes: &mut Vec<Node<NumOp>>,
     shapes: &[Shape],
     follows_input: &[bool],
+    uses: &[usize],
     unit: usize,
     node: usize,
     target: &Shape,
-) -> usize {
+) -> Result<usize, String> {
     if *target == Shape::Unit {
         if follows_input[node] {
-            return unit;
+            return Ok(unit);
         }
         let result = nodes.len();
         nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![node] });
-        return result;
+        return Ok(result);
+    }
+    if let NodeKind::Op(NumOp::Core(Op::Field(field))) = &nodes[node].kind {
+        let source = nodes[node].inputs[0];
+        if matches!(nodes[source].kind, NodeKind::Tuple) {
+            let selected = nodes[source].inputs[*field];
+            return prune_output(nodes, shapes, follows_input, uses, unit, selected, target);
+        }
     }
     if let (NodeKind::Tuple, Shape::Prod(targets)) = (&nodes[node].kind, target) {
         let inputs = nodes[node].inputs.clone();
@@ -250,22 +268,56 @@ fn prune_output(
             let rewritten: Vec<_> = inputs
                 .iter()
                 .zip(targets)
-                .map(|(&edge, target)| prune_output(nodes, shapes, follows_input, unit, edge, target))
-                .collect();
+                .map(|(&edge, target)| prune_output(nodes, shapes, follows_input, uses, unit, edge, target))
+                .collect::<Result<Vec<_>, _>>()?;
             if rewritten == inputs && shapes[node] == *target {
-                return node;
+                return Ok(node);
             }
             let result = nodes.len();
             nodes.push(Node { kind: NodeKind::Tuple, inputs: rewritten });
-            return result;
+            return Ok(result);
+        }
+    }
+    // Specializing a shared map would evaluate its retained work once per specialized use.
+    if uses[node] <= 1 {
+        if let (NodeKind::Op(NumOp::Core(Op::MapList(body))), Shape::List(element_target)) = (&nodes[node].kind, target) {
+            let source = nodes[node].inputs[0];
+            let Shape::List(element_input) = &shapes[source] else { unreachable!() };
+            let rewritten = prune_graph(body, element_input, element_target)?;
+            if rewritten != **body {
+                let result = nodes.len();
+                nodes.push(Node { kind: NodeKind::Op(Op::MapList(Box::new(rewritten)).into()), inputs: vec![source] });
+                return Ok(result);
+            }
+        }
+        if let (NodeKind::Op(NumOp::Core(Op::MapSum(arms))), Shape::Sum(targets)) = (&nodes[node].kind, target) {
+            let source = nodes[node].inputs[0];
+            let Shape::Sum(lanes) = &shapes[source] else { unreachable!() };
+            let mut changed = false;
+            let mut rewritten = Vec::with_capacity(arms.len());
+            for (tag, body) in arms {
+                let body_rewrite = prune_graph(body, &lanes[*tag], &targets[*tag])?;
+                changed |= body_rewrite != *body;
+                rewritten.push((*tag, body_rewrite));
+            }
+            if changed {
+                let result = nodes.len();
+                nodes.push(Node { kind: NodeKind::Op(Op::MapSum(rewritten).into()), inputs: vec![source] });
+                if shapes[node] == *target {
+                    return Ok(result);
+                }
+                let projected = nodes.len();
+                nodes.push(Node { kind: NodeKind::Op(Op::Project(target.clone()).into()), inputs: vec![result] });
+                return Ok(projected);
+            }
         }
     }
     if shapes[node] == *target {
-        return node;
+        return Ok(node);
     }
     let result = nodes.len();
     nodes.push(Node { kind: NodeKind::Op(Op::Project(target.clone()).into()), inputs: vec![node] });
-    result
+    Ok(result)
 }
 
 fn graph_shapes(graph: &Graph<NumOp>, input: &Shape) -> Result<Vec<Shape>, String> {
