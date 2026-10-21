@@ -33,7 +33,7 @@ pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
 
-pub use demand::{demand_projection, demand_transform, Demand, DemandTransform};
+pub use demand::{compact_unit_fields, compact_unit_input, demand_projection, demand_transform, Demand, DemandTransform, UnitCompaction};
 pub use frontend::{parse_ml, parse_ml_in, Program, Scope};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;

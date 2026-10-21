@@ -1,8 +1,134 @@
 use corgi::{
-    demand_projection, demand_transform, eval_graph, parse_ml, shape_of, ArithOp, BinOp, Bounds,
+    compact_unit_fields, compact_unit_input, demand_projection, demand_transform, eval_graph, parse_ml, shape_of, ArithOp, BinOp, Bounds,
     Builder, Demand, NumOp, Op, Pattern, Shape, Value,
 };
 use std::sync::Arc;
+
+#[test]
+fn unit_compaction_narrows_join_values_and_preserves_the_key() {
+    let graph = parse_ml("(input.0, input.1.0, input.1.2.1, input.2)").unwrap();
+    let key = Shape::Prod(vec![Shape::Int, Shape::Unit]);
+    let left = Shape::Prod(vec![
+        Shape::Int,
+        Shape::Unit,
+        Shape::Prod(vec![Shape::Unit, Shape::Int]),
+        Shape::Prod(vec![Shape::Unit, Shape::Unit]),
+    ]);
+    let right = Shape::Prod(vec![Shape::Unit, Shape::Unit]);
+    let input_shape = Shape::Prod(vec![key.clone(), left, right]);
+    let compacted = compact_unit_fields(&graph, &input_shape, &[1, 2]).unwrap().unwrap();
+    assert_eq!(
+        compacted.input_shape,
+        Shape::Prod(vec![
+            key,
+            Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Int])]),
+            Shape::Unit,
+        ])
+    );
+    assert_eq!(shape_of(&compacted.input_projection, &input_shape).unwrap(), compacted.input_shape);
+    assert_eq!(shape_of(&compacted.graph, &compacted.input_shape), shape_of(&graph, &input_shape));
+
+    let n = 3;
+    let input = Value::Prod(vec![
+        Value::Prod(vec![Value::i64(vec![5, 6, 7]), Value::Unit(n)]),
+        Value::Prod(vec![
+            Value::i64(vec![1, 2, 3]),
+            Value::Unit(n),
+            Value::Prod(vec![Value::Unit(n), Value::i64(vec![8, 9, 10])]),
+            Value::Prod(vec![Value::Unit(n), Value::Unit(n)]),
+        ]),
+        Value::Prod(vec![Value::Unit(n), Value::Unit(n)]),
+    ]);
+    assert_eq!(
+        eval_graph(&graph, input.clone()),
+        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
+    );
+}
+
+#[test]
+fn unit_compaction_handles_repeated_uses_and_validates_selection() {
+    let shape = Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Unit, Shape::Int, Shape::Unit])]);
+    let graph = parse_ml("(input.1.1, input.1.1)").unwrap();
+    let compacted = compact_unit_fields(&graph, &shape, &[1]).unwrap().unwrap();
+    assert_eq!(compacted.input_shape, Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Int])]));
+    let input = Value::Prod(vec![
+        Value::i64(vec![1, 2]),
+        Value::Prod(vec![Value::Unit(2), Value::i64(vec![3, 4]), Value::Unit(2)]),
+    ]);
+    assert_eq!(
+        eval_graph(&graph, input.clone()),
+        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
+    );
+    assert!(compact_unit_fields(&graph, &shape, &[0]).unwrap().is_none());
+    assert!(compact_unit_fields(&graph, &shape, &[2]).is_err());
+}
+
+#[test]
+fn unit_compaction_restores_structure_before_hashing() {
+    let shape = Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Int, Shape::Unit])]);
+    let mut builder = Builder::<NumOp>::default();
+    let root = builder.input();
+    let value = builder.add(Op::Field(1), vec![root]);
+    let hashed = builder.add(Op::Hash, vec![value]);
+    let graph = builder.finish(hashed);
+    let compacted = compact_unit_fields(&graph, &shape, &[1]).unwrap().unwrap();
+    let input = Value::Prod(vec![
+        Value::i64(vec![1, 2]),
+        Value::Prod(vec![Value::i64(vec![3, 4]), Value::Unit(2)]),
+    ]);
+    assert_eq!(
+        eval_graph(&graph, input.clone()),
+        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
+    );
+}
+
+#[test]
+fn unit_compaction_retargets_a_list_lambda() {
+    let graph = parse_ml("input map (x -> x.0.0)").unwrap();
+    let shape = Shape::List(Box::new(Shape::Prod(vec![
+        Shape::Prod(vec![Shape::Int, Shape::Unit]),
+        Shape::Int,
+    ])));
+    let compacted = compact_unit_input(&graph, &shape).unwrap().unwrap();
+    assert_eq!(
+        compacted.input_shape,
+        Shape::List(Box::new(Shape::Prod(vec![Shape::Prod(vec![Shape::Int]), Shape::Int])))
+    );
+    assert_eq!(compacted.graph.node_count(), graph.node_count());
+    let input = Value::List(
+        Bounds::offsets(vec![2, 3]),
+        Box::new(Value::Prod(vec![
+            Value::Prod(vec![Value::i64(vec![1, 2, 3]), Value::Unit(3)]),
+            Value::i64(vec![4, 5, 6]),
+        ])),
+    );
+    assert_eq!(
+        eval_graph(&graph, input.clone()),
+        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
+    );
+}
+
+#[test]
+fn unit_compaction_preserves_sum_tags() {
+    let graph = parse_ml("input").unwrap();
+    let shape = Shape::Sum(vec![
+        Shape::Prod(vec![Shape::Int, Shape::Unit]),
+        Shape::Prod(vec![Shape::Unit, Shape::Int]),
+    ]);
+    let compacted = compact_unit_input(&graph, &shape).unwrap().unwrap();
+    assert_eq!(
+        compacted.input_shape,
+        Shape::Sum(vec![Shape::Prod(vec![Shape::Int]), Shape::Prod(vec![Shape::Int])]),
+    );
+    let input = Value::sum(vec![0, 1, 0], vec![
+        Value::Prod(vec![Value::i64(vec![1, 2]), Value::Unit(2)]),
+        Value::Prod(vec![Value::Unit(1), Value::i64(vec![3])]),
+    ]);
+    assert_eq!(
+        eval_graph(&graph, input.clone()),
+        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
+    );
+}
 
 #[test]
 fn join_projection_erases_unread_input_fields() {
