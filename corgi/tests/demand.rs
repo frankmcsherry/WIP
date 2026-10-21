@@ -1,6 +1,6 @@
 use corgi::{
-    demand_projection, eval_graph, parse_ml, shape_of, Bounds, Builder, NumOp, Op, Pattern, Shape,
-    Value,
+    demand_projection, demand_transform, eval_graph, parse_ml, shape_of, ArithOp, BinOp, Bounds,
+    Builder, NumOp, Op, Pattern, Shape, Value,
 };
 use std::sync::Arc;
 
@@ -88,6 +88,98 @@ fn output_projection_drives_input_demand() {
         eval_graph(&graph, input.clone()),
         eval_graph(&graph, eval_graph(&projection, input))
     );
+}
+
+#[test]
+fn transform_prunes_add_before_projecting_its_input() {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let first = builder.add(Op::Field(0), vec![input]);
+    let second = builder.add(Op::Field(1), vec![input]);
+    let one = builder.add(Op::Lit(Value::i64(vec![1])), vec![input]);
+    let pair = builder.tuple(vec![second, one]);
+    let add = builder.add(ArithOp::Bin(BinOp::Add), vec![pair]);
+    let output = builder.tuple(vec![first, add]);
+    let subject = builder.finish(output);
+    let input_shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
+    let output_projection = Shape::Prod(vec![Shape::Int, Shape::Unit]);
+
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let result = builder.graft(&subject, input);
+    let output = builder.add(Op::Project(output_projection.clone()), vec![result]);
+    let unchanged = builder.finish(output);
+    assert!(demand_projection(&unchanged, &input_shape).unwrap().is_none());
+
+    let transformed = demand_transform(&subject, &input_shape, &output_projection).unwrap();
+    assert!(transformed.graph.node_count() < subject.node_count());
+    assert_eq!(shape_of(&transformed.graph, &input_shape).unwrap(), output_projection);
+    let input_projection = transformed.input_projection.unwrap();
+    assert_eq!(
+        shape_of(&input_projection, &input_shape).unwrap(),
+        Shape::Prod(vec![Shape::Int, Shape::Unit])
+    );
+    let input = Value::Prod(vec![Value::i64(vec![2, 3]), Value::i64(vec![4, 5])]);
+    assert_eq!(
+        eval_graph(&unchanged, input.clone()),
+        eval_graph(&transformed.graph, eval_graph(&input_projection, input))
+    );
+}
+
+#[test]
+fn transform_preserves_a_shared_add_with_an_observed_use() {
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let second = builder.add(Op::Field(1), vec![input]);
+    let one = builder.add(Op::Lit(Value::i64(vec![1])), vec![input]);
+    let pair = builder.tuple(vec![second, one]);
+    let add = builder.add(ArithOp::Bin(BinOp::Add), vec![pair]);
+    let output = builder.tuple(vec![add, add]);
+    let subject = builder.finish(output);
+    let input_shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
+    let output_projection = Shape::Prod(vec![Shape::Unit, Shape::Int]);
+    let transformed = demand_transform(&subject, &input_shape, &output_projection).unwrap();
+    let input_projection = transformed.input_projection.unwrap();
+    assert_eq!(
+        shape_of(&input_projection, &input_shape).unwrap(),
+        Shape::Prod(vec![Shape::Unit, Shape::Int])
+    );
+    let input = Value::Prod(vec![Value::i64(vec![2, 3]), Value::i64(vec![4, 5])]);
+    let mut builder = Builder::<NumOp>::default();
+    let root = builder.input();
+    let output = builder.add(Op::Project(output_projection), vec![root]);
+    let projector = builder.finish(output);
+    let expected = eval_graph(&projector, eval_graph(&subject, input.clone()));
+    assert_eq!(
+        expected,
+        eval_graph(&transformed.graph, eval_graph(&input_projection, input))
+    );
+}
+
+#[test]
+fn transform_preserves_fieldless_tuple_length() {
+    let mut builder = Builder::<NumOp>::default();
+    let _input = builder.input();
+    let output = builder.tuple(vec![]);
+    let subject = builder.finish(output);
+    let input_shape = Shape::Int;
+    let transformed = demand_transform(&subject, &input_shape, &Shape::Unit).unwrap();
+    let input = Value::i64(vec![1, 2]);
+    let projected_input = match transformed.input_projection {
+        Some(projection) => eval_graph(&projection, input.clone()),
+        None => input.clone(),
+    };
+    let original = eval_graph(&subject, input);
+    let expected = eval_graph(
+        &{
+            let mut builder = Builder::<NumOp>::default();
+            let root = builder.input();
+            let output = builder.add(Op::Project(Shape::Unit), vec![root]);
+            builder.finish(output)
+        },
+        original,
+    );
+    assert_eq!(eval_graph(&transformed.graph, projected_input), expected);
 }
 
 #[test]
