@@ -22,6 +22,7 @@
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
 
 pub mod bytes;
+pub(crate) mod demand;
 pub(crate) mod engine;
 pub mod explain;
 pub(crate) mod frontend;
@@ -32,6 +33,7 @@ pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
 
+pub use demand::demand_projection;
 pub use frontend::{parse_ml, parse_ml_in, Program, Scope};
 pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
 pub use hash::hash;
