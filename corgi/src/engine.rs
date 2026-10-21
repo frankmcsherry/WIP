@@ -310,15 +310,15 @@ pub(crate) fn compress(v: &Value, mask: &[u8], kept: usize) -> Value {
     if kept * 8 < mask.len() {
         return gather(v, at());
     }
-    fn dense<'a>(v: &Value, mask: &[u8], at: &dyn Fn() -> &'a [usize]) -> Value {
+    fn dense<'a>(v: &Value, mask: &[u8], kept: usize, at: &dyn Fn() -> &'a [usize]) -> Value {
         match v {
             Value::Prim(p) => Value::Prim(p.compress(mask)),
-            Value::Prod(fields) => Value::Prod(fields.iter().map(|f| dense(f, mask, at)).collect()),
-            Value::Unit(_) => Value::Unit(mask.iter().filter(|&&b| b != 0).count()),
+            Value::Prod(fields) => Value::Prod(fields.iter().map(|f| dense(f, mask, kept, at)).collect()),
+            Value::Unit(_) => Value::Unit(kept),
             other => gather(other, at()),
         }
     }
-    dense(v, mask, &at)
+    dense(v, mask, kept, &at)
 }
 
 /// rows of lists, each pick `(t, s, e)` naming rows `s..e` of `lists[t]`, as one list. Rows in a

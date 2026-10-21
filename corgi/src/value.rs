@@ -1039,6 +1039,26 @@ impl Value {
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
+    /// Whether every row has the same payload-free value.
+    pub(crate) fn unit_only(&self) -> bool {
+        match self {
+            Value::Unit(_) => true,
+            Value::Prod(fields) => fields.iter().all(Value::unit_only),
+            _ => false,
+        }
+    }
+
+    /// Whether two values have the same product structure and only `Unit` leaves.
+    pub(crate) fn same_unit_only_shape(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Unit(_), Value::Unit(_)) => true,
+            (Value::Prod(left), Value::Prod(right)) => {
+                left.len() == right.len() && left.iter().zip(right).all(|(l, r)| l.same_unit_only_shape(r))
+            }
+            _ => false,
+        }
+    }
+
     /// keep the first `n` rows, through every shape. A prefix of rows is a prefix of each witness
     /// column (a list's ends, a sum's tags and offsets), so nothing is rebased: each buffer is cut
     /// where it is when uniquely held, and copied up to the cut when shared. A sum's lanes keep

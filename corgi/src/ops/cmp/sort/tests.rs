@@ -140,6 +140,25 @@ fn ordered_refinements_preserve_labels_and_stable_positions() {
 }
 
 #[test]
+fn payload_free_product_fields_do_not_change_sort_order() {
+    let first = Value::i64(vec![2, 1, 2, 1, 2]);
+    let second = Value::i64(vec![4, 8, 3, 8, 4]);
+    let plain = Value::Prod(vec![first.clone(), second.clone()]);
+    let padded = Value::Prod(vec![
+        Value::Unit(5),
+        first,
+        Value::Prod(vec![Value::Unit(5), Value::Unit(5)]),
+        second,
+        Value::Unit(5),
+    ]);
+    let labels = vec![0u64; 5];
+    let index: Vec<usize> = (0..5).collect();
+    assert_eq!(sort_blocks(&labels, &padded), sort_blocks(&labels, &plain));
+    check(&padded, &labels, &index);
+    check(&Value::Prod(vec![Value::Unit(5), Value::Unit(5)]), &labels, &index);
+}
+
+#[test]
 fn random_shapes_agree_with_the_scalar_order() {
     for seed in 1..80u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);

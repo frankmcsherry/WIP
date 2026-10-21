@@ -189,6 +189,7 @@ fn sort_prod(
     }
     let mut outs: Vec<Value> = Vec::with_capacity(cols.len());
     let mut settled = false;
+    let mut compared = false;
     let mut f = 0;
     while f < cols.len() {
         if settled {
@@ -198,6 +199,15 @@ fn sort_prod(
             f += 1;
             continue;
         }
+        // A payload-free field leaves the order and tie labels unchanged.
+        if cols[f].unit_only() {
+            if emit.values() {
+                outs.push(gather(&cols[f], index));
+            }
+            f += 1;
+            continue;
+        }
+        compared = true;
         let (out, next) = match &cols[f] {
             Value::Prim(_) => sort_packed(cols, f, labels, index, emit, scratch),
             c => {
@@ -209,6 +219,9 @@ fn sort_prod(
         outs.extend(out);
         settled = fully_discriminated(labels);
         f = next;
+    }
+    if !compared {
+        densify(labels, m);
     }
     emit.values().then_some(Value::Prod(outs))
 }

@@ -110,6 +110,15 @@ fn groups_agree_with_the_scalar_walk_on_random_shapes() {
 }
 
 #[test]
+fn unit_list_survey_groups_by_length() {
+    let a = Value::List(vec![0, 1, 2, 5].into(), Box::new(Value::Unit(5)));
+    let b = Value::List(vec![1, 3, 6].into(), Box::new(Value::Unit(6)));
+    let a_lengths = Value::i64(vec![0, 1, 1, 3]);
+    let b_lengths = Value::i64(vec![1, 2, 3]);
+    assert_eq!(survey_groups(&a, &b), survey_groups(&a_lengths, &b_lengths));
+}
+
+#[test]
 fn singleton_list_spans_compare_mixed_integer_storage() {
     let bytes = Value::u8(vec![1, 2, 9, 1, 3, 9, 2, 4, 9]);
     let ints = Value::i64(vec![1, 2, 7, 1, 256, 7, 2, -1, 7]);
