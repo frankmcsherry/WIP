@@ -908,3 +908,174 @@ fn sum_map_discards_an_unread_lane() {
         eval_graph(&graph, eval_graph(&projection, input))
     );
 }
+
+struct DemandRng(u64);
+
+impl DemandRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+fn random_shape(rng: &mut DemandRng, depth: usize) -> Shape {
+    if depth == 0 {
+        return if rng.below(3) == 0 { Shape::Unit } else { Shape::Int };
+    }
+    match rng.below(5) {
+        0 => Shape::Int,
+        1 => Shape::Unit,
+        2 => Shape::Prod((0..1 + rng.below(3)).map(|_| random_shape(rng, depth - 1)).collect()),
+        3 => Shape::List(Box::new(random_shape(rng, depth - 1))),
+        _ => Shape::Sum((0..2).map(|_| random_shape(rng, depth - 1)).collect()),
+    }
+}
+
+fn random_value(rng: &mut DemandRng, shape: &Shape, rows: usize) -> Value {
+    match shape {
+        Shape::Int => Value::i64((0..rows).map(|_| rng.below(11) as i64 - 5).collect()),
+        Shape::Unit => Value::Unit(rows),
+        Shape::Prod(fields) => Value::Prod(fields.iter().map(|field| random_value(rng, field, rows)).collect()),
+        Shape::List(element) => {
+            let mut total = 0;
+            let ends = (0..rows).map(|_| { total += rng.below(4); total }).collect();
+            Value::List(Bounds::offsets(ends), Box::new(random_value(rng, element, total)))
+        }
+        Shape::Sum(lanes) => {
+            let tags: Vec<_> = (0..rows).map(|_| rng.below(lanes.len())).collect();
+            let values = lanes
+                .iter()
+                .enumerate()
+                .map(|(tag, lane)| random_value(rng, lane, tags.iter().filter(|&&t| t == tag).count()))
+                .collect();
+            Value::sum(tags, values)
+        }
+        _ => unreachable!("the test generator does not produce this shape"),
+    }
+}
+
+fn random_graph(
+    builder: &mut Builder<NumOp>,
+    input: usize,
+    shape: &Shape,
+    rng: &mut DemandRng,
+    depth: usize,
+) -> (usize, Shape) {
+    if depth == 0 {
+        return (input, shape.clone());
+    }
+    match rng.below(7) {
+        0 => (input, shape.clone()),
+        1 => (builder.add(Op::Unit, vec![input]), Shape::Unit),
+        2 => (builder.add(Op::Hash, vec![input]), Shape::Int),
+        3 => {
+            let (left, left_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (right, right_shape) = if rng.below(3) == 0 {
+                (left, left_shape.clone())
+            } else {
+                random_graph(builder, input, shape, rng, depth - 1)
+            };
+            (builder.tuple(vec![left, right]), Shape::Prod(vec![left_shape, right_shape]))
+        }
+        4 if matches!(shape, Shape::Prod(fields) if !fields.is_empty()) => {
+            let Shape::Prod(fields) = shape else { unreachable!() };
+            let field = rng.below(fields.len());
+            let selected = builder.add(Op::Field(field), vec![input]);
+            random_graph(builder, selected, &fields[field], rng, depth - 1)
+        }
+        5 if matches!(shape, Shape::List(_)) => {
+            let Shape::List(element) = shape else { unreachable!() };
+            if rng.below(2) == 0 {
+                (builder.add(Op::Len, vec![input]), Shape::Int)
+            } else {
+                let mut body = Builder::default();
+                let item = body.input();
+                let (output, output_shape) = random_graph(&mut body, item, element, rng, depth - 1);
+                (builder.add(Op::MapList(Box::new(body.finish(output))), vec![input]), Shape::List(Box::new(output_shape)))
+            }
+        }
+        6 if matches!(shape, Shape::Sum(_)) => {
+            let Shape::Sum(lanes) = shape else { unreachable!() };
+            let mut arms = Vec::new();
+            let mut output_shapes = Vec::new();
+            for (tag, lane) in lanes.iter().enumerate() {
+                let mut body = Builder::default();
+                let item = body.input();
+                let (output, output_shape) = random_graph(&mut body, item, lane, rng, depth - 1);
+                arms.push((tag, body.finish(output)));
+                output_shapes.push(output_shape);
+            }
+            (builder.add(Op::MapSum(arms), vec![input]), Shape::Sum(output_shapes))
+        }
+        _ => (input, shape.clone()),
+    }
+}
+
+fn random_projection(rng: &mut DemandRng, shape: &Shape) -> Shape {
+    if rng.below(4) == 0 {
+        return Shape::Unit;
+    }
+    match shape {
+        Shape::Prod(fields) => Shape::Prod(fields.iter().map(|field| random_projection(rng, field)).collect()),
+        Shape::List(element) => Shape::List(Box::new(random_projection(rng, element))),
+        Shape::Sum(lanes) => Shape::Sum(lanes.iter().map(|lane| random_projection(rng, lane)).collect()),
+        other => other.clone(),
+    }
+}
+
+#[test]
+fn random_demand_rewrites_preserve_values() {
+    let mut projected_inputs = 0;
+    let mut compacted_inputs = 0;
+    for seed in 1..=200u64 {
+        let mut rng = DemandRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let shape = random_shape(&mut rng, 2);
+        let rows = 1 + rng.below(20);
+        let input = random_value(&mut rng, &shape, rows);
+        let mut builder = Builder::default();
+        let root = builder.input();
+        let (output, output_shape) = random_graph(&mut builder, root, &shape, &mut rng, 4);
+        let graph = builder.finish(output);
+        assert_eq!(shape_of(&graph, &shape).unwrap(), output_shape, "seed {seed}");
+        let target = random_projection(&mut rng, &output_shape);
+
+        if let Some(projection) = demand_projection(&graph, &shape).unwrap() {
+            assert_eq!(
+                eval_graph(&graph, input.clone()),
+                eval_graph(&graph, eval_graph(&projection, input.clone())),
+                "unmodified graph seed {seed}",
+            );
+        }
+        if let Some(compacted) = compact_unit_input(&graph, &shape).unwrap() {
+            compacted_inputs += 1;
+            assert_eq!(
+                eval_graph(&graph, input.clone()),
+                eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input.clone())),
+                "compaction seed {seed}",
+            );
+        }
+
+        let mut builder = Builder::default();
+        let root = builder.input();
+        let result = builder.graft(&graph, root);
+        let projected = builder.add(Op::Project(target.clone()), vec![result]);
+        let projected_graph = builder.finish(projected);
+        let expected = eval_graph(&projected_graph, input.clone());
+
+        if let Some(projection) = demand_projection(&projected_graph, &shape).unwrap() {
+            projected_inputs += 1;
+            assert_eq!(expected, eval_graph(&projected_graph, eval_graph(&projection, input.clone())), "projection seed {seed}");
+        }
+        let transformed = demand_transform(&graph, &shape, &target).unwrap();
+        let projected_input = transformed.input_projection.map_or(input.clone(), |projection| eval_graph(&projection, input));
+        assert_eq!(expected, eval_graph(&transformed.graph, projected_input), "transform seed {seed}");
+    }
+    assert!(projected_inputs > 0);
+    assert!(compacted_inputs > 0);
+}
