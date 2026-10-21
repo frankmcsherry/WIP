@@ -134,12 +134,15 @@ mod compare {
             // case), later fields cost proportionally to the ties, not to m.
             (Value::Prod(ca), Value::Prod(cb)) => {
                 assert_eq!(ca.len(), cb.len(), "compare_idx: product arity");
-                let mut ord = compare_in(&ca[0], &cb[0], pairs, eq);
-                if ca.len() > 1 {
+                // Unit-only fields cannot break a tie, so the first real field can keep implicit pairs.
+                let mut fields = ca.iter().zip(cb).filter(|(a, b)| !a.same_unit_only_shape(b));
+                let Some((first_a, first_b)) = fields.next() else { return vec![0i8; m] };
+                let mut ord = compare_in(first_a, first_b, pairs, eq);
+                if let Some(second) = fields.next() {
                     let mut tie_k: Vec<usize> = (0..m).filter(|&k| ord[k] == 0).collect();
                     let mut tia: Vec<usize> = tie_k.iter().map(|&k| pairs.left(k)).collect();
                     let mut tib: Vec<usize> = tie_k.iter().map(|&k| pairs.right(k)).collect();
-                    for (x, y) in ca[1..].iter().zip(&cb[1..]) {
+                    for (x, y) in std::iter::once(second).chain(fields) {
                         if tie_k.is_empty() {
                             break;
                         }
@@ -207,6 +210,14 @@ mod compare {
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
+                // Lists of equal payload-free elements compare by length alone.
+                if va.same_unit_only_shape(vb) {
+                    return (0..m).map(|k| {
+                        let (sa, ea) = ba.span(pairs.left(k));
+                        let (sb, eb) = bb.span(pairs.right(k));
+                        (ea - sa).cmp(&(eb - sb)) as i8
+                    }).collect();
+                }
                 // leaf elements of one width: each pair is one slice compare, with no element pairs
                 // built. Equality reads every pair's lengths first, in a pass with no branch on the
                 // answer, and then the elements of only the pairs whose lengths agree.

@@ -99,6 +99,32 @@ fn implicit_pairs_match_explicit_ones() {
 }
 
 #[test]
+fn payload_free_product_fields_do_not_change_comparison() {
+    let first = u(&[2, 1, 2, 1, 2]);
+    let second = u(&[4, 8, 3, 8, 4]);
+    let plain = Value::Prod(vec![first.clone(), second.clone()]);
+    let padded = Value::Prod(vec![
+        Value::Unit(5),
+        first,
+        Value::Prod(vec![Value::Unit(5), Value::Unit(5)]),
+        second,
+        Value::Unit(5),
+    ]);
+    let left = [0usize, 1, 2, 3, 4, 0, 4];
+    let right = [4usize, 3, 0, 1, 2, 1, 3];
+    assert_eq!(compare_idx(&padded, &padded, &left, &right), compare_idx(&plain, &plain, &left, &right));
+    assert_eq!(equal_idx(&padded, &padded, &left, &right), equal_idx(&plain, &plain, &left, &right));
+    assert_eq!(compare_adjacent(&padded), compare_adjacent(&plain));
+
+    let lists = Value::List(
+        vec![0, 1, 3, 3, 6].into(),
+        Box::new(Value::Prod(vec![Value::Unit(6), Value::Unit(6)])),
+    );
+    let lengths = Value::i64(vec![0, 1, 2, 0, 3]);
+    assert_eq!(compare_idx(&lists, &lists, &left, &right), compare_idx(&lengths, &lengths, &left, &right));
+}
+
+#[test]
 fn compare_cols_matches_scalar() {
     // prim
     agree_cmp(&u(&[5, 3, 8, 1, 9]), &u(&[5, 4, 2, 1, 0]));

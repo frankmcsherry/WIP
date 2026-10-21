@@ -123,6 +123,15 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
             }
         }
         (Value::List(ba, va), Value::List(bb, vb)) => {
+            if va.same_unit_only_shape(vb) {
+                merge(
+                    |j| { let (s, e) = ba.span(ia.row(j)); e - s },
+                    |j| { let (s, e) = bb.span(ib.row(j)); e - s },
+                    open,
+                    tree,
+                );
+                return;
+            }
             // lexicographically: element by element over the classes still equal, the rows that
             // end at a position first in their class (each a proper prefix of the rest).
             let len = |bounds: &Bounds, r: usize| {

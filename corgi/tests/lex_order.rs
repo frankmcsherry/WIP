@@ -99,3 +99,34 @@ fn number_lists_sort_lexicographically_per_row() {
         assert_eq!(flat(&got), want_lim, "sort_limit, trial {trial}");
     }
 }
+
+#[test]
+fn sort_limit_ignores_payload_free_key_fields() {
+    let keys = Value::Prod(vec![
+        Value::Unit(4),
+        Value::i64(vec![3, 1, 2, 1]),
+        Value::Prod(vec![Value::Unit(4), Value::Unit(4)]),
+    ]);
+    let input = Value::List(Bounds::offsets(vec![4]), Box::new(keys));
+    let got = Program::compile_ml("input sort_limit 2").unwrap().run(input);
+    let expected = Value::List(
+        Bounds::offsets(vec![2]),
+        Box::new(Value::Prod(vec![
+            Value::Unit(2),
+            Value::i64(vec![1, 1]),
+            Value::Prod(vec![Value::Unit(2), Value::Unit(2)]),
+        ])),
+    );
+    assert_eq!(got, expected);
+
+    let nested = Value::List(
+        Bounds::offsets(vec![4]),
+        Box::new(Value::List(Bounds::offsets(vec![2, 2, 5, 6]), Box::new(Value::Unit(6)))),
+    );
+    let got = Program::compile_ml("input sort_limit 3").unwrap().run(nested);
+    let expected = Value::List(
+        Bounds::offsets(vec![3]),
+        Box::new(Value::List(Bounds::offsets(vec![0, 1, 3]), Box::new(Value::Unit(3)))),
+    );
+    assert_eq!(got, expected);
+}

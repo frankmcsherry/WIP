@@ -228,20 +228,24 @@ enum Level {
 }
 
 /// the levels whose lexicographic order is the structural order of `v`'s rows, most significant
-/// first: a product's fields' in turn, a list's elements by position and then its length (lists
+/// first: a product's fields in turn, a list's elements by position and then its length (lists
 /// order lexicographically), anything else itself.
+/// Payload-free fields need no level; a list of payload-free elements orders by length alone.
 fn order_levels(v: &Value, out: &mut Vec<Level>) {
     match v {
-        Value::Prod(fields) if !fields.is_empty() => fields.iter().for_each(|f| order_levels(f, out)),
-        Value::List(inner, _) => {
+        Value::Prod(fields) => fields.iter().for_each(|f| order_levels(f, out)),
+        Value::List(inner, elements) => {
             // the elements by position, a row past its end reading zero (the least value of any
             // shape), then the length: a proper prefix ties its padded rows and comes first.
-            out.push(Level::Elems(v.clone()));
+            if !elements.unit_only() {
+                out.push(Level::Elems(v.clone()));
+            }
             out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
                 let (s, e) = inner.span(i);
                 (e - s) as i64
             }).collect())));
         }
+        other if other.unit_only() => {}
         other => out.push(Level::Col(other.clone())),
     }
 }

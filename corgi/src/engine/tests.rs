@@ -147,7 +147,7 @@ fn gather_or_zero_reads_the_shapes_zero() {
 
 /// `compress` takes the kept rows by whichever path fits how many there are, and either way they are
 /// the rows `gather` takes at the kept positions: few kept and most kept, over a product of a leaf,
-/// a list, a sum and a reference.
+/// a list, a sum, a reference, and several payload-free fields.
 #[test]
 fn compress_keeps_what_gather_at_the_kept_positions_does() {
     let n = 40;
@@ -156,7 +156,14 @@ fn compress_keeps_what_gather_at_the_kept_positions_does() {
     let lists = Value::List(ends.clone().into(), Box::new(u(&(0..ends[n - 1] as u64).collect::<Vec<_>>())));
     let sum = Value::sum((0..n).map(|i| i % 2).collect(), vec![u(&(0..20).collect::<Vec<_>>()), Value::u8((0..20).collect())]);
     let refs = take_ref(lists.clone());
-    let v = Value::Prod(vec![u(&(0..n as u64).collect::<Vec<_>>()), lists, sum, refs]);
+    let v = Value::Prod(vec![
+        Value::Unit(n),
+        u(&(0..n as u64).collect::<Vec<_>>()),
+        Value::Prod(vec![Value::Unit(n), Value::Unit(n)]),
+        lists,
+        sum,
+        refs,
+    ]);
     for mask in [(0..n).map(|i| (i == 3 || i == 30) as u8).collect::<Vec<_>>(), (0..n).map(|i| (i % 5 != 0) as u8).collect()] {
         let kept: Vec<usize> = (0..n).filter(|&i| mask[i] != 0).collect();
         assert_eq!(compress(&v, &mask, kept.len()), gather(&v, &kept));
