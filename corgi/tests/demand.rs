@@ -1,6 +1,6 @@
 use corgi::{
     demand_projection, demand_transform, eval_graph, parse_ml, shape_of, ArithOp, BinOp, Bounds,
-    Builder, NumOp, Op, Pattern, Shape, Value,
+    Builder, Demand, NumOp, Op, Pattern, Shape, Value,
 };
 use std::sync::Arc;
 
@@ -60,6 +60,50 @@ fn shared_uses_union_their_demands() {
         shape_of(&projection, &shape).unwrap(),
         Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Unit])
     );
+}
+
+#[test]
+fn public_demand_merge_unions_consumers_of_one_input() {
+    let shape = Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Int]);
+    let first = demand_transform(&parse_ml("input.0").unwrap(), &shape, &Shape::Int).unwrap();
+    let second = demand_transform(&parse_ml("input.1").unwrap(), &shape, &Shape::Int).unwrap();
+    let mut need = first.input_demand;
+    need.merge(second.input_demand).unwrap();
+    let projected = need.to_shape(&shape).unwrap();
+    assert_eq!(projected, Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Unit]));
+    assert_eq!(shape_of(&first.graph, &projected).unwrap(), Shape::Int);
+    assert_eq!(shape_of(&second.graph, &projected).unwrap(), Shape::Int);
+}
+
+#[test]
+fn public_demand_merge_preserves_container_structure() {
+    let original = Shape::Prod(vec![
+        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int]))),
+        Shape::Sum(vec![Shape::Int, Shape::Int]),
+        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int]))))),
+    ]);
+    let left = Shape::Prod(vec![
+        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit]))),
+        Shape::Sum(vec![Shape::Int, Shape::Unit]),
+        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Unit, Shape::Int]))))),
+    ]);
+    let right = Shape::Prod(vec![
+        Shape::List(Box::new(Shape::Prod(vec![Shape::Unit, Shape::Int]))),
+        Shape::Sum(vec![Shape::Unit, Shape::Int]),
+        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit]))))),
+    ]);
+    let mut need = Demand::from_projection(&left);
+    need.merge(Demand::from_projection(&right)).unwrap();
+    assert_eq!(need.to_shape(&original).unwrap(), original);
+}
+
+#[test]
+fn public_demand_merge_rejects_incompatible_structures() {
+    let mut need = Demand::from_projection(&Shape::Prod(vec![Shape::Int]));
+    let before = need.clone();
+    assert!(need.merge(Demand::from_projection(&Shape::List(Box::new(Shape::Int)))).is_err());
+    assert_eq!(need, before);
+    assert!(need.to_shape(&Shape::Prod(vec![Shape::Int, Shape::Int])).is_err());
 }
 
 #[test]
@@ -220,6 +264,7 @@ fn transform_does_not_duplicate_a_shared_map() {
     let target = Shape::Prod(vec![list.clone(), projected_list.clone()]);
     let transformed = demand_transform(&graph, &list, &target).unwrap();
     assert!(transformed.input_projection.is_none());
+    assert_eq!(transformed.input_demand, Demand::All);
 
     let mut builder = Builder::<NumOp>::default();
     let input = builder.input();

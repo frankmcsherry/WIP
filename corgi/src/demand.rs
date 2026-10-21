@@ -4,6 +4,7 @@
 //! `None` needs only row count, `All` needs the value, and container demands keep their structure with demands for their contents.
 //! Backward propagation splits tuple demands, selects fields, follows `Enlist` and `Ref`, and enters the closed bodies of list and sum maps.
 //! Demands from multiple uses meet by union.
+//! Callers can merge demands from separate consumers and convert the result back to a projected shape.
 //! Reachability is tracked separately because a live value needed only for its row count also has `None` demand.
 //! Operations without a proved propagation rule demand their whole input.
 //! A host kernel therefore demands all columns explicitly passed to it, while surrounding tuple and field wiring can discard other source columns.
@@ -28,8 +29,10 @@ use crate::optimize::dce;
 use crate::shape::{shape_of_value, Shape};
 use crate::value::Value;
 
-#[derive(Clone)]
-enum Demand {
+/// The part of a value needed by a consumer.
+/// Container variants retain their structure while describing demand on their contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Demand {
     None,
     All,
     Prod(Vec<Demand>),
@@ -69,7 +72,38 @@ fn shape_requirement(shape: &Shape) -> Demand {
 }
 
 impl Demand {
-    fn merge(&mut self, other: Demand) {
+    /// The demand represented by a projection target, where `Unit` erases a subtree.
+    pub fn from_projection(target: &Shape) -> Self {
+        shape_requirement(target)
+    }
+
+    /// Union two demands on the same original shape.
+    /// A structural mismatch returns an error without changing `self`.
+    pub fn merge(&mut self, other: Demand) -> Result<(), String> {
+        if !self.compatible(&other) {
+            return Err("demands have different structures".into());
+        }
+        self.merge_unchecked(other);
+        Ok(())
+    }
+
+    /// Apply this demand to the original shape, replacing unread subtrees with `Unit`.
+    pub fn to_shape(&self, original: &Shape) -> Result<Shape, String> {
+        projected_shape(original, self)
+    }
+
+    fn compatible(&self, other: &Demand) -> bool {
+        match (self, other) {
+            (Demand::None | Demand::All, _) | (_, Demand::None | Demand::All) => true,
+            (Demand::Prod(left), Demand::Prod(right)) | (Demand::Sum(left), Demand::Sum(right)) => {
+                left.len() == right.len() && left.iter().zip(right).all(|(l, r)| l.compatible(r))
+            }
+            (Demand::List(left), Demand::List(right)) | (Demand::Ref(left), Demand::Ref(right)) => left.compatible(right),
+            _ => false,
+        }
+    }
+
+    fn merge_unchecked(&mut self, other: Demand) {
         match (&mut *self, other) {
             (Demand::All, _) | (_, Demand::None) => {}
             (here, Demand::All) => *here = Demand::All,
@@ -77,15 +111,15 @@ impl Demand {
             (Demand::Prod(left), Demand::Prod(right)) => {
                 assert_eq!(left.len(), right.len());
                 for (l, r) in left.iter_mut().zip(right) {
-                    l.merge(r);
+                    l.merge_unchecked(r);
                 }
             }
-            (Demand::List(left), Demand::List(right)) => left.merge(*right),
-            (Demand::Ref(left), Demand::Ref(right)) => left.merge(*right),
+            (Demand::List(left), Demand::List(right)) => left.merge_unchecked(*right),
+            (Demand::Ref(left), Demand::Ref(right)) => left.merge_unchecked(*right),
             (Demand::Sum(left), Demand::Sum(right)) => {
                 assert_eq!(left.len(), right.len());
                 for (l, r) in left.iter_mut().zip(right) {
-                    l.merge(r);
+                    l.merge_unchecked(r);
                 }
             }
             _ => unreachable!("demands for one node have different structures"),
@@ -154,7 +188,7 @@ pub fn demand_projection(
     input: &Shape,
 ) -> Result<Option<Graph<NumOp>>, String> {
     let (need, output) = input_demand(graph, input, Demand::All)?;
-    let projected = projected_shape(input, &need);
+    let projected = need.to_shape(input)?;
     if projected == *input {
         return Ok(None);
     }
@@ -174,12 +208,16 @@ pub fn demand_projection(
 pub struct DemandTransform {
     pub graph: Graph<NumOp>,
     pub input_projection: Option<Graph<NumOp>>,
+    /// The demand embodied by `input_projection`, or `All` when no projection is returned.
+    pub input_demand: Demand,
 }
 
 /// Remove computations behind output lanes erased by `output_projection`, then extract input demand.
 ///
 /// For every valid input `x`, the result satisfies `Project(output_projection)(graph(x)) = result.graph(result.input_projection(x))`.
 /// An absent input projection means that `result.graph` accepts the original input unchanged.
+/// `input_demand` describes the returned input projection and can be unioned with other consumers' demands on the same source.
+/// Each revised consumer must still accept the unioned shape or receive its own input projection.
 /// The original graph remains unchanged.
 pub fn demand_transform(
     graph: &Graph<NumOp>,
@@ -188,7 +226,11 @@ pub fn demand_transform(
 ) -> Result<DemandTransform, String> {
     let rewritten = prune_graph(graph, input, output_projection)?;
     let input_projection = demand_projection(&rewritten, input)?;
-    Ok(DemandTransform { graph: rewritten, input_projection })
+    let input_demand = match &input_projection {
+        Some(projection) => Demand::from_projection(&shape_of(projection, input)?),
+        None => Demand::All,
+    };
+    Ok(DemandTransform { graph: rewritten, input_projection, input_demand })
 }
 
 fn prune_graph(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape) -> Result<Graph<NumOp>, String> {
@@ -376,7 +418,7 @@ fn input_demand(
             NodeKind::Input => {}
             NodeKind::Tuple => {
                 for (&edge, field) in node.inputs.iter().zip(demand.fields(node.inputs.len())) {
-                    demands[edge].merge(field);
+                    demands[edge].merge_unchecked(field);
                 }
             }
             NodeKind::Op(NumOp::Core(Op::Field(field))) => {
@@ -385,22 +427,22 @@ fn input_demand(
                 };
                 let mut needs = vec![Demand::None; fields.len()];
                 needs[*field] = demand;
-                demands[node.inputs[0]].merge(Demand::Prod(needs));
+                demands[node.inputs[0]].merge_unchecked(Demand::Prod(needs));
             }
             NodeKind::Op(NumOp::Core(Op::Unit | Op::Lit(_))) => {}
             NodeKind::Op(NumOp::Core(Op::Pattern(pattern))) => {
                 let mut need = demand;
-                need.merge(pattern_requirement(pattern));
-                demands[node.inputs[0]].merge(need);
+                need.merge_unchecked(pattern_requirement(pattern));
+                demands[node.inputs[0]].merge_unchecked(need);
             }
             NodeKind::Op(NumOp::Core(Op::Project(target))) => {
-                demands[node.inputs[0]].merge(shape_requirement(target));
+                demands[node.inputs[0]].merge_unchecked(shape_requirement(target));
             }
             NodeKind::Op(NumOp::Core(Op::Enlist)) => {
-                demands[node.inputs[0]].merge(demand.list_element());
+                demands[node.inputs[0]].merge_unchecked(demand.list_element());
             }
             NodeKind::Op(NumOp::Core(Op::Ref)) => {
-                demands[node.inputs[0]].merge(before_ref(&shapes[node.inputs[0]], demand));
+                demands[node.inputs[0]].merge_unchecked(before_ref(&shapes[node.inputs[0]], demand));
             }
             NodeKind::Op(NumOp::Core(Op::Len)) => {
                 let need = match &shapes[node.inputs[0]] {
@@ -408,14 +450,14 @@ fn input_demand(
                     Shape::Ref(_) => Demand::Ref(Box::new(Demand::List(Box::new(Demand::None)))),
                     _ => unreachable!("Len input is a list or a reference to a list"),
                 };
-                demands[node.inputs[0]].merge(need);
+                demands[node.inputs[0]].merge_unchecked(need);
             }
             NodeKind::Op(NumOp::Core(Op::MapList(body))) => {
                 let Shape::List(element) = &shapes[node.inputs[0]] else {
                     unreachable!()
                 };
                 let (need, _) = input_demand(body, element, demand.list_element())?;
-                demands[node.inputs[0]].merge(Demand::List(Box::new(need)));
+                demands[node.inputs[0]].merge_unchecked(Demand::List(Box::new(need)));
             }
             NodeKind::Op(NumOp::Core(Op::MapSum(arms))) => {
                 let Shape::Sum(lanes) = &shapes[node.inputs[0]] else {
@@ -426,9 +468,9 @@ fn input_demand(
                     let (need, _) = input_demand(body, &lanes[*tag], needs[*tag].clone())?;
                     needs[*tag] = need;
                 }
-                demands[node.inputs[0]].merge(Demand::Sum(needs));
+                demands[node.inputs[0]].merge_unchecked(Demand::Sum(needs));
             }
-            NodeKind::Op(_) => demands[node.inputs[0]].merge(Demand::All),
+            NodeKind::Op(_) => demands[node.inputs[0]].merge_unchecked(Demand::All),
         }
     }
 
@@ -440,36 +482,40 @@ fn input_demand(
     Ok((demands[input_node].clone(), output))
 }
 
-fn projected_shape(shape: &Shape, demand: &Demand) -> Shape {
+fn projected_shape(shape: &Shape, demand: &Demand) -> Result<Shape, String> {
     match (shape, demand) {
-        (_, Demand::All) => shape.clone(),
-        (_, Demand::None) => Shape::Unit,
+        (_, Demand::All) => Ok(shape.clone()),
+        (_, Demand::None) => Ok(Shape::Unit),
         (Shape::Prod(fields), Demand::Prod(needs)) => {
-            assert_eq!(fields.len(), needs.len());
-            Shape::Prod(
+            if fields.len() != needs.len() {
+                return Err("product demand has the wrong number of fields".into());
+            }
+            Ok(Shape::Prod(
                 fields
                     .iter()
                     .zip(needs)
                     .map(|(shape, need)| projected_shape(shape, need))
-                    .collect(),
-            )
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
         }
         (Shape::List(element), Demand::List(need)) => {
-            Shape::List(Box::new(projected_shape(element, need)))
+            Ok(Shape::List(Box::new(projected_shape(element, need)?)))
         }
         (Shape::Ref(list), Demand::Ref(need)) => {
-            Shape::Ref(Box::new(projected_shape(list, need)))
+            Ok(Shape::Ref(Box::new(projected_shape(list, need)?)))
         }
         (Shape::Sum(lanes), Demand::Sum(needs)) => {
-            assert_eq!(lanes.len(), needs.len());
-            Shape::Sum(
+            if lanes.len() != needs.len() {
+                return Err("sum demand has the wrong number of lanes".into());
+            }
+            Ok(Shape::Sum(
                 lanes
                     .iter()
                     .zip(needs)
                     .map(|(shape, need)| projected_shape(shape, need))
-                    .collect(),
-            )
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
         }
-        _ => unreachable!(),
+        _ => Err(format!("demand {demand:?} does not match shape {shape}")),
     }
 }
