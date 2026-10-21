@@ -20,6 +20,7 @@
 //! `demand_transform` additionally prunes tuple lanes erased by a requested output projection, including through fields and list and sum map bodies, before extracting input demand.
 //! It rewires consumers and removes unreachable nodes, leaving shared producers in place when another consumer still needs them.
 //! A shared map stays intact because specializing one use could duplicate its retained work.
+//! It removes dead branches before counting map uses, then specializes maps that have only one remaining use.
 
 use crate::graph::{shape_of, Builder, Graph, Node, NodeKind, OpLike};
 use crate::ops::{NumOp, Op, Pattern};
@@ -191,6 +192,13 @@ pub fn demand_transform(
 }
 
 fn prune_graph(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape) -> Result<Graph<NumOp>, String> {
+    // The first pass discards dead branches without cloning any map.
+    // The second pass can then count only uses that survived.
+    let live = prune_graph_once(graph, input, output_projection, false)?;
+    prune_graph_once(&live, input, output_projection, true)
+}
+
+fn prune_graph_once(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape, specialize_maps: bool) -> Result<Graph<NumOp>, String> {
     let shapes = graph_shapes(graph, input)?;
     let output = shapes.get(graph.output).ok_or("graph has no output")?;
     let projected = NumOp::Core(Op::Project(output_projection.clone())).eval(Value::empty(output))?;
@@ -219,7 +227,7 @@ fn prune_graph(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape) -
     let mut nodes = graph.nodes.clone();
     let unit = nodes.len();
     nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![input_node] });
-    let result = prune_output(&mut nodes, &shapes, &follows_input, &uses, unit, graph.output, output_projection)?;
+    let result = prune_output(&mut nodes, &shapes, &follows_input, &uses, unit, graph.output, output_projection, specialize_maps)?;
     let mut rewritten = dce(&Graph { nodes, output: result });
     // DCE can remove the formal input of a constant graph; keep it for input-demand extraction.
     if !rewritten.nodes.iter().any(|node| matches!(node.kind, NodeKind::Input)) {
@@ -246,6 +254,7 @@ fn prune_output(
     unit: usize,
     node: usize,
     target: &Shape,
+    specialize_maps: bool,
 ) -> Result<usize, String> {
     if *target == Shape::Unit {
         if follows_input[node] {
@@ -255,11 +264,17 @@ fn prune_output(
         nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![node] });
         return Ok(result);
     }
+    if let NodeKind::Op(NumOp::Core(Op::Project(projected))) = &nodes[node].kind {
+        if projected == target {
+            let source = nodes[node].inputs[0];
+            return prune_output(nodes, shapes, follows_input, uses, unit, source, target, specialize_maps);
+        }
+    }
     if let NodeKind::Op(NumOp::Core(Op::Field(field))) = &nodes[node].kind {
         let source = nodes[node].inputs[0];
         if matches!(nodes[source].kind, NodeKind::Tuple) {
             let selected = nodes[source].inputs[*field];
-            return prune_output(nodes, shapes, follows_input, uses, unit, selected, target);
+            return prune_output(nodes, shapes, follows_input, uses, unit, selected, target, specialize_maps);
         }
     }
     if let (NodeKind::Tuple, Shape::Prod(targets)) = (&nodes[node].kind, target) {
@@ -268,7 +283,7 @@ fn prune_output(
             let rewritten: Vec<_> = inputs
                 .iter()
                 .zip(targets)
-                .map(|(&edge, target)| prune_output(nodes, shapes, follows_input, uses, unit, edge, target))
+                .map(|(&edge, target)| prune_output(nodes, shapes, follows_input, uses, unit, edge, target, specialize_maps))
                 .collect::<Result<Vec<_>, _>>()?;
             if rewritten == inputs && shapes[node] == *target {
                 return Ok(node);
@@ -279,7 +294,7 @@ fn prune_output(
         }
     }
     // Specializing a shared map would evaluate its retained work once per specialized use.
-    if uses[node] <= 1 {
+    if specialize_maps && uses[node] <= 1 {
         if let (NodeKind::Op(NumOp::Core(Op::MapList(body))), Shape::List(element_target)) = (&nodes[node].kind, target) {
             let source = nodes[node].inputs[0];
             let Shape::List(element_input) = &shapes[source] else { unreachable!() };
