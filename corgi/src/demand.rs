@@ -4,7 +4,7 @@
 //! `None` needs only row count, `All` needs the value, and container demands keep their structure with demands for their contents.
 //! Backward propagation splits tuple demands, selects fields, follows `Enlist` and `Ref`, and enters the closed bodies of list and sum maps.
 //! Demands from multiple uses meet by union.
-//! Callers can merge demands from separate consumers and convert the result back to a projected shape.
+//! `Demand::union_for_shape` checks two consumers' demands against one original shape and returns their union and its projected shape.
 //! Reachability is tracked separately because a live value needed only for its row count also has `None` demand.
 //! Operations without a proved propagation rule demand their whole input.
 //! A host kernel therefore demands all columns explicitly passed to it, while surrounding tuple and field wiring can discard other source columns.
@@ -79,12 +79,23 @@ impl Demand {
 
     /// Union two demands on the same original shape.
     /// A structural mismatch returns an error without changing `self`.
+    /// Use `union_for_shape` to also validate both demands against the original shape.
     pub fn merge(&mut self, other: Demand) -> Result<(), String> {
         if !self.compatible(&other) {
             return Err("demands have different structures".into());
         }
         self.merge_unchecked(other);
         Ok(())
+    }
+
+    /// Union two demands against one original shape and return the resulting projection shape.
+    pub fn union_for_shape(original: &Shape, left: &Demand, right: &Demand) -> Result<(Demand, Shape), String> {
+        left.to_shape(original)?;
+        right.to_shape(original)?;
+        let mut merged = left.clone();
+        merged.merge(right.clone())?;
+        let projected = merged.to_shape(original)?;
+        Ok((merged, projected))
     }
 
     /// Apply this demand to the original shape, replacing unread subtrees with `Unit`.

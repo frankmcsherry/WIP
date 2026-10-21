@@ -67,10 +67,9 @@ fn public_demand_merge_unions_consumers_of_one_input() {
     let shape = Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Int]);
     let first = demand_transform(&parse_ml("input.0").unwrap(), &shape, &Shape::Int).unwrap();
     let second = demand_transform(&parse_ml("input.1").unwrap(), &shape, &Shape::Int).unwrap();
-    let mut need = first.input_demand;
-    need.merge(second.input_demand).unwrap();
-    let projected = need.to_shape(&shape).unwrap();
+    let (need, projected) = Demand::union_for_shape(&shape, &first.input_demand, &second.input_demand).unwrap();
     assert_eq!(projected, Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Unit]));
+    assert_eq!(need.to_shape(&shape).unwrap(), projected);
     assert_eq!(shape_of(&first.graph, &projected).unwrap(), Shape::Int);
     assert_eq!(shape_of(&second.graph, &projected).unwrap(), Shape::Int);
 }
@@ -104,6 +103,11 @@ fn public_demand_merge_rejects_incompatible_structures() {
     assert!(need.merge(Demand::from_projection(&Shape::List(Box::new(Shape::Int)))).is_err());
     assert_eq!(need, before);
     assert!(need.to_shape(&Shape::Prod(vec![Shape::Int, Shape::Int])).is_err());
+    assert!(Demand::union_for_shape(
+        &Shape::Prod(vec![Shape::Int, Shape::Int]),
+        &need,
+        &Demand::None,
+    ).is_err());
 }
 
 #[test]
