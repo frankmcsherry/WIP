@@ -303,6 +303,7 @@ pub enum Op<L> {
     Pattern(Pattern), // check: X -> X, where X has the pattern's shape (see `Pattern`): what a
                     //        tuple pattern takes apart, checked whole where it takes it apart, and what
                     //        an ascription `: S` says. The pattern's names read through it.
+    Project(Shape), // replace unread payloads with Unit, retaining product positions, list bounds, sum tags, and reference rows.
     // SUM — witness: the tag column.
     Branch(usize),  // intro: (X, Int-tags) -> Sum{X × n}  data-driven demux: row i -> variant
                     //        tags[i]. (The boolean split is the idiom `Branch(2)` on a 0/1 mask.)
@@ -410,6 +411,35 @@ pub enum Op<L> {
                     // The word `try_chunk` puts such a row in a lane of its own instead.
 }
 
+/// Consume a column and replace only fields discarded by the target shape.
+/// Retained leaves keep their buffers; work depends on shape size, not row count.
+fn project_value(input: Value, target: &Shape) -> Result<Value, String> {
+    match (input, target) {
+        (value, Shape::Unit) => Ok(Value::Unit(value.len())),
+        (Value::Prod(mut fields), Shape::Prod(targets)) if fields.len() == targets.len() => {
+            for (field, target) in fields.iter_mut().zip(targets) {
+                let value = std::mem::replace(field, Value::Unit(0));
+                *field = project_value(value, target)?;
+            }
+            Ok(Value::Prod(fields))
+        }
+        (Value::List(bounds, values), Shape::List(target)) => Ok(Value::List(bounds, Box::new(project_value(*values, target)?))),
+        (Value::Sum(tags, mut lanes), Shape::Sum(targets)) if lanes.len() == targets.len() => {
+            for (lane, target) in lanes.iter_mut().zip(targets) {
+                let value = std::mem::replace(lane, Value::Unit(0));
+                *lane = project_value(value, target)?;
+            }
+            Ok(Value::Sum(tags, lanes))
+        }
+        (Value::Ref(list, rows), Shape::Ref(target)) if matches!(&**target, Shape::List(_)) => {
+            let list = std::sync::Arc::unwrap_or_clone(list);
+            Ok(Value::Ref(std::sync::Arc::new(project_value(list, target)?), rows))
+        }
+        (value, target) if shape_of_value(&value) == *target => Ok(value),
+        (value, target) => Err(format!("Project: cannot project {} to {target}", shape_of_value(&value))),
+    }
+}
+
 impl<L: OpLike> Op<L> {
     /// run the op on a column. `Err` is a SHAPE error — the operand is not what the op consumes —
     /// which is what makes this the typer when run on zero rows (see `graph::shape_of`). No op fails
@@ -422,6 +452,8 @@ impl<L: OpLike> Op<L> {
                 p.check(&input)?;
                 input
             }
+
+            Op::Project(shape) => project_value(input, shape)?,
 
             Op::Field(i) => {
                 let mut cols = input.into_prod("Field")?;

@@ -1,0 +1,750 @@
+//! Find input columns that a graph cannot observe, and erase their payloads.
+//!
+//! A demand describes the part of a value needed by a graph's output.
+//! `None` needs only row count, `All` needs the value, and container demands keep their structure with demands for their contents.
+//! Backward propagation splits tuple demands, selects fields, follows `Enlist` and `Ref`, and enters the closed bodies of list and sum maps.
+//! Demands from multiple uses meet by union.
+//! `Demand::union_for_shape` checks two consumers' demands against one original shape and returns their union and its projected shape.
+//! Reachability is tracked separately because a live value needed only for its row count also has `None` demand.
+//! Operations without a proved propagation rule demand their whole input.
+//! A host kernel therefore demands all columns explicitly passed to it, while surrounding tuple and field wiring can discard other source columns.
+//! `Len` demands list bounds but not their payload, including when it reads referenced rows.
+//! Appending `Project` to an expression states which output fields matter, so the same pass can return its input demand.
+//!
+//! A projection replaces `None` subtrees with `Unit` while retaining product positions, list bounds, sum tags, and reference row numbers.
+//! `Op::Project` consumes a column and reuses retained buffers, so its work depends on shape structure rather than row count.
+//! The final typecheck rejects a projected shape that the original graph cannot accept.
+//! The propagation rules establish value preservation; matching output shapes alone would not establish it.
+//! The route toward syntactic minimality is an exact backward rule for each operation, followed by union at shared nodes.
+//! No rule inspects row data or infers algebraic identities.
+//! This pass does not yet claim a minimal demand under all Corgi operations.
+//! `demand_transform` additionally prunes tuple lanes erased by a requested output projection, including through fields and list and sum map bodies, before extracting input demand.
+//! It rewires consumers and removes unreachable nodes, leaving shared producers in place when another consumer still needs them.
+//! A shared map stays intact because specializing one use could duplicate its retained work.
+//! It removes dead branches before counting map uses, then specializes maps that have only one remaining use.
+//! `compact_unit_input` removes payload-free product positions from a lambda input and rewrites the consumer for the narrower shape.
+//! `compact_unit_fields` restricts that change to selected top-level fields, such as a join's values rather than its key.
+//! Corgi establishes equivalence at the lambda boundary; the enclosing operator decides whether the projection can move farther upstream.
+
+use crate::graph::{shape_of, Builder, Graph, Node, NodeKind, OpLike};
+use crate::ops::{NumOp, Op, Pattern};
+use crate::optimize::{dce, fuse_maps, peephole};
+use crate::shape::{shape_of_value, Shape};
+use crate::value::Value;
+
+/// The part of a value needed by a consumer.
+/// Container variants retain their structure while describing demand on their contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Demand {
+    None,
+    All,
+    Prod(Vec<Demand>),
+    List(Box<Demand>),
+    Sum(Vec<Demand>),
+    Ref(Box<Demand>),
+}
+
+fn pattern_requirement(pattern: &Pattern) -> Demand {
+    match pattern {
+        Pattern::Any => Demand::None,
+        Pattern::Tuple(fields) if fields.is_empty() => Demand::None,
+        Pattern::Tuple(fields) => Demand::Prod(fields.iter().map(pattern_requirement).collect()),
+        Pattern::List(element) => Demand::List(Box::new(pattern_requirement(element))),
+        Pattern::Sum(lanes) => Demand::Sum(lanes.iter().map(pattern_requirement).collect()),
+        Pattern::Ref(list) => {
+            let need = match pattern_requirement(list) {
+                Demand::None => Demand::List(Box::new(Demand::None)),
+                need => need,
+            };
+            Demand::Ref(Box::new(need))
+        }
+        _ => Demand::All,
+    }
+}
+
+/// The input shape a `Project` target requires, with every erased subtree reduced to row count.
+fn shape_requirement(shape: &Shape) -> Demand {
+    match shape {
+        Shape::Unit => Demand::None,
+        Shape::Int | Shape::Float => Demand::All,
+        Shape::Prod(fields) => Demand::Prod(fields.iter().map(shape_requirement).collect()),
+        Shape::List(element) => Demand::List(Box::new(shape_requirement(element))),
+        Shape::Sum(lanes) => Demand::Sum(lanes.iter().map(shape_requirement).collect()),
+        Shape::Ref(list) => Demand::Ref(Box::new(shape_requirement(list))),
+    }
+}
+
+impl Demand {
+    /// The demand represented by a projection target, where `Unit` erases a subtree.
+    pub fn from_projection(target: &Shape) -> Self {
+        shape_requirement(target)
+    }
+
+    /// Union two demands on the same original shape.
+    /// A structural mismatch returns an error without changing `self`.
+    /// Use `union_for_shape` to also validate both demands against the original shape.
+    pub fn merge(&mut self, other: Demand) -> Result<(), String> {
+        if !self.compatible(&other) {
+            return Err("demands have different structures".into());
+        }
+        self.merge_unchecked(other);
+        Ok(())
+    }
+
+    /// Union two demands against one original shape and return the resulting projection shape.
+    pub fn union_for_shape(original: &Shape, left: &Demand, right: &Demand) -> Result<(Demand, Shape), String> {
+        left.to_shape(original)?;
+        right.to_shape(original)?;
+        let mut merged = left.clone();
+        merged.merge(right.clone())?;
+        let projected = merged.to_shape(original)?;
+        Ok((merged, projected))
+    }
+
+    /// Apply this demand to the original shape, replacing unread subtrees with `Unit`.
+    pub fn to_shape(&self, original: &Shape) -> Result<Shape, String> {
+        projected_shape(original, self)
+    }
+
+    fn compatible(&self, other: &Demand) -> bool {
+        match (self, other) {
+            (Demand::None | Demand::All, _) | (_, Demand::None | Demand::All) => true,
+            (Demand::Prod(left), Demand::Prod(right)) | (Demand::Sum(left), Demand::Sum(right)) => {
+                left.len() == right.len() && left.iter().zip(right).all(|(l, r)| l.compatible(r))
+            }
+            (Demand::List(left), Demand::List(right)) | (Demand::Ref(left), Demand::Ref(right)) => left.compatible(right),
+            _ => false,
+        }
+    }
+
+    fn merge_unchecked(&mut self, other: Demand) {
+        match (&mut *self, other) {
+            (Demand::All, _) | (_, Demand::None) => {}
+            (here, Demand::All) => *here = Demand::All,
+            (here @ Demand::None, other) => *here = other,
+            (Demand::Prod(left), Demand::Prod(right)) => {
+                assert_eq!(left.len(), right.len());
+                for (l, r) in left.iter_mut().zip(right) {
+                    l.merge_unchecked(r);
+                }
+            }
+            (Demand::List(left), Demand::List(right)) => left.merge_unchecked(*right),
+            (Demand::Ref(left), Demand::Ref(right)) => left.merge_unchecked(*right),
+            (Demand::Sum(left), Demand::Sum(right)) => {
+                assert_eq!(left.len(), right.len());
+                for (l, r) in left.iter_mut().zip(right) {
+                    l.merge_unchecked(r);
+                }
+            }
+            _ => unreachable!("demands for one node have different structures"),
+        }
+    }
+
+    fn fields(self, count: usize) -> Vec<Demand> {
+        match self {
+            Demand::None => vec![Demand::None; count],
+            Demand::All => vec![Demand::All; count],
+            Demand::Prod(fields) => {
+                assert_eq!(fields.len(), count);
+                fields
+            }
+            _ => unreachable!("a tuple demand must be for a product"),
+        }
+    }
+
+    fn list_element(self) -> Demand {
+        match self {
+            Demand::None | Demand::All => self,
+            Demand::List(element) => *element,
+            _ => unreachable!("a list demand must be for a list"),
+        }
+    }
+
+    fn sum_lanes(self, count: usize) -> Vec<Demand> {
+        match self {
+            Demand::None => vec![Demand::None; count],
+            Demand::All => vec![Demand::All; count],
+            Demand::Sum(lanes) => {
+                assert_eq!(lanes.len(), count);
+                lanes
+            }
+            _ => unreachable!("a sum demand must be for a sum"),
+        }
+    }
+}
+
+/// Undo the shape change made by `Ref`: top-level lists become references, while products and sums pass through.
+fn before_ref(shape: &Shape, demand: Demand) -> Demand {
+    match (shape, demand) {
+        (_, Demand::All) => Demand::All,
+        (_, Demand::None) => Demand::None,
+        (Shape::List(_), Demand::Ref(list)) => *list,
+        (Shape::Ref(_), demand @ Demand::Ref(_)) => demand,
+        (Shape::Prod(fields), Demand::Prod(needs)) => {
+            assert_eq!(fields.len(), needs.len());
+            Demand::Prod(fields.iter().zip(needs).map(|(shape, need)| before_ref(shape, need)).collect())
+        }
+        (Shape::Sum(lanes), Demand::Sum(needs)) => {
+            assert_eq!(lanes.len(), needs.len());
+            Demand::Sum(lanes.iter().zip(needs).map(|(shape, need)| before_ref(shape, need)).collect())
+        }
+        _ => unreachable!("demand does not match Ref output shape"),
+    }
+}
+
+/// An input operation that replaces unread payloads with `()`, if any exist.
+///
+/// `graph` must typecheck on `input`.
+/// The returned graph accepts `input` and produces a simpler shape on which `graph` still typechecks and has the same output for every value.
+/// Other operations are treated as reading their whole input until their demand rules are known.
+pub fn demand_projection(
+    graph: &Graph<NumOp>,
+    input: &Shape,
+) -> Result<Option<Graph<NumOp>>, String> {
+    let (need, output) = input_demand(graph, input, Demand::All)?;
+    let projected = need.to_shape(input)?;
+    if projected == *input {
+        return Ok(None);
+    }
+    let mut builder = Builder::default();
+    let root = builder.input();
+    let result = builder.add(Op::Project(projected.clone()), vec![root]);
+    let projection = builder.finish(result);
+    // An op may have a shape constraint beyond the values it reads.
+    // Refuse the projection unless the subject still typechecks and keeps its original output shape.
+    if shape_of(graph, &projected).as_ref() != Ok(&output) {
+        return Ok(None);
+    }
+    Ok(Some(projection))
+}
+
+/// A projected expression and the optional input operation to run before it.
+pub struct DemandTransform {
+    pub graph: Graph<NumOp>,
+    pub input_projection: Option<Graph<NumOp>>,
+    /// The demand embodied by `input_projection`, or `All` when no projection is returned.
+    pub input_demand: Demand,
+}
+
+/// Remove computations behind output lanes erased by `output_projection`, then extract input demand.
+///
+/// For every valid input `x`, the result satisfies `Project(output_projection)(graph(x)) = result.graph(result.input_projection(x))`.
+/// An absent input projection means that `result.graph` accepts the original input unchanged.
+/// `input_demand` describes the returned input projection and can be unioned with other consumers' demands on the same source.
+/// Each revised consumer must still accept the unioned shape or receive its own input projection.
+/// The original graph remains unchanged.
+pub fn demand_transform(
+    graph: &Graph<NumOp>,
+    input: &Shape,
+    output_projection: &Shape,
+) -> Result<DemandTransform, String> {
+    let rewritten = prune_graph(graph, input, output_projection)?;
+    let input_projection = demand_projection(&rewritten, input)?;
+    let input_demand = match &input_projection {
+        Some(projection) => Demand::from_projection(&shape_of(projection, input)?),
+        None => Demand::All,
+    };
+    Ok(DemandTransform { graph: rewritten, input_projection, input_demand })
+}
+
+/// A projection that removes `()` product positions and its revised consumer.
+pub struct UnitCompaction {
+    pub input_projection: Graph<NumOp>,
+    pub input_shape: Shape,
+    pub graph: Graph<NumOp>,
+}
+
+/// Remove `()` product positions from any typed lambda input.
+///
+/// For every input `x`, `graph(x) = result.graph(result.input_projection(x))`.
+/// Products inside lists and sums are compacted; references retain their shape.
+/// An all-`()` product becomes `Unit` so that its row count survives.
+/// This changes the lambda boundary only; callers decide whether projecting before an enclosing operator preserves its semantics.
+pub fn compact_unit_input(graph: &Graph<NumOp>, input: &Shape) -> Result<Option<UnitCompaction>, String> {
+    compact_to_shape(graph, input, compact_unit_shape(input), None)
+}
+
+/// Remove `()` positions inside selected fields of a product input.
+///
+/// For every input `x`, `graph(x) = result.graph(result.input_projection(x))`.
+/// Fields outside `selected` retain their exact shape, so a join key can be left untouched.
+/// Products inside selected lists and sums are also compacted; references retain their shape.
+/// An all-`()` product becomes `Unit` so that its row count survives.
+/// This can follow `demand_transform`, after its input projection has introduced `()` fields.
+pub fn compact_unit_fields(
+    graph: &Graph<NumOp>,
+    input: &Shape,
+    selected: &[usize],
+) -> Result<Option<UnitCompaction>, String> {
+    let Shape::Prod(fields) = input else { return Err("unit compaction expects a product input".into()) };
+    if selected.iter().any(|&i| i >= fields.len()) {
+        return Err("unit compaction selected a field outside the input product".into());
+    }
+    let mut choose = vec![false; fields.len()];
+    for &i in selected { choose[i] = true; }
+    let compacted: Vec<Shape> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| if choose[i] { compact_unit_shape(field) } else { field.clone() })
+        .collect();
+    compact_to_shape(graph, input, Shape::Prod(compacted), Some(&choose))
+}
+
+fn compact_to_shape(
+    graph: &Graph<NumOp>,
+    input: &Shape,
+    input_shape: Shape,
+    selected: Option<&[bool]>,
+) -> Result<Option<UnitCompaction>, String> {
+    let output = shape_of(graph, input)?;
+    if input_shape == *input {
+        return Ok(None);
+    }
+
+    let mut builder = Builder::default();
+    let root = builder.input();
+    let narrowed = if let (Some(selected), Shape::Prod(fields), Shape::Prod(compacted)) = (selected, input, &input_shape) {
+        let projected = fields
+            .iter()
+            .zip(compacted)
+            .enumerate()
+            .map(|(i, (old, new))| {
+                let field = builder.add(Op::Field(i), vec![root]);
+                if selected[i] { project_compact_shape(&mut builder, field, old, new) } else { field }
+            })
+            .collect();
+        builder.tuple(projected)
+    } else {
+        project_compact_shape(&mut builder, root, input, &input_shape)
+    };
+    let input_projection = peephole(&builder.finish(narrowed));
+
+    let mut builder = Builder::default();
+    let root = builder.input();
+    let restored = if let (Some(selected), Shape::Prod(fields), Shape::Prod(compacted)) = (selected, input, &input_shape) {
+        let restored = fields
+            .iter()
+            .zip(compacted)
+            .enumerate()
+            .map(|(i, (old, new))| {
+                let field = builder.add(Op::Field(i), vec![root]);
+                if selected[i] { inflate_compact_shape(&mut builder, field, old, new) } else { field }
+            })
+            .collect();
+        builder.tuple(restored)
+    } else {
+        inflate_compact_shape(&mut builder, root, input, &input_shape)
+    };
+    let output_node = builder.graft(graph, restored);
+    let graph = dce(&peephole(&fuse_maps(&peephole(&builder.finish(output_node)))));
+
+    if shape_of(&input_projection, input).as_ref() != Ok(&input_shape)
+        || shape_of(&graph, &input_shape).as_ref() != Ok(&output)
+    {
+        return Err("unit compaction did not preserve the graph's shapes".into());
+    }
+    Ok(Some(UnitCompaction { input_projection, input_shape, graph }))
+}
+
+fn compact_unit_shape(shape: &Shape) -> Shape {
+    match shape {
+        Shape::Prod(fields) => {
+            let kept: Vec<_> = fields.iter().map(compact_unit_shape).filter(|field| *field != Shape::Unit).collect();
+            if kept.is_empty() { Shape::Unit } else { Shape::Prod(kept) }
+        }
+        Shape::List(element) => Shape::List(Box::new(compact_unit_shape(element))),
+        Shape::Sum(lanes) => Shape::Sum(lanes.iter().map(compact_unit_shape).collect()),
+        other => other.clone(),
+    }
+}
+
+fn project_compact_shape(builder: &mut Builder<NumOp>, source: usize, old: &Shape, new: &Shape) -> usize {
+    if old == new {
+        return source;
+    }
+    match (old, new) {
+        (Shape::Prod(_), Shape::Unit) => builder.add(Op::Unit, vec![source]),
+        (Shape::Prod(fields), Shape::Prod(_)) => {
+            let kept = fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, old)| {
+                    let new = compact_unit_shape(old);
+                    (new != Shape::Unit).then(|| {
+                        let field = builder.add(Op::Field(i), vec![source]);
+                        project_compact_shape(builder, field, old, &new)
+                    })
+                })
+                .collect();
+            builder.tuple(kept)
+        }
+        (Shape::List(old), Shape::List(new)) => {
+            let mut body = Builder::default();
+            let element = body.input();
+            let projected = project_compact_shape(&mut body, element, old, new);
+            builder.add(Op::MapList(Box::new(body.finish(projected))), vec![source])
+        }
+        (Shape::Sum(olds), Shape::Sum(news)) => {
+            let arms = olds
+                .iter()
+                .zip(news)
+                .enumerate()
+                .filter(|(_, (old, new))| old != new)
+                .map(|(tag, (old, new))| {
+                    let mut body = Builder::default();
+                    let lane = body.input();
+                    let projected = project_compact_shape(&mut body, lane, old, new);
+                    (tag, body.finish(projected))
+                })
+                .collect();
+            builder.add(Op::MapSum(arms), vec![source])
+        }
+        _ => source,
+    }
+}
+
+fn inflate_compact_shape(builder: &mut Builder<NumOp>, source: usize, old: &Shape, new: &Shape) -> usize {
+    if old == new {
+        return source;
+    }
+    match (old, new) {
+        (Shape::Prod(_), Shape::Unit) => restore_erased_product(builder, source, old),
+        (Shape::Prod(fields), Shape::Prod(_)) => {
+            let mut next = 0;
+            let restored = fields
+                .iter()
+                .map(|field| {
+                    let compact = compact_unit_shape(field);
+                    if compact == Shape::Unit {
+                        restore_erased_product(builder, source, field)
+                    } else {
+                        let retained = builder.add(Op::Field(next), vec![source]);
+                        next += 1;
+                        inflate_compact_shape(builder, retained, field, &compact)
+                    }
+                })
+                .collect();
+            builder.tuple(restored)
+        }
+        (Shape::List(old), Shape::List(new)) => {
+            let mut body = Builder::default();
+            let element = body.input();
+            let restored = inflate_compact_shape(&mut body, element, old, new);
+            builder.add(Op::MapList(Box::new(body.finish(restored))), vec![source])
+        }
+        (Shape::Sum(olds), Shape::Sum(news)) => {
+            let arms = olds
+                .iter()
+                .zip(news)
+                .enumerate()
+                .filter(|(_, (old, new))| old != new)
+                .map(|(tag, (old, new))| {
+                    let mut body = Builder::default();
+                    let lane = body.input();
+                    let restored = inflate_compact_shape(&mut body, lane, old, new);
+                    (tag, body.finish(restored))
+                })
+                .collect();
+            builder.add(Op::MapSum(arms), vec![source])
+        }
+        _ => source,
+    }
+}
+
+fn restore_erased_product(builder: &mut Builder<NumOp>, source: usize, old: &Shape) -> usize {
+    match old {
+        Shape::Unit => builder.add(Op::Unit, vec![source]),
+        Shape::Prod(fields) => {
+            let restored = fields.iter().map(|field| restore_erased_product(builder, source, field)).collect();
+            builder.tuple(restored)
+        }
+        _ => unreachable!("only payload-free product fields can be erased"),
+    }
+}
+
+fn prune_graph(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape) -> Result<Graph<NumOp>, String> {
+    // The first pass discards dead branches without cloning any map.
+    // The second pass can then count only uses that survived.
+    let live = prune_graph_once(graph, input, output_projection, false)?;
+    prune_graph_once(&live, input, output_projection, true)
+}
+
+fn prune_graph_once(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape, specialize_maps: bool) -> Result<Graph<NumOp>, String> {
+    let shapes = graph_shapes(graph, input)?;
+    let output = shapes.get(graph.output).ok_or("graph has no output")?;
+    let projected = NumOp::Core(Op::Project(output_projection.clone())).eval(Value::empty(output))?;
+    if shape_of_value(&projected) != *output_projection {
+        return Err("output projection produced the wrong shape".into());
+    }
+    let input_node = graph
+        .nodes
+        .iter()
+        .position(|node| matches!(node.kind, NodeKind::Input))
+        .ok_or("graph has no input")?;
+
+    let mut follows_input = Vec::with_capacity(graph.nodes.len());
+    let mut uses = vec![0usize; graph.nodes.len()];
+    for node in &graph.nodes {
+        for &edge in &node.inputs {
+            uses[edge] += 1;
+        }
+        follows_input.push(match &node.kind {
+            NodeKind::Input => true,
+            NodeKind::Tuple => node.inputs.first().is_some_and(|&i| follows_input[i]),
+            NodeKind::Op(_) => follows_input[node.inputs[0]],
+        });
+    }
+
+    let mut nodes = graph.nodes.clone();
+    let unit = nodes.len();
+    nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![input_node] });
+    let result = prune_output(&mut nodes, &shapes, &follows_input, &uses, unit, graph.output, output_projection, specialize_maps)?;
+    let mut rewritten = dce(&Graph { nodes, output: result });
+    // DCE can remove the formal input of a constant graph; keep it for input-demand extraction.
+    if !rewritten.nodes.iter().any(|node| matches!(node.kind, NodeKind::Input)) {
+        rewritten.nodes.insert(0, Node { kind: NodeKind::Input, inputs: Vec::new() });
+        for node in rewritten.nodes.iter_mut().skip(1) {
+            for edge in &mut node.inputs {
+                *edge += 1;
+            }
+        }
+        rewritten.output += 1;
+    }
+    if shape_of(&rewritten, input).as_ref() != Ok(output_projection) {
+        return Err("rewritten graph does not produce the requested shape".into());
+    }
+    Ok(rewritten)
+}
+
+/// Rewrite a projected value only at its consumer; DCE removes a producer if no other use remains.
+fn prune_output(
+    nodes: &mut Vec<Node<NumOp>>,
+    shapes: &[Shape],
+    follows_input: &[bool],
+    uses: &[usize],
+    unit: usize,
+    node: usize,
+    target: &Shape,
+    specialize_maps: bool,
+) -> Result<usize, String> {
+    if *target == Shape::Unit {
+        if follows_input[node] {
+            return Ok(unit);
+        }
+        let result = nodes.len();
+        nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![node] });
+        return Ok(result);
+    }
+    if let NodeKind::Op(NumOp::Core(Op::Project(projected))) = &nodes[node].kind {
+        if projected == target {
+            let source = nodes[node].inputs[0];
+            return prune_output(nodes, shapes, follows_input, uses, unit, source, target, specialize_maps);
+        }
+    }
+    if let NodeKind::Op(NumOp::Core(Op::Field(field))) = &nodes[node].kind {
+        let source = nodes[node].inputs[0];
+        if matches!(nodes[source].kind, NodeKind::Tuple) {
+            let selected = nodes[source].inputs[*field];
+            return prune_output(nodes, shapes, follows_input, uses, unit, selected, target, specialize_maps);
+        }
+    }
+    if let (NodeKind::Tuple, Shape::Prod(targets)) = (&nodes[node].kind, target) {
+        let inputs = nodes[node].inputs.clone();
+        if inputs.len() == targets.len() {
+            let rewritten: Vec<_> = inputs
+                .iter()
+                .zip(targets)
+                .map(|(&edge, target)| prune_output(nodes, shapes, follows_input, uses, unit, edge, target, specialize_maps))
+                .collect::<Result<Vec<_>, _>>()?;
+            if rewritten == inputs && shapes[node] == *target {
+                return Ok(node);
+            }
+            let result = nodes.len();
+            nodes.push(Node { kind: NodeKind::Tuple, inputs: rewritten });
+            return Ok(result);
+        }
+    }
+    // Specializing a shared map would evaluate its retained work once per specialized use.
+    if specialize_maps && uses[node] <= 1 {
+        if let (NodeKind::Op(NumOp::Core(Op::MapList(body))), Shape::List(element_target)) = (&nodes[node].kind, target) {
+            let source = nodes[node].inputs[0];
+            let Shape::List(element_input) = &shapes[source] else { unreachable!() };
+            let rewritten = prune_graph(body, element_input, element_target)?;
+            if rewritten != **body {
+                let result = nodes.len();
+                nodes.push(Node { kind: NodeKind::Op(Op::MapList(Box::new(rewritten)).into()), inputs: vec![source] });
+                return Ok(result);
+            }
+        }
+        if let (NodeKind::Op(NumOp::Core(Op::MapSum(arms))), Shape::Sum(targets)) = (&nodes[node].kind, target) {
+            let source = nodes[node].inputs[0];
+            let Shape::Sum(lanes) = &shapes[source] else { unreachable!() };
+            let mut changed = false;
+            let mut rewritten = Vec::with_capacity(arms.len());
+            for (tag, body) in arms {
+                let body_rewrite = prune_graph(body, &lanes[*tag], &targets[*tag])?;
+                changed |= body_rewrite != *body;
+                rewritten.push((*tag, body_rewrite));
+            }
+            if changed {
+                let result = nodes.len();
+                nodes.push(Node { kind: NodeKind::Op(Op::MapSum(rewritten).into()), inputs: vec![source] });
+                if shapes[node] == *target {
+                    return Ok(result);
+                }
+                let projected = nodes.len();
+                nodes.push(Node { kind: NodeKind::Op(Op::Project(target.clone()).into()), inputs: vec![result] });
+                return Ok(projected);
+            }
+        }
+    }
+    if shapes[node] == *target {
+        return Ok(node);
+    }
+    let result = nodes.len();
+    nodes.push(Node { kind: NodeKind::Op(Op::Project(target.clone()).into()), inputs: vec![node] });
+    Ok(result)
+}
+
+fn graph_shapes(graph: &Graph<NumOp>, input: &Shape) -> Result<Vec<Shape>, String> {
+    // Keep each intermediate shape: a Field needs the arity of its own input, not the root's.
+    let mut values: Vec<Value> = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        let value = match &node.kind {
+            NodeKind::Input => Value::empty(input),
+            NodeKind::Tuple => {
+                Value::Prod(node.inputs.iter().map(|&i| values[i].clone()).collect())
+            }
+            NodeKind::Op(op) => op.eval(values[node.inputs[0]].clone())?,
+        };
+        values.push(value);
+    }
+    Ok(values.iter().map(shape_of_value).collect())
+}
+
+fn input_demand(
+    graph: &Graph<NumOp>,
+    input: &Shape,
+    output_demand: Demand,
+) -> Result<(Demand, Shape), String> {
+    let shapes = graph_shapes(graph, input)?;
+    let output = shapes[graph.output].clone();
+
+    let mut demands = vec![Demand::None; graph.nodes.len()];
+    demands[graph.output] = output_demand;
+    // An unused node must not contribute demand, even if its fallback rule would demand All.
+    let mut live = vec![false; graph.nodes.len()];
+    live[graph.output] = true;
+    for (id, node) in graph.nodes.iter().enumerate().rev() {
+        if !live[id] {
+            continue;
+        }
+        for &edge in &node.inputs {
+            live[edge] = true;
+        }
+        let demand = demands[id].clone();
+        match &node.kind {
+            NodeKind::Input => {}
+            NodeKind::Tuple => {
+                for (&edge, field) in node.inputs.iter().zip(demand.fields(node.inputs.len())) {
+                    demands[edge].merge_unchecked(field);
+                }
+            }
+            NodeKind::Op(NumOp::Core(Op::Field(field))) => {
+                let Shape::Prod(fields) = &shapes[node.inputs[0]] else {
+                    unreachable!()
+                };
+                let mut needs = vec![Demand::None; fields.len()];
+                needs[*field] = demand;
+                demands[node.inputs[0]].merge_unchecked(Demand::Prod(needs));
+            }
+            NodeKind::Op(NumOp::Core(Op::Unit | Op::Lit(_))) => {}
+            NodeKind::Op(NumOp::Core(Op::Pattern(pattern))) => {
+                let mut need = demand;
+                need.merge_unchecked(pattern_requirement(pattern));
+                demands[node.inputs[0]].merge_unchecked(need);
+            }
+            NodeKind::Op(NumOp::Core(Op::Project(target))) => {
+                demands[node.inputs[0]].merge_unchecked(shape_requirement(target));
+            }
+            NodeKind::Op(NumOp::Core(Op::Enlist)) => {
+                demands[node.inputs[0]].merge_unchecked(demand.list_element());
+            }
+            NodeKind::Op(NumOp::Core(Op::Ref)) => {
+                demands[node.inputs[0]].merge_unchecked(before_ref(&shapes[node.inputs[0]], demand));
+            }
+            NodeKind::Op(NumOp::Core(Op::Len)) => {
+                let need = match &shapes[node.inputs[0]] {
+                    Shape::List(_) => Demand::List(Box::new(Demand::None)),
+                    Shape::Ref(_) => Demand::Ref(Box::new(Demand::List(Box::new(Demand::None)))),
+                    _ => unreachable!("Len input is a list or a reference to a list"),
+                };
+                demands[node.inputs[0]].merge_unchecked(need);
+            }
+            NodeKind::Op(NumOp::Core(Op::MapList(body))) => {
+                let Shape::List(element) = &shapes[node.inputs[0]] else {
+                    unreachable!()
+                };
+                let (need, _) = input_demand(body, element, demand.list_element())?;
+                demands[node.inputs[0]].merge_unchecked(Demand::List(Box::new(need)));
+            }
+            NodeKind::Op(NumOp::Core(Op::MapSum(arms))) => {
+                let Shape::Sum(lanes) = &shapes[node.inputs[0]] else {
+                    unreachable!()
+                };
+                let mut needs = demand.sum_lanes(lanes.len());
+                for (tag, body) in arms {
+                    let (need, _) = input_demand(body, &lanes[*tag], needs[*tag].clone())?;
+                    needs[*tag] = need;
+                }
+                demands[node.inputs[0]].merge_unchecked(Demand::Sum(needs));
+            }
+            NodeKind::Op(_) => demands[node.inputs[0]].merge_unchecked(Demand::All),
+        }
+    }
+
+    let input_node = graph
+        .nodes
+        .iter()
+        .position(|node| matches!(node.kind, NodeKind::Input))
+        .ok_or("graph has no input")?;
+    Ok((demands[input_node].clone(), output))
+}
+
+fn projected_shape(shape: &Shape, demand: &Demand) -> Result<Shape, String> {
+    match (shape, demand) {
+        (_, Demand::All) => Ok(shape.clone()),
+        (_, Demand::None) => Ok(Shape::Unit),
+        (Shape::Prod(fields), Demand::Prod(needs)) => {
+            if fields.len() != needs.len() {
+                return Err("product demand has the wrong number of fields".into());
+            }
+            Ok(Shape::Prod(
+                fields
+                    .iter()
+                    .zip(needs)
+                    .map(|(shape, need)| projected_shape(shape, need))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        (Shape::List(element), Demand::List(need)) => {
+            Ok(Shape::List(Box::new(projected_shape(element, need)?)))
+        }
+        (Shape::Ref(list), Demand::Ref(need)) => {
+            Ok(Shape::Ref(Box::new(projected_shape(list, need)?)))
+        }
+        (Shape::Sum(lanes), Demand::Sum(needs)) => {
+            if lanes.len() != needs.len() {
+                return Err("sum demand has the wrong number of lanes".into());
+            }
+            Ok(Shape::Sum(
+                lanes
+                    .iter()
+                    .zip(needs)
+                    .map(|(shape, need)| projected_shape(shape, need))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        _ => Err(format!("demand {demand:?} does not match shape {shape}")),
+    }
+}
