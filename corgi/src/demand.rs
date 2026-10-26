@@ -206,6 +206,12 @@ pub(crate) fn movement_demand(op: &Op<NumOp>, input: &Shape, demand: Demand) -> 
             Demand::Prod(vec![pair.pop().unwrap(), Demand::List(Box::new(element))])
         }
         Op::Select => Demand::Prod(vec![Demand::All, demand.clone(), demand]),
+        Op::Flatten => {
+            // Ranges depend only on the two levels of bounds. The flat values
+            // retain exactly the demanded payload, regardless of ranges demand.
+            let values = demand.fields(2).pop().unwrap().list_element();
+            Demand::List(Box::new(Demand::List(Box::new(values))))
+        }
         _ => return None,
     })
 }
@@ -287,7 +293,7 @@ pub(crate) fn input_demand(
                 }
                 demands[node.inputs[0]].merge_unchecked(Demand::Sum(needs));
             }
-            NodeKind::Op(NumOp::Core(op)) if matches!(op, Op::Gather | Op::Filter | Op::CapList | Op::Select) => {
+            NodeKind::Op(NumOp::Core(op)) if matches!(op, Op::Gather | Op::Filter | Op::CapList | Op::Select | Op::Flatten) => {
                 let source = node.inputs[0];
                 demands[source].merge_unchecked(movement_demand(op, &shapes[source], demand).unwrap());
             }

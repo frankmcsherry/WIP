@@ -18,8 +18,10 @@ pub fn optimize(g: &Graph<NumOp>) -> Graph<NumOp> {
 /// No boundary adapter is built. The graph accepts both the original input and the
 /// validated `demand.to_shape(input)` layout, with the original output shape.
 pub fn optimize_with_demand(g: &Graph<NumOp>, input: &crate::Shape) -> Result<(Graph<NumOp>, crate::Demand), String> {
-    let output = crate::shape_of(g, input)?;
-    let graph = optimize(g);
+    let graph = passes::remove_checked_patterns(g, input)?;
+    let graph = optimize(&graph);
+    let graph = passes::compact_filter_payloads(&graph, input)?;
+    let output = crate::shape_of(&graph, input)?;
     let graph = passes::demand::prune_producers(&graph, input, &output)?;
     let graph = optimize(&graph);
     let (mut demand, _) = crate::demand::input_demand(&graph, input, crate::Demand::All)?;

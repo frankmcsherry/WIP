@@ -8,6 +8,8 @@ use crate::value::{Scalar, Value};
 use std::collections::HashMap;
 
 pub(crate) mod demand;
+mod payload;
+pub use payload::compact_filter_payloads;
 
 /// recurse a body-bearing core op's sub-graphs through a pass.
 fn map_kind(kind: &NodeKind<NumOp>, f: fn(&Graph<NumOp>) -> Graph<NumOp>) -> NodeKind<NumOp> {
@@ -332,6 +334,23 @@ pub fn cleanup(g: &Graph<NumOp>) -> Graph<NumOp> {
         graph = next;
     }
     graph
+}
+
+/// Remove shape guards only after checking the complete graph and its closed bodies.
+/// The result is checked again so erasing guards cannot change the output shape.
+pub fn remove_checked_patterns(g: &Graph<NumOp>, input: &crate::Shape) -> Result<Graph<NumOp>, String> {
+    fn strip(g: &Graph<NumOp>) -> Graph<NumOp> {
+        rewrite_graph(g, strip, |kind, inputs, _, _| {
+            matches!(kind, NodeKind::Op(NumOp::Core(Op::Pattern(_))))
+                .then(|| Rewrite::Redirect(inputs[0]))
+        })
+    }
+    let output = crate::shape_of(g, input)?;
+    let graph = dce(&strip(g));
+    if crate::shape_of(&graph, input)? != output {
+        return Err("removing checked patterns changed the output shape".into());
+    }
+    Ok(graph)
 }
 
 #[cfg(test)]
