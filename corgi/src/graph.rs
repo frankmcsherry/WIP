@@ -36,6 +36,27 @@ pub struct Graph<O> {
     pub(crate) output: usize,
 }
 
+/// An immutable view of one node. Inputs are indices of earlier nodes.
+pub enum NodeRef<'a, O> {
+    Input,
+    Tuple(&'a [usize]),
+    Op(&'a O, usize),
+}
+
+impl<O> Graph<O> {
+    /// Nodes in dependency order, without exposing mutable graph storage.
+    pub fn nodes(&self) -> impl ExactSizeIterator<Item = NodeRef<'_, O>> {
+        self.nodes.iter().map(|node| match &node.kind {
+            NodeKind::Input => NodeRef::Input,
+            NodeKind::Tuple => NodeRef::Tuple(&node.inputs),
+            NodeKind::Op(op) => NodeRef::Op(op, node.inputs[0]),
+        })
+    }
+
+    /// The index of the returned node.
+    pub fn output(&self) -> usize { self.output }
+}
+
 impl<O: OpLike> Graph<O> {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
