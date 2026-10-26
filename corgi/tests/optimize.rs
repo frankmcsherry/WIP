@@ -150,3 +150,32 @@ fn peephole_also_runs_under_bodies() {
     let opt = peephole(&g);
     assert_eq!(eval_str(&opt, &sample()), eval_str(&g, &sample()));
 }
+
+fn equivalent(src: &str, input: Value) {
+    let original = parse_ml(src).unwrap();
+    let shape = corgi::shape_of_value(&input);
+    let rewritten = optimize(&original);
+    rewritten.check();
+    assert_eq!(corgi::shape_of(&original, &shape), corgi::shape_of(&rewritten, &shape), "{src}");
+    let expected = corgi::eval_graph(&original, input.clone());
+    assert_eq!(expected, corgi::eval_graph(&rewritten, input.clone()), "{src}");
+}
+
+#[test]
+fn lossy_zip_then_transpose_must_not_cancel() {
+    let src = "input zip transpose";
+    for n in [0, 1, 8] {
+        for offset in 0..3 {
+            let lists = (0..2).map(|field| {
+                let mut ends = Vec::new();
+                let mut values = Vec::new();
+                for row in 0..n {
+                    values.extend((0..(row + field + offset) % 4).map(|x| x as i64 - 2));
+                    ends.push(values.len());
+                }
+                Value::List(ends.into(), Box::new(Value::i64(values)))
+            }).collect();
+            equivalent(src, Value::Prod(lists));
+        }
+    }
+}
