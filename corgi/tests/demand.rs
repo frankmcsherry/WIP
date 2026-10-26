@@ -940,6 +940,7 @@ fn random_shape(rng: &mut DemandRng, depth: usize) -> Shape {
 fn random_value(rng: &mut DemandRng, shape: &Shape, rows: usize) -> Value {
     match shape {
         Shape::Int => Value::i64((0..rows).map(|_| rng.below(11) as i64 - 5).collect()),
+        Shape::Float => Value::f64((0..rows).map(|_| f64::from_bits(rng.next())).collect()),
         Shape::Unit => Value::Unit(rows),
         Shape::Prod(fields) => Value::Prod(fields.iter().map(|field| random_value(rng, field, rows)).collect()),
         Shape::List(element) => {
@@ -956,7 +957,11 @@ fn random_value(rng: &mut DemandRng, shape: &Shape, rows: usize) -> Value {
                 .collect();
             Value::sum(tags, values)
         }
-        _ => unreachable!("the test generator does not produce this shape"),
+        Shape::Ref(list) => {
+            let arena = random_value(rng, list, rows + 3);
+            let named = (0..rows).map(|_| rng.below(rows + 3)).collect();
+            Value::Ref(Arc::new(arena), Arc::new(named))
+        }
     }
 }
 
@@ -1025,6 +1030,10 @@ fn random_projection(rng: &mut DemandRng, shape: &Shape) -> Shape {
         Shape::Prod(fields) => Shape::Prod(fields.iter().map(|field| random_projection(rng, field)).collect()),
         Shape::List(element) => Shape::List(Box::new(random_projection(rng, element))),
         Shape::Sum(lanes) => Shape::Sum(lanes.iter().map(|lane| random_projection(rng, lane)).collect()),
+        Shape::Ref(list) => {
+            let Shape::List(element) = &**list else { unreachable!() };
+            Shape::Ref(Box::new(Shape::List(Box::new(random_projection(rng, element)))))
+        }
         other => other.clone(),
     }
 }
@@ -1078,4 +1087,67 @@ fn random_demand_rewrites_preserve_values() {
     }
     assert!(projected_inputs > 0);
     assert!(compacted_inputs > 0);
+}
+
+#[test]
+fn generated_movement_projections_preserve_values() {
+    for seed in 1..=150u64 {
+        let mut rng = DemandRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let rows = (seed as usize) % 13; // includes empty and singleton batches
+        let element = Shape::Prod(vec![
+            Shape::Float, random_shape(&mut rng, 2), Shape::Int,
+            Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int]))))),
+        ]);
+
+        let positions = random_shape(&mut rng, 2);
+        let list = Shape::List(Box::new(element.clone()));
+        let haystack = if seed % 2 == 0 { Shape::Ref(Box::new(list)) } else { list };
+        let input_shape = Shape::Prod(vec![positions, haystack]);
+        let input = random_value(&mut rng, &input_shape, rows);
+        let mut b = Builder::<NumOp>::default();
+        let x = b.input();
+        let out = b.add(Op::Gather, vec![x]);
+        let output = shape_of(&b.finish(out), &input_shape).unwrap();
+        let target = random_projection(&mut rng, &output);
+        check_movement_projection(Op::Gather, input, target);
+
+        let filter_shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, element.clone()])));
+        let input = random_value(&mut rng, &filter_shape, rows);
+        let target = Shape::List(Box::new(random_projection(&mut rng, &element)));
+        check_movement_projection(Op::Filter, input, target);
+
+        let capture_shape = Shape::Prod(vec![element.clone(), Shape::List(Box::new(element.clone()))]);
+        let input = random_value(&mut rng, &capture_shape, rows);
+        let target = Shape::List(Box::new(Shape::Prod(vec![
+            random_projection(&mut rng, &element), random_projection(&mut rng, &element),
+        ])));
+        check_movement_projection(Op::CapList, input, target);
+
+        let select_shape = Shape::Prod(vec![Shape::Int, element.clone(), element.clone()]);
+        let input = random_value(&mut rng, &select_shape, rows);
+        let target = random_projection(&mut rng, &element);
+        check_movement_projection(Op::Select, input, target);
+    }
+}
+
+fn check_movement_projection(op: Op<NumOp>, input: Value, target: Shape) {
+    let shape = corgi::shape_of_value(&input);
+    let mut builder = Builder::<NumOp>::default();
+    let root = builder.input();
+    let result = builder.add(op, vec![root]);
+    let graph = builder.finish(result);
+    let mut builder = Builder::<NumOp>::default();
+    let root = builder.input();
+    let result = builder.graft(&graph, root);
+    let projected = builder.add(Op::Project(target.clone()), vec![result]);
+    let projected_graph = builder.finish(projected);
+    let expected = eval_graph(&projected_graph, input.clone());
+    if let Some(projection) = demand_projection(&projected_graph, &shape).unwrap() {
+        assert_eq!(expected, eval_graph(&projected_graph, eval_graph(&projection, input.clone())));
+    }
+    let transformed = demand_transform(&graph, &shape, &target).unwrap();
+    // The local rewrite itself must narrow movement; no boundary projection is required.
+    assert_eq!(expected, eval_graph(&transformed.graph, input.clone()));
+    let projected_input = transformed.input_projection.map_or(input.clone(), |p| eval_graph(&p, input));
+    assert_eq!(expected, eval_graph(&transformed.graph, projected_input));
 }

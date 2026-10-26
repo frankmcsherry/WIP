@@ -7,6 +7,8 @@ use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred};
 use crate::value::{Scalar, Value};
 use std::collections::HashMap;
 
+pub(crate) mod demand;
+
 /// recurse a body-bearing core op's sub-graphs through a pass.
 fn map_kind(kind: &NodeKind<NumOp>, f: fn(&Graph<NumOp>) -> Graph<NumOp>) -> NodeKind<NumOp> {
     match kind {

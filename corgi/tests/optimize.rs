@@ -140,6 +140,10 @@ fn optimize_preserves_every_corpus_program() {
         let g = parse_ml(prog.trim()).unwrap_or_else(|e| panic!("{who}: {e}"));
         let arg = int(&[n]);
         assert_eq!(eval_str(&optimize(&g), &arg), eval_str(&g, &arg), "optimize drifted on {who}");
+        let shape = corgi::shape_of_value(&arg);
+        let (typed, demand) = corgi::optimize_with_demand(&g, &shape).unwrap();
+        assert_eq!(corgi::shape_of(&typed, &demand.to_shape(&shape).unwrap()), corgi::shape_of(&g, &shape));
+        assert_eq!(corgi::eval_graph(&typed, arg.clone()), corgi::eval_graph(&g, arg), "typed optimize drifted on {who}");
     }
 }
 

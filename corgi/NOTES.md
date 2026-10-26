@@ -525,3 +525,6 @@ an enum + `OpLike` + `From` impls; touch nothing below.
 
 Optimizer rewrites live in `src/optimize/passes/`. `optimize(&Graph) -> Graph`
 normalizes without input shapes; scalar folding runs only in optimizer cleanup.
+`optimize_with_demand(&Graph, &Shape)` returns `(Graph, Demand)` for compilers.
+Analysis is in `demand.rs`; explicit caller-side adapters are in `boundary.rs`.
+Producer pruning introduces no Project nodes and leaves shared producers whole.

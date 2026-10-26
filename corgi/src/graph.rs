@@ -130,6 +130,26 @@ pub fn shape_of<O: OpLike>(g: &Graph<O>, input: &Shape) -> Result<Shape, String>
     try_eval_graph(g, Value::empty(input)).map(|v| shape_of_value(&v))
 }
 
+/// Shape-check every node, retaining intermediate shapes for analyses and rewrites.
+/// As with `shape_of`, the kernels run only on zero-row columns.
+pub(crate) fn node_shapes<O: OpLike>(g: &Graph<O>, input: &Shape) -> Result<Vec<Shape>, String> {
+    let mut shapes: Vec<Shape> = Vec::with_capacity(g.nodes.len());
+    for node in &g.nodes {
+        let shape = match &node.kind {
+            NodeKind::Input => input.clone(),
+            NodeKind::Tuple => Shape::Prod(node.inputs.iter().map(|&i| shapes[i].clone()).collect()),
+            NodeKind::Op(op) => shape_of_op(op, &shapes[node.inputs[0]])?,
+        };
+        shapes.push(shape);
+    }
+    Ok(shapes)
+}
+
+/// The same type check for an operation whose input shape a rewrite has changed.
+pub(crate) fn shape_of_op<O: OpLike>(op: &O, input: &Shape) -> Result<Shape, String> {
+    op.eval(Value::empty(input)).map(|value| shape_of_value(&value))
+}
+
 pub struct Builder<O> {
     nodes: Vec<Node<O>>,
 }
