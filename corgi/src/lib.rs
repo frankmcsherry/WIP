@@ -35,7 +35,7 @@ pub(crate) mod value;
 
 pub use demand::{compact_unit_fields, compact_unit_input, demand_projection, demand_transform, Demand, DemandTransform, UnitCompaction};
 pub use frontend::{parse_ml, parse_ml_in, Program, Scope};
-pub use graph::{eval_graph, shape_of, Builder, Graph, OpLike};
+pub use graph::{eval_graph, shape_of, Builder, Graph, NodeRef, OpLike};
 pub use hash::hash;
 pub use ops::host::{HostKernel, HostOp};
 pub use ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred, Red, ShiftOp, TextOp};
