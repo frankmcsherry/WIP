@@ -12,7 +12,7 @@
 //! gathered, and the shape is walked once per level rather than once per comparison. Layout, top
 //! down: the reports, the entry point, the level walk, the leaf merges, the report tree.
 
-use crate::value::{Bounds, Prim, Value};
+use crate::value::{Prim, Value};
 
 /// One report from [`survey_groups`]: a maximal range from one side that comes next in merged
 /// order, or an equal class as the maximal ranges on both sides.
@@ -123,77 +123,92 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
             }
         }
         (Value::List(ba, va), Value::List(bb, vb)) => {
-            if va.same_unit_only_shape(vb) {
-                merge(
-                    |j| { let (s, e) = ba.span(ia.row(j)); e - s },
-                    |j| { let (s, e) = bb.span(ib.row(j)); e - s },
-                    open,
-                    tree,
-                );
-                return;
-            }
-            // lexicographically: element by element over the classes still equal, the rows that
-            // end at a position first in their class (each a proper prefix of the rest).
-            let len = |bounds: &Bounds, r: usize| {
-                let (s, e) = bounds.span(r);
-                e - s
-            };
-            let (mut cur, mut ra, mut rb) = tree.refined(open, ia, ib);
-            let mut pos = 0;
-            while !cur.is_empty() {
-                merge(|j| len(ba, ra[j]) > pos, |j| len(bb, rb[j]) > pos, &cur, tree);
-                (cur, ra, rb) = tree.refined(&cur, &ra[..], &rb[..]);
-                // the classes whose rows are longer than `pos` refine at it; the rest are equal
-                // throughout and stay as they are.
-                let (mut live, mut la, mut lb, mut live_ra, mut live_rb) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                let (mut oa, mut ob) = (0usize, 0usize);
-                for &c in &cur {
-                    let (cl, _, _) = tree.class(c);
-                    let (na, nb) = (cl.ahi - cl.alo, cl.bhi - cl.blo);
-                    // one row a side over leaf elements: the rest of the two spans decide at
-                    // once, rather than a level per remaining position.
-                    if na == 1 && nb == 1 {
-                        if let Some(ord) = cmp_spans(va, vb, ba.span(ra[oa]), bb.span(rb[ob]), pos) {
-                            let first = tree.nodes.len();
-                            match ord {
-                                std::cmp::Ordering::Less => {
-                                    tree.push(Node::A(cl.alo, cl.ahi));
-                                    tree.push(Node::B(cl.blo, cl.bhi));
-                                }
-                                std::cmp::Ordering::Greater => {
-                                    tree.push(Node::B(cl.blo, cl.bhi));
-                                    tree.push(Node::A(cl.alo, cl.ahi));
-                                }
-                                std::cmp::Ordering::Equal => {}
-                            }
-                            if ord != std::cmp::Ordering::Equal {
-                                tree.set_kids(c, first, tree.nodes.len());
-                            }
-                            oa += na;
-                            ob += nb;
-                            continue;
+            lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree);
+        }
+        // a referenced list surveys as the rows it names, read through its arena.
+        (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
+            let (ba, va) = a.rows_of("survey").expect("a list");
+            let (bb, vb) = b.rows_of("survey").expect("a list");
+            lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree);
+        }
+        _ => panic!("survey: shape mismatch"),
+    }
+}
+
+/// Refine the open classes at a list level: each side is its payload and the span of a row's
+/// elements in it. Generic in the span, so an owned list reads its `Bounds` directly and a
+/// referenced list its arena's, with nothing copied out.
+fn lists<IA: Rows, IB: Rows>(
+    (va, span_a): (&Value, impl Fn(usize) -> (usize, usize)),
+    (vb, span_b): (&Value, impl Fn(usize) -> (usize, usize)),
+    ia: IA, ib: IB, open: &[usize], tree: &mut Tree,
+) {
+    if va.same_unit_only_shape(vb) {
+        merge(
+            |j| { let (s, e) = span_a(ia.row(j)); e - s },
+            |j| { let (s, e) = span_b(ib.row(j)); e - s },
+            open,
+            tree,
+        );
+        return;
+    }
+    // lexicographically: element by element over the classes still equal, the rows that
+    // end at a position first in their class (each a proper prefix of the rest).
+    let len_a = |r: usize| { let (s, e) = span_a(r); e - s };
+    let len_b = |r: usize| { let (s, e) = span_b(r); e - s };
+    let (mut cur, mut ra, mut rb) = tree.refined(open, ia, ib);
+    let mut pos = 0;
+    while !cur.is_empty() {
+        merge(|j| len_a(ra[j]) > pos, |j| len_b(rb[j]) > pos, &cur, tree);
+        (cur, ra, rb) = tree.refined(&cur, &ra[..], &rb[..]);
+        // the classes whose rows are longer than `pos` refine at it; the rest are equal
+        // throughout and stay as they are.
+        let (mut live, mut la, mut lb, mut live_ra, mut live_rb) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut oa, mut ob) = (0usize, 0usize);
+        for &c in &cur {
+            let (cl, _, _) = tree.class(c);
+            let (na, nb) = (cl.ahi - cl.alo, cl.bhi - cl.blo);
+            // one row a side over leaf elements: the rest of the two spans decide at
+            // once, rather than a level per remaining position.
+            if na == 1 && nb == 1 {
+                if let Some(ord) = cmp_spans(va, vb, span_a(ra[oa]), span_b(rb[ob]), pos) {
+                    let first = tree.nodes.len();
+                    match ord {
+                        std::cmp::Ordering::Less => {
+                            tree.push(Node::A(cl.alo, cl.ahi));
+                            tree.push(Node::B(cl.blo, cl.bhi));
                         }
+                        std::cmp::Ordering::Greater => {
+                            tree.push(Node::B(cl.blo, cl.bhi));
+                            tree.push(Node::A(cl.alo, cl.ahi));
+                        }
+                        std::cmp::Ordering::Equal => {}
                     }
-                    if len(ba, ra[oa]) > pos {
-                        live.push(c);
-                        tree.set_offsets(c, la.len(), lb.len());
-                        la.extend(ra[oa..oa + na].iter().map(|&r| ba.span(r).0 + pos));
-                        lb.extend(rb[ob..ob + nb].iter().map(|&r| bb.span(r).0 + pos));
-                        live_ra.extend_from_slice(&ra[oa..oa + na]);
-                        live_rb.extend_from_slice(&rb[ob..ob + nb]);
+                    if ord != std::cmp::Ordering::Equal {
+                        tree.set_kids(c, first, tree.nodes.len());
                     }
                     oa += na;
                     ob += nb;
+                    continue;
                 }
-                if live.is_empty() {
-                    break;
-                }
-                level(va, vb, &la[..], &lb[..], &live, tree);
-                (cur, ra, rb) = tree.refined(&live, &live_ra[..], &live_rb[..]);
-                pos += 1;
             }
+            if len_a(ra[oa]) > pos {
+                live.push(c);
+                tree.set_offsets(c, la.len(), lb.len());
+                la.extend(ra[oa..oa + na].iter().map(|&r| span_a(r).0 + pos));
+                lb.extend(rb[ob..ob + nb].iter().map(|&r| span_b(r).0 + pos));
+                live_ra.extend_from_slice(&ra[oa..oa + na]);
+                live_rb.extend_from_slice(&rb[ob..ob + nb]);
+            }
+            oa += na;
+            ob += nb;
         }
-        _ => panic!("survey: shape mismatch"),
+        if live.is_empty() {
+            break;
+        }
+        level(va, vb, &la[..], &lb[..], &live, tree);
+        (cur, ra, rb) = tree.refined(&live, &live_ra[..], &live_rb[..]);
+        pos += 1;
     }
 }
 

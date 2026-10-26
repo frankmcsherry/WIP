@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::gather;
+use crate::value::Bounds;
 use crate::ops::cmp::order::compare_at;
 use crate::ops::cmp::sort::sort_values;
 use std::cmp::Ordering;
@@ -225,4 +226,45 @@ fn one_side_empty_is_one_run() {
     assert_eq!(survey_groups(&a, &e), vec![GroupRun::A(0, 3)]);
     assert_eq!(survey_groups(&e, &a), vec![GroupRun::B(0, 3)]);
     assert!(survey_groups(&e, &e).is_empty());
+}
+
+/// referenced list rows survey as the rows they name: one arena, distinct arenas with equal
+/// contents, and a reference against an owned list.
+#[test]
+fn referenced_lists_survey_as_the_rows_they_name() {
+    use std::sync::Arc;
+    for seed in 1..60u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut ends = Vec::new();
+        let mut elements = 0;
+        for _ in 0..7 {
+            elements += rng.below(5);
+            ends.push(elements);
+        }
+        let arena = Arc::new(Value::List(ends.into(), Box::new(random_value(&mut rng, elements, 3))));
+        let rows: Vec<usize> = (0..32).map(|_| rng.below(7)).collect();
+        let refs = Value::Ref(arena, Arc::new(rows));
+        let suffix = Value::u8((0..32).map(|_| rng.below(3) as u8).collect());
+        for both in [
+            refs.clone(),
+            Value::Prod(vec![suffix.clone(), refs.clone(), suffix.clone()]),
+            Value::List(Bounds::Stride(2, 16), Box::new(refs.clone())),
+            Value::sum(vec![0; 32], vec![refs]),
+        ] {
+            let (_, _, sorted) = sort_values(&[], &both);
+            for (na, offset) in [(0, 0), (1, 1), (sorted.len(), 0), (sorted.len() - 1, 1)] {
+                let a = gather(&sorted, &(0..na).collect::<Vec<_>>());
+                let b = gather(&sorted, &(offset..sorted.len()).collect::<Vec<_>>());
+                assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b), "seed={seed}");
+                assert_eq!(survey_groups(&b, &a), naive_groups(&b, &a), "seed={seed}");
+            }
+        }
+    }
+    let arena = Value::List(vec![0, 1, 3, 5].into(), Box::new(Value::i64(vec![0, 1, 2, 1, 2])));
+    let a = Value::Ref(Arc::new(arena.clone()), Arc::new(vec![0, 1, 2, 3, 2]));
+    let b = Value::Ref(Arc::new(arena), Arc::new(vec![0, 1, 1, 3, 2]));
+    for other in [b.clone(), crate::engine::clone_ref(b)] {
+        assert_eq!(survey_groups(&a, &other), naive_groups(&a, &other));
+        assert_eq!(survey_groups(&other, &a), naive_groups(&other, &a));
+    }
 }
