@@ -522,3 +522,6 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 Run after any `src/` change: `cargo test && cargo clippy --all-targets`. Dependency-free and tight.
 Adding an op: ONE arm in `eval` (a failure-family op's lives in `ops/fail.rs`). There is no judge to keep in step: `eval` on a zero-row column IS the typer, so an op's shape rule is its accessor calls (`into_pair`/`into_list`/…, whose `Err` is the shape error) plus any explicit `same(..)` check it needs; the output shape is whatever it builds. Adding a layer:
 an enum + `OpLike` + `From` impls; touch nothing below.
+
+Optimizer rewrites live in `src/optimize/passes/`. `optimize(&Graph) -> Graph`
+normalizes without input shapes; scalar folding runs only in optimizer cleanup.

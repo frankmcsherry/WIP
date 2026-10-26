@@ -179,3 +179,38 @@ fn lossy_zip_then_transpose_must_not_cancel() {
         }
     }
 }
+
+#[test]
+fn singleton_map_is_inlined_but_shared_producers_stay_shared() {
+    let graph = optimize(&parse_ml("input enlist map (x -> (x, 1) add)").unwrap());
+    assert!(!graph.nodes().any(|n| matches!(n, corgi::NodeRef::Op(NumOp::Core(Op::MapList(_)), _))));
+    let src = "let xs = input enlist in (xs, xs map (x -> (x, 1) add))";
+    equivalent(src, Value::i64(vec![1, -2, i64::MAX]));
+    let graph = optimize(&parse_ml(src).unwrap());
+    assert!(graph.nodes().any(|n| matches!(n, corgi::NodeRef::Op(NumOp::Core(Op::MapList(_)), _))));
+}
+
+#[test]
+fn scalar_folding_keeps_float_payload_bits() {
+    use corgi::{ArithOp, BinOp};
+    let bits = [0, 1 << 63, 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000,
+        0x7ff8_0000_0000_1234, 0x7ff8_0000_0000_5678, 0xfff0_0000_0000_0001];
+    for left in bits {
+        for right in bits {
+            for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div] {
+                let mut b = Builder::<NumOp>::default();
+                let input = b.input();
+                let a = b.add(Op::Lit(Value::f64(vec![f64::from_bits(left)])), vec![input]);
+                let c = b.add(Op::Lit(Value::f64(vec![f64::from_bits(right)])), vec![input]);
+                let pair = b.tuple(vec![a, c]);
+                let out = b.add(ArithOp::Bin(op), vec![pair]);
+                let graph = b.finish(out);
+                let rewritten = optimize(&graph);
+                for n in [0, 1, 17] {
+                    let value = Value::Unit(n);
+                    assert_eq!(corgi::eval_graph(&graph, value.clone()), corgi::eval_graph(&rewritten, value));
+                }
+            }
+        }
+    }
+}
