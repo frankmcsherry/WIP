@@ -9,27 +9,26 @@
 use super::parse_ml;
 use crate::graph::{eval_graph, shape_of, Graph};
 use crate::ops::NumOp;
-use crate::optimize::{dce, immediates};
+use crate::optimize::optimize;
 use crate::shape::Shape;
 use crate::value::Value;
 
 pub struct Program {
-    /// the graph that runs and types: the one given, with constants made immediates.
+    /// The graph that runs and types, exactly as supplied to `from_graph`.
     graph: Graph<NumOp>,
 }
 
 impl Program {
-    /// compile an `ml` source string into a runnable program (a parse — use [`Program::shape`] to
-    /// type-check it against an input shape).
+    /// Parse and explicitly normalize ML into a runnable program. Use [`Program::shape`] to
+    /// type-check it against an input shape.
     pub fn compile_ml(src: &str) -> Result<Program, String> {
-        Ok(Program::from_graph(parse_ml(src)?))
+        Ok(Program::from_graph(optimize(&parse_ml(src)?)))
     }
 
     /// wrap an already-built graph — from the `Builder`, the optimizer, or a host's own lowering.
-    /// What runs is the graph with constant operands made immediates and unreachable nodes dropped
-    /// (both exact).
+    /// No rewriting occurs here. Call `optimize` explicitly when normalization is wanted.
     pub fn from_graph(graph: Graph<NumOp>) -> Program {
-        Program { graph: dce(immediates(graph)) }
+        Program { graph }
     }
 
     /// the output shape for a given input shape.

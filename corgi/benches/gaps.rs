@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 /// best-of-`reps` wall time for one whole-graph `eval` of a surface graph (see `compile`). The arg
 /// is cloned (Arc bump) outside the timer, matching a pipeline that hands an owned column to each op.
 fn corgi_t(g: &Graph<NumOp>, arg: &Value, reps: u32) -> Duration {
-    // run through `Program`, the path a user's program takes (constant operands as immediates, and
+    // run through `Program`, the path a user's program takes (optimized, as `compile_ml` does, and
     // on branches that have one, the program's buffer pool kept from run to run).
-    let p = Program::from_graph(g.clone());
+    let p = Program::from_graph(corgi::optimize(g));
     if std::env::var_os("GAPS_CHECK").is_some() {
         assert_eq!(corgi::show(&eval_graph(g, arg.clone())), corgi::show(&p.run(arg.clone())));
     }

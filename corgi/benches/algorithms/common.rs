@@ -101,6 +101,7 @@ pub fn run_case<R>(cfg: &Cfg, name: &str, what: &str, src: &str, input: Value, e
         return;
     }
     let graph = parse_ml(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+    // Without --opt this evaluates the graph as parsed.
     let p = Program::from_graph(if cfg.optimize { corgi::optimize(&graph) } else { graph });
     let rows = input.len();
     let got = p.run(input.clone());
