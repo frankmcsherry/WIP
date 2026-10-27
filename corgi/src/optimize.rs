@@ -165,13 +165,14 @@ pub fn fuse_maps(g: &Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
-/// adjacent structural isos that are exact inverses (`Zip∘Transpose`, `Weave∘Unweave`, and their
-/// mirrors) cancel: `outer(inner(x)) = x`, so the consumer reads `inner`'s input directly. Sound
+/// adjacent structural isos that are exact inverses (`Zip∘Transpose`, and `Weave∘Unweave` both
+/// ways) cancel: `outer(inner(x)) = x`, so the consumer reads `inner`'s input directly. Sound
 /// regardless of fan-out — only this edge is redirected; a still-shared `inner` survives for dce.
 fn is_inverse(outer: &Op<NumOp>, inner: &Op<NumOp>) -> bool {
     use Op::*;
     match (outer, inner) {
-        (Zip, Transpose) | (Transpose, Zip) | (Weave, Unweave) | (Unweave, Weave) => true,
+        // Not `Transpose∘Zip`: Zip truncates unequal rows, and Transpose cannot restore them.
+        (Zip, Transpose) | (Weave, Unweave) | (Unweave, Weave) => true,
         // `unwrap(inject x) = x`, the Sum-side pair. Only when every lane has one shape: otherwise
         // `Unwrap` is a shape ERROR on this sum, and cancelling would turn a program the typer
         // rejects into one it accepts. A lane taking its shape from the payload is known only then,
