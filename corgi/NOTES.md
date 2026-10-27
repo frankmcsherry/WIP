@@ -289,7 +289,9 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   it only supplies a definite position where IEEE declines.* The deviations, all on the "naughty" sort/eq path: NaN is orderable (sorts to the top)
   and equals itself bit-for-bit; `-0 != +0` (distinct bits — no canonicalization, by choice). The
   win: no NaN-poisons-comparison surprise. *Arithmetic stays IEEE* (NaN/inf propagate; `x/0 -> ±inf`,
-  `0/0 -> NaN` — total, no panic). A future IEEE `eq` can be offered if needed. Floats enter via
+  `0/0 -> NaN` — total, no panic). Arithmetic, negation, sums and products canonicalize computed
+  NaNs to `0x7ff8_0000_0000_0000`, discarding their sign and payload. Inputs, selections and host
+  results keep their bits. A future IEEE `eq` can be offered if needed. Floats enter via
   `to_float` or a float literal (`1.5`, `1e3`: a fraction or exponent); an Int literal is `5` or
   `-3`. Arithmetic takes its kind from its operands, and an Int meeting a Float is a shape error.
 - **All cardinality change lives inside `List`.** Filter/Group/Reduce are `List<X> -> …`; the SEQ
