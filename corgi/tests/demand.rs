@@ -1,912 +1,53 @@
-use corgi::{
-    compact_unit_fields, compact_unit_input, demand_projection, demand_transform, eval_graph, parse_ml, shape_of, ArithOp, BinOp, Bounds,
-    Builder, Demand, NumOp, Op, Pattern, Shape, Value,
-};
-use std::sync::Arc;
+use corgi::*;
 
 #[test]
-fn unit_compaction_narrows_join_values_and_preserves_the_key() {
-    let graph = parse_ml("(input.0, input.1.0, input.1.2.1, input.2)").unwrap();
-    let key = Shape::Prod(vec![Shape::Int, Shape::Unit]);
-    let left = Shape::Prod(vec![
-        Shape::Int,
-        Shape::Unit,
-        Shape::Prod(vec![Shape::Unit, Shape::Int]),
-        Shape::Prod(vec![Shape::Unit, Shape::Unit]),
-    ]);
-    let right = Shape::Prod(vec![Shape::Unit, Shape::Unit]);
-    let input_shape = Shape::Prod(vec![key.clone(), left, right]);
-    let compacted = compact_unit_fields(&graph, &input_shape, &[1, 2]).unwrap().unwrap();
-    assert_eq!(
-        compacted.input_shape,
-        Shape::Prod(vec![
-            key,
-            Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Int])]),
-            Shape::Unit,
-        ])
-    );
-    assert_eq!(shape_of(&compacted.input_projection, &input_shape).unwrap(), compacted.input_shape);
-    assert_eq!(shape_of(&compacted.graph, &compacted.input_shape), shape_of(&graph, &input_shape));
+fn analysis_unions_readers_and_skips_row_count_computations() {
+    use corgi::{analyze_demand, Demand};
+    let mut b = Builder::<NumOp>::default();
+    let x = b.input();
+    let dead = b.add(Op::Hash, vec![x]);
+    let a = b.add(Op::Field(0), vec![x]);
+    let c = b.add(Op::Field(2), vec![x]);
+    let constant = b.add(Op::Lit(Value::i64(vec![7])), vec![dead]);
+    let output = b.tuple(vec![a, c, constant]);
+    let graph = b.finish(output);
+    let shape = Shape::Prod(vec![Shape::Int; 3]);
+    let analysis = analyze_demand(&graph, &shape, &Demand::All).unwrap();
+    assert_eq!(analysis.input_demand(), &Demand::Prod(vec![Demand::All, Demand::None, Demand::All]));
+    assert_eq!(analysis.node_demands()[dead], Demand::None);
+    assert_eq!(analysis.input_demand().projected_shape(&shape).unwrap(), Shape::Prod(vec![Shape::Int; 2]));
 
-    let n = 3;
-    let input = Value::Prod(vec![
-        Value::Prod(vec![Value::i64(vec![5, 6, 7]), Value::Unit(n)]),
-        Value::Prod(vec![
-            Value::i64(vec![1, 2, 3]),
-            Value::Unit(n),
-            Value::Prod(vec![Value::Unit(n), Value::i64(vec![8, 9, 10])]),
-            Value::Prod(vec![Value::Unit(n), Value::Unit(n)]),
-        ]),
-        Value::Prod(vec![Value::Unit(n), Value::Unit(n)]),
-    ]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
-    );
-}
+    let mut b = Builder::default();
+    let x = b.input();
+    let mapped = b.add(Op::MapList(Box::new(graph)), vec![x]);
+    let graph = b.finish(mapped);
+    let analysis = analyze_demand(&graph, &Shape::List(Box::new(shape)), &Demand::All).unwrap();
+    assert_eq!(analysis.input_demand(), &Demand::List(Box::new(Demand::Prod(vec![Demand::All, Demand::None, Demand::All]))));
+    assert!(analyze_demand(&graph, &Shape::Int, &Demand::None).is_err());
+    let value = Value::Prod(vec![Value::Unit(3), Value::i64(vec![4,5,6])]);
+    assert_eq!(Demand::Prod(vec![Demand::None, Demand::All]).project(value.clone()).unwrap(), Value::Prod(vec![Value::i64(vec![4,5,6])]));
+    assert_eq!(Demand::Prod(vec![Demand::None; 2]).project(value.clone()).unwrap(), Value::Unit(3));
+    for request in [Demand::Prod(vec![Demand::All]), Demand::List(Box::new(Demand::All)), Demand::Prod(vec![Demand::Sum(vec![]), Demand::All])] {
+        assert!(request.project(value.clone()).is_err());
+        assert!(request.projected_shape(&shape_of_value(&value)).is_err());
+    }
+    let reference = Value::Ref(std::sync::Arc::new(Value::List(vec![1,3].into(), Box::new(value))), std::sync::Arc::new(vec![1,0,1]));
+    let request = Demand::Ref(Box::new(Demand::List(Box::new(Demand::Prod(vec![Demand::None,Demand::All])))));
+    let projected = request.project(reference.clone()).unwrap();
+    assert_eq!(shape_of_value(&projected), request.projected_shape(&shape_of_value(&reference)).unwrap());
+    let Value::Ref(_, rows) = projected else { unreachable!() };
+    assert_eq!(*rows, vec![1,0,1]);
+    assert!(Demand::Ref(Box::new(Demand::None)).project(reference).is_err());
+    let identity_shape = Shape::Prod(vec![Shape::Unit, Shape::List(Box::new(Shape::Int))]);
+    let identity_request = Demand::Prod(vec![Demand::All, Demand::List(Box::new(Demand::All))]);
+    let (identity, projected) = Demand::union_for_shape(&identity_shape, &identity_request, &Demand::None).unwrap();
+    assert_eq!(identity, Demand::All);
+    assert_eq!(projected, identity_shape);
+    let (unread_unit, _) = Demand::union_for_shape(&Shape::Unit, &Demand::None, &Demand::None).unwrap();
+    assert_eq!(unread_unit, Demand::None);
+    let dropped_unit = Demand::Prod(vec![Demand::None, Demand::All]);
+    assert_eq!(dropped_unit.projected_shape(&identity_shape).unwrap(), Shape::Prod(vec![Shape::List(Box::new(Shape::Int))]));
 
-#[test]
-fn unit_compaction_handles_repeated_uses_and_validates_selection() {
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Unit, Shape::Int, Shape::Unit])]);
-    let graph = parse_ml("(input.1.1, input.1.1)").unwrap();
-    let compacted = compact_unit_fields(&graph, &shape, &[1]).unwrap().unwrap();
-    assert_eq!(compacted.input_shape, Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Int])]));
-    let input = Value::Prod(vec![
-        Value::i64(vec![1, 2]),
-        Value::Prod(vec![Value::Unit(2), Value::i64(vec![3, 4]), Value::Unit(2)]),
-    ]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
-    );
-    assert!(compact_unit_fields(&graph, &shape, &[0]).unwrap().is_none());
-    assert!(compact_unit_fields(&graph, &shape, &[2]).is_err());
-}
-
-#[test]
-fn unit_compaction_restores_structure_before_hashing() {
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Prod(vec![Shape::Int, Shape::Unit])]);
-    let mut builder = Builder::<NumOp>::default();
-    let root = builder.input();
-    let value = builder.add(Op::Field(1), vec![root]);
-    let hashed = builder.add(Op::Hash, vec![value]);
-    let graph = builder.finish(hashed);
-    let compacted = compact_unit_fields(&graph, &shape, &[1]).unwrap().unwrap();
-    let input = Value::Prod(vec![
-        Value::i64(vec![1, 2]),
-        Value::Prod(vec![Value::i64(vec![3, 4]), Value::Unit(2)]),
-    ]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
-    );
-}
-
-#[test]
-fn unit_compaction_retargets_a_list_lambda() {
-    let graph = parse_ml("input map (x -> x.0.0)").unwrap();
-    let shape = Shape::List(Box::new(Shape::Prod(vec![
-        Shape::Prod(vec![Shape::Int, Shape::Unit]),
-        Shape::Int,
-    ])));
-    let compacted = compact_unit_input(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        compacted.input_shape,
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Prod(vec![Shape::Int]), Shape::Int])))
-    );
-    assert_eq!(compacted.graph.node_count(), graph.node_count());
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![
-            Value::Prod(vec![Value::i64(vec![1, 2, 3]), Value::Unit(3)]),
-            Value::i64(vec![4, 5, 6]),
-        ])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
-    );
-}
-
-#[test]
-fn unit_compaction_preserves_sum_tags() {
-    let graph = parse_ml("input").unwrap();
-    let shape = Shape::Sum(vec![
-        Shape::Prod(vec![Shape::Int, Shape::Unit]),
-        Shape::Prod(vec![Shape::Unit, Shape::Int]),
-    ]);
-    let compacted = compact_unit_input(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        compacted.input_shape,
-        Shape::Sum(vec![Shape::Prod(vec![Shape::Int]), Shape::Prod(vec![Shape::Int])]),
-    );
-    let input = Value::sum(vec![0, 1, 0], vec![
-        Value::Prod(vec![Value::i64(vec![1, 2]), Value::Unit(2)]),
-        Value::Prod(vec![Value::Unit(1), Value::i64(vec![3])]),
-    ]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input)),
-    );
-}
-
-#[test]
-fn join_projection_erases_unread_input_fields() {
-    let graph = parse_ml("(input.0.0, input.2.1)").unwrap();
-    let shape = Shape::Prod(vec![
-        Shape::Prod(vec![Shape::Int, Shape::Int]),
-        Shape::Int,
-        Shape::Prod(vec![Shape::Int, Shape::Int]),
-    ]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(projection.node_count(), 2);
-    let projected = shape_of(&projection, &shape).unwrap();
-    assert_eq!(
-        projected,
-        Shape::Prod(vec![
-            Shape::Prod(vec![Shape::Int, Shape::Unit]),
-            Shape::Unit,
-            Shape::Prod(vec![Shape::Unit, Shape::Int]),
-        ])
-    );
-    assert_eq!(shape_of(&graph, &projected), shape_of(&graph, &shape));
-
-    let input = Value::Prod(vec![
-        Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]),
-        Value::i64(vec![5, 6]),
-        Value::Prod(vec![Value::i64(vec![7, 8]), Value::i64(vec![9, 10])]),
-    ]);
-    let original_ptr = match &input {
-        Value::Prod(fields) => match &fields[0] {
-            Value::Prod(key) => corgi::arrange::borrowed_i64(&key[0]).unwrap().as_ptr(),
-            _ => unreachable!(),
-        },
-        _ => unreachable!(),
-    };
-    let expected = eval_graph(&graph, input.clone());
-    let projected_input = eval_graph(&projection, input);
-    let retained_ptr = match &projected_input {
-        Value::Prod(fields) => match &fields[0] {
-            Value::Prod(key) => corgi::arrange::borrowed_i64(&key[0]).unwrap().as_ptr(),
-            _ => unreachable!(),
-        },
-        _ => unreachable!(),
-    };
-    assert_eq!(retained_ptr, original_ptr);
-    let actual = eval_graph(&graph, projected_input);
-    assert_eq!(actual, expected);
-}
-
-#[test]
-fn shared_uses_union_their_demands() {
-    let graph = parse_ml("(input.0, input.1)").unwrap();
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Unit])
-    );
-}
-
-#[test]
-fn public_demand_merge_unions_consumers_of_one_input() {
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Int]);
-    let first = demand_transform(&parse_ml("input.0").unwrap(), &shape, &Shape::Int).unwrap();
-    let second = demand_transform(&parse_ml("input.1").unwrap(), &shape, &Shape::Int).unwrap();
-    let (need, projected) = Demand::union_for_shape(&shape, &first.input_demand, &second.input_demand).unwrap();
-    assert_eq!(projected, Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Unit]));
-    assert_eq!(need.to_shape(&shape).unwrap(), projected);
-    assert_eq!(shape_of(&first.graph, &projected).unwrap(), Shape::Int);
-    assert_eq!(shape_of(&second.graph, &projected).unwrap(), Shape::Int);
-}
-
-#[test]
-fn public_demand_merge_preserves_container_structure() {
-    let original = Shape::Prod(vec![
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int]))),
-        Shape::Sum(vec![Shape::Int, Shape::Int]),
-        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int]))))),
-    ]);
-    let left = Shape::Prod(vec![
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit]))),
-        Shape::Sum(vec![Shape::Int, Shape::Unit]),
-        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Unit, Shape::Int]))))),
-    ]);
-    let right = Shape::Prod(vec![
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Unit, Shape::Int]))),
-        Shape::Sum(vec![Shape::Unit, Shape::Int]),
-        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit]))))),
-    ]);
-    let mut need = Demand::from_projection(&left);
-    need.merge(Demand::from_projection(&right)).unwrap();
-    assert_eq!(need.to_shape(&original).unwrap(), original);
-}
-
-#[test]
-fn public_demand_merge_rejects_incompatible_structures() {
-    let mut need = Demand::from_projection(&Shape::Prod(vec![Shape::Int]));
-    let before = need.clone();
-    assert!(need.merge(Demand::from_projection(&Shape::List(Box::new(Shape::Int)))).is_err());
-    assert_eq!(need, before);
-    assert!(need.to_shape(&Shape::Prod(vec![Shape::Int, Shape::Int])).is_err());
-    assert!(Demand::union_for_shape(
-        &Shape::Prod(vec![Shape::Int, Shape::Int]),
-        &need,
-        &Demand::None,
-    ).is_err());
-}
-
-#[test]
-fn output_projection_drives_input_demand() {
-    let subject = parse_ml("(input.0, input.1)").unwrap();
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let result = builder.graft(&subject, input);
-    let output = builder.add(
-        Op::Project(Shape::Prod(vec![Shape::Int, Shape::Unit])),
-        vec![result],
-    );
-    let graph = builder.finish(output);
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Unit, Shape::Unit])
-    );
-    let input = Value::Prod(vec![
-        Value::i64(vec![1, 2]),
-        Value::i64(vec![3, 4]),
-        Value::i64(vec![5, 6]),
-    ]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn transform_prunes_add_before_projecting_its_input() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let first = builder.add(Op::Field(0), vec![input]);
-    let second = builder.add(Op::Field(1), vec![input]);
-    let one = builder.add(Op::Lit(Value::i64(vec![1])), vec![input]);
-    let pair = builder.tuple(vec![second, one]);
-    let add = builder.add(ArithOp::Bin(BinOp::Add), vec![pair]);
-    let output = builder.tuple(vec![first, add]);
-    let subject = builder.finish(output);
-    let input_shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let output_projection = Shape::Prod(vec![Shape::Int, Shape::Unit]);
-
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let result = builder.graft(&subject, input);
-    let output = builder.add(Op::Project(output_projection.clone()), vec![result]);
-    let unchanged = builder.finish(output);
-    assert!(demand_projection(&unchanged, &input_shape).unwrap().is_none());
-
-    let transformed = demand_transform(&subject, &input_shape, &output_projection).unwrap();
-    assert!(transformed.graph.node_count() < subject.node_count());
-    assert_eq!(shape_of(&transformed.graph, &input_shape).unwrap(), output_projection);
-    let input_projection = transformed.input_projection.unwrap();
-    assert_eq!(
-        shape_of(&input_projection, &input_shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Unit])
-    );
-    let input = Value::Prod(vec![Value::i64(vec![2, 3]), Value::i64(vec![4, 5])]);
-    assert_eq!(
-        eval_graph(&unchanged, input.clone()),
-        eval_graph(&transformed.graph, eval_graph(&input_projection, input))
-    );
-}
-
-fn computed_pair() -> corgi::Graph<NumOp> {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let first = builder.add(Op::Field(0), vec![input]);
-    let second = builder.add(Op::Field(1), vec![input]);
-    let one = builder.add(Op::Lit(Value::i64(vec![1])), vec![input]);
-    let pair = builder.tuple(vec![second, one]);
-    let add = builder.add(ArithOp::Bin(BinOp::Add), vec![pair]);
-    let output = builder.tuple(vec![first, add]);
-    builder.finish(output)
-}
-
-#[test]
-fn transform_prunes_add_behind_field_of_tuple() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let pair = builder.graft(&computed_pair(), input);
-    let selected = builder.add(Op::Field(0), vec![pair]);
-    let graph = builder.finish(selected);
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let transformed = demand_transform(&graph, &shape, &Shape::Int).unwrap();
-    let projection = transformed.input_projection.unwrap();
-    assert_eq!(shape_of(&projection, &shape).unwrap(), Shape::Prod(vec![Shape::Int, Shape::Unit]));
-    assert!(transformed.graph.node_count() < graph.node_count());
-    let input = Value::Prod(vec![Value::i64(vec![2, 3]), Value::i64(vec![4, 5])]);
-    assert_eq!(eval_graph(&graph, input.clone()), eval_graph(&transformed.graph, eval_graph(&projection, input)));
-}
-
-#[test]
-fn transform_prunes_add_inside_list_map() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let output = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    let target = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])));
-    let transformed = demand_transform(&graph, &shape, &target).unwrap();
-    let projection = transformed.input_projection.unwrap();
-    assert_eq!(shape_of(&projection, &shape).unwrap(), target);
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![Value::i64(vec![1, 2, 3]), Value::i64(vec![4, 5, 6])])),
-    );
-    let mut builder = Builder::<NumOp>::default();
-    let root = builder.input();
-    let projected = builder.add(Op::Project(target), vec![root]);
-    let projector = builder.finish(projected);
-    assert_eq!(
-        eval_graph(&projector, eval_graph(&graph, input.clone())),
-        eval_graph(&transformed.graph, eval_graph(&projection, input)),
-    );
-}
-
-#[test]
-fn transform_prunes_add_inside_sum_map() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let output = builder.add(Op::MapSum(vec![(0, computed_pair())]), vec![input]);
-    let graph = builder.finish(output);
-    let shape = Shape::Sum(vec![Shape::Prod(vec![Shape::Int, Shape::Int]), Shape::Int]);
-    let target = Shape::Sum(vec![Shape::Prod(vec![Shape::Int, Shape::Unit]), Shape::Unit]);
-    let transformed = demand_transform(&graph, &shape, &target).unwrap();
-    let projection = transformed.input_projection.unwrap();
-    assert_eq!(shape_of(&projection, &shape).unwrap(), target);
-    let input = Value::sum(
-        vec![0, 1, 0],
-        vec![
-            Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![4, 5])]),
-            Value::i64(vec![6]),
-        ],
-    );
-    let mut builder = Builder::<NumOp>::default();
-    let root = builder.input();
-    let projected = builder.add(Op::Project(target), vec![root]);
-    let projector = builder.finish(projected);
-    assert_eq!(
-        eval_graph(&projector, eval_graph(&graph, input.clone())),
-        eval_graph(&transformed.graph, eval_graph(&projection, input)),
-    );
-}
-
-#[test]
-fn transform_does_not_duplicate_a_shared_map() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let mapped = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
-    let output = builder.tuple(vec![mapped, mapped]);
-    let graph = builder.finish(output);
-    let element = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let list = Shape::List(Box::new(element.clone()));
-    let projected_list = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])));
-    let target = Shape::Prod(vec![list.clone(), projected_list.clone()]);
-    let transformed = demand_transform(&graph, &list, &target).unwrap();
-    assert!(transformed.input_projection.is_none());
-    assert_eq!(transformed.input_demand, Demand::All);
-
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let mapped = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
-    let projected = builder.add(Op::Project(projected_list), vec![mapped]);
-    let output = builder.tuple(vec![mapped, projected]);
-    assert_eq!(transformed.graph, builder.finish(output));
-}
-
-#[test]
-fn transform_prunes_map_after_its_other_use_dies() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let mapped = builder.add(Op::MapList(Box::new(computed_pair())), vec![input]);
-    let output = builder.tuple(vec![mapped, mapped]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    let projected_list = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])));
-    let target = Shape::Prod(vec![projected_list.clone(), Shape::Unit]);
-    let transformed = demand_transform(&graph, &shape, &target).unwrap();
-    let projection = transformed.input_projection.unwrap();
-    assert_eq!(shape_of(&projection, &shape).unwrap(), projected_list);
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![Value::i64(vec![1, 2, 3]), Value::i64(vec![4, 5, 6])])),
-    );
-    let mut builder = Builder::<NumOp>::default();
-    let root = builder.input();
-    let projected = builder.add(Op::Project(target), vec![root]);
-    let projector = builder.finish(projected);
-    assert_eq!(
-        eval_graph(&projector, eval_graph(&graph, input.clone())),
-        eval_graph(&transformed.graph, eval_graph(&projection, input)),
-    );
-}
-
-#[test]
-fn transform_preserves_a_shared_add_with_an_observed_use() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let second = builder.add(Op::Field(1), vec![input]);
-    let one = builder.add(Op::Lit(Value::i64(vec![1])), vec![input]);
-    let pair = builder.tuple(vec![second, one]);
-    let add = builder.add(ArithOp::Bin(BinOp::Add), vec![pair]);
-    let output = builder.tuple(vec![add, add]);
-    let subject = builder.finish(output);
-    let input_shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let output_projection = Shape::Prod(vec![Shape::Unit, Shape::Int]);
-    let transformed = demand_transform(&subject, &input_shape, &output_projection).unwrap();
-    let input_projection = transformed.input_projection.unwrap();
-    assert_eq!(
-        shape_of(&input_projection, &input_shape).unwrap(),
-        Shape::Prod(vec![Shape::Unit, Shape::Int])
-    );
-    let input = Value::Prod(vec![Value::i64(vec![2, 3]), Value::i64(vec![4, 5])]);
-    let mut builder = Builder::<NumOp>::default();
-    let root = builder.input();
-    let output = builder.add(Op::Project(output_projection), vec![root]);
-    let projector = builder.finish(output);
-    let expected = eval_graph(&projector, eval_graph(&subject, input.clone()));
-    assert_eq!(
-        expected,
-        eval_graph(&transformed.graph, eval_graph(&input_projection, input))
-    );
-}
-
-#[test]
-fn transform_preserves_fieldless_tuple_length() {
-    let mut builder = Builder::<NumOp>::default();
-    let _input = builder.input();
-    let output = builder.tuple(vec![]);
-    let subject = builder.finish(output);
-    let input_shape = Shape::Int;
-    let transformed = demand_transform(&subject, &input_shape, &Shape::Unit).unwrap();
-    let input = Value::i64(vec![1, 2]);
-    let projected_input = match transformed.input_projection {
-        Some(projection) => eval_graph(&projection, input.clone()),
-        None => input.clone(),
-    };
-    let original = eval_graph(&subject, input);
-    let expected = eval_graph(
-        &{
-            let mut builder = Builder::<NumOp>::default();
-            let root = builder.input();
-            let output = builder.add(Op::Project(Shape::Unit), vec![root]);
-            builder.finish(output)
-        },
-        original,
-    );
-    assert_eq!(eval_graph(&transformed.graph, projected_input), expected);
-}
-
-#[test]
-fn tuple_pattern_keeps_its_shape_check() {
-    let graph = parse_ml("let (x, _) = input in x").unwrap();
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Unit])
-    );
-    let input = Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn eager_unused_fields_do_not_keep_their_values() {
-    // DDIR's projection compiler creates all environment fields before compiling the terms.
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let _unused = builder.add(Op::Field(0), vec![input]);
-    let used = builder.add(Op::Field(1), vec![input]);
-    let graph = builder.finish(used);
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Unit, Shape::Int])
-    );
-}
-
-#[test]
-fn dead_opaque_use_does_not_demand_shared_input() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let _unused = builder.add(Op::Hash, vec![input]);
-    let used = builder.add(Op::Field(0), vec![input]);
-    let graph = builder.finish(used);
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Unit])
-    );
-}
-
-#[test]
-fn unknown_operations_keep_their_whole_input() {
-    let graph = parse_ml("input hash").unwrap();
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    assert!(demand_projection(&graph, &shape).unwrap().is_none());
-}
-
-#[test]
-fn unknown_operations_only_keep_fields_passed_to_them() {
-    let graph = parse_ml("input.0 hash").unwrap();
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Unit])
-    );
-    let input = Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn unused_input_keeps_only_its_length() {
-    let graph = parse_ml("input unit").unwrap();
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(shape_of(&projection, &shape).unwrap(), Shape::Unit);
-    let input = Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn project_rejects_shape_changes_other_than_erasure() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let output = builder.add(Op::Project(Shape::Prod(vec![Shape::Float])), vec![input]);
-    let graph = builder.finish(output);
-    assert!(shape_of(&graph, &Shape::Prod(vec![Shape::Int])).is_err());
-}
-
-#[test]
-fn list_map_reads_only_one_element_field() {
-    let mut body = Builder::<NumOp>::default();
-    let element = body.input();
-    let first = body.add(Op::Field(0), vec![element]);
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let output = builder.add(Op::MapList(Box::new(body.finish(first))), vec![input]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])))
-    );
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![
-            Value::i64(vec![1, 2, 3]),
-            Value::i64(vec![4, 5, 6]),
-        ])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn list_maps_union_their_element_demands() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let maps: Vec<_> = (0..2)
-        .map(|field| {
-            let mut body = Builder::<NumOp>::default();
-            let element = body.input();
-            let selected = body.add(Op::Field(field), vec![element]);
-            builder.add(Op::MapList(Box::new(body.finish(selected))), vec![input])
-        })
-        .collect();
-    let output = builder.tuple(maps);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![
-        Shape::Int,
-        Shape::Int,
-        Shape::Int,
-    ])));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::List(Box::new(Shape::Prod(vec![
-            Shape::Int,
-            Shape::Int,
-            Shape::Unit
-        ])))
-    );
-    let input = Value::List(
-        Bounds::offsets(vec![2]),
-        Box::new(Value::Prod(vec![
-            Value::i64(vec![1, 2]),
-            Value::i64(vec![3, 4]),
-            Value::i64(vec![5, 6]),
-        ])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn enlist_passes_element_demand_back_to_its_input() {
-    let graph = parse_ml("input enlist map (x -> x.0)").unwrap();
-    let shape = Shape::Prod(vec![Shape::Int, Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Int, Shape::Unit])
-    );
-    let input = Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn list_pattern_keeps_bounds_without_payload() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let checked = builder.add(
-        Op::Pattern(Pattern::List(Box::new(Pattern::Any))),
-        vec![input],
-    );
-    let output = builder.add(Op::Unit, vec![checked]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Int));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::List(Box::new(Shape::Unit))
-    );
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::i64(vec![1, 2, 3])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn len_keeps_bounds_without_list_payload() {
-    let graph = parse_ml("input len").unwrap();
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::List(Box::new(Shape::Unit))
-    );
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![
-            Value::i64(vec![1, 2, 3]),
-            Value::i64(vec![4, 5, 6]),
-        ])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn shared_list_unions_len_and_payload_demands() {
-    let mut body = Builder::<NumOp>::default();
-    let element = body.input();
-    let first = body.add(Op::Field(0), vec![element]);
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let lengths = builder.add(Op::Len, vec![input]);
-    let mapped = builder.add(Op::MapList(Box::new(body.finish(first))), vec![input]);
-    let output = builder.tuple(vec![lengths, mapped]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])))
-    );
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![
-            Value::i64(vec![1, 2, 3]),
-            Value::i64(vec![4, 5, 6]),
-        ])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn len_projects_a_referenced_list_without_copying_rows() {
-    let graph = parse_ml("input len").unwrap();
-    let shape = Shape::Ref(Box::new(Shape::List(Box::new(Shape::Prod(vec![
-        Shape::Int,
-        Shape::Int,
-    ])))));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Unit))))
-    );
-    let rows = Arc::new(vec![2, 0, 2]);
-    let input = Value::Ref(
-        Arc::new(Value::List(
-            Bounds::offsets(vec![2, 3, 5]),
-            Box::new(Value::Prod(vec![
-                Value::i64(vec![1, 2, 3, 4, 5]),
-                Value::i64(vec![6, 7, 8, 9, 10]),
-            ])),
-        )),
-        rows.clone(),
-    );
-    let expected = eval_graph(&graph, input.clone());
-    let projected = eval_graph(&projection, input);
-    let Value::Ref(_, projected_rows) = &projected else {
-        panic!("projection must retain the reference")
-    };
-    assert!(Arc::ptr_eq(&rows, projected_rows));
-    assert_eq!(eval_graph(&graph, projected), expected);
-}
-
-#[test]
-fn ref_passes_list_demand_through_a_product() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let referenced = builder.add(Op::Ref, vec![input]);
-    let list = builder.add(Op::Field(1), vec![referenced]);
-    let output = builder.add(Op::Len, vec![list]);
-    let graph = builder.finish(output);
-    let shape = Shape::Prod(vec![
-        Shape::Int,
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int]))),
-    ]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Prod(vec![Shape::Unit, Shape::List(Box::new(Shape::Unit))])
-    );
-    let input = Value::Prod(vec![
-        Value::i64(vec![10, 20]),
-        Value::List(
-            Bounds::offsets(vec![2, 3]),
-            Box::new(Value::Prod(vec![
-                Value::i64(vec![1, 2, 3]),
-                Value::i64(vec![4, 5, 6]),
-            ])),
-        ),
-    ]);
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn shared_ref_unions_len_and_pattern_demands() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let referenced = builder.add(Op::Ref, vec![input]);
-    let lengths = builder.add(Op::Len, vec![referenced]);
-    let pattern = Pattern::Ref(Box::new(Pattern::List(Box::new(Pattern::Tuple(vec![
-        Pattern::Int,
-        Pattern::Any,
-    ])))));
-    let checked = builder.add(Op::Pattern(pattern), vec![referenced]);
-    let checked = builder.add(Op::Unit, vec![checked]);
-    let output = builder.tuple(vec![lengths, checked]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Unit])))
-    );
-    let input = Value::List(
-        Bounds::offsets(vec![2, 3]),
-        Box::new(Value::Prod(vec![
-            Value::i64(vec![1, 2, 3]),
-            Value::i64(vec![4, 5, 6]),
-        ])),
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
-}
-
-#[test]
-fn full_use_of_shared_ref_prevents_erasure() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let referenced = builder.add(Op::Ref, vec![input]);
-    let lengths = builder.add(Op::Len, vec![referenced]);
-    let output = builder.tuple(vec![lengths, referenced]);
-    let graph = builder.finish(output);
-    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-    assert!(demand_projection(&graph, &shape).unwrap().is_none());
-}
-
-#[test]
-fn ref_pattern_requires_reference_shape_but_not_payload() {
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let pattern = Pattern::Ref(Box::new(Pattern::Any));
-    let checked = builder.add(Op::Pattern(pattern), vec![input]);
-    let output = builder.add(Op::Unit, vec![checked]);
-    let graph = builder.finish(output);
-    let shape = Shape::Ref(Box::new(Shape::List(Box::new(Shape::Int))));
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Ref(Box::new(Shape::List(Box::new(Shape::Unit))))
-    );
-}
-
-#[test]
-fn sum_map_discards_an_unread_lane() {
-    let mut first_body = Builder::<NumOp>::default();
-    let first_input = first_body.input();
-    let first = first_body.add(Op::Field(0), vec![first_input]);
-    let mut second_body = Builder::<NumOp>::default();
-    let second_input = second_body.input();
-    let second = second_body.add(Op::Unit, vec![second_input]);
-    let mut builder = Builder::<NumOp>::default();
-    let input = builder.input();
-    let output = builder.add(
-        Op::MapSum(vec![
-            (0, first_body.finish(first)),
-            (1, second_body.finish(second)),
-        ]),
-        vec![input],
-    );
-    let graph = builder.finish(output);
-    let shape = Shape::Sum(vec![Shape::Prod(vec![Shape::Int, Shape::Int]), Shape::Int]);
-    let projection = demand_projection(&graph, &shape).unwrap().unwrap();
-    assert_eq!(
-        shape_of(&projection, &shape).unwrap(),
-        Shape::Sum(vec![
-            Shape::Prod(vec![Shape::Int, Shape::Unit]),
-            Shape::Unit
-        ])
-    );
-    let input = Value::sum(
-        vec![0, 1, 0],
-        vec![
-            Value::Prod(vec![Value::i64(vec![1, 2]), Value::i64(vec![3, 4])]),
-            Value::i64(vec![5]),
-        ],
-    );
-    assert_eq!(
-        eval_graph(&graph, input.clone()),
-        eval_graph(&graph, eval_graph(&projection, input))
-    );
 }
 
 struct DemandRng(u64);
@@ -970,8 +111,16 @@ fn random_graph(
     if depth == 0 {
         return (input, shape.clone());
     }
-    match rng.below(7) {
+    match rng.below(10) {
         0 => (input, shape.clone()),
+        7 => (builder.tuple(vec![]), Shape::Unit),
+        9 => (builder.add(Op::Lit(Value::Prod(vec![])), vec![input]), Shape::Unit),
+        8 if matches!(shape, Shape::List(_)) => {
+            let empty = builder.tuple(vec![]);
+            let pair = builder.tuple(vec![empty, input]);
+            let captured = builder.add(Op::CapList, vec![pair]);
+            (builder.add(Op::Len, vec![captured]), Shape::Int)
+        }
         1 => (builder.add(Op::Unit, vec![input]), Shape::Unit),
         2 => (builder.add(Op::Hash, vec![input]), Shape::Int),
         3 => {
@@ -1017,23 +166,39 @@ fn random_graph(
     }
 }
 
-fn random_projection(rng: &mut DemandRng, shape: &Shape) -> Shape {
-    if rng.below(4) == 0 {
-        return Shape::Unit;
-    }
+
+fn random_request(rng: &mut DemandRng, shape: &Shape) -> Demand {
+    if rng.below(4) == 0 { return Demand::None; }
     match shape {
-        Shape::Prod(fields) => Shape::Prod(fields.iter().map(|field| random_projection(rng, field)).collect()),
-        Shape::List(element) => Shape::List(Box::new(random_projection(rng, element))),
-        Shape::Sum(lanes) => Shape::Sum(lanes.iter().map(|lane| random_projection(rng, lane)).collect()),
-        other => other.clone(),
+        Shape::Prod(fields) => Demand::Prod(fields.iter().map(|s| random_request(rng,s)).collect()),
+        Shape::List(s) => Demand::List(Box::new(random_request(rng,s))),
+        Shape::Sum(lanes) => Demand::Sum(lanes.iter().map(|s| random_request(rng,s)).collect()),
+        _ => Demand::All,
     }
+}
+
+fn check(graph: &Graph<NumOp>, input: Value, request: &Demand) -> (Graph<NumOp>, Demand) {
+    let shape = shape_of_value(&input);
+    let original = eval_graph(graph, input.clone());
+    let graph = compile(graph.clone(), &shape).unwrap();
+    let Narrowed { graph: rewritten, input: need, output } = narrow(graph, request).unwrap();
+    let original_shape = shape_of_value(&original);
+    let (union, _) = Demand::union_for_shape(&original_shape, &output, request).unwrap();
+    assert_eq!(union, output);
+    let expected_shape = output.projected_shape(&original_shape).unwrap();
+    let expected = output.project(original).unwrap();
+    let narrowed = need.project(input).unwrap();
+    assert_eq!(shape_of_value(&narrowed), need.projected_shape(&shape).unwrap());
+    assert_eq!(shape_of(&rewritten, &shape_of_value(&narrowed)).unwrap(), expected_shape);
+    assert_eq!(shape_of_value(&expected), expected_shape);
+    assert_eq!(eval_graph(&rewritten, narrowed), expected);
+    (rewritten, need)
 }
 
 #[test]
 fn random_demand_rewrites_preserve_values() {
-    let mut projected_inputs = 0;
-    let mut compacted_inputs = 0;
-    for seed in 1..=200u64 {
+    let cases = std::env::var("CORGI_DEMAND_CASES").map(|s| s.parse::<u64>().unwrap()).unwrap_or(200);
+    for seed in 1..=cases {
         let mut rng = DemandRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let shape = random_shape(&mut rng, 2);
         let rows = 1 + rng.below(20);
@@ -1042,66 +207,82 @@ fn random_demand_rewrites_preserve_values() {
         let root = builder.input();
         let (output, output_shape) = random_graph(&mut builder, root, &shape, &mut rng, 4);
         let graph = builder.finish(output);
-        assert_eq!(shape_of(&graph, &shape).unwrap(), output_shape, "seed {seed}");
-        let target = random_projection(&mut rng, &output_shape);
-
-        if let Some(projection) = demand_projection(&graph, &shape).unwrap() {
-            assert_eq!(
-                eval_graph(&graph, input.clone()),
-                eval_graph(&graph, eval_graph(&projection, input.clone())),
-                "unmodified graph seed {seed}",
-            );
-        }
-        if let Some(compacted) = compact_unit_input(&graph, &shape).unwrap() {
-            compacted_inputs += 1;
-            assert_eq!(
-                eval_graph(&graph, input.clone()),
-                eval_graph(&compacted.graph, eval_graph(&compacted.input_projection, input.clone())),
-                "compaction seed {seed}",
-            );
-        }
-
-        let mut builder = Builder::default();
-        let root = builder.input();
-        let result = builder.graft(&graph, root);
-        let projected = builder.add(Op::Project(target.clone()), vec![result]);
-        let projected_graph = builder.finish(projected);
-        let expected = eval_graph(&projected_graph, input.clone());
-
-        if let Some(projection) = demand_projection(&projected_graph, &shape).unwrap() {
-            projected_inputs += 1;
-            assert_eq!(expected, eval_graph(&projected_graph, eval_graph(&projection, input.clone())), "projection seed {seed}");
-        }
-        let transformed = demand_transform(&graph, &shape, &target).unwrap();
-        let projected_input = transformed.input_projection.map_or(input.clone(), |projection| eval_graph(&projection, input));
-        assert_eq!(expected, eval_graph(&transformed.graph, projected_input), "transform seed {seed}");
+        let request = random_request(&mut rng, &output_shape);
+        check(&graph, Value::empty(&shape), &request);
+        check(&graph, input.clone(), &Demand::All);
+        check(&graph, input, &request);
     }
-    assert!(projected_inputs > 0);
-    assert!(compacted_inputs > 0);
+    println!("{cases} seeds; {} comparisons", cases * 3);
 }
 
 #[test]
-fn analysis_unions_readers_and_skips_row_count_computations() {
-    use corgi::{analyze_demand, Demand};
-    let mut b = Builder::<NumOp>::default();
-    let x = b.input();
-    let dead = b.add(Op::Hash, vec![x]);
-    let a = b.add(Op::Field(0), vec![x]);
-    let c = b.add(Op::Field(2), vec![x]);
-    let constant = b.add(Op::Lit(Value::i64(vec![7])), vec![dead]);
-    let output = b.tuple(vec![a, c, constant]);
-    let graph = b.finish(output);
-    let shape = Shape::Prod(vec![Shape::Int; 3]);
-    let analysis = analyze_demand(&graph, &shape, &Demand::All).unwrap();
-    assert_eq!(analysis.input_demand(), &Demand::Prod(vec![Demand::All, Demand::None, Demand::All]));
-    assert_eq!(analysis.node_demands()[dead], Demand::None);
-    assert_eq!(analysis.input_demand().projected_shape(&shape).unwrap(), Shape::Prod(vec![Shape::Int; 2]));
+fn shared_maps_rebase_fields_and_unlisted_sum_lanes() {
+    let graph = parse_ml("let p = input map (x -> (x.0 hash, x.1, x.2, x.3)) in (p map (x -> (x.1, x.3)), p map (x -> (x.2, x.3)))").unwrap();
+    let input = Value::List(vec![0,2].into(),Box::new(Value::Prod(vec![Value::i64(vec![1,2]),Value::i64(vec![3,4]),Value::i64(vec![5,6]),Value::i64(vec![7,8])])));
+    let (out, need) = check(&graph, input, &Demand::All);
+    assert_eq!(need,Demand::List(Box::new(Demand::Prod(vec![Demand::None,Demand::All,Demand::All,Demand::All]))));
+    assert!(!format!("{out:?}").contains("Hash"));
+    assert_eq!(out.nodes().filter(|n| matches!(n,NodeRef::Op(NumOp::Core(Op::MapList(_)),_))).count(),3);
 
-    let mut b = Builder::default();
-    let x = b.input();
-    let mapped = b.add(Op::MapList(Box::new(graph)), vec![x]);
+    let mut b = Builder::default(); let x = b.input();
+    let out = b.add(Op::MapSum(vec![(0,parse_ml("(input.2, input.0)").unwrap())]),vec![x]);
+    let graph = b.finish(out);
+    let input = Value::sum(vec![0,1,0],vec![Value::Prod(vec![Value::i64(vec![1,2]),Value::i64(vec![3,4]),Value::i64(vec![5,6])]),Value::Prod(vec![Value::i64(vec![7]),Value::i64(vec![8])])]);
+    check(&graph,input,&Demand::Sum(vec![Demand::Prod(vec![Demand::None,Demand::All]),Demand::Prod(vec![Demand::None,Demand::All])]));
+}
+
+#[test]
+fn literal_anchors_and_reference_boundaries() {
+    let mut body = Builder::default(); let x = body.input();
+    let hash = body.add(Op::Hash,vec![x]);
+    let lit = body.add(Op::Lit(Value::Prod(vec![Value::f64(vec![f64::from_bits(0x7ff8000000001234)]),Value::i64(vec![9])])),vec![hash]);
+    let mut b = Builder::default(); let x = b.input();
+    let body = body.finish(lit);
+    let mapped = b.add(Op::MapList(Box::new(body.clone())),vec![x]);
     let graph = b.finish(mapped);
-    let analysis = analyze_demand(&graph, &Shape::List(Box::new(shape)), &Demand::All).unwrap();
-    assert_eq!(analysis.input_demand(), &Demand::List(Box::new(Demand::Prod(vec![Demand::All, Demand::None, Demand::All]))));
-    assert!(analyze_demand(&graph, &Shape::Int, &Demand::None).is_err());
+    let input = Value::List(vec![0,2,2].into(),Box::new(Value::i64(vec![1,2])));
+    let (out,_) = check(&graph,input,&Demand::List(Box::new(Demand::Prod(vec![Demand::All,Demand::None]))));
+    assert!(!format!("{out:?}").contains("Hash"));
+    let mut b = Builder::default(); let x = b.input();
+    let mapped = b.add(Op::MapSum(vec![(0, body)]),vec![x]);
+    let graph = b.finish(mapped);
+    for (tags, first, second) in [(vec![1,1],vec![],vec![4,5]), (vec![0,1,0],vec![2,3],vec![4])] {
+        let input = Value::sum(tags,vec![Value::i64(first),Value::i64(second)]);
+        check(&graph,input,&Demand::Sum(vec![Demand::Prod(vec![Demand::All,Demand::None]),Demand::All]));
+    }
+    for src in ["input ref len", "input len"] {
+        let g = parse_ml(src).unwrap();
+        let list = Value::List(vec![1,3].into(),Box::new(Value::Prod(vec![Value::i64(vec![1,2,3]),Value::i64(vec![4,5,6])])));
+        let v = if src == "input len" { Value::Ref(std::sync::Arc::new(list),std::sync::Arc::new(vec![1,0,1])) } else {list};
+        let (_,d) = check(&g,v,&Demand::All);
+        assert_eq!(d, if src=="input len" {Demand::All}else{Demand::List(Box::new(Demand::None))});
+    }
+    // A final reference keeps its arena, including when nested in a requested field.
+    let list = Value::List(vec![1,3].into(), Box::new(Value::Prod(vec![
+        Value::i64(vec![1,2,3]), Value::i64(vec![4,5,6]),
+    ])));
+    let reference = Value::Ref(std::sync::Arc::new(list), std::sync::Arc::new(vec![1,0,1]));
+    let request = Demand::Ref(Box::new(Demand::List(Box::new(Demand::Prod(vec![Demand::All,Demand::None])))));
+    for nested in [false, true] {
+        let (src, input, request, expected, need) = if nested {
+            ("(input.1, input.0)", Value::Prod(vec![Value::i64(vec![7,8,9]), reference.clone()]),
+                Demand::Prod(vec![request.clone(), Demand::None]), Value::Prod(vec![reference.clone()]),
+                Demand::Prod(vec![Demand::None, Demand::All]))
+        } else {
+            ("input", reference.clone(), request.clone(), reference.clone(), Demand::All)
+        };
+        let shape = shape_of_value(&input);
+        let graph = compile(parse_ml(src).unwrap(), &shape).unwrap();
+        let Narrowed { graph: out, input: actual, output } = narrow(graph, &request).unwrap();
+        assert_eq!(output, if nested { Demand::Prod(vec![Demand::All, Demand::None]) } else { Demand::All });
+        assert_eq!(actual, need);
+        assert_eq!(shape_of(&out, &actual.projected_shape(&shape).unwrap()).unwrap(), shape_of_value(&expected));
+        assert_eq!(eval_graph(&out, actual.project(input).unwrap()), expected);
+    }
+    let graph = parse_ml("input map (x -> x ref) map (x -> x len)").unwrap();
+    let input = Value::List(vec![0,2].into(),Box::new(Value::List(vec![1,2].into(),Box::new(Value::i64(vec![3,4])))));
+    let (_,need) = check(&graph,input,&Demand::All);
+    assert_eq!(need,Demand::List(Box::new(Demand::List(Box::new(Demand::None)))));
+    let mut b=Builder::<NumOp>::default();b.input();let empty=b.tuple(vec![]);let lit=b.add(Op::Lit(Value::i64(vec![7])),vec![empty]);
+    check(&b.finish(lit),Value::Unit(3),&Demand::All);
 }

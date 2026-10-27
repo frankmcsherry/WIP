@@ -531,6 +531,18 @@ normalizes without input shapes; scalar folding runs before immediate lowering i
 type, strips checked patterns (including in bodies), then normalizes. `Compiled`
 keeps the graph and checked input type together, with read-only accessors.
 `analyze_demand` reports requests in original field positions without rebuilding.
+`narrow(Compiled, &Demand) -> Result<Narrowed, String>` rebuilds each producer
+at its readers' request and normalizes. `Narrowed` returns the graph and the
+requests on its original input and actual output, including wider references.
+`Demand::project` compacts a value at a request, matching `projected_shape`.
+Analysis, shape-aware union and rebuilding normalize identity requests recursively:
+nonempty products of All, sums of All, List(All), and Ref(All) become All. None stays
+None, even on unit; a retained unit field and a dropped field are distinct.
+Products of unread fields retain their slot when nested and stay explicit.
+Call `compile` first; `narrow` consumes that graph and its recorded type, and does
+not strip patterns. `Demand::All` asks for everything
+the caller reads. Existing references keep their available payload, even when the
+requested output asks for less.
 
 `Program::from_graph` wraps its graph unchanged. ML compilation calls `optimize`
 explicitly; callers supplying graphs choose their own normalization step.

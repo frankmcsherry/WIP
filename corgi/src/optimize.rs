@@ -40,3 +40,31 @@ pub fn compile(graph: Graph<NumOp>, input: &crate::Shape) -> Result<Compiled, St
     crate::graph::node_shapes(&graph, input)?;
     Ok(Compiled { graph: normalize(passes::strip_patterns(graph)), input: input.clone() })
 }
+
+/// A graph rebuilt at its input request, with the output it actually retains.
+pub struct Narrowed {
+    pub graph: Graph<NumOp>,
+    /// Request on the original input; the graph accepts its projected shape.
+    pub input: crate::Demand,
+    /// Actual request on the original output, including any wider references.
+    pub output: crate::Demand,
+}
+
+/// Push an output request back through a graph, rebuild at the requested types,
+/// and normalize. `Demand::All` requests everything the caller reads, the common case.
+///
+/// Call [`compile`] first. Its result owns the checked graph and its input type;
+/// narrowing cannot substitute a different type and does not strip patterns.
+/// The returned graph accepts `result.input.projected_shape(compiled.input())` and produces
+/// `result.output.projected_shape(original_output_shape)`.
+/// Requests use original field positions. An existing reference keeps everything
+/// it holds, so the output can be wider at references than `output` asks.
+pub fn narrow(
+    compiled: Compiled, output: &crate::Demand,
+) -> Result<Narrowed, String> {
+    let Compiled { graph, input } = compiled;
+    let analysis = crate::analyze_demand(&graph, &input, output)?;
+    let input_request = analysis.input_demand().clone();
+    let (graph, output) = passes::demand::rewrite_demand(graph, &analysis, &input_request)?;
+    Ok(Narrowed { graph: normalize(graph), input: input_request, output })
+}
