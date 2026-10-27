@@ -206,6 +206,58 @@ pub(crate) fn before_ref(shape: &Shape, demand: Demand) -> Demand {
     }
 }
 
+fn gathered_element_demand(positions: &Shape, demand: Demand) -> Demand {
+    match positions {
+        Shape::Int => demand,
+        Shape::Unit => Demand::None,
+        Shape::Prod(fields) => fields.iter().zip(demand.fields(fields.len()))
+            .fold(Demand::None, |mut need, (field, demand)| {
+                need.merge_unchecked(gathered_element_demand(field, demand));
+                need
+            }),
+        Shape::List(element) => gathered_element_demand(element, demand.list_element()),
+        Shape::Sum(lanes) => lanes.iter().zip(demand.sum_lanes(lanes.len()))
+            .fold(Demand::None, |mut need, (lane, demand)| {
+                need.merge_unchecked(gathered_element_demand(lane, demand));
+                need
+            }),
+        _ => unreachable!("Gather positions contain only integers and containers"),
+    }
+}
+
+/// Payload projections commute with these operations, including Gather's zero on a miss.
+/// Keep the witnesses that decide which rows move, even when no payload is needed.
+pub(crate) fn movement_demand(op: &Op<NumOp>, input: &Shape, demand: Demand) -> Option<Demand> {
+    Some(match op {
+        Op::Gather => {
+            let Shape::Prod(pair) = input else { unreachable!() };
+            let element = gathered_element_demand(&pair[0], demand);
+            let list = Demand::List(Box::new(element));
+            let haystack = if matches!(pair[1], Shape::Ref(_)) { Demand::Ref(Box::new(list)) } else { list };
+            Demand::Prod(vec![Demand::All, haystack])
+        }
+        Op::Filter => Demand::List(Box::new(Demand::Prod(vec![Demand::All, demand.list_element()]))),
+        Op::CapList => {
+            let mut pair = demand.list_element().fields(2);
+            let element = pair.pop().unwrap();
+            Demand::Prod(vec![pair.pop().unwrap(), Demand::List(Box::new(element))])
+        }
+        Op::Select => {
+            let Shape::Prod(fields) = input else { unreachable!() };
+            // Both alternatives must keep the same reference arena type.
+            let demand = keep_references(&fields[1], demand);
+            Demand::Prod(vec![Demand::All, demand.clone(), demand])
+        }
+        Op::Flatten => {
+            // Ranges depend only on the two levels of bounds. The flat values
+            // retain exactly the demanded payload, regardless of ranges demand.
+            let values = demand.fields(2).pop().unwrap().list_element();
+            Demand::List(Box::new(Demand::List(Box::new(values))))
+        }
+        _ => return None,
+    })
+}
+
 /// Requests at original node and field positions, unioned over all readers.
 /// Identity requests are canonicalized to All; None stays None even on unit.
 /// Body results and shapes are retained for the forward rebuild.
@@ -228,6 +280,15 @@ impl DemandAnalysis {
 /// Check the entire graph, then find its requests without constructing a graph.
 /// Unread computations contribute no demand. Remaining patterns keep their full input;
 /// call `compile` first to remove them and expose narrower requests.
+///
+/// Rules pass a request through tuples, `field`, `unit`, literals, `enlist`, `ref`, `len`,
+/// list and sum maps, `gather`, `filter`, `cap_list`, `select` and `flatten`. Every other
+/// operator requests all of its input. That is exact for operators that read everything
+/// they are given (arithmetic, comparisons, text, host calls, `hash`, `range`, `iota`,
+/// reductions and sorts that order by the whole element). It is wider than needed for
+/// operators that carry part of their input through unread: `inject`, `branch`, `unwrap`,
+/// `cap_sum`, `append`, `zip`, `transpose`, `cut`, `chunk`, `weave`, `unweave`, `clone`,
+/// the carried value of `sort_by`, and the bodies of `fold` and `fold_scan`.
 pub fn analyze_demand(
     graph: &Graph<NumOp>,
     input: &Shape,
@@ -314,6 +375,10 @@ fn analyze(
                     bodies[id].push((*tag, analysis));
                 }
                 demands[node.inputs[0]].merge_unchecked(Demand::Sum(needs));
+            }
+            NodeKind::Op(NumOp::Core(op)) if matches!(op, Op::Gather | Op::Filter | Op::CapList | Op::Select | Op::Flatten) => {
+                let source = node.inputs[0];
+                demands[source].merge_unchecked(movement_demand(op, &shapes[source], demand).unwrap());
             }
             NodeKind::Op(_) => demands[node.inputs[0]].merge_unchecked(Demand::All),
         }

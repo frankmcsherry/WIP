@@ -65,6 +65,6 @@ pub fn narrow(
     let Compiled { graph, input } = compiled;
     let analysis = crate::analyze_demand(&graph, &input, output)?;
     let input_request = analysis.input_demand().clone();
-    let (graph, output) = passes::demand::rewrite_demand(graph, &analysis, &input_request)?;
+    let (graph, output) = passes::narrow::rewrite_demand(graph, &analysis, &input_request)?;
     Ok(Narrowed { graph: normalize(graph), input: input_request, output })
 }

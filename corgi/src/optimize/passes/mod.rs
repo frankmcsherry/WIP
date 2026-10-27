@@ -2,7 +2,7 @@
 //! (`cse`/`dce`) are vocabulary-agnostic in spirit; the semantic peephole pattern-
 //! matches core `Field`/`Tuple`, so it reaches through `NumOp::Core`.
 
-pub(crate) mod demand;
+pub(crate) mod narrow;
 
 use crate::graph::{Builder, Graph, Node, NodeKind, OpLike};
 use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred};

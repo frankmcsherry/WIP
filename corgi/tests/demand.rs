@@ -97,7 +97,28 @@ fn random_value(rng: &mut DemandRng, shape: &Shape, rows: usize) -> Value {
                 .collect();
             Value::sum(tags, values)
         }
+        Shape::Ref(list) => {
+            let arena = random_value(rng, list, 3);
+            let indices = (0..rows).map(|_| rng.below(3)).collect();
+            Value::Ref(std::sync::Arc::new(arena), std::sync::Arc::new(indices))
+        }
         _ => unreachable!("the test generator does not produce this shape"),
+    }
+}
+
+fn as_list(builder: &mut Builder<NumOp>, node: usize, shape: Shape) -> (usize, Shape) {
+    if let Shape::List(element) = shape { (node, *element) }
+    else { (builder.add(Op::Enlist, vec![node]), shape) }
+}
+
+fn gathered_shape(positions: &Shape, element: &Shape) -> Shape {
+    match positions {
+        Shape::Int => element.clone(),
+        Shape::Unit => Shape::Unit,
+        Shape::Prod(fields) => Shape::Prod(fields.iter().map(|s| gathered_shape(s, element)).collect()),
+        Shape::List(s) => Shape::List(Box::new(gathered_shape(s, element))),
+        Shape::Sum(lanes) => Shape::Sum(lanes.iter().map(|s| gathered_shape(s, element)).collect()),
+        _ => unreachable!("positions use integers and containers"),
     }
 }
 
@@ -111,15 +132,66 @@ fn random_graph(
     if depth == 0 {
         return (input, shape.clone());
     }
-    match rng.below(10) {
+    match rng.below(16) {
         0 => (input, shape.clone()),
         7 => (builder.tuple(vec![]), Shape::Unit),
-        9 => (builder.add(Op::Lit(Value::Prod(vec![])), vec![input]), Shape::Unit),
-        8 if matches!(shape, Shape::List(_)) => {
-            let empty = builder.tuple(vec![]);
-            let pair = builder.tuple(vec![empty, input]);
-            let captured = builder.add(Op::CapList, vec![pair]);
-            (builder.add(Op::Len, vec![captured]), Shape::Int)
+        8 => (builder.add(Op::Lit(Value::Prod(vec![])), vec![input]), Shape::Unit),
+        9 => {
+            let (context, context_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (list, element) = as_list(builder, payload, payload_shape);
+            let pair = builder.tuple(vec![context, list]);
+            (builder.add(Op::CapList, vec![pair]), Shape::List(Box::new(Shape::Prod(vec![context_shape, element]))))
+        }
+        10 => {
+            let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (list, element) = as_list(builder, payload, payload_shape);
+            let mut body = Builder::default();
+            let item = body.input();
+            let hash = body.add(Op::Hash, vec![item]);
+            let mask = body.add(ArithOp::BitsImm(BitOp::And, 1), vec![hash]);
+            let pair = body.tuple(vec![mask, item]);
+            let pairs = builder.add(Op::MapList(Box::new(body.finish(pair))), vec![list]);
+            (builder.add(Op::Filter, vec![pairs]), Shape::List(Box::new(element)))
+        }
+        11 => {
+            let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (mut list, element) = as_list(builder, payload, payload_shape);
+            if rng.below(2) == 0 { list = builder.add(Op::Ref, vec![list]); }
+            let positions = random_shape(rng, 2);
+            let indices = random_value(rng, &positions, 1);
+            let indices = builder.add(Op::Lit(indices), vec![input]);
+            let pair = builder.tuple(vec![indices, list]);
+            let output_shape = gathered_shape(&positions, &element);
+            (builder.add(Op::Gather, vec![pair]), output_shape)
+        }
+        12 => {
+            let (left, branch_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let right = if rng.below(3) == 0 { left } else {
+                let value = random_value(rng, &branch_shape, 1);
+                builder.add(Op::Lit(value), vec![input])
+            };
+            let hash = builder.add(Op::Hash, vec![input]);
+            let mask = builder.add(ArithOp::BitsImm(BitOp::And, 1), vec![hash]);
+            let args = builder.tuple(vec![mask, left, right]);
+            (builder.add(Op::Select, vec![args]), branch_shape)
+        }
+        13 => {
+            let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (list, element) = as_list(builder, payload, payload_shape);
+            let nested = builder.add(Op::Enlist, vec![list]);
+            let ranges = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
+            (builder.add(Op::Flatten, vec![nested]), Shape::Prod(vec![ranges, Shape::List(Box::new(element))]))
+        }
+        14 => {
+            let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
+            let (list, element) = as_list(builder, payload, payload_shape);
+            (builder.add(Op::Ref, vec![list]), Shape::Ref(Box::new(Shape::List(Box::new(element)))))
+        }
+        15 => {
+            let literal_shape = random_shape(rng, 2);
+            let value = random_value(rng, &literal_shape, 1);
+            (builder.add(Op::Lit(value), vec![input]), literal_shape)
         }
         1 => (builder.add(Op::Unit, vec![input]), Shape::Unit),
         2 => (builder.add(Op::Hash, vec![input]), Shape::Int),
@@ -172,6 +244,10 @@ fn random_request(rng: &mut DemandRng, shape: &Shape) -> Demand {
     match shape {
         Shape::Prod(fields) => Demand::Prod(fields.iter().map(|s| random_request(rng,s)).collect()),
         Shape::List(s) => Demand::List(Box::new(random_request(rng,s))),
+        Shape::Ref(list) => {
+            let Shape::List(element) = &**list else { unreachable!() };
+            Demand::Ref(Box::new(Demand::List(Box::new(random_request(rng, element)))))
+        }
         Shape::Sum(lanes) => Demand::Sum(lanes.iter().map(|s| random_request(rng,s)).collect()),
         _ => Demand::All,
     }
@@ -195,9 +271,32 @@ fn check(graph: &Graph<NumOp>, input: Value, request: &Demand) -> (Graph<NumOp>,
     (rewritten, need)
 }
 
+fn random_coverage(graph: &Graph<NumOp>, present: &mut [bool; 8]) {
+    for node in graph.nodes() {
+        match node {
+            NodeRef::Tuple([]) => present[7] = true,
+            NodeRef::Op(op, _) => {
+                match op {
+                    NumOp::Core(Op::Gather) => present[0] = true,
+                    NumOp::Core(Op::Filter) => present[1] = true,
+                    NumOp::Core(Op::CapList) => present[2] = true,
+                    NumOp::Core(Op::Select) => present[3] = true,
+                    NumOp::Core(Op::Flatten) => present[4] = true,
+                    NumOp::Core(Op::Ref) => present[5] = true,
+                    NumOp::Core(Op::Lit(_)) => present[6] = true,
+                    _ => {}
+                }
+                for body in op.children() { random_coverage(body, present); }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[test]
 fn random_demand_rewrites_preserve_values() {
     let cases = std::env::var("CORGI_DEMAND_CASES").map(|s| s.parse::<u64>().unwrap()).unwrap_or(200);
+    let mut counts = [0; 8];
     for seed in 1..=cases {
         let mut rng = DemandRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let shape = random_shape(&mut rng, 2);
@@ -207,12 +306,18 @@ fn random_demand_rewrites_preserve_values() {
         let root = builder.input();
         let (output, output_shape) = random_graph(&mut builder, root, &shape, &mut rng, 4);
         let graph = builder.finish(output);
+        let mut present = [false; 8];
+        random_coverage(&graph, &mut present);
+        for (count, present) in counts.iter_mut().zip(present) { *count += usize::from(present); }
         let request = random_request(&mut rng, &output_shape);
         check(&graph, Value::empty(&shape), &request);
         check(&graph, input.clone(), &Demand::All);
         check(&graph, input, &request);
     }
-    println!("{cases} seeds; {} comparisons", cases * 3);
+    println!("{cases} seeds; {} comparisons; graphs containing each op:", cases * 3);
+    for (name, count) in ["Gather", "Filter", "CapList", "Select", "Flatten", "Ref", "Lit", "empty Tuple"].into_iter().zip(counts) {
+        println!("{name}: {count}");
+    }
 }
 
 #[test]
@@ -285,4 +390,106 @@ fn literal_anchors_and_reference_boundaries() {
     assert_eq!(need,Demand::List(Box::new(Demand::List(Box::new(Demand::None)))));
     let mut b=Builder::<NumOp>::default();b.input();let empty=b.tuple(vec![]);let lit=b.add(Op::Lit(Value::i64(vec![7])),vec![empty]);
     check(&b.finish(lit),Value::Unit(3),&Demand::All);
+}
+
+#[test]
+fn movement_preserves_witnesses_and_projects_shared_payloads() {
+    let pair = Value::Prod(vec![Value::i64(vec![10, 20, 30]), Value::i64(vec![40, 50, 60])]);
+    let filtered_input = Value::List(vec![0, 2, 3].into(), Box::new(Value::Prod(vec![
+        Value::i64(vec![1, 0, 1]), pair.clone(),
+    ])));
+    let filter = parse_ml("input filter").unwrap();
+    let second_field = Demand::Prod(vec![Demand::None, Demand::All]);
+    let second_payload = Demand::List(Box::new(second_field.clone()));
+    check(&filter, filtered_input.clone(), &second_payload);
+    check(&filter, Value::empty(&shape_of_value(&filtered_input)), &second_payload);
+    let bounds_only = Demand::List(Box::new(Demand::None));
+    check(&filter, filtered_input.clone(), &bounds_only);
+
+    let rows = Value::List(vec![0, 2, 3].into(), Box::new(pair.clone()));
+    let capture_input = Value::Prod(vec![pair.clone(), rows]);
+    let capture = parse_ml("input cap_list").unwrap();
+    let payload_without_context = Demand::List(Box::new(Demand::Prod(vec![Demand::None, second_field])));
+    check(&capture, capture_input.clone(), &payload_without_context);
+    check(&capture, Value::empty(&shape_of_value(&capture_input)), &payload_without_context);
+    check(&capture, capture_input, &bounds_only);
+
+    // Both operands are unit-shaped, but neither output field was requested.
+    let mut builder = Builder::<NumOp>::default();
+    let input = builder.input();
+    let context = builder.add(Op::Unit, vec![input]);
+    let empty = builder.tuple(vec![]);
+    let list = builder.add(Op::Enlist, vec![empty]);
+    let operands = builder.tuple(vec![context, list]);
+    let captured = builder.add(Op::CapList, vec![operands]);
+    let graph = builder.finish(captured);
+    let unread_fields = Demand::List(Box::new(Demand::Prod(vec![Demand::None, Demand::None])));
+    check(&graph, Value::Unit(3), &unread_fields);
+    check(&graph, Value::Unit(0), &unread_fields);
+    let compiled = compile(graph, &Shape::Unit).unwrap();
+    let narrowed = narrow(compiled, &unread_fields).unwrap();
+    assert_eq!(narrowed.output, unread_fields);
+    assert_eq!(shape_of(&narrowed.graph, &Shape::Unit).unwrap(), Shape::List(Box::new(Shape::Unit)));
+
+    let nested = Value::List(vec![0, 2].into(), Box::new(Value::List(vec![0, 3].into(), Box::new(pair))));
+    let flatten = parse_ml("input flatten").unwrap();
+    let ranges_only = Demand::Prod(vec![Demand::All, Demand::None]);
+    check(&flatten, nested.clone(), &ranges_only);
+    check(&flatten, Value::empty(&shape_of_value(&nested)), &ranges_only);
+    let values_only = Demand::Prod(vec![Demand::None, second_payload]);
+    check(&flatten, nested, &values_only);
+
+    let shared = parse_ml("let f = input filter in (input, f map (x -> x.1))").unwrap();
+    check(&shared, filtered_input, &Demand::All);
+
+    // The success tag survives even when the parsed payload is not read.
+    let select = parse_ml("(input.0, input.1 parse_int, input.2 parse_int) select").unwrap();
+    let bytes = Value::List(vec![1, 2, 2].into(), Box::new(Value::u8(b"4x".to_vec())));
+    let alternatives = Value::Prod(vec![Value::i64(vec![1, 0, 1]), bytes.clone(), bytes]);
+    let tags_only = Demand::Sum(vec![Demand::None, Demand::None]);
+    check(&select, alternatives, &tags_only);
+}
+
+#[test]
+fn gather_references_misses_and_unequal_position_requests() {
+    let arena = Value::List(vec![2, 2, 5].into(), Box::new(Value::Prod(vec![
+        Value::i64(vec![1, 2, 3, 4, 5]),
+        Value::i64(vec![11, 12, 13, 14, 15]),
+        Value::i64(vec![21, 22, 23, 24, 25]),
+    ])));
+    let references = Value::Ref(std::sync::Arc::new(arena.clone()), std::sync::Arc::new(vec![2, 0, 2]));
+    let positions = Value::Prod(vec![
+        Value::i64(vec![1, -1, 9]),
+        Value::List(vec![0, 2, 3].into(), Box::new(Value::i64(vec![0, 8, 2]))),
+    ]);
+    let first_field = Demand::Prod(vec![Demand::All, Demand::None, Demand::None]);
+    let last_field = Demand::Prod(vec![Demand::None, Demand::None, Demand::All]);
+    let unequal_requests = Demand::Prod(vec![first_field, Demand::List(Box::new(last_field))]);
+    let positions_only = Demand::Prod(vec![Demand::None, Demand::List(Box::new(Demand::None))]);
+
+    let gather_incoming = parse_ml("input gather").unwrap();
+    let incoming = Value::Prod(vec![positions.clone(), references]);
+    let (_, incoming_request) = check(&gather_incoming, incoming.clone(), &unequal_requests);
+    assert_eq!(incoming_request, Demand::All);
+    check(&gather_incoming, Value::empty(&shape_of_value(&incoming)), &unequal_requests);
+    check(&gather_incoming, incoming, &positions_only);
+
+    let gather_created = parse_ml("(input.0, input.1 ref) gather").unwrap();
+    let created = Value::Prod(vec![positions, arena]);
+    let (_, created_request) = check(&gather_created, created.clone(), &unequal_requests);
+    let retained_payload = Demand::Prod(vec![Demand::All, Demand::None, Demand::All]);
+    assert_eq!(created_request, Demand::Prod(vec![Demand::All, Demand::List(Box::new(retained_payload))]));
+    check(&gather_created, Value::empty(&shape_of_value(&created)), &unequal_requests);
+    check(&gather_created, created, &positions_only);
+
+    // The returned reference keeps its arena. The other reader drops excess
+    // fields after gathering from it, without copying the arena.
+    let shared = parse_ml("let r = input.1 ref in (r, (input.0, r) gather map (x -> x.2))").unwrap();
+    let input = Value::Prod(vec![
+        Value::List(vec![1, 1, 2].into(), Box::new(Value::i64(vec![0, 1]))),
+        Value::List(vec![1, 1, 2].into(), Box::new(Value::Prod(vec![
+            Value::i64(vec![1, 2]), Value::i64(vec![3, 4]), Value::i64(vec![5, 6]),
+        ]))),
+    ]);
+    check(&shared, input, &Demand::All);
 }
