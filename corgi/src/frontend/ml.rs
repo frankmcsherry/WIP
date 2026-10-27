@@ -81,7 +81,7 @@
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::{CmpOp, NumOp, Op, Pattern};
+use crate::ops::{CmpOp, NumOp, Op, Pattern, Pred};
 use crate::shape::Shape;
 use crate::value::{Prim, Scalar, Value};
 use std::collections::HashMap;
@@ -1038,17 +1038,20 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             }
             lower(body, &env2, b)
         }
-        // `(c1, c2, ..) all`: every condition holds; `any`: one does. Conditions are masks (0 or 1,
-        // as comparisons give), so these are `min` and `max` along the tuple as written.
+        // `(c1, c2, ..) all`: every condition holds; `any`: one does. Normalize nonzero masks
+        // to 1 before taking `min` or `max` along the tuple as written.
         E::Pipe(e, Apply::Op(name, None)) if name == "all" || name == "any" => {
             let E::Tuple(conds) = &**e else {
                 return Err(format!("'{name}' takes a tuple of conditions, written out: (c1, c2, ..) {name}"));
             };
             let op = if name == "all" { CmpOp::Min } else { CmpOp::Max };
+            let normalize = CmpOp::RelImm(Pred::Ne, Scalar::Int(0));
             let (first, rest) = conds.split_first().ok_or_else(|| format!("'{name}' of no conditions"))?;
-            let mut acc = lower(first, env, b)?;
+            let first = lower(first, env, b)?;
+            let mut acc = b.add(normalize.clone(), vec![first]);
             for c in rest {
                 let c = lower(c, env, b)?;
+                let c = b.add(normalize.clone(), vec![c]);
                 let pair = b.tuple(vec![acc, c]);
                 acc = b.add(op.clone(), vec![pair]);
             }

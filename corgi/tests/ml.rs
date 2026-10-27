@@ -461,6 +461,38 @@ fn all_and_any_of_written_conditions() {
 }
 
 #[test]
+fn tuple_masks_use_nonzero_truth() {
+    for (fields, all, any) in [("-1, 0", 0, 1), ("-1, 2", 1, 1), ("0, 0", 0, 0), ("-1", 1, 1), ("0", 0, 0)] {
+        for (op, expected) in [("all", all), ("any", any)] {
+            let src = format!("(({fields}) {op}, [{fields}] fold_{op})");
+            let graph = parse_ml(&src).unwrap();
+            for graph in [graph.clone(), corgi::optimize(&graph)] {
+                let p = Program::from_graph(graph);
+                assert_eq!(p.shape(&Shape::Int), Ok(Shape::Prod(vec![Shape::Int; 2])));
+                assert_eq!(p.run(int(&[0])), Value::Prod(vec![int(&[expected]); 2]), "{src}");
+            }
+        }
+    }
+    // Written fields may read tuple-valued input, with both integer storages and values beyond 0/1.
+    let input = Value::Prod(vec![int(&[-1, 0, 2, i64::MIN]), Value::u8(vec![0, 2, 255, 1])]);
+    for (op, expected) in [("all", vec![0, 0, 1, 1]), ("any", vec![1, 1, 1, 1])] {
+        let graph = parse_ml(&format!("(input.0, input.1) {op}")).unwrap();
+        for graph in [graph.clone(), corgi::optimize(&graph)] {
+            let p = Program::from_graph(graph);
+            assert_eq!(p.shape(&Shape::Prod(vec![Shape::Int; 2])), Ok(Shape::Int));
+            assert_eq!(p.run(input.clone()), Value::u8(expected.clone()));
+            for shape in [Shape::Unit, Shape::Int, Shape::Prod(vec![]), Shape::Prod(vec![Shape::Int, Shape::Float])] {
+                assert!(p.shape(&shape).is_err(), "{op}: {shape}");
+            }
+        }
+        for src in [format!("input {op}"), format!("let p = (1, 1) in p {op}"), format!("input map (w -> w {op})")] {
+            assert!(parse_ml(&src).unwrap_err().contains("conditions, written out"), "{src}");
+        }
+        assert!(parse_ml(&format!("() {op}")).is_err());
+    }
+}
+
+#[test]
 fn try_zip_checks_every_list() {
     for (src, expected) in [
         ("[([1,2], [3,4], [5]), ([1], [2], [3,4]), ([], [], []), ([1], [2], [3])] map (p -> (p.0, p.1, p.2) try_zip match (0 (zs -> zs len), 1 (_ -> -1)))", "List ends=[4] <[-1, -1, 0, 1]>"),
