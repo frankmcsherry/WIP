@@ -36,3 +36,31 @@ fn immediates_keep_wide_literals() {
     let wide = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Arith(ArithOp::BinImm(_, crate::Scalar::Int(c)))) if *c == big);
     assert!(any_node(&g, &wide), "the immediate lost its high bits");
 }
+
+#[test]
+fn checked_patterns_include_dead_code_and_nested_bodies() {
+    use crate::{eval_graph, parse_ml, shape_of, Shape, Value};
+    let mut b = Builder::<NumOp>::default();
+    let x = b.input();
+    b.add(Op::Pattern(Pattern::List(Box::new(Pattern::Any))), vec![x]);
+    assert!(crate::compile(b.finish(x), &Shape::Int).is_err());
+
+    let g = parse_ml("input map ((a, b) -> (a, b))").unwrap();
+    let shape = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
+    let clean = crate::compile(g.clone(), &shape).unwrap();
+    fn no_patterns(g: &Graph<NumOp>) {
+        for node in g.nodes() {
+            if let crate::NodeRef::Op(op, _) = node {
+                assert!(!matches!(op, NumOp::Core(Op::Pattern(_))));
+                for child in op.children() { no_patterns(child); }
+            }
+        }
+    }
+    assert_eq!(clean.input(), &shape);
+    no_patterns(clean.graph());
+    assert_eq!(shape_of(clean.graph(), &shape), shape_of(&g, &shape));
+    let input = Value::List(vec![0, 2].into(), Box::new(Value::Prod(vec![
+        Value::i64(vec![3, 4]), Value::i64(vec![5, 6]),
+    ])));
+    assert_eq!(eval_graph(clean.graph(), input.clone()), eval_graph(&g, input));
+}

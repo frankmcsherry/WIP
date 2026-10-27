@@ -26,7 +26,7 @@
 //! `compact_unit_fields` restricts that change to selected top-level fields, such as a join's values rather than its key.
 //! Corgi establishes equivalence at the lambda boundary; the enclosing operator decides whether the projection can move farther upstream.
 
-use crate::graph::{shape_of, Builder, Graph, Node, NodeKind, OpLike};
+use crate::graph::{node_shapes, shape_of, Builder, Graph, Node, NodeKind, OpLike};
 use crate::ops::{NumOp, Op, Pattern};
 use crate::optimize::{dce, fuse_maps, peephole};
 use crate::shape::{shape_of_value, Shape};
@@ -470,7 +470,7 @@ fn prune_graph(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape) -
 }
 
 fn prune_graph_once(graph: &Graph<NumOp>, input: &Shape, output_projection: &Shape, specialize_maps: bool) -> Result<Graph<NumOp>, String> {
-    let shapes = graph_shapes(graph, input)?;
+    let shapes = node_shapes(graph, input)?;
     let output = shapes.get(graph.output).ok_or("graph has no output")?;
     let projected = NumOp::Core(Op::Project(output_projection.clone())).eval(Value::empty(output))?;
     if shape_of_value(&projected) != *output_projection {
@@ -606,29 +606,13 @@ fn prune_output(
     Ok(result)
 }
 
-fn graph_shapes(graph: &Graph<NumOp>, input: &Shape) -> Result<Vec<Shape>, String> {
-    // Keep each intermediate shape: a Field needs the arity of its own input, not the root's.
-    let mut values: Vec<Value> = Vec::with_capacity(graph.nodes.len());
-    for node in &graph.nodes {
-        let value = match &node.kind {
-            NodeKind::Input => Value::empty(input),
-            NodeKind::Tuple if node.inputs.is_empty() => Value::Unit(0),
-            NodeKind::Tuple => {
-                Value::Prod(node.inputs.iter().map(|&i| values[i].clone()).collect())
-            }
-            NodeKind::Op(op) => op.eval(values[node.inputs[0]].clone())?,
-        };
-        values.push(value);
-    }
-    Ok(values.iter().map(shape_of_value).collect())
-}
 
 fn input_demand(
     graph: &Graph<NumOp>,
     input: &Shape,
     output_demand: Demand,
 ) -> Result<(Demand, Shape), String> {
-    let shapes = graph_shapes(graph, input)?;
+    let shapes = node_shapes(graph, input)?;
     let output = shapes[graph.output].clone();
 
     let mut demands = vec![Demand::None; graph.nodes.len()];

@@ -55,6 +55,14 @@ fn rewrite_graph(
     Graph { nodes: built, output: remap[g.output] }
 }
 
+/// Erase pattern assertions after the complete graph has been checked.
+pub(super) fn strip_patterns(graph: Graph<NumOp>) -> Graph<NumOp> {
+    rewrite_graph(graph, strip_patterns, |kind, inputs, _, _| {
+        matches!(kind, NodeKind::Op(NumOp::Core(Op::Pattern(_))))
+            .then(|| Rewrite::Redirect(inputs[0]))
+    })
+}
+
 /// hash-consing: fold structurally-identical nodes into one.
 pub fn cse(g: Graph<NumOp>) -> Graph<NumOp> {
     let mut new_nodes: Vec<Node<NumOp>> = Vec::with_capacity(g.nodes.len());
