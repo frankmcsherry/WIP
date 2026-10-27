@@ -530,6 +530,7 @@ normalizes without input shapes; scalar folding runs before immediate lowering i
 `compile(Graph, &Shape) -> Result<Compiled, String>` checks the whole graph at its input
 type, strips checked patterns (including in bodies), then normalizes. `Compiled`
 keeps the graph and checked input type together, with read-only accessors.
+`analyze_demand` reports requests in original field positions without rebuilding.
 
 `Program::from_graph` wraps its graph unchanged. ML compilation calls `optimize`
 explicitly; callers supplying graphs choose their own normalization step.

@@ -1079,3 +1079,29 @@ fn random_demand_rewrites_preserve_values() {
     assert!(projected_inputs > 0);
     assert!(compacted_inputs > 0);
 }
+
+#[test]
+fn analysis_unions_readers_and_skips_row_count_computations() {
+    use corgi::{analyze_demand, Demand};
+    let mut b = Builder::<NumOp>::default();
+    let x = b.input();
+    let dead = b.add(Op::Hash, vec![x]);
+    let a = b.add(Op::Field(0), vec![x]);
+    let c = b.add(Op::Field(2), vec![x]);
+    let constant = b.add(Op::Lit(Value::i64(vec![7])), vec![dead]);
+    let output = b.tuple(vec![a, c, constant]);
+    let graph = b.finish(output);
+    let shape = Shape::Prod(vec![Shape::Int; 3]);
+    let analysis = analyze_demand(&graph, &shape, &Demand::All).unwrap();
+    assert_eq!(analysis.input_demand(), &Demand::Prod(vec![Demand::All, Demand::None, Demand::All]));
+    assert_eq!(analysis.node_demands()[dead], Demand::None);
+    assert_eq!(analysis.input_demand().projected_shape(&shape).unwrap(), Shape::Prod(vec![Shape::Int; 2]));
+
+    let mut b = Builder::default();
+    let x = b.input();
+    let mapped = b.add(Op::MapList(Box::new(graph)), vec![x]);
+    let graph = b.finish(mapped);
+    let analysis = analyze_demand(&graph, &Shape::List(Box::new(shape)), &Demand::All).unwrap();
+    assert_eq!(analysis.input_demand(), &Demand::List(Box::new(Demand::Prod(vec![Demand::All, Demand::None, Demand::All]))));
+    assert!(analyze_demand(&graph, &Shape::Int, &Demand::None).is_err());
+}
