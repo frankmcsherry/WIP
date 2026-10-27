@@ -49,7 +49,7 @@ pub enum CmpOp {
     Rel(Pred), // (X, X) -> Int mask   compare row by row in structural order: leaves lane-wise by
                // value, lists/products/sums as `sort` orders them. The mask is 0/1, held as bytes.
     RelImm(Pred, Scalar), // X -> Int mask   `x pred c`, `c` a constant of x's kind
-    ListImm(Pred, Prim), // List<X> -> Int mask   `xs eq c` or `xs ne c`, `c` a constant list of leaves
+    ListImm(bool, Prim), // List<X> -> Int mask   `xs eq c` (false) or `xs ne c` (true), c a list of leaves
                // of xs's kind (a string literal, say): each row's length against c's, and only the
                // rows whose length agrees read their elements, against c's
     Min,       // (X, X) -> X   lane-wise minimum, by value
@@ -103,12 +103,12 @@ impl CmpOp {
                 Value::u8(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
-            CmpOp::ListImm(pred, c) => {
+            CmpOp::ListImm(ne, c) => {
                 // a list, as the pair `(xs, c) eq` takes: a referenced list there is a shape error
                 let Value::List(bounds, vals) = &input else {
                     return Err(format!("compare with a constant list: {} against {c:?}", shape_of_value(&input)));
                 };
-                let ne = matches!(pred, Pred::Ne);
+                let ne = *ne;
                 Value::u8(match (&**vals, c) {
                     (Value::Prim(Prim::U8(x)), Prim::U8(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
                     (Value::Prim(Prim::I64(x)), Prim::I64(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
