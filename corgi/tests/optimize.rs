@@ -192,6 +192,7 @@ fn singleton_map_is_inlined_but_shared_producers_stay_shared() {
 #[test]
 fn scalar_folding_keeps_float_payload_bits() {
     use corgi::{ArithOp, BinOp};
+    let bits_of = |v: Value| v.as_f64("test").unwrap().into_iter().map(f64::to_bits).collect::<Vec<_>>();
     let bits = [0, 1 << 63, 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000,
         0x7ff8_0000_0000_1234, 0x7ff8_0000_0000_5678, 0xfff0_0000_0000_0001];
     for left in bits {
@@ -205,9 +206,11 @@ fn scalar_folding_keeps_float_payload_bits() {
                 let out = b.add(ArithOp::Bin(op), vec![pair]);
                 let graph = b.finish(out);
                 let rewritten = optimize(&graph);
-                for n in [0, 1, 17] {
+                for n in [0, 1, 2, 3, 4, 8, 17, 64] {
                     let value = Value::Unit(n);
-                    assert_eq!(corgi::eval_graph(&graph, value.clone()), corgi::eval_graph(&rewritten, value));
+                    let raw = bits_of(corgi::eval_graph(&graph, value.clone()));
+                    let folded = bits_of(corgi::eval_graph(&rewritten, value));
+                    assert_eq!(raw, folded, "{op:?}: {left:016x}, {right:016x}, {n} rows");
                 }
             }
         }

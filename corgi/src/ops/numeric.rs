@@ -6,7 +6,8 @@
 //! Two leaves carry numbers. `Int` is an integer: arithmetic on it means integer arithmetic, and
 //! it is exact within `i64` (past that it wraps, the one documented edge for now; truncating
 //! division, `x / 0 = 0` and `x % 0 = x`, so nothing fails on data). `Float` is an `f64`, with IEEE
-//! arithmetic. The plain ops (`add`, `mul`, ..) take either, two of one kind; a mix is a shape
+//! arithmetic, with computed NaNs replaced by the positive quiet NaN `0x7ff8_0000_0000_0000`.
+//! The plain ops (`add`, `mul`, ..) take either, two of one kind; a mix is a shape
 //! error. Integers a program wants to treat as 64-bit words (hashing, bit banging) use the `_b64`
 //! verbs, the shifts and the bitwise ops ([`BitOp`], [`ShiftOp`]): each takes the low 64 bits of
 //! its operands, does the `u64` operation, and reads the result back as an `i64`.
@@ -15,7 +16,7 @@ use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
-use crate::value::{f64_key, f64_of_key, Prim, Scalar, Value};
+use crate::value::{f64_key, f64_of_key, f64_result_key, Prim, Scalar, Value};
 use std::sync::Arc;
 
 /// the named monoid reductions — `List<Int> -> Int` or `List<Float> -> Float` per row, each a
@@ -170,14 +171,14 @@ macro_rules! int_body {
 }
 
 /// `$apply(args.., body)` with the float lane body of `$op`, on total-order keys (decode, IEEE op,
-/// encode); `rem` is integer-only. Matched once, as `int_body`.
+/// canonicalize NaNs, encode); `rem` is integer-only. Matched once, as `int_body`.
 macro_rules! float_body {
     ($op:expr, $apply:ident($($arg:expr),*)) => {
         match $op {
-            BinOp::Add => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) + f64_of_key(y))),
-            BinOp::Sub => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) - f64_of_key(y))),
-            BinOp::Mul => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) * f64_of_key(y))),
-            BinOp::Div => $apply($($arg,)* |x: u64, y: u64| f64_key(f64_of_key(x) / f64_of_key(y))),
+            BinOp::Add => $apply($($arg,)* |x: u64, y: u64| f64_result_key(f64_of_key(x) + f64_of_key(y))),
+            BinOp::Sub => $apply($($arg,)* |x: u64, y: u64| f64_result_key(f64_of_key(x) - f64_of_key(y))),
+            BinOp::Mul => $apply($($arg,)* |x: u64, y: u64| f64_result_key(f64_of_key(x) * f64_of_key(y))),
+            BinOp::Div => $apply($($arg,)* |x: u64, y: u64| f64_result_key(f64_of_key(x) / f64_of_key(y))),
             BinOp::Rem => return Err("rem is integer-only".into()),
         }
     };
@@ -435,8 +436,8 @@ fn reduce_floats(bounds: &crate::value::Bounds, ks: &[u64], r: Red) -> Result<Va
     });
     let zero = f64_key(0.0);
     let out: Vec<u64> = match r {
-        Red::Add => rows.map(|s| f64_key(s.iter().fold(0.0, |a, &k| a + f64_of_key(k)))).collect(),
-        Red::Mul => rows.map(|s| f64_key(s.iter().fold(1.0, |a, &k| a * f64_of_key(k)))).collect(),
+        Red::Add => rows.map(|s| f64_result_key(s.iter().fold(0.0, |a, &k| a + f64_of_key(k)))).collect(),
+        Red::Mul => rows.map(|s| f64_result_key(s.iter().fold(1.0, |a, &k| a * f64_of_key(k)))).collect(),
         Red::Min => rows.map(|s| s.iter().copied().min().unwrap_or(zero)).collect(),
         Red::Max => rows.map(|s| s.iter().copied().max().unwrap_or(zero)).collect(),
         Red::All | Red::Any => return Err("fold_all and fold_any read a mask, which is an Int, not a Float".into()),
@@ -480,11 +481,12 @@ impl ArithOp {
             ArithOp::ImmBits(c, op) => Value::Prim(bits_imm(*op, input.into_prim("bitwise with a constant")?, *c, true)?),
             ArithOp::Shift(op, k) => Value::Prim(shift_eval(*op, input.into_prim("shift")?, *k)?),
             ArithOp::Neg => Value::Prim(match input.into_prim("neg")? {
-                Prim::F64(v) => Prim::F64(map_into(v, |k| f64_key(-f64_of_key(k)))),
+                Prim::F64(v) => Prim::F64(map_into(v, |k| f64_result_key(-f64_of_key(k)))),
                 p => int_map(p, |x: i64| x.wrapping_neg()),
             }),
             ArithOp::ToFloat => {
                 let xs = input.as_i64("to_float")?;
+                // An integer-to-float conversion cannot produce a NaN.
                 Value::f64(xs.iter().map(|&x| x as f64).collect())
             }
             ArithOp::Reduce(r) => {
@@ -502,7 +504,7 @@ impl ArithOp {
                     // encodes; a running least or greatest compares the keys.
                     Prim::F64(ks) => {
                         let mut ks = Arc::unwrap_or_clone(ks);
-                        let float = |f: fn(f64, f64) -> f64| move |a: u64, k: u64| f64_key(f(f64_of_key(a), f64_of_key(k)));
+                        let float = |f: fn(f64, f64) -> f64| move |a: u64, k: u64| f64_result_key(f(f64_of_key(a), f64_of_key(k)));
                         match r {
                             Red::Add => prefix_rows(&bounds, &mut ks, f64_key(0.0), float(|a, x| a + x)),
                             Red::Mul => prefix_rows(&bounds, &mut ks, f64_key(1.0), float(|a, x| a * x)),
@@ -598,5 +600,19 @@ impl From<ArithOp> for NumOp {
 impl From<TextOp> for NumOp {
     fn from(t: TextOp) -> Self {
         NumOp::Text(t)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn nan_results_agree_across_buffer_ownership() {
+    let a = Arc::new(vec![f64_key(f64::from_bits(0xfff8_0000_0000_1234)); 17]);
+    let b = Arc::new(vec![f64_key(f64::from_bits(0x7ff8_0000_0000_5678)); 17]);
+    for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div] {
+        // Reuse the left buffer, reuse the right buffer, or allocate when both are shared.
+        for (a, b) in [(Arc::new((*a).clone()), b.clone()), (a.clone(), Arc::new((*b).clone())), (a.clone(), b.clone())] {
+            let result = Value::Prim(bin_eval(op, Prim::F64(a), Prim::F64(b)).unwrap());
+            assert_eq!(result, Value::f64(vec![f64::from_bits(0x7ff8_0000_0000_0000); 17]));
+        }
     }
 }

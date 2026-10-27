@@ -360,6 +360,13 @@ pub(crate) fn f64_key(f: f64) -> u64 {
     let b = f.to_bits();
     if b >> 63 == 1 { !b } else { b ^ SIGN }
 }
+
+/// A computed float result as an order key. NaNs lose their sign and payload; input data
+/// uses `f64_key` directly and keeps every bit.
+pub(crate) fn f64_result_key(f: f64) -> u64 {
+    f64_key(if f.is_nan() { f64::from_bits(0x7ff8_0000_0000_0000) } else { f })
+}
+
 /// the `f64` whose key is `k`.
 pub(crate) fn f64_of_key(k: u64) -> f64 {
     f64::from_bits(if k >> 63 == 1 { k ^ SIGN } else { !k })
