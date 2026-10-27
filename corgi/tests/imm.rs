@@ -28,7 +28,7 @@ fn run_pair(src: &str, input: Value) -> Value {
 
 /// nodes left once the rewrite and dead-node sweep have run: `input` plus one immediate op is 2.
 fn nodes_after(src: &str) -> usize {
-    dce(&immediates(&parse_ml(src).unwrap())).node_count()
+    dce(immediates(parse_ml(src).unwrap())).node_count()
 }
 
 /// the storages a leaf column comes in.

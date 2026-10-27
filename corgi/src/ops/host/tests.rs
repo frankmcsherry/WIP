@@ -92,7 +92,7 @@ fn cse_merges_calls_of_one_kernel_only() {
     let g = b.finish(out);
     let hosts = |g: &crate::Graph<NumOp>| g.nodes.iter().filter(|n| matches!(n.kind, crate::graph::NodeKind::Op(NumOp::Host(_)))).count();
     assert_eq!(hosts(&g), 3);
-    assert_eq!(hosts(&crate::cse(&g)), 2);
+    assert_eq!(hosts(&crate::cse(g)), 2);
 }
 
 #[test]

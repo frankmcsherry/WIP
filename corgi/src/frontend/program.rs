@@ -29,7 +29,7 @@ impl Program {
     /// What runs is the graph with constant operands made immediates and unreachable nodes dropped
     /// (both exact).
     pub fn from_graph(graph: Graph<NumOp>) -> Program {
-        Program { graph: dce(&immediates(&graph)) }
+        Program { graph: dce(immediates(graph)) }
     }
 
     /// the output shape for a given input shape.

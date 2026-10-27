@@ -76,7 +76,7 @@ fn list_col<B, T: AsRef<[B]>>(rows: &[T], values: impl FnOnce(&[T]) -> Value) ->
 
 /// the graph a `Program` runs for `src`: constants as immediates, dead nodes dropped.
 pub fn lowered(src: &str) -> Graph<NumOp> {
-    dce(&immediates(&parse_ml(src).unwrap_or_else(|e| panic!("parse: {e}"))))
+    dce(immediates(parse_ml(src).unwrap_or_else(|e| panic!("parse: {e}"))))
 }
 
 /// best wall time of `f` over enough runs to take about 0.3 s (at least 3).
