@@ -132,6 +132,24 @@ pub fn shape_of<O: OpLike>(g: &Graph<O>, input: &Shape) -> Result<Shape, String>
     try_eval_graph(g, Value::empty(input)).map(|v| shape_of_value(&v))
 }
 
+/// Check every node, including dead code and closed bodies, and retain its shape.
+pub(crate) fn node_shapes<O: OpLike>(graph: &Graph<O>, input: &Shape) -> Result<Vec<Shape>, String> {
+    // Keep each intermediate shape: a Field needs the arity of its own input, not the root's.
+    let mut values: Vec<Value> = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        let value = match &node.kind {
+            NodeKind::Input => Value::empty(input),
+            NodeKind::Tuple if node.inputs.is_empty() => Value::Unit(0),
+            NodeKind::Tuple => {
+                Value::Prod(node.inputs.iter().map(|&i| values[i].clone()).collect())
+            }
+            NodeKind::Op(op) => op.eval(values[node.inputs[0]].clone())?,
+        };
+        values.push(value);
+    }
+    Ok(values.iter().map(shape_of_value).collect())
+}
+
 pub struct Builder<O> {
     nodes: Vec<Node<O>>,
 }
