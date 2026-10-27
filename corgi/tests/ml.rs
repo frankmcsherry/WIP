@@ -460,6 +460,39 @@ fn all_and_any_of_written_conditions() {
     assert!(Program::compile_ml("input map (w -> w all)").is_err());
 }
 
+#[test]
+fn try_zip_checks_every_list() {
+    for (src, expected) in [
+        ("[([1,2], [3,4], [5]), ([1], [2], [3,4]), ([], [], []), ([1], [2], [3])] map (p -> (p.0, p.1, p.2) try_zip match (0 (zs -> zs len), 1 (_ -> -1)))", "List ends=[4] <[-1, -1, 0, 1]>"),
+        ("([1,2], [3,4], [5,6], [7]) try_zip match (0 (zs -> zs len), 1 (_ -> -1))", "[-1]"),
+        ("([1,2], [3.0,4.0], [(),()]) try_zip match (0 (zs -> zs len), 1 (_ -> -1))", "[2]"),
+        ("([1,2]) try_zip match (0 (zs -> zs len), 1 (_ -> -1))", "[2]"),
+        ("([] : List(int)) try_zip match (0 (zs -> zs len), 1 (_ -> -1))", "[0]"),
+        ("[([1,2], [3]), ([], []), ([1], [2])] map (p -> p try_zip match (0 (zs -> zs len), 1 (_ -> -1)))", "List ends=[3] <[-1, 0, 1]>"),
+    ] {
+        let graph = parse_ml(src).unwrap();
+        for graph in [graph.clone(), corgi::optimize(&graph)] {
+            let p = Program::from_graph(graph);
+            p.shape(&Shape::Int).unwrap();
+            assert_eq!(show(&p.run(int(&[0]))), expected, "{src}");
+        }
+    }
+    for src in ["() try_zip", "([1], [2], 3) try_zip", "let p = ([1], [2], [3]) in p try_zip", "let p = ([1]) in p try_zip"] {
+        let graph = parse_ml(src).unwrap();
+        for graph in [graph.clone(), corgi::optimize(&graph)] {
+            assert!(Program::from_graph(graph).shape(&Shape::Int).is_err(), "{src}");
+        }
+    }
+    let graph = parse_ml("input try_zip").unwrap();
+    for graph in [graph.clone(), corgi::optimize(&graph)] {
+        let p = Program::from_graph(graph);
+        for n in [0, 1, 3, 4] {
+            assert!(p.shape(&Shape::Prod(vec![Shape::List(Box::new(Shape::Int)); n])).is_err());
+        }
+        assert!(p.shape(&Shape::Prod(vec![Shape::List(Box::new(Shape::Int)); 2])).is_ok());
+    }
+}
+
 /// shape errors from typing `src` against `input`'s shape.
 fn shape_err(src: &str, input: &Shape) -> String {
     Program::compile_ml(src).expect("parse error").shape(input).expect_err("typed")
