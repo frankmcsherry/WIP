@@ -235,23 +235,23 @@ fn lex(s: &str) -> Result<(Vec<Tok>, Vec<usize>), String> {
                         i += 1;
                     }
                 }
-                let at = position(&cs, start);
+                let at = || position(&cs, start);
                 if i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
                     let mut suffix = String::new();
                     while i < cs.len() && cs[i].is_ascii_alphanumeric() {
                         suffix.push(cs[i]);
                         i += 1;
                     }
-                    return Err(format!("{at}: '{text}{suffix}': a literal takes no suffix (integers have no width), so write {text}"));
+                    return Err(format!("{}: '{text}{suffix}': a literal takes no suffix (integers have no width), so write {text}", at()));
                 }
                 if float {
-                    let x: f64 = text.parse().map_err(|_| format!("{at}: '{text}' is not a float"))?;
+                    let x: f64 = text.parse().map_err(|_| format!("{}: '{text}' is not a float", at()))?;
                     Tok::Lit(Value::f64(vec![x]))
                 } else if text.starts_with('-') {
-                    let n: i64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
+                    let n: i64 = text.parse().map_err(|_| format!("{}: '{text}' does not fit in an Int (an i64)", at()))?;
                     Tok::Lit(Value::int([n]))
                 } else {
-                    let n: u64 = text.parse().map_err(|_| format!("{at}: '{text}' does not fit in an Int (an i64)"))?;
+                    let n: u64 = text.parse().map_err(|_| format!("{}: '{text}' does not fit in an Int (an i64)", at()))?;
                     Tok::Num(n)
                 }
             }
@@ -385,7 +385,8 @@ impl Enums {
 struct P<'a> {
     toks: Vec<Tok>,
     i: usize,
-    src: Vec<char>,
+    source_len: usize,
+    lines: Vec<usize>, // char offset after each newline, including the first line
     starts: Vec<usize>, // char offset of each token
     seen: std::cell::Cell<usize>, // the last token looked at, where a parse error is reported
     enums: Enums,                             // the scope's, and then the program's own
@@ -396,10 +397,14 @@ impl<'a> P<'a> {
     /// a parser over `src`, its tables starting as `scope`'s.
     fn new(src: &str, scope: &'a Scope) -> Result<Self, String> {
         let (toks, starts) = lex(src)?;
+        let source_len = src.chars().count();
+        let lines = std::iter::once(0).chain(src.chars().enumerate()
+            .filter_map(|(i, c)| (c == '\n').then_some(i + 1))).collect();
         Ok(P {
             toks,
             i: 0,
-            src: src.chars().collect(),
+            source_len,
+            lines,
             starts,
             seen: std::cell::Cell::new(0),
             enums: scope.enums.clone(),
@@ -494,7 +499,9 @@ impl<'a> P<'a> {
 
     /// the source position of token `k` (or of the end of input).
     fn at(&self, k: usize) -> String {
-        position(&self.src, self.starts.get(k).copied().unwrap_or(self.src.len()))
+        let offset = self.starts.get(k).copied().unwrap_or(self.source_len);
+        let line = self.lines.partition_point(|&start| start <= offset);
+        format!("{}:{}", line, offset - self.lines[line - 1] + 1)
     }
 
     /// a binding pattern, used by `let` and lambda parameters alike, perhaps ascribed a shape:
@@ -1362,4 +1369,22 @@ pub fn parse_ml_in(src: &str, scope: &Scope) -> Result<Graph<NumOp>, String> {
     env.insert(ROOT.to_string(), input);
     let out = lower(&e, &env, &mut b)?;
     Ok(b.finish(out))
+}
+
+#[cfg(test)]
+mod source_positions {
+    use super::*;
+
+    #[test]
+    fn indexed_positions_match_character_offsets() {
+        for src in ["let x = 1 in x", "# π\nlet x = 1 in\n  x", "\n\ninput\n"] {
+            let scope = Scope::default();
+            let parser = P::new(src, &scope).unwrap();
+            let chars: Vec<_> = src.chars().collect();
+            for k in 0..=parser.toks.len() {
+                let offset = parser.starts.get(k).copied().unwrap_or(chars.len());
+                assert_eq!(parser.at(k), position(&chars, offset));
+            }
+        }
+    }
 }
