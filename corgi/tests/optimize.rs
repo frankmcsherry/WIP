@@ -234,6 +234,10 @@ fn empty_tuples_keep_the_stratum_row_count() {
     ] {
         assert_eq!(eval_graph(&graph, input.clone()), expected);
         assert_eq!(eval_graph(&optimize(&graph), input.clone()), expected);
+        let result = corgi::narrow(corgi::compile(graph.clone(), &shape).unwrap(), &corgi::Demand::None).unwrap();
+        assert_eq!(result.input, corgi::Demand::None);
+        assert_eq!(result.output, corgi::Demand::None);
+        assert_eq!(eval_graph(&result.graph, result.input.project(input).unwrap()), Value::Unit(expected.len()));
     }
     let mut body = Builder::<NumOp>::default();
     let empty = body.tuple(vec![]); // no explicit Input node is needed for the row count
@@ -262,4 +266,7 @@ fn empty_product_literals_fill_at_their_anchor() {
     assert_eq!(eval_graph(&b.finish(literal), Value::Unit(2)), Value::Prod(vec![Value::Unit(2), Value::i64(vec![7, 7])]));
     // Values supplied as data still have their original shape and zero rows.
     assert_eq!(Value::Prod(vec![]).len(), 0);
+    let result = corgi::narrow(corgi::compile(graph, &Shape::Int).unwrap(), &corgi::Demand::All).unwrap();
+    assert_eq!(result.output, corgi::Demand::All);
+    assert_eq!(eval_graph(&result.graph, result.input.project(Value::i64(vec![1, 2, 3])).unwrap()), Value::Unit(3));
 }
