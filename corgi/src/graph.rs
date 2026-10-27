@@ -83,7 +83,7 @@ impl<O: OpLike> Graph<O> {
 }
 
 /// evaluate the graph on one argument, CONSUMING it. `Input` takes it, `Tuple` gathers its edges
-/// into a product, every op delegates to `O::eval`.
+/// into a product (or unit at the input row count when empty), every op delegates to `O::eval`.
 ///
 /// A node's value is MOVED to its last consumer and only cloned for earlier ones, so the final
 /// reader holds the sole `Arc` to each leaf — `into_*` can move the buffer out (refcount 1) and an
@@ -107,11 +107,13 @@ pub(crate) fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Valu
         else { vals[i].as_ref().unwrap().clone() }
     };
 
+    let rows = arg.len();
     let mut arg = Some(arg); // moved into the (single) `Input` node; `take` errors on a second one
     let mut vals: Vec<Option<Value>> = Vec::with_capacity(g.nodes.len());
     for node in &g.nodes {
         let v = match &node.kind {
             NodeKind::Input => arg.take().expect("graph has more than one Input node"),
+            NodeKind::Tuple if node.inputs.is_empty() => Value::Unit(rows),
             NodeKind::Tuple => {
                 Value::Prod(node.inputs.iter().map(|&i| take(&mut vals, &mut uses, i)).collect())
             }
@@ -149,7 +151,8 @@ impl<O: OpLike> Builder<O> {
     pub fn input(&mut self) -> usize {
         self.push(NodeKind::Input, vec![])
     }
-    /// fan-in: collect edges into a product.
+    /// Fan-in: collect edges into a product. No edges produces unit with the
+    /// row count of this graph's input, including inside a closed body.
     pub fn tuple(&mut self, inputs: Vec<usize>) -> usize {
         self.push(NodeKind::Tuple, inputs)
     }
