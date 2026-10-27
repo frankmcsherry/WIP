@@ -490,7 +490,7 @@ fn prune_graph_once(graph: &Graph<NumOp>, input: &Shape, output_projection: &Sha
         }
         follows_input.push(match &node.kind {
             NodeKind::Input => true,
-            NodeKind::Tuple => node.inputs.first().is_some_and(|&i| follows_input[i]),
+            NodeKind::Tuple => node.inputs.first().is_none_or(|&i| follows_input[i]),
             NodeKind::Op(_) => follows_input[node.inputs[0]],
         });
     }
@@ -612,6 +612,7 @@ fn graph_shapes(graph: &Graph<NumOp>, input: &Shape) -> Result<Vec<Shape>, Strin
     for node in &graph.nodes {
         let value = match &node.kind {
             NodeKind::Input => Value::empty(input),
+            NodeKind::Tuple if node.inputs.is_empty() => Value::Unit(0),
             NodeKind::Tuple => {
                 Value::Prod(node.inputs.iter().map(|&i| values[i].clone()).collect())
             }

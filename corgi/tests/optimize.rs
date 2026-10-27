@@ -216,3 +216,50 @@ fn scalar_folding_keeps_float_payload_bits() {
         }
     }
 }
+
+#[test]
+fn empty_tuples_keep_the_stratum_row_count() {
+    use corgi::{eval_graph, shape_of, Shape};
+    let mut b = Builder::<NumOp>::default();
+    let list = b.input();
+    let empty = b.tuple(vec![]);
+    let pair = b.tuple(vec![empty, list]);
+    let captured = b.add(Op::CapList, vec![pair]);
+    let len = b.add(Op::Len, vec![captured]);
+    let graph = b.finish(len);
+    let shape = Shape::List(Box::new(Shape::Int));
+    for (input, expected) in [
+        (Value::empty(&shape), Value::i64(vec![])),
+        (Value::List(vec![0, 2, 3].into(), Box::new(Value::i64(vec![4, 5, 6]))), Value::i64(vec![0, 2, 1])),
+    ] {
+        assert_eq!(eval_graph(&graph, input.clone()), expected);
+        assert_eq!(eval_graph(&optimize(&graph), input.clone()), expected);
+    }
+    let mut body = Builder::<NumOp>::default();
+    let empty = body.tuple(vec![]); // no explicit Input node is needed for the row count
+    let body = body.finish(empty);
+    assert_eq!(shape_of(&body, &Shape::Int), Ok(Shape::Unit));
+    let mut b = Builder::<NumOp>::default();
+    let list = b.input();
+    let mapped = b.add(Op::MapList(Box::new(body)), vec![list]);
+    let input = Value::List(vec![0, 2, 3].into(), Box::new(Value::i64(vec![4, 5, 6])));
+    assert_eq!(eval_graph(&b.finish(mapped), input), Value::List(vec![0, 2, 3].into(), Box::new(Value::Unit(3))));
+}
+
+#[test]
+fn empty_product_literals_fill_at_their_anchor() {
+    use corgi::{eval_graph, shape_of, Shape};
+    let mut b = Builder::<NumOp>::default();
+    let input = b.input();
+    let empty = b.add(Op::Lit(Value::Prod(vec![])), vec![input]);
+    let graph = b.finish(empty);
+    assert_eq!(shape_of(&graph, &Shape::Int), Ok(Shape::Unit));
+    assert_eq!(eval_graph(&graph, Value::i64(vec![1, 2, 3])), Value::Unit(3));
+    assert_eq!(eval_graph(&optimize(&graph), Value::i64(vec![])), Value::Unit(0));
+    let mut b = Builder::<NumOp>::default();
+    let input = b.input();
+    let literal = b.add(Op::Lit(Value::Prod(vec![Value::Prod(vec![]), Value::i64(vec![7])])), vec![input]);
+    assert_eq!(eval_graph(&b.finish(literal), Value::Unit(2)), Value::Prod(vec![Value::Unit(2), Value::i64(vec![7, 7])]));
+    // Values supplied as data still have their original shape and zero rows.
+    assert_eq!(Value::Prod(vec![]).len(), 0);
+}

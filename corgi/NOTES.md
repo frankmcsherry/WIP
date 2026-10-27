@@ -530,3 +530,8 @@ normalizes without input shapes; scalar folding runs before immediate lowering i
 
 `Program::from_graph` wraps its graph unchanged. ML compilation calls `optimize`
 explicitly; callers supplying graphs choose their own normalization step.
+
+A Builder tuple with no fields evaluates to unit at its graph input's row count,
+including inside map and fold bodies. A literal empty product also fills to unit
+at its anchor's row count. Explicit `Value::Prod(vec![])` values passed as data
+still have zero rows.
