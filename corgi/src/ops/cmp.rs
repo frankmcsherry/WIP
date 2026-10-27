@@ -265,9 +265,9 @@ impl InPlay {
         let (perm, refined) = sort_blocks(&self.labels, col);
         let sorted: Vec<usize> = perm.iter().map(|&p| self.idx[p]).collect();
         let (mut keep, mut lab, mut ends) = (Vec::new(), Vec::new(), Vec::with_capacity(self.ends.len()));
-        let mut s = 0;
+        let mut s = 0usize;
         for &e in &self.ends {
-            let mut stop = e.min(s + k);
+            let mut stop = e.min(s.saturating_add(k));
             while stop > s && stop < e && refined[stop] == refined[stop - 1] {
                 stop += 1; // the run of ties at the k-th position comes whole
             }
@@ -370,9 +370,9 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
         }
     }
     // every level sorted: each row's first k positions are its answer
-    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(play.ends.len()), 0);
+    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(play.ends.len()), 0usize);
     for &e in &play.ends {
-        take.extend_from_slice(&play.idx[s..e.min(s + k)]);
+        take.extend_from_slice(&play.idx[s..e.min(s.saturating_add(k))]);
         out_ends.push(take.len());
         s = e;
     }
