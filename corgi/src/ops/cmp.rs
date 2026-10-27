@@ -49,7 +49,7 @@ pub enum CmpOp {
     Rel(Pred), // (X, X) -> Int mask   compare row by row in structural order: leaves lane-wise by
                // value, lists/products/sums as `sort` orders them. The mask is 0/1, held as bytes.
     RelImm(Pred, Scalar), // X -> Int mask   `x pred c`, `c` a constant of x's kind
-    ListImm(Pred, Prim), // List<X> -> Int mask   `xs eq c` or `xs ne c`, `c` a constant list of leaves
+    ListImm(bool, Prim), // List<X> -> Int mask   `xs eq c` (false) or `xs ne c` (true), c a list of leaves
                // of xs's kind (a string literal, say): each row's length against c's, and only the
                // rows whose length agrees read their elements, against c's
     Min,       // (X, X) -> X   lane-wise minimum, by value
@@ -103,12 +103,12 @@ impl CmpOp {
                 Value::u8(p.rel_imm(*c, pred.test(-1), pred.test(0), pred.test(1)))
             }
 
-            CmpOp::ListImm(pred, c) => {
+            CmpOp::ListImm(ne, c) => {
                 // a list, as the pair `(xs, c) eq` takes: a referenced list there is a shape error
                 let Value::List(bounds, vals) = &input else {
                     return Err(format!("compare with a constant list: {} against {c:?}", shape_of_value(&input)));
                 };
-                let ne = matches!(pred, Pred::Ne);
+                let ne = *ne;
                 Value::u8(match (&**vals, c) {
                     (Value::Prim(Prim::U8(x)), Prim::U8(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
                     (Value::Prim(Prim::I64(x)), Prim::I64(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
@@ -265,9 +265,9 @@ impl InPlay {
         let (perm, refined) = sort_blocks(&self.labels, col);
         let sorted: Vec<usize> = perm.iter().map(|&p| self.idx[p]).collect();
         let (mut keep, mut lab, mut ends) = (Vec::new(), Vec::new(), Vec::with_capacity(self.ends.len()));
-        let mut s = 0;
+        let mut s = 0usize;
         for &e in &self.ends {
-            let mut stop = e.min(s + k);
+            let mut stop = e.min(s.saturating_add(k));
             while stop > s && stop < e && refined[stop] == refined[stop - 1] {
                 stop += 1; // the run of ties at the k-th position comes whole
             }
@@ -370,9 +370,9 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
         }
     }
     // every level sorted: each row's first k positions are its answer
-    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(play.ends.len()), 0);
+    let (mut take, mut out_ends, mut s) = (Vec::new(), Vec::with_capacity(play.ends.len()), 0usize);
     for &e in &play.ends {
-        take.extend_from_slice(&play.idx[s..e.min(s + k)]);
+        take.extend_from_slice(&play.idx[s..e.min(s.saturating_add(k))]);
         out_ends.push(take.len());
         s = e;
     }

@@ -81,7 +81,7 @@
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
-use crate::ops::{CmpOp, NumOp, Op, Pattern};
+use crate::ops::{CmpOp, NumOp, Op, Pattern, Pred};
 use crate::shape::Shape;
 use crate::value::{Prim, Scalar, Value};
 use std::collections::HashMap;
@@ -1038,17 +1038,20 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             }
             lower(body, &env2, b)
         }
-        // `(c1, c2, ..) all`: every condition holds; `any`: one does. Conditions are masks (0 or 1,
-        // as comparisons give), so these are `min` and `max` along the tuple as written.
+        // `(c1, c2, ..) all`: every condition holds; `any`: one does. Normalize nonzero masks
+        // to 1 before taking `min` or `max` along the tuple as written.
         E::Pipe(e, Apply::Op(name, None)) if name == "all" || name == "any" => {
             let E::Tuple(conds) = &**e else {
                 return Err(format!("'{name}' takes a tuple of conditions, written out: (c1, c2, ..) {name}"));
             };
             let op = if name == "all" { CmpOp::Min } else { CmpOp::Max };
+            let normalize = CmpOp::RelImm(Pred::Ne, Scalar::Int(0));
             let (first, rest) = conds.split_first().ok_or_else(|| format!("'{name}' of no conditions"))?;
-            let mut acc = lower(first, env, b)?;
+            let first = lower(first, env, b)?;
+            let mut acc = b.add(normalize.clone(), vec![first]);
             for c in rest {
                 let c = lower(c, env, b)?;
+                let c = b.add(normalize.clone(), vec![c]);
                 let pair = b.tuple(vec![acc, c]);
                 acc = b.add(op.clone(), vec![pair]);
             }
@@ -1058,7 +1061,10 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
             let id = lower(e, env, b)?;
             match ap {
                 Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
-                Apply::Op(name, arg) if name.starts_with("try_") => try_word(b, id, name, *arg),
+                Apply::Op(name, arg) if name.starts_with("try_") => {
+                    let arity = match &**e { E::Tuple(es) => Some(es.len()), _ => None };
+                    try_word(b, id, name, *arg, arity)
+                }
                 Apply::Op(name, _) if matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(sort_word(b, id, name)),
                 Apply::Op(name, _) if name == "hash_group" => Ok(b.graft(&parse_ml(HASH_GROUP)?, id)),
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
@@ -1125,9 +1131,10 @@ fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
 /// - `(i, xs) try_get`: `i` is outside `0 .. xs len`;
 /// - `(ps, xs) try_gather`: a position in `ps` is outside it (the least below 0, or the greatest at
 ///   `xs len` or past it);
-/// - `(xs, ys) try_zip`: `xs len` and `ys len` differ;
+/// - `(xs, ys, ..) try_zip`: any list's length differs from the first. A tuple not written out
+///   must be a pair, checked by a pattern before reading its fields;
 /// - `xs try_chunk k`: `xs len` leaves a remainder by `k` (the remainder is the mark).
-fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> Result<usize, String> {
+fn try_word(b: &mut Builder<NumOp>, mut x: usize, name: &str, arg: Option<u64>, arity: Option<usize>) -> Result<usize, String> {
     use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, Pred, Red};
     fn on(b: &mut Builder<NumOp>, op: impl Into<NumOp>, l: usize, r: usize) -> usize {
         let pair = b.tuple(vec![l, r]);
@@ -1164,9 +1171,24 @@ fn try_word(b: &mut Builder<NumOp>, x: usize, name: &str, arg: Option<u64>) -> R
             (Op::Gather.into(), mark)
         }
         "try_zip" => {
-            let (xs, ys) = (b.add(Op::Field(0), vec![x]), b.add(Op::Field(1), vec![x]));
-            let (nx, ny) = (b.add(Op::Len, vec![xs]), b.add(Op::Len, vec![ys]));
-            (Op::Zip.into(), on(b, CmpOp::Rel(Pred::Ne), nx, ny))
+            let n = arity.unwrap_or_else(|| {
+                x = b.add(Op::Pattern(Pattern::Tuple(vec![Pattern::Any; 2])), vec![x]);
+                2
+            });
+            let first = b.add(Op::Field(0), vec![x]);
+            let len = b.add(Op::Len, vec![first]);
+            let mut mark = None;
+            for i in 1..n {
+                let field = b.add(Op::Field(i), vec![x]);
+                let next = b.add(Op::Len, vec![field]);
+                let differs = on(b, CmpOp::Rel(Pred::Ne), len, next);
+                mark = Some(match mark {
+                    None => differs,
+                    Some(prev) => on(b, CmpOp::Max, prev, differs),
+                });
+            }
+            // One list always agrees with itself; `len` still checks that it is a list.
+            (Op::Zip.into(), mark.unwrap_or_else(|| lit(b, 0, len)))
         }
         "try_chunk" => {
             let k = arg.ok_or("try_chunk needs a width")?;

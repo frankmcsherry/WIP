@@ -101,6 +101,32 @@ fn number_lists_sort_lexicographically_per_row() {
 }
 
 #[test]
+fn sort_limit_saturates_at_the_end_of_each_row() {
+    use corgi::{shape_of_value, Builder, CmpOp, NumOp};
+    for input in [
+        Value::List(vec![1, 2].into(), Box::new(Value::int([2, 1]))),
+        Value::List(vec![0, 3, 3, 5].into(), Box::new(Value::int([3, 1, 2, 5, 4]))),
+        Value::List(vec![1, 2].into(), Box::new(Value::Unit(2))), // no sort levels: final truncation only
+        Value::List(vec![0, 0].into(), Box::new(Value::int([]))),
+        Value::List(vec![].into(), Box::new(Value::int([]))),
+    ] {
+        for (k, reference) in [
+            (usize::MAX, "input sort"),
+            (0, "(0 iota, input) gather"),
+            (1, "let xs = input sort in ((xs len, 1) min iota, xs) gather"),
+        ] {
+            let mut b = Builder::<NumOp>::default();
+            let i = b.input();
+            let out = b.add(CmpOp::SortLimit(k), vec![i]);
+            let p = Program::from_graph(b.finish(out));
+            assert_eq!(p.shape(&shape_of_value(&input)), Ok(shape_of_value(&input)));
+            let expected = Program::compile_ml(reference).unwrap().run(input.clone());
+            assert_eq!(p.run(input.clone()), expected, "limit {k}, input {input:?}");
+        }
+    }
+}
+
+#[test]
 fn sort_limit_ignores_payload_free_key_fields() {
     let keys = Value::Prod(vec![
         Value::Unit(4),

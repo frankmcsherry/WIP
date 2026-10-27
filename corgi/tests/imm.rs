@@ -144,6 +144,25 @@ fn pairs_with_a_literal_become_immediates() {
 }
 
 #[test]
+fn list_immediates_have_only_equality_and_inequality() {
+    use corgi::{Builder, CmpOp, NumOp, Shape};
+    let input = Value::List(vec![1, 2, 2, 4].into(), Box::new(Value::int([1, 2, 1, 1])));
+    for ne in [false, true] {
+        for (constant, equal) in [(vec![1], vec![1, 0, 0, 0]), (vec![], vec![0, 0, 1, 0])] {
+            let Value::Prim(c) = Value::i64(constant) else { unreachable!() };
+            let mut b = Builder::<NumOp>::default();
+            let i = b.input();
+            let out = b.add(CmpOp::ListImm(ne, c), vec![i]);
+            let p = Program::from_graph(b.finish(out));
+            assert_eq!(p.shape(&Shape::List(Box::new(Shape::Int))), Ok(Shape::Int));
+            assert!(p.shape(&Shape::List(Box::new(Shape::Float))).is_err());
+            let expected = Value::u8(equal.into_iter().map(|eq| eq ^ ne as u8).collect());
+            assert_eq!(p.run(input.clone()), expected);
+        }
+    }
+}
+
+#[test]
 fn the_rewrite_keeps_every_answer() {
     // left-literal and flipped comparisons against the pair as parsed; each column fresh
     let xs: Vec<i64> = (0..200).map(|i| (i * 7919) % 50 - 25).collect();

@@ -242,7 +242,7 @@ pub fn immediates(g: Graph<NumOp>) -> Graph<NumOp> {
             };
             let found = list(1).map(|c| (pair.inputs[0], c)).or_else(|| list(0).map(|c| (pair.inputs[1], c)));
             if let Some((x, c)) = found {
-                return Some(Rewrite::Replace(Node { kind: NodeKind::Op(NumOp::Cmp(CmpOp::ListImm(*p, c))), inputs: vec![x] }));
+                return Some(Rewrite::Replace(Node { kind: NodeKind::Op(NumOp::Cmp(CmpOp::ListImm(*p == Pred::Ne, c))), inputs: vec![x] }));
             }
         }
         let literal = |i: usize| match &built[pair.inputs[i]].kind {
