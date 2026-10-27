@@ -224,8 +224,7 @@ pub fn cancel_isos(g: Graph<NumOp>) -> Graph<NumOp> {
 /// (`ArithOp::ImmBin`, `ArithOp::ImmBits`): `(100, d) sub`, `div`, `rem`, `sub_b64`, and float
 /// `add`/`mul`, whose NaN payloads can depend on the order. A constant whose kind disagrees with
 /// the op still fails where it did. The pair and the literal remain while anything else reads
-/// them; [`dce`] sweeps them otherwise. `Program` runs this, then `dce`, on every program; the ML
-/// notation has no spelling of its own for these ops.
+/// them; [`dce`] sweeps them otherwise. The ML notation has no spelling of its own for these ops.
 pub fn immediates(g: Graph<NumOp>) -> Graph<NumOp> {
     rewrite_graph(g, immediates, |kind, inputs, built, _| {
         let NodeKind::Op(op) = kind else { return None };

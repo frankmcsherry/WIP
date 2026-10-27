@@ -4,7 +4,7 @@
 
 use corgi::{
     cancel_isos, cse, dce, fuse_maps, optimize, parse_ml, peephole, show, Builder, Graph, NumOp, Op,
-    Program, Value,
+    Value,
 };
 
 fn int(xs: &[i64]) -> Value {
@@ -12,8 +12,7 @@ fn int(xs: &[i64]) -> Value {
 }
 
 fn eval_str(g: &Graph<NumOp>, arg: &Value) -> String {
-    let p = Program::from_graph(g.clone());
-    show(&p.run(arg.clone()))
+    show(&corgi::eval_graph(g, arg.clone()))
 }
 
 fn sample() -> Value {

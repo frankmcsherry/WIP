@@ -525,3 +525,6 @@ an enum + `OpLike` + `From` impls; touch nothing below.
 
 Optimizer rewrites live in `src/optimize/passes/`. `optimize(&Graph) -> Graph`
 normalizes without input shapes; scalar folding runs before immediate lowering in the optimizer.
+
+`Program::from_graph` wraps its graph unchanged. ML compilation calls `optimize`
+explicitly; callers supplying graphs choose their own normalization step.
