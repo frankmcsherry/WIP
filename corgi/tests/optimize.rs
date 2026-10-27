@@ -46,7 +46,7 @@ const ML_JOIN: &str =
 #[test]
 fn cse_collapses_the_fanout_join() {
     let fanout = parse_ml(INLINED_JOIN).unwrap();
-    let folded = cse(&fanout);
+    let folded = cse(fanout.clone());
     // CSE merges the duplicated `transpose` down to the hand-shared `let` form.
     assert!(folded.node_count() < fanout.node_count());
     assert_eq!(folded.node_count(), parse_ml(ML_JOIN).unwrap().node_count());
@@ -58,7 +58,7 @@ fn cse_collapses_the_fanout_join() {
 fn dce_drops_a_dead_let() {
     // `x` (a transpose) is computed but the body ignores it.
     let g = parse_ml("let x = input.0 transpose in input.1").unwrap();
-    let lean = dce(&g);
+    let lean = dce(g.clone());
     assert!(lean.node_count() < g.node_count());
     assert_eq!(eval_str(&lean, &join_input()), eval_str(&g, &join_input()));
 }
@@ -97,7 +97,7 @@ fn fuse_maps_collapses_adjacent_passes() {
     // two passes over the same list become one. The fused graph has fewer nodes (one MapList, one
     // composed body) and the same result.
     let g = parse_ml("input.1 transpose .1 map (x -> (x, 1) add) map (x -> (x, 10) add)").unwrap();
-    let fused = dce(&fuse_maps(&g)); // fusion orphans the producer MapList; dce sweeps it
+    let fused = dce(fuse_maps(g.clone())); // fusion orphans the producer MapList; dce sweeps it
     assert!(fused.node_count() < g.node_count(), "fusion should drop the intermediate MapList node");
     assert_eq!(eval_str(&fused, &sample()), eval_str(&g, &sample()));
 }
@@ -111,7 +111,7 @@ fn cancel_isos_drops_inverse_pairs() {
     let t = b.add(NumOp::Core(Op::Transpose), vec![f1]);
     let z = b.add(NumOp::Core(Op::Zip), vec![t]);
     let g = b.finish(z);
-    let opt = dce(&cancel_isos(&g));
+    let opt = dce(cancel_isos(g.clone()));
     assert!(opt.node_count() < g.node_count(), "Zip∘Transpose should cancel");
     assert_eq!(eval_str(&opt, &sample()), eval_str(&g, &sample()));
 }
@@ -147,7 +147,7 @@ fn optimize_preserves_every_corpus_program() {
 fn peephole_also_runs_under_bodies() {
     // a Field-of-Tuple inside a map body should fold too.
     let g = parse_ml("input.1 map (p -> (p, p).0)").unwrap();
-    let opt = peephole(&g);
+    let opt = peephole(g.clone());
     assert_eq!(eval_str(&opt, &sample()), eval_str(&g, &sample()));
 }
 
@@ -176,6 +176,41 @@ fn lossy_zip_then_transpose_must_not_cancel() {
                 Value::List(ends.into(), Box::new(Value::i64(values)))
             }).collect();
             equivalent(src, Value::Prod(lists));
+        }
+    }
+}
+
+#[test]
+fn singleton_map_is_inlined_but_shared_producers_stay_shared() {
+    let graph = optimize(&parse_ml("input enlist map (x -> (x, 1) add)").unwrap());
+    assert!(!graph.nodes().any(|n| matches!(n, corgi::NodeRef::Op(NumOp::Core(Op::MapList(_)), _))));
+    let src = "let xs = input enlist in (xs, xs map (x -> (x, 1) add))";
+    equivalent(src, Value::i64(vec![1, -2, i64::MAX]));
+    let graph = optimize(&parse_ml(src).unwrap());
+    assert!(graph.nodes().any(|n| matches!(n, corgi::NodeRef::Op(NumOp::Core(Op::MapList(_)), _))));
+}
+
+#[test]
+fn scalar_folding_keeps_float_payload_bits() {
+    use corgi::{ArithOp, BinOp};
+    let bits = [0, 1 << 63, 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000,
+        0x7ff8_0000_0000_1234, 0x7ff8_0000_0000_5678, 0xfff0_0000_0000_0001];
+    for left in bits {
+        for right in bits {
+            for op in [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div] {
+                let mut b = Builder::<NumOp>::default();
+                let input = b.input();
+                let a = b.add(Op::Lit(Value::f64(vec![f64::from_bits(left)])), vec![input]);
+                let c = b.add(Op::Lit(Value::f64(vec![f64::from_bits(right)])), vec![input]);
+                let pair = b.tuple(vec![a, c]);
+                let out = b.add(ArithOp::Bin(op), vec![pair]);
+                let graph = b.finish(out);
+                let rewritten = optimize(&graph);
+                for n in [0, 1, 17] {
+                    let value = Value::Unit(n);
+                    assert_eq!(corgi::eval_graph(&graph, value.clone()), corgi::eval_graph(&rewritten, value));
+                }
+            }
         }
     }
 }

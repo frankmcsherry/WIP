@@ -317,7 +317,7 @@ fn compact_to_shape(
     } else {
         project_compact_shape(&mut builder, root, input, &input_shape)
     };
-    let input_projection = peephole(&builder.finish(narrowed));
+    let input_projection = peephole(builder.finish(narrowed));
 
     let mut builder = Builder::default();
     let root = builder.input();
@@ -336,7 +336,7 @@ fn compact_to_shape(
         inflate_compact_shape(&mut builder, root, input, &input_shape)
     };
     let output_node = builder.graft(graph, restored);
-    let graph = dce(&peephole(&fuse_maps(&peephole(&builder.finish(output_node)))));
+    let graph = dce(peephole(fuse_maps(peephole(builder.finish(output_node)))));
 
     if shape_of(&input_projection, input).as_ref() != Ok(&input_shape)
         || shape_of(&graph, &input_shape).as_ref() != Ok(&output)
@@ -499,7 +499,7 @@ fn prune_graph_once(graph: &Graph<NumOp>, input: &Shape, output_projection: &Sha
     let unit = nodes.len();
     nodes.push(Node { kind: NodeKind::Op(Op::Unit.into()), inputs: vec![input_node] });
     let result = prune_output(&mut nodes, &shapes, &follows_input, &uses, unit, graph.output, output_projection, specialize_maps)?;
-    let mut rewritten = dce(&Graph { nodes, output: result });
+    let mut rewritten = dce(Graph { nodes, output: result });
     // DCE can remove the formal input of a constant graph; keep it for input-demand extraction.
     if !rewritten.nodes.iter().any(|node| matches!(node.kind, NodeKind::Input)) {
         rewritten.nodes.insert(0, Node { kind: NodeKind::Input, inputs: Vec::new() });

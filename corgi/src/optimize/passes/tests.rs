@@ -20,7 +20,7 @@ fn immediates_reach_into_bodies() {
         "(input, input iota) fold ((a, x) -> ((a, x) add, 3) mul)",
         "input iota map (x -> (x, x and 1) branch 2 match (0 (e -> (e, 100) add), 1 (o -> o)))",
     ] {
-        let g = dce(&immediates(&parse_ml(src).unwrap()));
+        let g = dce(immediates(parse_ml(src).unwrap()));
         let lit = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Core(Op::Lit(_))));
         let imm = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Arith(ArithOp::BinImm(..))));
         assert!(!any_node(&g, &lit), "{src}: a literal is left");
@@ -32,7 +32,7 @@ fn immediates_reach_into_bodies() {
 #[test]
 fn immediates_keep_wide_literals() {
     let big = (3i64 << 46) + 5;
-    let g = dce(&immediates(&parse_ml(&format!("input map (x -> (x, {big}) add)")).unwrap()));
+    let g = dce(immediates(parse_ml(&format!("input map (x -> (x, {big}) add)")).unwrap()));
     let wide = |k: &NodeKind<NumOp>| matches!(k, NodeKind::Op(NumOp::Arith(ArithOp::BinImm(_, crate::Scalar::Int(c)))) if *c == big);
     assert!(any_node(&g, &wide), "the immediate lost its high bits");
 }
