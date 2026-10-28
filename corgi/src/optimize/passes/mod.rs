@@ -65,6 +65,62 @@ pub(super) fn strip_patterns(graph: Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
+/// A checked graph's canonical form, so graphs that compute the same thing in the same way compare
+/// equal however they were built. Every node of a graph has its input's row count, and typing has
+/// already checked them all, so each constant and unit counts its rows from the input itself; this
+/// frees any node that only anchored one. Nodes are then numbered in one order, the input first and
+/// the rest as a walk from the output reaches them.
+pub(super) fn canonical(g: Graph<NumOp>) -> Graph<NumOp> {
+    ordered(cse(anchor_to_input(g)))
+}
+
+/// Count every constant's and unit's rows from the graph's input, in closed bodies too.
+fn anchor_to_input(g: Graph<NumOp>) -> Graph<NumOp> {
+    let input = std::cell::Cell::new(None);
+    rewrite_graph(g, anchor_to_input, |kind, inputs, built, _| match kind {
+        NodeKind::Input => {
+            input.set(Some(built.len()));
+            None
+        }
+        NodeKind::Op(NumOp::Core(Op::Unit | Op::Lit(_))) => {
+            let anchor = input.get()?;
+            (inputs[0] != anchor).then(|| Rewrite::Replace(Node { kind: kind.clone(), inputs: vec![anchor] }))
+        }
+        _ => None,
+    })
+}
+
+/// Keep the nodes the output reaches, numbered with the input first, then in the order a
+/// left-to-right walk from the output finishes them. Iterative, as composed graphs can be deep.
+fn ordered(mut g: Graph<NumOp>) -> Graph<NumOp> {
+    const UNSEEN: usize = usize::MAX;
+    let mut remap = vec![UNSEEN; g.nodes.len()];
+    let mut order = Vec::with_capacity(g.nodes.len());
+    let mut stack = vec![(g.output, false)];
+    let mut reached = vec![false; g.nodes.len()];
+    while let Some((i, finished)) = stack.pop() {
+        if finished {
+            remap[i] = order.len();
+            order.push(i);
+        } else if !std::mem::replace(&mut reached[i], true) {
+            stack.push((i, true));
+            stack.extend(g.nodes[i].inputs.iter().rev().map(|&e| (e, false)));
+        }
+    }
+    if let Some(at) = order.iter().position(|&i| matches!(g.nodes[i].kind, NodeKind::Input)) {
+        order[..=at].rotate_right(1);
+        for (new, &old) in order.iter().enumerate() { remap[old] = new; }
+    }
+    let mut taken: Vec<Option<Node<NumOp>>> = std::mem::take(&mut g.nodes).into_iter().map(Some).collect();
+    let nodes = order.iter().map(|&old| {
+        let mut node = taken[old].take().expect("each node is ordered once");
+        for edge in &mut node.inputs { *edge = remap[*edge]; }
+        map_kind(&mut node.kind, ordered);
+        node
+    }).collect();
+    Graph { nodes, output: remap[g.output] }
+}
+
 /// hash-consing: fold structurally-identical nodes into one.
 pub fn cse(g: Graph<NumOp>) -> Graph<NumOp> {
     let mut new_nodes: Vec<Node<NumOp>> = Vec::with_capacity(g.nodes.len());
