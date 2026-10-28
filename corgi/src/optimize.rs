@@ -35,10 +35,12 @@ impl Compiled {
 }
 
 /// Compile at `input`: check the whole graph, strip the patterns typing proved,
-/// including in closed bodies, then run the usual normalization once.
+/// including in closed bodies, run the usual normalization once, and put the result in
+/// canonical form, so graphs that compute the same thing the same way compare equal.
 pub fn compile(graph: Graph<NumOp>, input: &crate::Shape) -> Result<Compiled, String> {
     crate::graph::node_shapes(&graph, input)?;
-    Ok(Compiled { graph: normalize(passes::strip_patterns(graph)), input: input.clone() })
+    let graph = passes::canonical(normalize(passes::strip_patterns(graph)));
+    Ok(Compiled { graph, input: input.clone() })
 }
 
 /// A graph rebuilt at its input request, with the output it actually retains.

@@ -270,3 +270,15 @@ fn empty_product_literals_fill_at_their_anchor() {
     assert_eq!(result.output, corgi::Demand::All);
     assert_eq!(eval_graph(&result.graph, result.input.project(Value::i64(vec![1, 2, 3])).unwrap()), Value::Unit(3));
 }
+
+#[test]
+fn compiled_graphs_are_canonical() {
+    // Moving a map across `enlist` leaves its unit counting rows from the enlisted tuple, and
+    // the two sources build their nodes in different orders; both compile to one graph.
+    let composed = corgi::parse_ml("let y = (input, 7) enlist in y map (p -> ((), p.1))").unwrap();
+    let spelled = corgi::parse_ml("((), 7) enlist").unwrap();
+    let composed = corgi::compile(composed, &corgi::Shape::Int).unwrap();
+    let spelled = corgi::compile(spelled, &corgi::Shape::Int).unwrap();
+    assert_eq!(composed.graph(), spelled.graph());
+    assert_eq!(corgi::compile(composed.graph().clone(), &corgi::Shape::Int).unwrap().graph(), composed.graph());
+}
