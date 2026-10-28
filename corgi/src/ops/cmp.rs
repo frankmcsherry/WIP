@@ -133,6 +133,11 @@ impl CmpOp {
             CmpOp::SortBy => {
                 let (bounds, vals) = input.into_list("SortBy")?;
                 let (k, v) = vals.into_pair("SortBy elements")?;
+                // already ascending: nothing moves, and every element is its own run
+                if ascending_by_lead(&bounds, &k) {
+                    let runs = Value::i64((0..k.len() as i64).collect());
+                    return Ok(Value::List(bounds, Box::new(Value::Prod(vec![k, v, runs]))));
+                }
                 let labels = row_labels(&bounds);
                 let (sk, sv, refined) = if let Value::Unit(n) = v {
                     let (refined, sk) = sort_values_only(&labels, &k);
@@ -377,6 +382,31 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
         s = e;
     }
     Value::List(out_ends.into(), Box::new(gather(vals, &take)))
+}
+
+/// whether each row's elements are already strictly ascending, judged by their leading leaf (a
+/// product's first field, down to a leaf) and given up at the first pair that is not. Elements
+/// strictly ascending in their leading leaf are in order and distinct, whatever follows it.
+fn ascending_by_lead(bounds: &Bounds, k: &Value) -> bool {
+    fn rows<T: Ord>(bounds: &Bounds, xs: &[T]) -> bool {
+        let mut start = 0;
+        bounds.ends().all(|end| {
+            let up = xs[start..end].windows(2).all(|w| w[0] < w[1]);
+            start = end;
+            up
+        })
+    }
+    let mut lead = k;
+    while let Value::Prod(fields) = lead {
+        let Some(first) = fields.first() else { return false };
+        lead = first;
+    }
+    match lead {
+        Value::Prim(Prim::U8(xs)) => rows(bounds, xs),
+        Value::Prim(Prim::I64(xs)) => rows(bounds, xs),
+        Value::Prim(Prim::F64(xs)) => rows(bounds, xs),
+        _ => false,
+    }
 }
 
 /// The labels for a per-row sort: each element its row, or none at all when there is one row.
