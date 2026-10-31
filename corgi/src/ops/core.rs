@@ -383,6 +383,7 @@ pub enum Op<L> {
                     // Total but lossy: a position outside its row reads the ZERO of the element's
                     // shape (zero bits, the empty list, a sum's lane 0). The words `try_get` and
                     // `try_gather` put such a row in a lane of its own instead.
+    GatherRange,    // ((lo:Int, hi:Int), haystack:List<T>) -> List<T>; fused Range then Gather
     Range,          // (lo:Int, hi:Int) -> List<Int>  per row [lo, hi), empty when lo >= hi: `iota` with
                     // a start. Total.
     Iota,           // Int -> List<Int>  per row [0,1,…,n-1] (empty for n <= 0) — a List-introducer / data generator
@@ -408,6 +409,21 @@ pub enum Op<L> {
                     // chunked record stream feeds the stride fast paths. Total but lossy: a row that
                     // doesn't divide by `k` drops its remainder (and only then are values copied).
                     // The word `try_chunk` puts such a row in a lane of its own instead.
+}
+
+/// Share the zero's extended reference arenas without changing the source's row numbers.
+/// A miss can add an empty arena row; using that same arena for valid spans preserves refs.
+fn zero_arenas(source: &Value, zero: &Value) -> Value {
+    match (source, zero) {
+        (Value::Ref(_, rows), Value::Ref(arena, _)) => Value::Ref(arena.clone(), rows.clone()),
+        (Value::Prod(fields), Value::Prod(zs)) =>
+            Value::Prod(fields.iter().zip(zs).map(|(v, z)| zero_arenas(v, z)).collect()),
+        (Value::Sum(tags, lanes), Value::Sum(_, zs)) =>
+            Value::Sum(tags.clone(), lanes.iter().zip(zs).map(|(v, z)| zero_arenas(v, z)).collect()),
+        (Value::List(bounds, vals), Value::List(_, zs)) =>
+            Value::List(bounds.clone(), Box::new(zero_arenas(vals, zs))),
+        _ => source.clone(),
+    }
 }
 
 impl<L: OpLike> Op<L> {
@@ -963,6 +979,39 @@ impl<L: OpLike> Op<L> {
                     variants[*k] = res;
                 }
                 Value::Sum(tags, variants)
+            }
+
+            Op::GatherRange => {
+                let (range, haystack) = input.into_pair("GatherRange")?;
+                let (lo, hi) = range.into_pair("Range")?;
+                let (lo, hi) = (lo.as_i64("Range lo")?, hi.as_i64("Range hi")?);
+                let (hb, hvals) = haystack.rows_of("Gather haystack")?;
+                assert_eq!(lo.len(), hi.len(), "Range: lo/hi row count");
+                assert_eq!(lo.len(), hb.len(), "Gather: indices/haystack row count");
+                // Check the payload's zero even on empty input, as raw Gather does.
+                let mut zero = crate::engine::gather_or_zero(hvals, &[])?;
+                let (mut spans, mut ends, mut total, mut padding) = (Vec::new(), Vec::new(), 0, 0);
+                for (i, (&a, &z)) in lo.iter().zip(hi.iter()).enumerate() {
+                    let z = z.max(a);
+                    let (s, e) = hb.span(i);
+                    let len = (e - s) as i128;
+                    let (a, z) = (a as i128, z as i128);
+                    let before = (z.min(0) - a.min(0)) as usize;
+                    let after = (z.max(len) - a.max(len)) as usize;
+                    if before != 0 { spans.push((1, padding, padding + before)); padding += before; }
+                    let (start, end) = (a.clamp(0, len) as usize, z.clamp(0, len) as usize);
+                    if start < end { spans.push((0, s + start, s + end)); }
+                    if after != 0 { spans.push((1, padding, padding + after)); padding += after; }
+                    total += (z - a) as usize;
+                    ends.push(total);
+                }
+                let padded;
+                let source = if padding != 0 {
+                    zero = fill(&crate::engine::gather_or_zero(hvals, &[usize::MAX])?, padding);
+                    padded = zero_arenas(hvals, &zero);
+                    &padded
+                } else { hvals };
+                Value::List(ends.into(), Box::new(crate::engine::take_spans(&[source, &zero], &spans)))
             }
 
             Op::Gather => {

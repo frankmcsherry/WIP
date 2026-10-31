@@ -19,7 +19,7 @@ fn normalize(g: Graph<NumOp>) -> Graph<NumOp> {
     let graph = passes::fold_scalar(graph);
     let graph = passes::immediates(graph);
     let graph = passes::cse(graph);
-    passes::dce(graph)
+    passes::dce(passes::fuse_range_gather(graph))
 }
 
 /// A normalized graph and the input type it was checked at.
