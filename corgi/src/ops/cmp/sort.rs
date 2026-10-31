@@ -10,6 +10,8 @@
 //! permutation a caller wants. Layout, top down: the entry points, the four arms, the leaf
 //! kernel, the label and position helpers.
 
+use std::borrow::Borrow;
+
 use crate::engine::gather;
 use crate::value::{Bounds, Prim, Tags, Value};
 
@@ -82,6 +84,13 @@ pub(crate) fn sort_indexed(
     }
     match v {
         Value::Prim(p) => sort_leaf(p, labels, index, emit, scratch),
+        // with only the index wanted, a product is the run of its leaves (see `sort_fields`)
+        Value::Prod(cols) if emit == Emit::Index => {
+            let mut fields = Vec::new();
+            flatten(cols, &mut fields);
+            sort_fields(&fields, labels, index, scratch);
+            None
+        }
         Value::Prod(cols) => sort_prod(cols, labels, index, emit, scratch),
         // a sum's lanes and a list's elements are read through the index after their sorts.
         Value::Sum(tags, lanes) => sort_sum(tags, lanes, labels, index, emit.keeping_index(), scratch),
@@ -226,6 +235,111 @@ fn sort_prod(
     emit.values().then_some(Value::Prod(outs))
 }
 
+/// The leaves of a product's fields, in order, payload-free ones left out. A product orders
+/// lexicographically by field, and so by this sequence: nesting changes nothing about the order.
+fn flatten<'a>(cols: &'a [Value], out: &mut Vec<&'a Value>) {
+    for c in cols {
+        match c {
+            Value::Prod(inner) => flatten(inner, out),
+            _ if c.unit_only() => {}
+            _ => out.push(c),
+        }
+    }
+}
+
+/// A product's leaves `fields` in turn, under the labels the leaves before refined, when only the
+/// index is wanted. Consecutive leaves that fit one `u64` sort as one packed key ([`sort_packed`]).
+///
+/// Once a leaf leaves many rows alone in their runs, no later leaf can move or split them, so
+/// the later leaves sort only the rows still tied ([`sort_tied`]): each level then reads keys,
+/// checks order and refines labels for those rows alone, not for every row. Whether that pays is
+/// judged from the run count, which the dense labels give for free: with `r` runs over `m`
+/// positions at least `2r - m` positions are alone, so the tied rows are collected only when
+/// `r` is at least half of `m`, and sorted apart when they are at most three quarters of `m`.
+fn sort_fields(fields: &[&Value], labels: &mut Vec<u64>, index: &mut [usize], scratch: &mut SortScratch) {
+    let m = index.len();
+    if fields.is_empty() {
+        densify(labels, m);
+        return;
+    }
+    let mut f = 0;
+    while f < fields.len() {
+        if f > 0 {
+            // the labels are the dense run index of the leaves so far
+            let runs = labels.last().map_or(0, |&l| l as usize + 1);
+            if runs == m {
+                return; // nothing tied: no later leaf can move a row or split a run
+            }
+            if 2 * runs >= m {
+                if let Some(live) = tied_positions(labels, m - m / 4) {
+                    sort_tied(&fields[f..], labels, index, &live, scratch);
+                    return;
+                }
+            }
+        }
+        f = match packable_bits(fields[f]) {
+            Some(_) => sort_packed(fields, f, labels, index, Emit::Index, scratch).1,
+            None => {
+                sort_indexed(fields[f], labels, index, Emit::Index, scratch);
+                f + 1
+            }
+        };
+    }
+}
+
+/// The positions in runs of more than one position, ascending, if there are at most `cap` of them.
+/// `labels` is a dense run index.
+fn tied_positions(labels: &[u64], cap: usize) -> Option<Vec<usize>> {
+    let m = labels.len();
+    let mut live = Vec::new();
+    let mut lo = 0;
+    while lo < m {
+        let mut hi = lo + 1;
+        while hi < m && labels[hi] == labels[lo] {
+            hi += 1;
+        }
+        if hi - lo > 1 {
+            if live.len() + (hi - lo) > cap {
+                return None;
+            }
+            live.extend(lo..hi);
+        }
+        lo = hi;
+    }
+    Some(live)
+}
+
+/// Sort the tied positions `live` (whole runs of `labels`, ascending) by the leaves `fields`, apart
+/// from the rest: their rows and labels are copied out (positions only, no data), sorted as a
+/// smaller problem under the same labels, and written back to the same positions, which a run's
+/// rows only permute within. Then the labels are renumbered densely over every position, a run
+/// ending where it did or where the leaves told two tied neighbours apart.
+fn sort_tied(fields: &[&Value], labels: &mut [u64], index: &mut [usize], live: &[usize], scratch: &mut SortScratch) {
+    let mut rows: Vec<usize> = live.iter().map(|&q| index[q]).collect();
+    let mut tied: Vec<u64> = live.iter().map(|&q| labels[q]).collect();
+    sort_fields(fields, &mut tied, &mut rows, scratch);
+    for (&q, &r) in live.iter().zip(&rows) {
+        index[q] = r;
+    }
+    let mut next = 0u64;
+    let mut prev = labels.first().copied().unwrap_or(0);
+    let mut k = 0;
+    for q in 0..labels.len() {
+        let old = labels[q];
+        // a tied position whose tied neighbour before it shares its old run: the leaves decide
+        let mut split = false;
+        if k < live.len() && live[k] == q {
+            split = k > 0 && live[k - 1] + 1 == q && tied[k] != tied[k - 1];
+            k += 1;
+        }
+        if q > 0 && (old != prev || split) {
+            next += 1;
+        }
+        prev = old;
+        labels[q] = next;
+    }
+}
+
 fn packable_bits(v: &Value) -> Option<u32> {
     match v {
         Value::Unit(_) => Some(0),
@@ -275,8 +389,8 @@ fn unpack_value(v: &Value, keys: &[u64], shift: &mut u32) -> Value {
 /// sorted as one key, most significant leaf first: one set of passes and one refinement for
 /// the run. Unit and product structure occupy no key bits. Returns one column per field with
 /// `emit`, and the index of the first field not taken.
-fn sort_packed(
-    cols: &[Value],
+fn sort_packed<C: Borrow<Value>>(
+    cols: &[C],
     f: usize,
     labels: &mut Vec<u64>,
     index: &mut [usize],
@@ -286,7 +400,7 @@ fn sort_packed(
     let mut g = f;
     let mut used = 0u32;
     while g < cols.len() {
-        let Some(bits) = packable_bits(&cols[g]) else { break };
+        let Some(bits) = packable_bits(cols[g].borrow()) else { break };
         if used + bits > 64 {
             break;
         }
@@ -297,7 +411,7 @@ fn sort_packed(
     keys.clear();
     let mut first = true;
     for c in &cols[f..g] {
-        pack_value(c, index, &mut keys, &mut first);
+        pack_value(c.borrow(), index, &mut keys, &mut first);
     }
     debug_assert!(!first);
     if emit == Emit::Values && g == cols.len() {
@@ -309,7 +423,7 @@ fn sort_packed(
     if emit.values() {
         let mut shift = used;
         for c in &cols[f..g] {
-            outs.push(unpack_value(c, &keys, &mut shift));
+            outs.push(unpack_value(c.borrow(), &keys, &mut shift));
         }
     }
     scratch.keys = keys;
@@ -424,11 +538,16 @@ fn sort_list(
     // Lexicographic: position by position over the rows still tied. In each tied block the rows
     // that end at `pos` go first, as one class (each is a proper prefix of the rest), and the
     // rows that go on sort by their element at `pos`: a leaf's read straight into keys, anything
-    // else's through its positions.
+    // else's through its positions. Bytes go `WINDOW` positions at a time ([`window_key`]).
     let leaf = match vals {
         Value::Prim(p) => Some(p),
         _ => None,
     };
+    let bytes = match vals {
+        Value::Prim(Prim::U8(b)) => Some(&b[..]),
+        _ => None,
+    };
+    let step = if bytes.is_some() { WINDOW } else { 1 };
     let mut live: Vec<usize> = (0..m).filter(|&q| in_tie(labels, q)).collect();
     let mut pos = 0;
     let (mut going, mut rows, mut keys, mut labels_j, mut elem) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -453,11 +572,14 @@ fn sort_list(
             for q in q0..q1 {
                 let r = index[q];
                 let (s, t) = bounds.span(r);
-                if s + pos == t {
+                // past the end too: rows that ended inside the last window, all equal
+                if s + pos >= t {
                     index[q0 + ends] = r;
                     ends += 1;
                 } else {
-                    if let Some(p) = leaf {
+                    if let Some(b) = bytes {
+                        keys.push(window_key(&b[s + pos..t]));
+                    } else if let Some(p) = leaf {
                         keys.push(p.key_at(s + pos));
                     }
                     rows.push(r);
@@ -492,7 +614,7 @@ fn sort_list(
             index[q] = r;
         }
         write_starts(labels, &going, &labels_j);
-        pos += 1;
+        pos += step;
         live.clear();
         live.extend(going.iter().copied().filter(|&q| in_tie(labels, q)));
     }
@@ -508,6 +630,22 @@ fn sort_list(
         }
         Value::List(ends.into(), Box::new(gather(vals, &elems)))
     })
+}
+
+/// How many bytes of a byte list one pass of [`sort_list`] reads.
+const WINDOW: usize = 7;
+
+/// The sort key of a byte list's next `WINDOW` positions, `rest` being what remains of the row:
+/// those bytes, zero padded, in the high bytes, and in the low byte how many there were, or
+/// `WINDOW + 1` if more follow. Keys order as the rows do from here: two rows that differ within
+/// the window differ in the bytes there, or else the one that ends first is the other's prefix and
+/// has the smaller count. Equal keys are rows that agree on the window and both go on, or are equal
+/// and both end in it; the next pass finds the latter past their ends.
+fn window_key(rest: &[u8]) -> u64 {
+    let k = rest.len().min(WINDOW);
+    let mut word = [0u8; 8];
+    word[..k].copy_from_slice(&rest[..k]);
+    u64::from_be_bytes(word) | rest.len().min(WINDOW + 1) as u64
 }
 
 // ---- the leaf kernel ------------------------------------------------------------------------
@@ -571,19 +709,56 @@ fn sort_keys_only(keys: &mut [u64], labels: &mut Vec<u64>, scratch: &mut SortScr
 /// and report it, touching nothing else. Most later product fields are constant, or ascending,
 /// within the classes the fields before them formed. Leaves the labels as they were otherwise.
 fn refine_if_ordered(keys: &[u64], labels: &mut Vec<u64>) -> bool {
-    let ordered = if labels.is_empty() {
-        keys.windows(2).all(|w| w[0] <= w[1])
-    } else {
-        keys.windows(2).zip(labels.windows(2)).all(|(k, l)| k[0] <= k[1] || l[0] != l[1])
-    };
-    if ordered {
-        if labels.is_empty() {
+    if labels.is_empty() {
+        let ordered = ascending(keys);
+        if ordered {
             label_runs(labels, keys.len(), |q| keys[q] != keys[q - 1]);
-        } else {
+        }
+        return ordered;
+    }
+    match ascending_within(keys, labels) {
+        None => false,
+        // the keys split no run and the labels are already the dense run index: nothing to write
+        Some(true) => true,
+        Some(false) => {
             refine(labels, |q| keys[q] != keys[q - 1]);
+            true
         }
     }
-    ordered
+}
+
+/// How many adjacent pairs the order checks compare between early exits: enough for the
+/// comparisons to run as vector operations, few enough that an early descent stops them soon.
+const CHECK: usize = 256;
+
+/// No descent in `keys`: a block of pairs at a time, with no branch per pair.
+fn ascending(keys: &[u64]) -> bool {
+    let n = keys.len();
+    n < 2 || keys[..n - 1].chunks(CHECK).zip(keys[1..].chunks(CHECK)).all(|(a, b)| {
+        a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x > y) as u8) == 0
+    })
+}
+
+/// No descent in `keys` between positions that share a label ([`ascending`], within runs): `None`
+/// if there is one, else whether refining by `keys` would leave `labels` as they are, which is
+/// when no two neighbours in a run differ and `labels` is already the dense run index (from
+/// zero, in steps of at most one).
+fn ascending_within(keys: &[u64], labels: &[u64]) -> Option<bool> {
+    let n = keys.len();
+    let mut same = labels.first().is_none_or(|&l| l == 0);
+    if n < 2 {
+        return Some(same);
+    }
+    for ((ka, kb), (la, lb)) in keys[..n - 1].chunks(CHECK).zip(keys[1..].chunks(CHECK)).zip(labels[..n - 1].chunks(CHECK).zip(labels[1..].chunks(CHECK))) {
+        let (descent, change) = ka.iter().zip(kb).zip(la.iter().zip(lb)).fold((0u8, 0u8), |(d, c), ((x, y), (l, r))| {
+            (d | ((x > y) & (l == r)) as u8, c | ((x != y) & (l == r) | (r.wrapping_sub(*l) > 1)) as u8)
+        });
+        if descent != 0 {
+            return None;
+        }
+        same &= change == 0;
+    }
+    Some(same)
 }
 
 /// Stable sort of one block by `keys`, `rows` moving with them. Blocks of 32 or fewer take an

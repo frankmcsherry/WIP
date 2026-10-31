@@ -315,3 +315,79 @@ fn signed_values_around_zero() {
         }
     }
 }
+
+/// Products whose first leaves leave some rows alone and some tied, at sizes where the later
+/// leaves sort only the tied rows, nested and with a list and a sum among the later leaves;
+/// from caller labels and from a scrambled subset of rows.
+#[test]
+fn later_leaves_sort_only_the_tied_rows() {
+    let mut rng = Rng(31);
+    for n in [3usize, 64, 2000] {
+        for alone in [0usize, 1, 2, 3] {
+            // the first leaf: every row distinct except a share of them in small runs
+            let first: Vec<i64> = (0..n).map(|i| if rng.below(4) < alone { i as i64 * 8 } else { (i as i64 / 3) * 8 + 1 }).collect();
+            let second = Value::u8((0..n).map(|_| rng.below(3) as u8).collect());
+            let third = Value::i64((0..n).map(|_| rng.below(4) as i64 - 2).collect());
+            let mut ends = Vec::with_capacity(n);
+            let mut total = 0;
+            for _ in 0..n {
+                total += rng.below(3);
+                ends.push(total);
+            }
+            let list = Value::List(ends.into(), Box::new(Value::i64((0..total).map(|_| rng.below(2) as i64).collect())));
+            let tags: Vec<usize> = (0..n).map(|_| rng.below(2)).collect();
+            let lanes = (0..2).map(|t| Value::i64((0..tags.iter().filter(|&&x| x == t).count()).map(|_| rng.below(2) as i64).collect())).collect();
+            let sum = Value::sum(tags, lanes);
+            let v = Value::Prod(vec![
+                Value::Prod(vec![Value::i64(first), second]),
+                Value::Unit(n),
+                third,
+                Value::Prod(vec![list, sum]),
+            ]);
+            let index: Vec<usize> = (0..n).collect();
+            for labels in label_patterns(&mut rng, n) {
+                check(&v, &labels, &index);
+            }
+            let mut subset: Vec<usize> = (0..n).filter(|_| rng.below(3) != 0).collect();
+            for k in (1..subset.len()).rev() {
+                subset.swap(k, rng.below(k + 1));
+            }
+            check(&v, &[], &subset);
+        }
+    }
+}
+
+/// Byte lists of every length around the window, with zero bytes and shared prefixes (a row and
+/// its extension by zeros, rows equal for a window and then different), as rows, as product fields
+/// after a tied leaf, and from caller labels and subsets.
+#[test]
+fn byte_lists_sort_a_window_at_a_time() {
+    let mut rng = Rng(41);
+    for n in [2usize, 50, 600] {
+        let mut ends = Vec::with_capacity(n);
+        let mut bytes = Vec::new();
+        let stem: Vec<u8> = (0..20).map(|_| rng.below(3) as u8).collect();
+        for _ in 0..n {
+            let len = rng.below(18);
+            // half the rows extend a common stem, so that windows tie and rows are prefixes
+            if rng.below(2) == 0 {
+                bytes.extend_from_slice(&stem[..len]);
+            } else {
+                bytes.extend((0..len).map(|_| rng.below(3) as u8));
+            }
+            ends.push(bytes.len());
+        }
+        let list = Value::List(ends.into(), Box::new(Value::u8(bytes)));
+        let index: Vec<usize> = (0..n).collect();
+        for labels in label_patterns(&mut rng, n) {
+            check(&list, &labels, &index);
+        }
+        let first = Value::i64((0..n).map(|_| rng.below(3) as i64).collect());
+        check(&Value::Prod(vec![first, list.clone()]), &[], &index);
+        let mut subset: Vec<usize> = (0..n).filter(|_| rng.below(3) != 0).collect();
+        for k in (1..subset.len()).rev() {
+            subset.swap(k, rng.below(k + 1));
+        }
+        check(&list, &[], &subset);
+    }
+}
