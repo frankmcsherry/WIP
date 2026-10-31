@@ -1,7 +1,7 @@
 //! Structural, content-addressed hashing: `hash(v) -> U64 column`, one stable u64 per row.
 //!
 //! The hash-analogue of the structural comparator ([`crate::ops::cmp`]'s `compare_cols`): it folds
-//! the SAME type structure — leaf bytes, `Prod` field-by-field, `List` length-then-elements, `Sum`
+//! the SAME value structure — leaf words, `Prod` field-by-field, `List` length and ordered contents, `Sum`
 //! tag-then-payload — so it is CONSISTENT WITH corgi's structural equality. Rows that compare equal
 //! (hence collapse under `sort`/`dedup`/`group`) hash identically; the converse holds only up to the
 //! birthday bound (collisions are accepted, see below).
@@ -11,18 +11,17 @@
 //!     bytes, so signed/float encodings hash by their stored form just as equality compares them.
 //!   * COLUMNAR — one bottom-up pass, no per-row `Value`; a `Sum` reads its carried within-variant
 //!     offset O(1) per row (no rank rescan), exactly like `compare_idx`.
-//!   * STABLE — pure integer math with fixed constants, no seed, no address or batch dependence — so
+//!   * STABLE — pure integer math with fixed seeds, no address or batch dependence — so
 //!     the same value yields the same u64 on every machine and every run.
 //!
 //! REPRESENTATION-BLIND — the id addresses the VALUE, not its layout. A `List`'s `Stride` and the
 //! equivalent `Offsets` hash the same (by partition), and a leaf's WIDTH drops out for the raw/unsigned
 //! reading: `u8` 5 and `u64` 5 collapse to one id (the fold widens every leaf to u64), so a
 //! narrowing/widening for storage is id-preserving and a join can match equal keys carried at
-//! different widths. CAVEAT for signed/float: those store a WIDTH-DEPENDENT order-preserving encoding
-//! (`i8` -1 = `0x7F`, `i64` -1 = `0x7FFF…FF` — not zero-extensions), so cross-width identity is NOT
-//! promised for them (kind-blindness — ignoring the U/I/F label — still holds; it is width-invariance
-//! that does not). Downstream constraint on the DD side: keep signed/float leaf widths consistent
-//! across a join's two inputs and across the output→input boundary, or equal keys can hash unequal.
+//! different widths. A list of leaves hashes as bytes when every word is in 0..=255, otherwise
+//! as little-endian u64 words under a separate seed. This decision is per row, including references;
+//! neither the containing batch nor the storage variant affects it. Float leaves use their stored
+//! order keys, as does structural equality.
 //!
 //! This is the boundary id function: present a record as `((hash(key), hash(value)), time, diff)` and
 //! the ids stay equal-for-equal-values across operators and runs (a reduce OUTPUT hashes to the same
@@ -35,8 +34,10 @@
 
 use crate::value::{Prim, Value};
 
-/// splitmix64 finalizer — a full-avalanche 64-bit mix. The one bit-mixing primitive; both the leaf
-/// hashing ([`Prim::hashes`]) and the structural [`combine`] build on it.
+mod foldhash;
+
+/// splitmix64 finalizer — a full-avalanche 64-bit mix for primitive leaves ([`Prim::hashes`])
+/// and the structural [`combine`]. Lists of leaves use foldhash quality instead.
 pub(crate) fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -108,9 +109,9 @@ pub fn hash(v: &Value) -> Vec<u64> {
                 .collect()
         }
 
-        // list = length first, then each element in order, folded by SPAN — so a `Stride` and the
+        // Lists hash by SPAN — so a `Stride` and the
         // equivalent `Offsets` hash identically (matching `Bounds` equality, which is by the
-        // partition, not its representation). A list of leaves folds them in the row's own loop.
+        // partition, not its representation). A list of leaves uses a single row hash.
         Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
             let ends: Vec<usize> = bounds.ends().collect();
             leaf_list_rows(vals, ends.len(), |r| (if r == 0 { 0 } else { ends[r - 1] }, ends[r]))
@@ -137,7 +138,7 @@ pub fn hash(v: &Value) -> Vec<u64> {
     }
 }
 
-/// `n` rows of a list of leaves, row `i` the elements `span(i)` of `vals`: the fold of each row,
+/// `n` rows of a list of leaves, row `i` the elements `span(i)` of `vals`: the hash of each row,
 /// computed in the row's own loop.
 fn leaf_list_rows(vals: &Value, n: usize, span: impl Fn(usize) -> (usize, usize)) -> Vec<u64> {
     match vals {
@@ -148,38 +149,30 @@ fn leaf_list_rows(vals: &Value, n: usize, span: impl Fn(usize) -> (usize, usize)
     }
 }
 
-/// rows of bytes — the same fold as any list, computed faster. A byte has 256 possible hashes, so
-/// each one's contribution to the fold comes from a table; and four rows run side by side (for as
-/// long as the shortest of them), so the multiply each byte waits on overlaps with three others'.
+/// Lists of leaves use foldhash quality, with distinct domains for bytes and words.
 fn byte_rows(n: usize, span: impl Fn(usize) -> (usize, usize), bytes: &[u8]) -> Vec<u64> {
-    let table: [u64; 256] = std::array::from_fn(|b| mix64(mix64(b as u64)));
-    let step = |a: u64, b: u8| (a ^ table[b as usize]).wrapping_mul(K);
-    let row = |(s, e): (usize, usize)| bytes[s..e].iter().fold(combine(LIST, (e - s) as u64), |a, &b| step(a, b));
-    let mut out = Vec::with_capacity(n);
-    let mut r = 0;
-    while r + 4 <= n {
-        let spans: [(usize, usize); 4] = std::array::from_fn(|j| span(r + j));
-        let mut a: [u64; 4] = std::array::from_fn(|j| combine(LIST, (spans[j].1 - spans[j].0) as u64));
-        let shortest = spans.iter().map(|(s, e)| e - s).min().unwrap_or(0);
-        for i in 0..shortest {
-            for j in 0..4 {
-                a[j] = step(a[j], bytes[spans[j].0 + i]);
-            }
-        }
-        out.extend((0..4).map(|j| bytes[spans[j].0 + shortest..spans[j].1].iter().fold(a[j], |a, &b| step(a, b))));
-        r += 4;
-    }
-    out.extend((r..n).map(|r| row(span(r))));
-    out
+    (0..n).map(|r| {
+        let (s, e) = span(r);
+        foldhash::hash(&bytes[s..e], LIST)
+    }).collect()
 }
 
-/// rows of leaves other than bytes: each element's hash folded in as it is made, rather than
-/// written to a column first.
+/// Reuse one encoding buffer; byte-valued rows must agree with U8 storage, even in a mixed batch.
 fn leaf_rows<T: Copy>(n: usize, span: impl Fn(usize) -> (usize, usize), xs: &[T], word: impl Fn(T) -> u64) -> Vec<u64> {
+    const WORDS: u64 = 0x4528_21e6_38d0_1377;
+    let mut bytes = Vec::new();
     (0..n)
         .map(|r| {
             let (s, e) = span(r);
-            xs[s..e].iter().fold(combine(LIST, (e - s) as u64), |a, &x| combine(a, mix64(word(x))))
+            let row = &xs[s..e];
+            let is_bytes = row.iter().all(|&x| word(x) <= 255);
+            bytes.clear();
+            if is_bytes {
+                bytes.extend(row.iter().map(|&x| word(x) as u8));
+            } else {
+                bytes.extend(row.iter().flat_map(|&x| word(x).to_le_bytes()));
+            }
+            foldhash::hash(&bytes, if is_bytes { LIST } else { WORDS })
         })
         .collect()
 }
