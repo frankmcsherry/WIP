@@ -245,6 +245,35 @@ pub fn fuse_maps(g: Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
+/// A private Range feeding only Gather need not write an integer per copied element.
+/// Run after sharing, so another reader of the range prevents fusion. Recurse into bodies.
+pub(super) fn fuse_range_gather(g: Graph<NumOp>) -> Graph<NumOp> {
+    let mut uses = vec![0usize; g.nodes.len()];
+    for n in &g.nodes { for &e in &n.inputs { uses[e] += 1; } }
+    uses[g.output] += 1;
+    let private: Vec<_> = g.nodes.iter().map(|n| {
+        n.inputs.first().is_some_and(|&p| {
+            let pair = &g.nodes[p];
+            matches!(pair.kind, NodeKind::Tuple) && pair.inputs.len() == 2
+                && uses[p] == 1 && uses[pair.inputs[0]] == 1
+        })
+    }).collect();
+    rewrite_graph(g, fuse_range_gather, |kind, inputs, built, old| {
+        if !matches!(kind, NodeKind::Op(NumOp::Core(Op::Gather))) { return None; }
+        if !private[old] { return None; }
+        let pair = &built[inputs[0]];
+        if !matches!(pair.kind, NodeKind::Tuple) || pair.inputs.len() != 2 { return None; }
+        let (range, haystack) = (pair.inputs[0], pair.inputs[1]);
+        let producer = &built[range];
+        if !matches!(producer.kind, NodeKind::Op(NumOp::Core(Op::Range))) { return None; }
+        let ranges = producer.inputs[0];
+        built.push(Node { kind: NodeKind::Tuple, inputs: vec![ranges, haystack] });
+        Some(Rewrite::Replace(Node {
+            kind: NodeKind::Op(NumOp::Core(Op::GatherRange)), inputs: vec![built.len() - 1],
+        }))
+    })
+}
+
 /// Adjacent structural isos that are exact inverses (`Zip∘Transpose`, `Weave∘Unweave`, and
 /// `Unweave∘Weave`) cancel: `outer(inner(x)) = x`, so the consumer reads `inner`'s input directly.
 /// Sound regardless of fan-out — only this edge is redirected; a still-shared `inner` survives for
