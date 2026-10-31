@@ -33,23 +33,26 @@ fn storage_invariant() {
 }
 
 #[test]
-fn lists_of_leaves_fold_their_elements() {
-    // a list of leaves is folded in the row's own loop (bytes four rows at a time, from a table);
-    // it must be the fold of its elements' hashes, at every row length and count of rows
-    let mut s = 0x9E37_79B9_7F4A_7C15u64;
-    let mut next = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
-    for rows in [0usize, 1, 3, 4, 5, 9, 37] {
-        let lens: Vec<usize> = (0..rows).map(|_| (next() % 21) as usize).collect();
-        let ends: Vec<usize> = lens.iter().scan(0, |e, &l| { *e += l; Some(*e) }).collect();
-        let total = ends.last().copied().unwrap_or(0);
-        let bytes: Vec<u8> = (0..total).map(|_| next() as u8).collect();
-        let ints: Vec<i64> = (0..total).map(|_| next() as i64).collect();
-        for vals in [Value::u8(bytes), u(&ints), Value::f64(ints.iter().map(|&x| x as f64).collect())] {
-            let ch = h(&vals);
-            let want: Vec<u64> = (0..rows).map(|r| hash_span(&ch, (if r == 0 { 0 } else { ends[r - 1] }, ends[r]))).collect();
-            assert_eq!(h(&Value::List(Bounds::offsets(ends.clone()), Box::new(vals))), want, "{rows} rows");
-        }
+fn leaf_lists_are_storage_and_batch_independent() {
+    // Exercise byte/word domain boundaries, empty rows, long rows, and mixed batches.
+    for len in [0, 1, 3, 4, 7, 8, 16, 17, 64, 129, 257, 1024] {
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 137) as u8).collect();
+        let list = |vals| Value::List(Bounds::Stride(len, 1), Box::new(vals));
+        let want = h(&list(Value::u8(bytes.clone())));
+        assert_eq!(want, h(&list(u(&bytes.iter().map(|&b| b as i64).collect::<Vec<_>>()))));
+        let mut mixed: Vec<i64> = bytes.iter().map(|&b| b as i64).collect();
+        mixed.extend([-1, 256, i64::MIN, i64::MAX]);
+        let batch = Value::List(Bounds::offsets(vec![len, len + 4]), Box::new(u(&mixed)));
+        assert_eq!(want[0], h(&batch)[0]);
+        assert_eq!(h(&batch)[1], h(&Value::List(Bounds::Stride(4, 1), Box::new(u(&mixed[len..]))))[0]);
+        let named = Value::Ref(std::sync::Arc::new(batch), std::sync::Arc::new(vec![1, 0, 1]));
+        assert_eq!(h(&named)[1], want[0]);
     }
+    // F64 carries raw order keys, which compare kind-blindly with the other stored words.
+    let words = vec![0, 255, 256, u64::MAX];
+    let f = Value::Prim(Prim::F64(std::sync::Arc::new(words.clone())));
+    assert_eq!(h(&Value::List(Bounds::Stride(2, 2), Box::new(f))),
+               h(&Value::List(Bounds::Stride(2, 2), Box::new(u(&words.iter().map(|&x| x as i64).collect::<Vec<_>>())))));
 }
 
 #[test]
@@ -176,6 +179,17 @@ fn stable_golden() {
         h(&u(&[0, 1, 2])),
         vec![0, 6238072747940578789, 15839785061582574730],
     );
+    assert_eq!(h(&Value::List(Bounds::Stride(2, 1), Box::new(u(&[-1, 256])))), vec![13253637079594526188]);
+    // Pin the canonical byte algorithm on every target, including empty and long rows.
+    for (bytes, expected) in [
+        (vec![], 3531106307585754724),
+        (b"a".to_vec(), 11134521749165977850),
+        (b"abcdefgh".to_vec(), 12131656011083297291),
+        ((0..=255).collect(), 4077148437932887628),
+    ] {
+        let len = bytes.len();
+        assert_eq!(h(&Value::List(Bounds::Stride(len, 1), Box::new(Value::u8(bytes)))), vec![expected]);
+    }
 }
 
 #[test]
