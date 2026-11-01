@@ -144,6 +144,14 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "fold_max" => ArithOp::Reduce(Red::Max).into(),
         "fold_all" => ArithOp::Reduce(Red::All).into(), // 1 iff every element nonzero (mask AND)
         "fold_any" => ArithOp::Reduce(Red::Any).into(), // 1 iff any element nonzero (mask OR)
+        // the keyed reductions: (keys, values) -> one (key, total) per distinct key, in an order not
+        // promised. `scatter_<binop>`.
+        "scatter_add" => ArithOp::Scatter(Red::Add).into(),
+        "scatter_mul" => ArithOp::Scatter(Red::Mul).into(),
+        "scatter_min" => ArithOp::Scatter(Red::Min).into(),
+        "scatter_max" => ArithOp::Scatter(Red::Max).into(),
+        "scatter_all" => ArithOp::Scatter(Red::All).into(),
+        "scatter_any" => ArithOp::Scatter(Red::Any).into(),
         // the inclusive-prefix monoid scans — `scan_<binop>`, the one-pass fast paths for `scan` with a
         // monoid body (the `fold_*` siblings that KEEP each prefix instead of dropping to the total).
         "scan_add" => ArithOp::Scan(Red::Add).into(),
