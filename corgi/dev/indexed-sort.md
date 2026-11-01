@@ -6,18 +6,17 @@ copies it made per level are in this file's history (commit 9c32786).
 
 ## Contract
 
-    sort_indexed(v, labels: &mut [u64], index: &mut [usize], emit: bool, scratch) -> (perm, Option<Value>)
+    sort_indexed(v, labels: &mut Vec<u64>, index: &mut [usize], emit: Emit, scratch) -> Option<Value>
 
 Requires `labels` empty or of `index`'s length and non-decreasing (position `k` is row `index[k]`
 in block `labels[k]`; checked in debug builds), and every `index[k]` a row of `v`. Ensures:
 
-- `index` is permuted so that each block holds its rows in structural order; blocks keep their
-  places, equal rows keep their order.
+- With `Emit::Index` or `Emit::Both`, `index` is permuted so that each block holds its rows in
+  structural order; blocks keep their places, equal rows keep their order.
 - `labels` is the dense run index of the refined partition, in that order: two positions share a
   label iff they did before and their rows are structurally equal.
-- `perm` satisfies `new_index[k] == old_index[perm[k]]`, so a caller can move a parallel array
-  the same way.
-- With `emit`, the returned column is `gather(v, &new_index)`, produced by the sort.
+- With `Emit::Values` or `Emit::Both`, the returned column is the sorted rows, produced by the
+  sort. With `Emit::Values`, the final contents of `index` are unspecified.
 
 Structural order: leaf by value (an integer as a signed number, a float by its total order); `Prod` lexicographic by field; `Sum` by tag
 then payload; `List` lexicographically, element by element, a proper prefix first; `Unit` all
@@ -25,11 +24,11 @@ equal.
 
 `labels` may arrive empty, meaning every position is one block, which is the first rank of any
 sort and the whole of a primitive column's; the refined labels always come back. `emit` is
-`Groups` (the permuted index and `perm`), `Values` (the column; `index` and `perm` unspecified,
-so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(labels, v) ->
-(perm, labels)` is `Groups` at the identity index (`perm[k]` the input row at output position
-`k`); `sort_values(labels, v)` is `Both`; `sort_values_only(labels, v)` is `Values`. `arrange` exposes
-`sort_perm`, `sort_blocks`, `sort_values` and `sort_indexed`.
+`Emit::Index` (the permuted index), `Emit::Values` (the column, so a leaf sorts its keys without
+carrying positions), or `Emit::Both`. Each internal caller selects its mode and supplies its
+index. The public Rust entry point is `arrange::sort_blocks(labels, v) -> (perm, labels)`: it
+requests `Emit::Index` at the identity index (`perm[k]` is the input row at output position `k`).
+`arrange::sort_blocks(&[], v)` sorts all rows as one block.
 
 ## Design
 

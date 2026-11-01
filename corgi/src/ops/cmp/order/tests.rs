@@ -1,15 +1,10 @@
 use super::*;
 use crate::engine::gather;
-use crate::ops::cmp::sort::sort_blocks;
+use crate::arrange::sort_blocks;
 
 /// integers from their 64-bit words (so the full range, negatives included, is easy to write).
 fn u(xs: &[u64]) -> Value {
     Value::i64(xs.iter().map(|&x| x as i64).collect())
-}
-
-/// single-block sort of `v`'s rows → the permutation.
-fn sort_perm(v: &Value) -> Vec<usize> {
-    sort_blocks(&vec![0u64; v.len()], v).0
 }
 
 /// the obviously-correct scalar reference: structural order of row `i` of `a` vs row `j` of `b`,
@@ -243,7 +238,7 @@ fn reference(v: &Value) -> Value {
 /// discrimination must agree with the reference on the sorted VALUES (equal rows may permute differently,
 /// but materialise identically).
 fn agree(v: &Value) {
-    assert_eq!(gather(v, &sort_perm(v)), reference(v));
+    assert_eq!(gather(v, &sort_blocks(&[], v).0), reference(v));
 }
 
 #[test]

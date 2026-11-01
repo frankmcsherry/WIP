@@ -1,4 +1,5 @@
 use super::*;
+use crate::arrange::sort_blocks;
 use crate::ops::cmp::order::compare_at;
 use std::cmp::Ordering;
 
@@ -272,7 +273,9 @@ fn the_labels_form_is_the_identity_index() {
     let (_, rows, labels_ref) = reference(&v, &labels, &[0, 1, 2, 3, 4, 5]);
     assert_eq!(perm, rows);
     assert_eq!(refined, labels_ref);
-    let (perm2, refined2, sorted) = sort_values(&labels, &v);
+    let mut perm2: Vec<usize> = (0..v.len()).collect();
+    let mut refined2 = labels.to_vec();
+    let sorted = sort_indexed(&v, &mut refined2, &mut perm2, Emit::Both, &mut SortScratch::default()).unwrap();
     assert_eq!((perm2, refined2), (perm, refined));
     assert_eq!(sorted, gather(&v, &rows));
 }
