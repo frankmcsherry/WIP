@@ -715,18 +715,18 @@ fn family_arrange(n: usize, reps: u32) {
     let col = Value::i64(src.clone());
 
     let c = rust_t(reps, || {
-        black_box(arrange::sort_perm(black_box(&col)));
+        black_box(arrange::sort_blocks(&[], black_box(&col)).0);
     });
     let r = rust_t(reps, || {
         let s = black_box(&src);
         let mut perm: Vec<usize> = (0..s.len()).collect();
         // Cache each key once while `perm` is still in input order. Plain `sort_by_key` would reload
         // the large key column at every comparison and is not an honest argsort ceiling at DRAM scale.
-        perm.sort_by_cached_key(|&i| s[i]); // stable, matching sort_perm's contract
+        perm.sort_by_cached_key(|&i| s[i]); // stable, matching sort_blocks' contract
         black_box(perm);
     });
     row(
-        "R1 arrange_sort_perm",
+        "R1 arrange_sort_blocks",
         n,
         c,
         r,
@@ -744,7 +744,7 @@ fn family_arrange(n: usize, reps: u32) {
         for (i, &t) in tags.iter().enumerate() { lanes[t].push(payload[i]); }
         let col = Value::sum(tags.clone(), lanes.into_iter().map(Value::i64).collect());
         let c = rust_t(reps, || {
-            black_box(arrange::sort_perm(black_box(&col)));
+            black_box(arrange::sort_blocks(&[], black_box(&col)).0);
         });
         let r = rust_t(reps, || {
             let (tags, payload) = (black_box(&tags), black_box(&payload));
@@ -762,7 +762,7 @@ fn family_arrange(n: usize, reps: u32) {
         let elems: Vec<i64> = scrambled(total).into_iter().map(|x| x % 1000).collect();
         let col = Value::List(Bounds::offsets(ends.clone()), Box::new(Value::i64(elems.clone())));
         let c = rust_t(reps, || {
-            black_box(arrange::sort_perm(black_box(&col)));
+            black_box(arrange::sort_blocks(&[], black_box(&col)).0);
         });
         let r = rust_t(reps, || {
             let (ends, elems) = (black_box(&ends), black_box(&elems));

@@ -40,8 +40,10 @@ impl Rounds {
         let (order, lens) = if in_order {
             ((0..lens.len()).collect(), lens)
         } else {
+            use crate::ops::cmp::sort::{sort_indexed, Emit, SortScratch};
             let neg = Value::i64(lens.iter().map(|&l| -(l as i64)).collect());
-            let (order, _) = crate::ops::cmp::sort::sort_blocks(&[], &neg);
+            let mut order: Vec<usize> = (0..neg.len()).collect();
+            sort_indexed(&neg, &mut Vec::new(), &mut order, Emit::Index, &mut SortScratch::default());
             let lens = order.iter().map(|&r| lens[r]).collect();
             (order, lens)
         };

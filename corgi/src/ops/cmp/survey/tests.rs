@@ -2,7 +2,7 @@ use super::*;
 use crate::engine::gather;
 use crate::value::Bounds;
 use crate::ops::cmp::order::compare_at;
-use crate::ops::cmp::sort::sort_values;
+use crate::ops::cmp::sort::{sort_indexed, Emit, SortScratch};
 use std::cmp::Ordering;
 
 struct Rng(u64);
@@ -53,8 +53,10 @@ fn two_sorted(rng: &mut Rng, na: usize, nb: usize, depth: usize) -> (Value, Valu
     let both = random_value(rng, na + nb, depth);
     let a = gather(&both, &(0..na).collect::<Vec<_>>());
     let b = gather(&both, &(na..na + nb).collect::<Vec<_>>());
-    let (_, _, a) = sort_values(&[], &a);
-    let (_, _, b) = sort_values(&[], &b);
+    let mut index: Vec<usize> = (0..a.len()).collect();
+    let a = sort_indexed(&a, &mut Vec::new(), &mut index, Emit::Both, &mut SortScratch::default()).unwrap();
+    let mut index: Vec<usize> = (0..b.len()).collect();
+    let b = sort_indexed(&b, &mut Vec::new(), &mut index, Emit::Both, &mut SortScratch::default()).unwrap();
     (a, b)
 }
 
@@ -134,8 +136,10 @@ fn singleton_list_spans_compare_mixed_integer_storage() {
     // differently sized suffixes to decide. Both surveys must match the scalar oracle.
     let a = Value::List(Bounds::Stride(3, 3), Box::new(bytes));
     let b = Value::List(Bounds::Stride(3, 3), Box::new(ints));
-    let (_, _, a) = sort_values(&[], &a);
-    let (_, _, b) = sort_values(&[], &b);
+    let mut index: Vec<usize> = (0..a.len()).collect();
+    let a = sort_indexed(&a, &mut Vec::new(), &mut index, Emit::Both, &mut SortScratch::default()).unwrap();
+    let mut index: Vec<usize> = (0..b.len()).collect();
+    let b = sort_indexed(&b, &mut Vec::new(), &mut index, Emit::Both, &mut SortScratch::default()).unwrap();
     assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b));
     assert_eq!(survey_groups(&b, &a), naive_groups(&b, &a));
 }
@@ -201,7 +205,8 @@ fn nested_product_reports_can_be_refined_by_an_enclosing_field() {
             Value::List(Bounds::Stride(2, n / 2), Box::new(nested.clone())),
             Value::sum(vec![0; n], vec![nested]),
         ] {
-            let (_, _, sorted) = sort_values(&[], &both);
+            let mut index: Vec<usize> = (0..both.len()).collect();
+            let sorted = sort_indexed(&both, &mut Vec::new(), &mut index, Emit::Both, &mut SortScratch::default()).unwrap();
             let a = gather(&sorted, &(0..sorted.len() - 2).collect::<Vec<_>>());
             let b = gather(&sorted, &(2..sorted.len()).collect::<Vec<_>>());
             assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b), "seed={seed}");
@@ -251,7 +256,8 @@ fn referenced_lists_survey_as_the_rows_they_name() {
             Value::List(Bounds::Stride(2, 16), Box::new(refs.clone())),
             Value::sum(vec![0; 32], vec![refs]),
         ] {
-            let (_, _, sorted) = sort_values(&[], &both);
+            let mut index: Vec<usize> = (0..both.len()).collect();
+            let sorted = sort_indexed(&both, &mut Vec::new(), &mut index, Emit::Both, &mut SortScratch::default()).unwrap();
             for (na, offset) in [(0, 0), (1, 1), (sorted.len(), 0), (sorted.len() - 1, 1)] {
                 let a = gather(&sorted, &(0..na).collect::<Vec<_>>());
                 let b = gather(&sorted, &(offset..sorted.len()).collect::<Vec<_>>());

@@ -7,7 +7,7 @@
 //! radixes them with the index's rows alongside, every pass sequential, and the sorted keys are
 //! the output column. The index is the only positional state: it is the rows in their current
 //! order, a later level reads its data through it, and from an identity start it is the
-//! permutation a caller wants. Layout, top down: the entry points, the four arms, the leaf
+//! permutation a caller wants. Layout, top down: the entry point, the four arms, the leaf
 //! kernel, the label and position helpers.
 
 use std::borrow::Borrow;
@@ -48,7 +48,7 @@ impl Emit {
     }
 }
 
-// ---- entry points ---------------------------------------------------------------------------
+// ---- entry point ----------------------------------------------------------------------------
 
 /// Sort the rows `index[..]` of `v` within the blocks of `labels`.
 ///
@@ -123,36 +123,6 @@ pub(crate) fn sort_indexed(
             emit.values().then_some(Value::Unit(m))
         }
     }
-}
-
-/// The labels form: every row of `v`, in stored order. Requires `labels` non-decreasing over
-/// `v`'s rows, or empty for one block. Returns `(perm, labels)`: `perm[k]` is the input row at
-/// output position `k` (the sorted identity index), and the refined labels are aligned with it.
-pub(crate) fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-    let mut labels = labels.to_vec();
-    let mut index: Vec<usize> = (0..v.len()).collect();
-    let mut scratch = SortScratch::default();
-    sort_indexed(v, &mut labels, &mut index, Emit::Index, &mut scratch);
-    (index, labels)
-}
-
-/// [`sort_blocks`] and the sorted rows: `(perm, labels, sorted)` with `sorted == gather(v, &perm)`.
-pub(crate) fn sort_values(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>, Value) {
-    let mut labels = labels.to_vec();
-    let mut index: Vec<usize> = (0..v.len()).collect();
-    let mut scratch = SortScratch::default();
-    let out = sort_indexed(v, &mut labels, &mut index, Emit::Both, &mut scratch);
-    (index, labels, out.expect("emit was requested"))
-}
-
-/// The sorted rows and the refined labels, and nothing else: a leaf sorts its keys without
-/// carrying rows.
-pub(crate) fn sort_values_only(labels: &[u64], v: &Value) -> (Vec<u64>, Value) {
-    let mut labels = labels.to_vec();
-    let mut index: Vec<usize> = (0..v.len()).collect();
-    let mut scratch = SortScratch::default();
-    let out = sort_indexed(v, &mut labels, &mut index, Emit::Values, &mut scratch);
-    (labels, out.expect("emit was requested"))
 }
 
 // ---- the arms -------------------------------------------------------------------------------

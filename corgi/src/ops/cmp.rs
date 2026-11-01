@@ -13,7 +13,7 @@ pub(crate) mod survey;
 
 use crate::engine::gather;
 use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
-use sort::{sort_blocks, sort_values, sort_values_only};
+use sort::{sort_indexed, Emit, SortScratch};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Prim, Scalar, Value};
 use search::find_leaf;
@@ -133,13 +133,15 @@ impl CmpOp {
             CmpOp::SortBy => {
                 let (bounds, vals) = input.into_list("SortBy")?;
                 let (k, v) = vals.into_pair("SortBy elements")?;
-                let labels = row_labels(&bounds);
-                let (sk, sv, refined) = if let Value::Unit(n) = v {
-                    let (refined, sk) = sort_values_only(&labels, &k);
-                    (sk, Value::Unit(n), refined)
+                let mut refined = row_labels(&bounds);
+                let mut perm: Vec<usize> = (0..k.len()).collect();
+                let emit = if matches!(v, Value::Unit(_)) { Emit::Values } else { Emit::Both };
+                let sk = sort_indexed(&k, &mut refined, &mut perm, emit, &mut SortScratch::default())
+                    .expect("emit was requested");
+                let sv = if let Value::Unit(n) = v {
+                    Value::Unit(n)
                 } else {
-                    let (perm, refined, sk) = sort_values(&labels, &k);
-                    (sk, gather(&v, &perm), refined)
+                    gather(&v, &perm)
                 };
                 // the runs the sort found, as it found them: each element's run, numbered densely
                 // over the whole column (a run never spans two rows)
@@ -262,7 +264,9 @@ impl InPlay {
     /// sort the rows in play by `col` (one value per row in play) within their ties, then keep each
     /// row's first `k` and the whole run of ties at the `k`-th.
     fn level(&mut self, col: &Value, k: usize) {
-        let (perm, refined) = sort_blocks(&self.labels, col);
+        let mut refined = self.labels.clone();
+        let mut perm: Vec<usize> = (0..col.len()).collect();
+        sort_indexed(col, &mut refined, &mut perm, Emit::Index, &mut SortScratch::default());
         let sorted: Vec<usize> = perm.iter().map(|&p| self.idx[p]).collect();
         let (mut keep, mut lab, mut ends) = (Vec::new(), Vec::new(), Vec::with_capacity(self.ends.len()));
         let mut s = 0usize;

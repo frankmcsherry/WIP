@@ -102,20 +102,13 @@ pub mod arrange {
         crate::ops::cmp::order::equal_idx(a, b, ia, ib)
     }
 
-    /// Multi-record argsort: the permutation that sorts *all* of `v`'s rows by structural order, in
-    /// one columnar discrimination pass — the batched replacement for driving `sort_by(compare_at)`
-    /// per pair.
-    pub fn sort_perm(v: &Value) -> Vec<usize> {
-        crate::ops::cmp::sort::sort_blocks(&[], v).0
-    }
-
-    /// Segmented (discrimination) argsort: the multi-block generalization of [`sort_perm`]. Given
+    /// Segmented (discrimination) argsort: the positions that sort each block of rows. Given
     /// per-row `labels` marking segments (non-decreasing — segment `s` is the maximal run of rows
     /// sharing a label; empty for one segment), return `(perm, refined_labels)` where `perm` sorts `v`'s rows WITHIN each
     /// label block by corgi structural order (stable, so ties keep input order), and `refined_labels`
     /// further splits each block by equal value (two rows share a refined label iff they shared a
-    /// `labels` value AND are structurally equal). `sort_perm(v)` is exactly the single-block case
-    /// `sort_blocks(&[0; n], v).0`.
+    /// `labels` value AND are structurally equal). To sort all rows as one block, use
+    /// `sort_blocks(&[], v)`.
     ///
     /// This is the load-bearing segmented primitive for the dd backend: within a segment `[lo, hi)`
     /// (a run of one input label), `perm[lo]` is the segment's structural
@@ -123,7 +116,11 @@ pub mod arrange {
     /// so argmin/argmax/first-per-segment and per-segment sorted order fall out while keeping the row
     /// positions the caller indexed by.
     pub fn sort_blocks(labels: &[u64], v: &Value) -> (Vec<usize>, Vec<u64>) {
-        crate::ops::cmp::sort::sort_blocks(labels, v)
+        use crate::ops::cmp::sort::{sort_indexed, Emit, SortScratch};
+        let mut labels = labels.to_vec();
+        let mut index: Vec<usize> = (0..v.len()).collect();
+        sort_indexed(v, &mut labels, &mut index, Emit::Index, &mut SortScratch::default());
+        (index, labels)
     }
 
     /// Per-element segment labels from a `List`'s row `Bounds`: element of row `r` gets label `r`.
