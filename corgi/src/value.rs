@@ -499,8 +499,13 @@ macro_rules! prim {
             }
 
             /// the elements of each span `(t, s, e)`, elements `s..e` of `srcs[t]`, in turn, each
-            /// copied whole. All at one storage.
+            /// copied whole. Integer sources at different storages give an `i64` result, each copied
+            /// element widened as it is written ([`Prim::copy_spans_wide`]), so the cost is the
+            /// elements copied and not the sources' lengths.
             pub(crate) fn copy_spans(srcs: &[&Prim], spans: &[(usize, usize, usize)]) -> Prim {
+                if srcs.iter().any(|s| s.bits() != srcs[0].bits()) {
+                    return Prim::copy_spans_wide(srcs, spans);
+                }
                 match srcs[0] {
                     $( Prim::$V(_) => {
                         let vs: Vec<&[$t]> = srcs.iter().map(|p| match p {
@@ -606,15 +611,15 @@ macro_rules! prim {
             /// multi-source gather: result row `k` is element `off[k]` of source `srcs[tags[k]]`. The
             /// leaf of [`crate::engine::gather_lanes`]; `gather` is the 1-source case. The tags may
             /// be a `Sum`'s own `u8` discriminants, read in place, or any `usize` column. Integer
-            /// sources at different storages are widened first.
+            /// sources at different storages give an `i64` result, each gathered element widened as
+            /// it is read ([`Prim::gather_lanes_wide`]), so the cost is the rows gathered and not
+            /// the sources' lengths.
             pub(crate) fn gather_lanes<T: Copy>(srcs: &[&Prim], tags: &[T], off: &[usize]) -> Prim
             where
                 usize: From<T>,
             {
                 if srcs.iter().any(|s| s.bits() != srcs[0].bits()) {
-                    let wide: Vec<Prim> = srcs.iter().map(|s| s.widen()).collect();
-                    let refs: Vec<&Prim> = wide.iter().collect();
-                    return Prim::gather_lanes(&refs, tags, off);
+                    return Prim::gather_lanes_wide(srcs, tags, off);
                 }
                 match srcs[0] {
                     $( Prim::$V(_) => {
@@ -873,6 +878,32 @@ impl Prim {
             Prim::U8(v) => Prim::I64(Arc::new(v.iter().map(|&x| x as i64).collect())),
             other => other.clone(),
         }
+    }
+
+    /// [`Prim::gather_lanes`] over integer sources at more than one storage: the result is at
+    /// `i64`, and each element is widened as it is read. Widening the sources first instead cost
+    /// a pass over every byte source, however few of its rows the gather took.
+    fn gather_lanes_wide<T: Copy>(srcs: &[&Prim], tags: &[T], off: &[usize]) -> Prim
+    where
+        usize: From<T>,
+    {
+        let cols: Vec<Ints> = srcs.iter().map(|s| Ints::of(s, "gather_lanes")).collect();
+        Prim::I64(Arc::new(tags.iter().zip(off).map(|(&t, &o)| cols[usize::from(t)].at(o)).collect()))
+    }
+
+    /// [`Prim::copy_spans`] over integer sources at more than one storage: the result is at
+    /// `i64`, and each copied element is widened as it is written, so a source is read only
+    /// where a span takes from it.
+    fn copy_spans_wide(srcs: &[&Prim], spans: &[(usize, usize, usize)]) -> Prim {
+        let cols: Vec<Ints> = srcs.iter().map(|s| Ints::of(s, "copy_spans")).collect();
+        let mut out = Vec::with_capacity(spans.iter().map(|&(_, s, e)| e - s).sum());
+        for &(t, s, e) in spans {
+            match cols[t] {
+                Ints::U8(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
+                Ints::I64(v) => out.extend_from_slice(&v[s..e]),
+            }
+        }
+        Prim::I64(Arc::new(out))
     }
 
     /// two leaves at one storage, to be combined lane by lane: two integer leaves at different
@@ -1258,6 +1289,34 @@ pub fn show(v: &Value) -> String {
         Value::List(b, vals) => format!("List ends={:?} <{}>", b.to_vec(), show(vals)),
         Value::Unit(n) => format!("()x{n}"),
         Value::Ref(..) => format!("Ref <{}>", show(&crate::engine::clone_ref(v.clone()))),
+    }
+}
+
+/// an integer leaf read in place at `i64`, whatever its storage: how a gather over leaves at
+/// different storages reads only the rows it takes.
+#[derive(Clone, Copy)]
+enum Ints<'a> {
+    U8(&'a [u8]),
+    I64(&'a [i64]),
+}
+
+impl<'a> Ints<'a> {
+    /// the leaf's integers; a float leaf here is a bug, as the typer keeps integers and floats apart.
+    fn of(p: &'a Prim, op: &str) -> Self {
+        match p {
+            Prim::U8(v) => Ints::U8(v),
+            Prim::I64(v) => Ints::I64(v),
+            Prim::F64(_) => panic!("{op}: an integer meets a float"),
+        }
+    }
+
+    /// element `i`, at `i64`.
+    #[inline]
+    fn at(self, i: usize) -> i64 {
+        match self {
+            Ints::U8(v) => v[i] as i64,
+            Ints::I64(v) => v[i],
+        }
     }
 }
 

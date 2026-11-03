@@ -102,3 +102,24 @@ fn const_and_column_assignments_agree() {
     // a mixed assignment is not equal to either.
     assert_ne!(konst, Tags::from_tags(vec![1, 0, 1], 2));
 }
+
+/// A gather over integer leaves at different storages reads each source in place: the result is
+/// at `i64`, and holds each row as its source held it.
+#[test]
+fn gather_lanes_reads_mixed_storages_in_place() {
+    let (bytes, wide) = (Prim::U8(Arc::new(vec![1, 2, 255])), Prim::I64(Arc::new(vec![-1, 300])));
+    let (tags, off) = ([1usize, 0, 0, 1, 0], [1usize, 2, 0, 0, 1]);
+    let out = Prim::gather_lanes(&[&bytes, &wide], &tags, &off);
+    assert!(matches!(&out, Prim::I64(v) if **v == vec![300, 255, 1, -1, 2]));
+    let flipped = Prim::gather_lanes(&[&wide, &bytes], &[0usize, 1], &[0, 2]);
+    assert!(matches!(&flipped, Prim::I64(v) if **v == vec![-1, 255]));
+}
+
+/// Copying spans from integer leaves at different storages reads each source in place: the
+/// result is at `i64`, the spans in turn.
+#[test]
+fn copy_spans_reads_mixed_storages_in_place() {
+    let (bytes, wide) = (Prim::U8(Arc::new(vec![1, 2, 255])), Prim::I64(Arc::new(vec![-1, 300, 7])));
+    let out = Prim::copy_spans(&[&bytes, &wide], &[(1, 1, 3), (0, 0, 2), (0, 3, 3), (1, 0, 1)]);
+    assert!(matches!(&out, Prim::I64(v) if **v == vec![300, 7, 1, 2, -1]));
+}

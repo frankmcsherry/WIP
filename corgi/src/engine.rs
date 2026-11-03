@@ -418,14 +418,11 @@ fn take(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positions) ->
 fn copy_spans(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positions) -> Option<Value> {
     match srcs[0] {
         Value::Prim(_) => {
-            let mut ps: Vec<Prim> = srcs.iter().map(|v| match v {
-                Value::Prim(p) => p.clone(),
+            let ps: Vec<&Prim> = srcs.iter().map(|v| match v {
+                Value::Prim(p) => p,
                 _ => panic!("copy_spans: shape mismatch"),
             }).collect();
-            if ps.iter().any(|p| p.bits() != ps[0].bits()) {
-                ps = ps.iter().map(Prim::widen).collect();
-            }
-            Some(Value::Prim(Prim::copy_spans(&ps.iter().collect::<Vec<_>>(), spans)))
+            Some(Value::Prim(Prim::copy_spans(&ps, spans)))
         }
         Value::Prod(c0) => {
             let mut taken = Vec::with_capacity(c0.len());
