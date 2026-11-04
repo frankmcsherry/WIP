@@ -30,6 +30,7 @@ pub(crate) mod graph;
 pub(crate) mod hash;
 pub(crate) mod ops;
 pub(crate) mod optimize;
+pub mod pack;
 pub(crate) mod shape;
 pub(crate) mod value;
 
