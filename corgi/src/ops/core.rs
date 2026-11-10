@@ -134,6 +134,76 @@ impl Rounds {
     }
 }
 
+/// A `Fold` or a `FoldScan` over its rounds: the body maps `(state, element)` to what `split` takes
+/// apart as the new state and, for a `FoldScan`, the round's outputs. Returns each row's final state,
+/// and the outputs, if any, in the list's order. `who` names the op in errors.
+fn fold_rounds<L: OpLike>(
+    body: &Graph<L>,
+    seed: Value,
+    bounds: &Bounds,
+    vals: Value,
+    who: &str,
+    split: impl Fn(Value) -> Result<(Value, Option<Value>), String>,
+) -> Result<(Value, Option<Value>), String> {
+    // the body must hand back the seed's shape: checked on the first round — or, when no row has
+    // an element (no rounds at all, the typer's zero-row run included), on a zero-row run of the body.
+    let seed_shape = shape_of_value(&seed);
+    let check = |state: &Value| {
+        same(&seed_shape, &shape_of_value(state)).map(drop).map_err(|e| format!("{who} body: {e}"))
+    };
+    let round = |acc: Value, at: &[usize]| split(try_eval_graph(body, Value::Prod(vec![acc, gather(&vals, at)]))?);
+    // no rounds: an empty output column, obtained by running the body on zero rows (an output may
+    // differ from the state, so the seed can't stand in for it).
+    if bounds.total() == 0 {
+        let (state, outs) = round(gather(&seed, &[]), &[])?;
+        check(&state)?;
+        return Ok((seed, outs));
+    }
+    // every row the same length, as a stride says: every row runs every round, in row order, so the
+    // rounds need no schedule, and row r's t-th output is row r of round t's
+    if let Some(k) = bounds.strided() {
+        let n = bounds.len();
+        let (mut acc, mut chunks) = (seed, Vec::new());
+        for t in 0..k {
+            let (state, out) = round(acc, &(0..n).map(|r| r * k + t).collect::<Vec<_>>())?;
+            if t == 0 {
+                check(&state)?;
+            }
+            acc = state;
+            chunks.extend(out);
+        }
+        let outs = (!chunks.is_empty()).then(|| {
+            let (mut tags, mut off) = (Vec::with_capacity(n * k), Vec::with_capacity(n * k));
+            for r in 0..n {
+                tags.extend(0..k);
+                off.extend(std::iter::repeat_n(r, k));
+            }
+            let srcs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
+            gather_lanes(&srcs, &tags, &off)
+        });
+        return Ok((acc, outs));
+    }
+    let mut rounds = Rounds::new(bounds);
+    let (mut acc, seed) = rounds.start(seed);
+    let (mut done, mut chunks) = (Vec::new(), Vec::new());
+    for t in 0.. {
+        let running = rounds.next.len();
+        let (state, out) = round(acc, &rounds.next)?;
+        if t == 0 {
+            check(&state)?;
+        }
+        assert_eq!(state.len(), running, "{who} body changed the row count");
+        acc = state;
+        chunks.extend(out);
+        done.extend(rounds.finish(t, &mut acc));
+        if rounds.next.is_empty() {
+            break;
+        }
+    }
+    let outs = (!chunks.is_empty()).then(|| rounds.stitch(bounds, &chunks));
+    Ok((rounds.assemble(seed, done), outs))
+}
+
 /// a shape with holes: what a tuple pattern takes apart, and what an ascription `: S` checks. A
 /// pattern of n fields wants a product of exactly n fields (the unit, for none), each matching its
 /// own pattern; `Int`, `Float`, `List`, `Sum` and `Ref` want what the shapes of those names are, at
@@ -849,48 +919,7 @@ impl<L: OpLike> Op<L> {
             Op::Fold(body) => {
                 let (seed, list) = input.into_pair("Fold")?;
                 let (bounds, vals) = list.into_list("Fold list")?;
-                // the body must hand back the seed's shape: checked on the first round — or, when no
-                // row has an element (no rounds at all, the typer's zero-row run included), on a
-                // zero-row run of the body.
-                let seed_shape = shape_of_value(&seed);
-                let check = |updated: &Value| {
-                    same(&seed_shape, &shape_of_value(updated)).map(drop).map_err(|e| format!("Fold body: {e}"))
-                };
-                if bounds.total() == 0 {
-                    let z = try_eval_graph(body, Value::Prod(vec![gather(&seed, &[]), gather(&vals, &[])]))?;
-                    check(&z)?;
-                    return Ok(seed);
-                }
-                // every row the same length, as a stride says: every row runs every round, in row
-                // order, so the rounds need no schedule
-                if let Some(k) = bounds.strided() {
-                    let n = bounds.len();
-                    let mut acc = seed;
-                    for t in 0..k {
-                        let elt = gather(&vals, &(0..n).map(|r| r * k + t).collect::<Vec<_>>());
-                        acc = try_eval_graph(body, Value::Prod(vec![acc, elt]))?;
-                        if t == 0 {
-                            check(&acc)?;
-                        }
-                    }
-                    return Ok(acc);
-                }
-                let mut rounds = Rounds::new(&bounds);
-                let (mut acc, seed) = rounds.start(seed);
-                let mut done = Vec::new();
-                for t in 0.. {
-                    let running = rounds.next.len();
-                    acc = try_eval_graph(body, Value::Prod(vec![acc, gather(&vals, &rounds.next)]))?;
-                    if t == 0 {
-                        check(&acc)?;
-                    }
-                    assert_eq!(acc.len(), running, "Fold body changed the row count");
-                    done.extend(rounds.finish(t, &mut acc));
-                    if rounds.next.is_empty() {
-                        break;
-                    }
-                }
-                rounds.assemble(seed, done)
+                fold_rounds(body, seed, &bounds, vals, "Fold", |state| Ok((state, None)))?.0
             }
 
             // mapAccumL: the body returns a PAIR (new state, output R). The state is threaded as in
@@ -899,62 +928,10 @@ impl<L: OpLike> Op<L> {
             Op::FoldScan(body) => {
                 let (seed, list) = input.into_pair("FoldScan")?;
                 let (bounds, vals) = list.into_list("FoldScan list")?;
-                // the body's new state must have the seed's shape (checked as in `Fold`).
-                let seed_shape = shape_of_value(&seed);
-                let check = |state: &Value| {
-                    same(&seed_shape, &shape_of_value(state)).map(drop).map_err(|e| format!("FoldScan body: {e}"))
-                };
-                // no rounds: an empty R-shaped column, obtained by running the body on zero rows (R
-                // may differ from the state, so the seed can't stand in for it).
-                if bounds.total() == 0 {
-                    let z = try_eval_graph(body, Value::Prod(vec![gather(&seed, &[]), gather(&vals, &[])]))?;
-                    let (state, r) = z.into_pair("FoldScan body")?;
-                    check(&state)?;
-                    return Ok(Value::Prod(vec![seed, Value::List(bounds, Box::new(r))]));
-                }
-                // every row the same length, as a stride says: every row runs every round, in row
-                // order, and row r's t-th output is row r of round t's
-                if let Some(k) = bounds.strided() {
-                    let n = bounds.len();
-                    let mut acc = seed;
-                    let mut chunks = Vec::with_capacity(k);
-                    for t in 0..k {
-                        let elt = gather(&vals, &(0..n).map(|r| r * k + t).collect::<Vec<_>>());
-                        let (state, r) = try_eval_graph(body, Value::Prod(vec![acc, elt]))?.into_pair("FoldScan body")?;
-                        if t == 0 {
-                            check(&state)?;
-                        }
-                        acc = state;
-                        chunks.push(r);
-                    }
-                    let (mut tags, mut off) = (Vec::with_capacity(n * k), Vec::with_capacity(n * k));
-                    for r in 0..n {
-                        tags.extend(0..k);
-                        off.extend(std::iter::repeat_n(r, k));
-                    }
-                    let srcs: Vec<Option<&Value>> = chunks.iter().map(Some).collect();
-                    return Ok(Value::Prod(vec![acc, Value::List(bounds, Box::new(gather_lanes(&srcs, &tags, &off)))]));
-                }
-                let mut rounds = Rounds::new(&bounds);
-                let (mut acc, seed) = rounds.start(seed);
-                let (mut done, mut chunks) = (Vec::new(), Vec::new());
-                for t in 0.. {
-                    let running = rounds.next.len();
-                    let (state, r) = try_eval_graph(body, Value::Prod(vec![acc, gather(&vals, &rounds.next)]))?
-                        .into_pair("FoldScan body")?;
-                    if t == 0 {
-                        check(&state)?;
-                    }
-                    assert_eq!(state.len(), running, "FoldScan body changed the row count");
-                    acc = state;
-                    chunks.push(r);
-                    done.extend(rounds.finish(t, &mut acc));
-                    if rounds.next.is_empty() {
-                        break;
-                    }
-                }
-                let out = rounds.stitch(&bounds, &chunks);
-                Value::Prod(vec![rounds.assemble(seed, done), Value::List(bounds, Box::new(out))])
+                let pair = |out: Value| out.into_pair("FoldScan body").map(|(state, r)| (state, Some(r)));
+                let (state, outs) = fold_rounds(body, seed, &bounds, vals, "FoldScan", pair)?;
+                let outs = outs.expect("a FoldScan body emits an output every round");
+                Value::Prod(vec![state, Value::List(bounds, Box::new(outs))])
             }
 
             Op::MapSum(arms) => {
