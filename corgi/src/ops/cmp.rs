@@ -13,7 +13,7 @@ pub(crate) mod survey;
 
 use crate::engine::gather;
 use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
-use sort::{sort_blocks, sort_values, sort_values_only};
+use sort::{sort_blocks, sort_values, sort_values_only, window_key, WINDOW};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Prim, Scalar, Value};
 use search::find_leaf;
@@ -311,30 +311,26 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
             Level::Col(c) => play.level(&gather(c, &play.idx), k),
             Level::Elems(list) => {
                 let Value::List(inner, elems) = list else { unreachable!("a list level is a List") };
-                // bytes go eight at a time, packed big-endian into one u64 level; a short row pads
-                // with zeros, and ties the padding leaves are the length level's to break.
-                // Eight bytes every tied run agrees on (a shared prefix) change nothing: no sort.
+                // bytes go `WINDOW` at a time, as the sort reads them: one u64 level per window
+                // (`window_key`), which also puts a row that ends first ahead of the rows it is a
+                // prefix of. A window every tied run agrees on (a shared prefix) changes nothing: no sort.
                 if let Ok(bytes) = elems.as_u8("bytes") {
-                    for j in (0..).step_by(8) {
+                    for j in (0..).step_by(WINDOW) {
                         if play.settled() {
                             break;
                         }
                         let mut any = false;
                         let col: Vec<u64> = play.idx.iter().map(|&r| {
                             let (s, e) = inner.span(r);
-                            let mut word = 0u64;
-                            for b in 0..8 {
-                                let at = s + j + b;
-                                word = (word << 8) | if at < e { any = true; bytes[at] as u64 } else { 0 };
-                            }
-                            word
+                            any |= s + j < e;
+                            window_key(&bytes[(s + j).min(e)..e])
                         }).collect();
                         if !any {
                             break;
                         }
                         let splits = (1..col.len()).any(|p| play.tied(p) && col[p] != col[p - 1]);
                         if splits {
-                            // the words order unsigned: as `i64`s, each with its top bit flipped
+                            // the keys order unsigned: as `i64`s, each with its top bit flipped
                             play.level(&Value::i64(col.iter().map(|&w| (w ^ (1 << 63)) as i64).collect()), k);
                         }
                     }
