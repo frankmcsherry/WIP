@@ -589,6 +589,55 @@ where
     }
 }
 
+/// `v`'s rows split into the lanes of a sum's assignment `tags`: row `i` goes to lane `tags[i]`, at
+/// its carried within-lane offset, and lane `t` holds `sizes[t]` rows. The inverse of
+/// [`gather_lanes`], and how `Branch` and `CapSum` move rows into lanes. Leaves, and products and
+/// units of them, are written straight into their lanes in one pass; any other shape gathers each
+/// lane's rows, by positions built once for all of them. One tag throughout moves `v` whole into
+/// that lane.
+pub(crate) fn partition(v: Value, tags: &Tags, sizes: &[usize]) -> Vec<Value> {
+    match tags {
+        Tags::Const(t, _) => {
+            let mut lanes: Vec<Value> = sizes.iter().map(|_| gather(&v, &[])).collect();
+            lanes[*t] = v;
+            lanes
+        }
+        Tags::Column(Prim::U8(t8), off) => partition_by(&v, t8, off, sizes, &std::cell::OnceCell::new()),
+        Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
+    }
+}
+
+/// [`partition`] by a tag and an offset per row, with each lane's rows as positions, built when a
+/// shape first needs them.
+fn partition_by<T: Copy>(v: &Value, tags: &[T], off: &[usize], sizes: &[usize], rows: &std::cell::OnceCell<Vec<Vec<usize>>>) -> Vec<Value>
+where
+    usize: From<T>,
+{
+    match v {
+        Value::Prim(p) => p.partition(tags, off, sizes).into_iter().map(Value::Prim).collect(),
+        Value::Prod(fields) => {
+            let mut lanes: Vec<Vec<Value>> = sizes.iter().map(|_| Vec::with_capacity(fields.len())).collect();
+            for f in fields {
+                for (lane, part) in lanes.iter_mut().zip(partition_by(f, tags, off, sizes, rows)) {
+                    lane.push(part);
+                }
+            }
+            lanes.into_iter().map(Value::Prod).collect()
+        }
+        Value::Unit(_) => sizes.iter().map(|&n| Value::Unit(n)).collect(),
+        other => {
+            let rows = rows.get_or_init(|| {
+                let mut rows: Vec<Vec<usize>> = sizes.iter().map(|&n| vec![0; n]).collect();
+                for (i, (&t, &o)) in tags.iter().zip(off).enumerate() {
+                    rows[usize::from(t)][o] = i;
+                }
+                rows
+            });
+            rows.iter().map(|r| gather(other, r)).collect()
+        }
+    }
+}
+
 /// per-row blend: row `i` of the result is row `i` of `then` where `mask[i]` is nonzero, else row
 /// `i` of `els` (both same-shape columns at the mask's stratum) — what [`crate::ops::Op::Select`] is.
 ///
