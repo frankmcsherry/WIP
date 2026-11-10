@@ -198,88 +198,76 @@ mod generators {
 
 }
 
-/// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape.
+/// build a column whose row j is `v`'s row `idx[j]`; recurses through every shape. Every position
+/// must name a row.
 pub(crate) fn gather(v: &Value, idx: &[usize]) -> Value {
-    match v {
-        Value::Prim(p) => Value::Prim(p.gather(idx)),
-        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather(c, idx)).collect()),
-        // rows of one length of leaves: a block of k per row, copied
-        Value::List(Bounds::Stride(k, _), vals) if matches!(**vals, Value::Prim(_)) => {
-            let Value::Prim(p) = &**vals else { unreachable!() };
-            Value::List(Bounds::Stride(*k, idx.len()), Box::new(Value::Prim(p.gather_blocks(idx, *k))))
-        }
-        Value::List(bounds, vals) => list_rows(&[(bounds, vals)], idx.iter().map(|&i| (0, i, i + 1))),
-        Value::Sum(tags, variants) => {
-            // one tag throughout: the selected rows are lane `t`'s rows at exactly `idx` (a `Const`
-            // assignment's offset IS the row index), so this is one lane gather and no witness work.
-            if let Some(t) = tags.const_tag() {
-                let mut lanes: Vec<Value> = variants.iter().map(|v| gather(v, &[])).collect();
-                lanes[t] = gather(&variants[t], idx);
-                return Value::Sum(Tags::Const(t, idx.len()), lanes);
-            }
-            // Otherwise build the result's assignment in the SAME pass that routes the rows: a row's
-            // new offset is the size its lane had when the row arrived, so nothing is recomputed
-            // afterwards. Both reads are in place — a gather of k rows is O(k), not O(column).
-            let mut per = vec![Vec::new(); variants.len()];
-            let (mut new_tags, mut new_off) = (Vec::with_capacity(idx.len()), Vec::with_capacity(idx.len()));
-            for &i in idx {
-                let t = tags.tag_at(i);
-                new_tags.push(t as u8);
-                new_off.push(per[t].len());
-                per[t].push(tags.offset_at(i));
-            }
-            let nv = variants.iter().zip(&per).map(|(v, s)| gather(v, s)).collect();
-            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
-        }
-        Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
-        // a reference column: move the row numbers, never the arena. This one arm is the entire cost
-        // model of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Ref they move
-        // one number per row.
-        Value::Ref(list, rows) => Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows[i]).collect())),
-    }
+    gather_impl::<false>(v, idx).unwrap_or_else(|e| unreachable!("{e}"))
 }
 
 /// `gather` where a position past `v`'s rows reads the ZERO of the element's shape: zero bits for a
 /// leaf, the empty list, a unit, lane 0 (holding its own zero) for a sum. A sum of no lanes has no
 /// zero, so it is an error. Every in-range position reads as `gather` would.
 pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> {
+    gather_impl::<true>(v, idx)
+}
+
+/// [`gather`], and with `ZERO` [`gather_or_zero`]: one walk, so the two move rows alike.
+fn gather_impl<const ZERO: bool>(v: &Value, idx: &[usize]) -> Result<Value, String> {
+    let inside = |n: usize| !ZERO || idx.iter().all(|&i| i < n);
     Ok(match v {
-        Value::Prim(p) => Value::Prim(p.gather_or_zero(idx)),
-        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather_or_zero(c, idx)).collect::<Result<_, _>>()?),
-        Value::Unit(_) => Value::Unit(idx.len()),
-        Value::List(bounds, vals) => {
-            let (mut elem, mut nb) = (Vec::new(), Vec::with_capacity(idx.len()));
-            for &i in idx {
-                if i < bounds.len() {
-                    let (s, e) = row_span(bounds, i);
-                    elem.extend(s..e);
-                }
-                nb.push(elem.len());
-            }
-            Value::List(nb.into(), Box::new(gather(vals, &elem)))
+        Value::Prim(p) => Value::Prim(if ZERO { p.gather_or_zero(idx) } else { p.gather(idx) }),
+        Value::Prod(cols) => Value::Prod(cols.iter().map(|c| gather_impl::<ZERO>(c, idx)).collect::<Result<_, _>>()?),
+        // rows of one length of leaves: a block of k per row, copied
+        Value::List(Bounds::Stride(k, _), vals) if matches!(**vals, Value::Prim(_)) && inside(v.len()) => {
+            let Value::Prim(p) = &**vals else { unreachable!() };
+            Value::List(Bounds::Stride(*k, idx.len()), Box::new(Value::Prim(p.gather_blocks(idx, *k))))
         }
-        Value::Sum(tags, lanes) => {
-            if lanes.is_empty() {
+        // rows as ranges of elements; a position past the rows names the one empty row of a second list
+        Value::List(bounds, vals) => {
+            let n = bounds.len();
+            if inside(n) {
+                list_rows(&[(bounds, vals)], idx.iter().map(|&i| (0, i, i + 1)))
+            } else {
+                let (empty, none) = (Bounds::Stride(0, 1), gather(vals, &[]));
+                list_rows(&[(bounds, vals), (&empty, &none)], idx.iter().map(|&i| if i < n { (0, i, i + 1) } else { (1, 0, 1) }))
+            }
+        }
+        Value::Sum(tags, variants) => {
+            if ZERO && variants.is_empty() {
                 return Err("gather: a sum of no lanes has no zero to read out of range".into());
             }
-            // a position past the rows goes to lane 0, which reads it as its own zero.
-            let mut per = vec![Vec::new(); lanes.len()];
+            // one tag throughout, with no position past the rows unless that tag is lane 0's: the
+            // selected rows are lane `t`'s rows at exactly `idx` (a `Const` assignment's offset IS the
+            // row index), so this is one lane gather and no witness work.
+            if let Some(t) = tags.const_tag().filter(|&t| t == 0 || inside(tags.len())) {
+                let mut lanes: Vec<Value> = variants.iter().map(|v| gather(v, &[])).collect();
+                lanes[t] = gather_impl::<ZERO>(&variants[t], idx)?;
+                return Ok(Value::Sum(Tags::Const(t, idx.len()), lanes));
+            }
+            // Otherwise build the result's assignment in the SAME pass that routes the rows: a row's
+            // new offset is the size its lane had when the row arrived, so nothing is recomputed
+            // afterwards. Both reads are in place — a gather of k rows is O(k), not O(column). A
+            // position past the rows goes to lane 0, which reads it as its own zero.
+            let mut per = vec![Vec::new(); variants.len()];
             let (mut new_tags, mut new_off) = (Vec::with_capacity(idx.len()), Vec::with_capacity(idx.len()));
             for &i in idx {
-                let (t, at) = if i < tags.len() { (tags.tag_at(i), tags.offset_at(i)) } else { (0, usize::MAX) };
+                let (t, at) = if !ZERO || i < tags.len() { (tags.tag_at(i), tags.offset_at(i)) } else { (0, usize::MAX) };
                 new_tags.push(t as u8);
                 new_off.push(per[t].len());
                 per[t].push(at);
             }
-            let mut nv = Vec::with_capacity(lanes.len());
-            for (k, (lane, at)) in lanes.iter().zip(&per).enumerate() {
-                nv.push(if k == 0 { gather_or_zero(lane, at)? } else { gather(lane, at) });
-            }
+            // only lane 0 is read out of range
+            let nv = variants.iter().zip(&per).enumerate()
+                .map(|(k, (v, s))| if k == 0 { gather_impl::<ZERO>(v, s) } else { Ok(gather(v, s)) })
+                .collect::<Result<_, _>>()?;
             Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), nv)
         }
-        // in range, the row numbers; out of range, an empty row of the arena (see `with_empty_row`).
+        Value::Unit(_) => Value::Unit(idx.len()), // no payload to move — just the new row count
+        // a reference column: move the row numbers, never the arena. This one arm is the entire cost
+        // model of capture-by-reference — `CapList`/`CapSum`/`Lit` are gathers, so on a Ref they move
+        // one number per row. Out of range, an empty row of the arena (see `with_empty_row`).
         Value::Ref(list, rows) => {
-            if idx.iter().all(|&i| i < rows.len()) {
+            if inside(rows.len()) {
                 Value::Ref(list.clone(), Arc::new(idx.iter().map(|&i| rows[i]).collect()))
             } else {
                 let (list, zero) = with_empty_row(list);
