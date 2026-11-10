@@ -513,16 +513,16 @@ where
             assert!(sums.iter().all(|sm| sm.1.len() == arity), "gather_lanes: sum sources differ in arity");
             let out_vars: Vec<Value> = (0..arity)
                 .map(|s| {
+                    // the sources keep the caller's tags, at the caller's type
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
                     for (i, &os) in out_tag.iter().enumerate() {
                         if os == s {
-                            let (t, o) = (usize::from(tags[i]), off[i]);
-                            s_t.push(t);
-                            s_o.push(sums[t].0.offset_at(o)); // carried offset within the source's lane s
+                            s_t.push(tags[i]);
+                            s_o.push(sums[usize::from(tags[i])].0.offset_at(off[i])); // carried offset within the source's lane s
                         }
                     }
                     let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.1[s])).collect();
-                    gather_lanes::<usize>(&vsrcs, &s_t, &s_o)
+                    gather_lanes(&vsrcs, &s_t, &s_o)
                 })
                 .collect();
             Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
