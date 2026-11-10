@@ -633,7 +633,7 @@ fn sort_list(
 }
 
 /// How many bytes of a byte list one pass of [`sort_list`] reads.
-const WINDOW: usize = 7;
+pub(crate) const WINDOW: usize = 7;
 
 /// The sort key of a byte list's next `WINDOW` positions, `rest` being what remains of the row:
 /// those bytes, zero padded, in the high bytes, and in the low byte how many there were, or
@@ -641,7 +641,7 @@ const WINDOW: usize = 7;
 /// the window differ in the bytes there, or else the one that ends first is the other's prefix and
 /// has the smaller count. Equal keys are rows that agree on the window and both go on, or are equal
 /// and both end in it; the next pass finds the latter past their ends.
-fn window_key(rest: &[u8]) -> u64 {
+pub(crate) fn window_key(rest: &[u8]) -> u64 {
     let k = rest.len().min(WINDOW);
     let mut word = [0u8; 8];
     word[..k].copy_from_slice(&rest[..k]);
