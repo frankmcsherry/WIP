@@ -493,8 +493,6 @@ where
             list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (usize::from(t), o, o + 1)))
         }
         Value::Sum(..) => {
-            // pick each output row's tagged payload: build the output tag column, then per output-tag
-            // gather that variant from the sources at the carried within-offset.
             // (tags, within-offsets, lanes) borrowed from each source sum.
             type SumView<'a> = (&'a Tags, &'a [Value]);
             let sums: Vec<SumView> = filled
@@ -504,28 +502,33 @@ where
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
-            // each output row takes its source row's tag, read in place from that source.
-            let out_tag: Vec<usize> =
-                tags.iter().zip(off).map(|(&t, &o)| sums[usize::from(t)].0.tag_at(o)).collect();
             // every source has the same shape, hence the same arity (there is no uncommitted lane
             // for sources to disagree by); a mismatch is the caller's shape error.
             let arity = sums[0].1.len();
             assert!(sums.iter().all(|sm| sm.1.len() == arity), "gather_lanes: sum sources differ in arity");
-            let out_vars: Vec<Value> = (0..arity)
-                .map(|s| {
-                    // the sources keep the caller's tags, at the caller's type
-                    let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
-                    for (i, &os) in out_tag.iter().enumerate() {
-                        if os == s {
-                            s_t.push(tags[i]);
-                            s_o.push(sums[usize::from(tags[i])].0.offset_at(off[i])); // carried offset within the source's lane s
-                        }
-                    }
+            // one pass routes the rows: each output row takes its source row's tag, read in place
+            // from that source; its offset in that lane is the size the lane had when it arrived;
+            // and the lane picks the row from its source (the caller's tag, at the caller's type) at
+            // the carried within-lane offset.
+            let mut picks: Vec<(Vec<T>, Vec<usize>)> = vec![(Vec::new(), Vec::new()); arity];
+            let (mut new_tags, mut new_off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
+            for (&t, &o) in tags.iter().zip(off) {
+                let source = sums[usize::from(t)].0;
+                let lane = source.tag_at(o);
+                new_tags.push(lane as u8);
+                new_off.push(picks[lane].0.len());
+                picks[lane].0.push(t);
+                picks[lane].1.push(source.offset_at(o));
+            }
+            let lanes: Vec<Value> = picks
+                .iter()
+                .enumerate()
+                .map(|(s, (s_t, s_o))| {
                     let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.1[s])).collect();
-                    gather_lanes(&vsrcs, &s_t, &s_o)
+                    gather_lanes(&vsrcs, s_t, s_o)
                 })
                 .collect();
-            Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
+            Value::Sum(Tags::column(Prim::U8(Arc::new(new_tags)), new_off), lanes)
         }
         Value::Unit(_) => Value::Unit(tags.len()), // all sources unit -> one unit row per pick
         // pick row numbers, never elements. Sources over ONE arena (by pointer) merge row numbers
