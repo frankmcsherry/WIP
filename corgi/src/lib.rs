@@ -21,6 +21,8 @@
 //! [`ops`] (the vocabulary; `ops::cmp` carries its own `compare_idx`/structural-order
 //! and discrimination-sort engine) → [`graph`] (the IR + evaluator).
 
+#![forbid(unsafe_code)]
+
 pub mod bytes;
 pub(crate) mod demand;
 pub(crate) mod engine;

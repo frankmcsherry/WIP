@@ -152,9 +152,9 @@ src/
                `Rows` = the reader's borrowed view (List or Ref) via `rows_of`; `into_list` takes only a
                List, so a Ref elsewhere is the shape error "clone first". Compare/sort read through refs.
   shape.rs     Shape (Int | Float | Prod | Sum | List | Ref) + shape_of_value + Display.
-  optimize.rs  cse / dce / peephole / fuse_maps / cancel_isos over Graph<NumOp>. OPT-IN: `run` evals
-               the unoptimized graph; tested for semantic preservation on every corpus program, so the
-               passes are latent, not dead.
+  optimize.rs  the schedules (`optimize`, `compile`, `narrow`); the rewrites (cse / dce / peephole /
+               fuse_maps / cancel_isos / immediates / ...) are in optimize/passes/. `compile_ml` runs
+               `optimize`; a host that builds its own graph chooses whether to.
   ops/
     core.rs    Op<L>: structure only, organized as the KERNEL MATRIX
                           intro          elim     map       capture
@@ -209,8 +209,8 @@ src/
                kernel being one node), grafted by `x call name`, and enums declared once for every
                program parsed in it (`parse_ml_in`).
     program.rs `Program`: parse, type and run in one path (compile_ml / shape / run).
-tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · text · effect · kernel · ref ·
-        fail_allocations   (no Builder-demo file —
+tests/  corpus (runs programs/*.col) · ml · typer · numeric · optimize · demand · text · fold · imm ·
+        kernel · lanes · lex_order · ref   (no Builder-demo file —
         every surface example, algebraic law, and property test lives in the corpus.)
 programs/  *.col — the self-generating example corpus (program + `# n =` seed + `# =` golden, or
            an equivalence via `(A, B) eq → [1]`). One source: tests/corpus.rs verifies, the tour displays.
@@ -511,8 +511,6 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
   any `i64` or `u64`, and the sums that leave 64 bits, e.g. ClickBench q03's AVG of ids), then
   arbitrary precision held apart as a sum. Narrower storages (`i8` for DD diffs, 32-bit for offsets
   and ids) come in behind the same `Int`, each measured as it lands.
-- **Length / stratum checker** — the one judgment `shape_of` skips (Tuple/Add same length; map body
-  one stratum deeper). A pass beside `check`.
 - **Sum random-access cost — RESOLVED (via representation).** A `Value::Sum` carries each row's
   offset WITHIN its lane, built once at construction and maintained by `gather`/`concat`.
   `compare_idx` reads it O(1), so `Rel`/`find` over sum-shaped data are linear (no per-call rank
@@ -522,7 +520,8 @@ the per-batch linear/expression engine; DD keeps Join/Reduce/Arrange/iteration. 
 ## Conventions
 
 Run after any `src/` change: `cargo test && cargo clippy --all-targets`. Dependency-free and tight.
-Adding an op: ONE arm in `eval` (a failure-family op's lives in `ops/fail.rs`). There is no judge to keep in step: `eval` on a zero-row column IS the typer, so an op's shape rule is its accessor calls (`into_pair`/`into_list`/…, whose `Err` is the shape error) plus any explicit `same(..)` check it needs; the output shape is whatever it builds. Adding a layer:
+No `unsafe`: `lib.rs` forbids it, and the compiler enforces that.
+Adding an op: ONE arm in `eval`. There is no judge to keep in step: `eval` on a zero-row column IS the typer, so an op's shape rule is its accessor calls (`into_pair`/`into_list`/…, whose `Err` is the shape error) plus any explicit `same(..)` check it needs; the output shape is whatever it builds. Adding a layer:
 an enum + `OpLike` + `From` impls; touch nothing below.
 
 Optimizer rewrites live in `src/optimize/passes/`. `optimize(&Graph) -> Graph`

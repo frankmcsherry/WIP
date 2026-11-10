@@ -372,19 +372,15 @@ pub(crate) fn f64_of_key(k: u64) -> f64 {
     f64::from_bits(if k >> 63 == 1 { k ^ SIGN } else { !k })
 }
 
-/// the `u64` words as the `i64`s whose two's complement they are, in the same buffer.
+/// the `u64` words as the `i64`s whose two's complement they are, in the same buffer: the two
+/// types share a size and alignment, so collecting the converted iterator reuses its allocation.
 pub(crate) fn i64s_of_words(xs: Vec<u64>) -> Vec<i64> {
-    let mut xs = std::mem::ManuallyDrop::new(xs);
-    // SAFETY: `u64` and `i64` have one size and alignment, every bit pattern is an `i64`, and the
-    // buffer's ownership moves to the new `Vec` (the old one is never dropped).
-    unsafe { Vec::from_raw_parts(xs.as_mut_ptr() as *mut i64, xs.len(), xs.capacity()) }
+    xs.into_iter().map(|x| x as i64).collect()
 }
 
 /// the `i64`s as their two's complement words, in the same buffer.
 pub(crate) fn words_of_i64s(xs: Vec<i64>) -> Vec<u64> {
-    let mut xs = std::mem::ManuallyDrop::new(xs);
-    // SAFETY: as `i64s_of_words`, the other way.
-    unsafe { Vec::from_raw_parts(xs.as_mut_ptr() as *mut u64, xs.len(), xs.capacity()) }
+    xs.into_iter().map(|x| x as u64).collect()
 }
 
 /// a one-row constant an immediate op carries: an integer, or a float as its total-order key
