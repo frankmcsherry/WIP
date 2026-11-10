@@ -40,6 +40,7 @@ TABLES = {
     'orders': {
         'o_orderkey': ('o_orderkey', 'u'), 'o_custkey': ('o_custkey', 'u'), 'o_orderdate': (DAYS.format('o_orderdate'), 'u'),
         'o_orderpriority': ('o_orderpriority', 's'), 'o_shippriority': ('o_shippriority', 'u'),
+        'o_totalprice': (CENTS.format('o_totalprice'), 'u'),
     },
     'customer': {'c_custkey': ('c_custkey', 'u'), 'c_nationkey': ('c_nationkey', 'u'), 'c_mktsegment': ('c_mktsegment', 's')},
     'part': {

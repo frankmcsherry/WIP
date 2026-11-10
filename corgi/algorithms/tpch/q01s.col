@@ -1,0 +1,19 @@
+# TPC-H Q1 by scatter: each line item's group is its two flag bytes as one number, f * 256 + s, or -1
+# when its ship date leaves it out; one scatter_add totals every column by group, a 1 per line item
+# counting them, with no filter and no sort of the line items. Then the group of -1 is dropped, and
+# the four groups sorted.
+# sql: SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice),
+# sql:   sum(l_extendedprice * (100 - l_discount)), sum(l_extendedprice * (100 - l_discount) * (100 + l_tax)),
+# sql:   sum(l_quantity)::DOUBLE / count(*), count(*)
+# sql:   FROM lineitem WHERE l_shipdate <= 10471 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+# columns: l_returnflag l_linestatus l_quantity l_extendedprice l_discount l_tax l_shipdate
+# output: [s,s,u,u,u,u,f,u]
+let (rf, ls, qty, price, disc, tax, date) = input in
+let ids = ((rf, ls) zip, date) zip
+    map (((f, s), dt) -> ((dt, 10471) le, (((0, f) get, 256) mul, (0, s) get) add, -1) select) in
+let vals = ((qty, price) zip, (disc, tax) zip) zip
+    map (((q, p), (d, t)) -> let dp = (p, (100, d) sub) mul in (1, q, p, dp, (dp, (100, t) add) mul)) in
+(ids, vals) scatter_add
+    map ((g, (n, q, p, x, c)) ->
+        ((g, 0) ge, ((g, 256) div enlist, (g, 256) rem enlist, q, p, x, c, (q to_float, n to_float) div, n)))
+    filter sort

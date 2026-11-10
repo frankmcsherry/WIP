@@ -1,0 +1,7 @@
+# scatter_add with keys of any shape: here the strings "even" and "odd", and each value is (1, x)
+# for x in 0..9, so the first total counts. One (key, total) pair per distinct key comes out, in an
+# order not promised; `sort` puts them in key order.
+# n = 9
+# = List ends=[2] <(List ends=[4, 7] <[101, 118, 101, 110, 111, 100, 100]>, ([5, 4], [20, 16]))>
+let xs = input iota in
+(xs map (x -> (((x, 2) rem, 0) eq, "even", "odd") select), xs map (x -> (1, x))) scatter_add sort
