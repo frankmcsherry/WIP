@@ -446,44 +446,15 @@ fn copy_spans(srcs: &[&Value], spans: &[(usize, usize, usize)], at: &mut Positio
     }
 }
 
-/// `Unwrap` for lanes made of leaves (a leaf, or products of leaves): each row read from its lane
-/// with the sum's own `u8` discriminants, in place, rather than widened into a `usize` column first.
-/// `None` when a lane holds a list, sum, reference or unit, which take [`gather_lanes`].
-pub(crate) fn unwrap_leaves(lanes: &[&Value], tags: &[u8], off: &[usize]) -> Option<Value> {
-    match lanes[0] {
-        Value::Prim(_) => {
-            let prims: Vec<&Prim> = lanes
-                .iter()
-                .map(|v| match v {
-                    Value::Prim(p) => Some(p),
-                    _ => None,
-                })
-                .collect::<Option<_>>()?;
-            Some(Value::Prim(Prim::gather_lanes(&prims, tags, off)))
-        }
-        Value::Prod(c0) => {
-            let mut fields = Vec::with_capacity(c0.len());
-            for f in 0..c0.len() {
-                let lanes_f: Vec<&Value> = lanes
-                    .iter()
-                    .map(|v| match v {
-                        Value::Prod(c) => c.get(f),
-                        _ => None,
-                    })
-                    .collect::<Option<_>>()?;
-                fields.push(unwrap_leaves(&lanes_f, tags, off)?);
-            }
-            Some(Value::Prod(fields))
-        }
-        _ => None,
-    }
-}
-
 /// multi-source gather: result row `i` is row `off[i]` of source `srcs[tags[i]]` — all sources sharing
 /// one shape. The multi-source generalisation of [`gather`] (the 1-source case) and the fused
 /// inverse of `Inject`: `Unwrap` is `gather_lanes(variants, tags, offset)`, reading each row straight from
 /// its variant instead of materialising `concat(variants)` first. `off` is the carried within-variant offset.
-pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize]) -> Value {
+/// The tags may be a `Sum`'s own `u8` discriminants, read in place, or any `usize` column.
+pub(crate) fn gather_lanes<T: Copy>(srcs: &[Option<&Value>], tags: &[T], off: &[usize]) -> Value
+where
+    usize: From<T>,
+{
     // a `None` source is one `tags` never names; fill it with a zero-row value of the witness (first
     // present) shape to hold its slot for tag-indexing. At least one source must be present.
     let witness = srcs.iter().flatten().next().copied().expect("gather_lanes: no committed source");
@@ -519,7 +490,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 Value::List(b, vals) => (b, &**vals),
                 _ => panic!("gather_lanes: shape mismatch"),
             }).collect();
-            list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (t, o, o + 1)))
+            list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (usize::from(t), o, o + 1)))
         }
         Value::Sum(..) => {
             // pick each output row's tagged payload: build the output tag column, then per output-tag
@@ -535,7 +506,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 .collect();
             // each output row takes its source row's tag, read in place from that source.
             let out_tag: Vec<usize> =
-                tags.iter().zip(off).map(|(&t, &o)| sums[t].0.tag_at(o)).collect();
+                tags.iter().zip(off).map(|(&t, &o)| sums[usize::from(t)].0.tag_at(o)).collect();
             // every source has the same shape, hence the same arity (there is no uncommitted lane
             // for sources to disagree by); a mismatch is the caller's shape error.
             let arity = sums[0].1.len();
@@ -545,13 +516,13 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                     let (mut s_t, mut s_o) = (Vec::new(), Vec::new());
                     for (i, &os) in out_tag.iter().enumerate() {
                         if os == s {
-                            let (t, o) = (tags[i], off[i]);
+                            let (t, o) = (usize::from(tags[i]), off[i]);
                             s_t.push(t);
                             s_o.push(sums[t].0.offset_at(o)); // carried offset within the source's lane s
                         }
                     }
                     let vsrcs: Vec<Option<&Value>> = sums.iter().map(|sm| Some(&sm.1[s])).collect();
-                    gather_lanes(&vsrcs, &s_t, &s_o)
+                    gather_lanes::<usize>(&vsrcs, &s_t, &s_o)
                 })
                 .collect();
             Value::Sum(Tags::from_tags(out_tag, arity), out_vars)
@@ -572,7 +543,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                     _ => panic!("gather_lanes: shape mismatch"),
                 })
                 .collect();
-            let picked = |i: usize| parts[tags[i]].1[off[i]];
+            let picked = |i: usize| parts[usize::from(tags[i])].1[off[i]];
             let mut arenas: Vec<&Arc<Value>> = Vec::new();
             let mut arena_of = vec![0usize; parts.len()];
             for (k, (list, rows)) in parts.iter().enumerate() {
@@ -592,7 +563,7 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
             // arena's rows in turn, so a row's new number is its arena's base plus its rank.
             let mut used: Vec<Vec<usize>> = vec![Vec::new(); arenas.len()];
             for i in 0..tags.len() {
-                used[arena_of[tags[i]]].push(picked(i));
+                used[arena_of[usize::from(tags[i])]].push(picked(i));
             }
             let (mut atags, mut aoff, mut base) = (Vec::new(), Vec::new(), Vec::with_capacity(arenas.len()));
             for (a, rows) in used.iter_mut().enumerate() {
@@ -603,10 +574,10 @@ pub(crate) fn gather_lanes(srcs: &[Option<&Value>], tags: &[usize], off: &[usize
                 aoff.extend(rows.iter().copied());
             }
             let srcs: Vec<Option<&Value>> = arenas.iter().map(|a| Some(&***a)).collect();
-            let list = Arc::new(gather_lanes(&srcs, &atags, &aoff));
+            let list = Arc::new(gather_lanes::<usize>(&srcs, &atags, &aoff));
             let rows = (0..tags.len())
                 .map(|i| {
-                    let a = arena_of[tags[i]];
+                    let a = arena_of[usize::from(tags[i])];
                     base[a] + used[a].binary_search(&picked(i)).expect("a picked row is used")
                 })
                 .collect();

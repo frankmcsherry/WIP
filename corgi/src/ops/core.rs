@@ -3,8 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, take_ref,
-    unwrap_leaves, Owners,
+    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, take_ref, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
@@ -860,19 +859,12 @@ impl<L: OpLike> Op<L> {
                 if let Some(t) = tags.const_tag() {
                     return Ok(variants.into_iter().nth(t).expect("tag names a lane"));
                 }
-                let Tags::Column(tp, os) = &tags else { unreachable!("const handled above") };
-                // lanes of leaves read each row with the u8 discriminants in place.
-                if let Prim::U8(t8) = tp {
-                    let lanes: Vec<&Value> = variants.iter().collect();
-                    if let Some(v) = unwrap_leaves(&lanes, t8, os) {
-                        return Ok(v);
-                    }
-                }
-                // otherwise the carried offsets are already the `&[usize]` `gather_lanes` wants;
-                // only the u8 discriminants widen.
-                let ts: Vec<usize> = tags.tags_iter().collect();
+                // the u8 discriminants and the carried offsets, read in place
+                let Tags::Column(Prim::U8(t8), os) = &tags else {
+                    unreachable!("const handled above, and a sum's tags are one byte per row")
+                };
                 let refs: Vec<Option<&Value>> = variants.iter().map(Some).collect();
-                gather_lanes(&refs, &ts, os)
+                gather_lanes(&refs, t8, os)
             }
 
             // sum introduction: every row goes to variant `tag` (a constant tag run), the
