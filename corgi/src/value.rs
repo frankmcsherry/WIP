@@ -378,11 +378,6 @@ pub(crate) fn i64s_of_words(xs: Vec<u64>) -> Vec<i64> {
     xs.into_iter().map(|x| x as i64).collect()
 }
 
-/// the `i64`s as their two's complement words, in the same buffer.
-pub(crate) fn words_of_i64s(xs: Vec<i64>) -> Vec<u64> {
-    xs.into_iter().map(|x| x as u64).collect()
-}
-
 /// a one-row constant an immediate op carries: an integer, or a float as its total-order key
 /// (a key, not an `f64`, so that ops holding it are `Eq` and `Hash`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -618,6 +613,35 @@ macro_rules! prim {
             pub(crate) fn gather_or_zero(&self, idx: &[usize]) -> Prim {
                 match self {
                     $( Prim::$V(v) => Prim::$V(Arc::new(idx.iter().map(|&i| v.get(i).copied().unwrap_or_default()).collect())), )+
+                }
+            }
+
+            /// Read positions at their storage, with no intermediate index column.
+            fn gather_positions<T: Elem>(&self, idx: &[T]) -> Prim {
+                match self {
+                    $( Prim::$V(v) => Prim::$V(Arc::new(idx.iter().map(|&x|
+                        v.get(usize::try_from(x.word()).unwrap_or(usize::MAX)).copied().unwrap_or_default()
+                    ).collect())), )+
+                }
+            }
+
+            /// A leaf of `hay` at these owned positions (each read as a word: a negative position is
+            /// past every row). `i64` positions into an `i64` haystack are rewritten in place into
+            /// the result; other pairs read their own storage and allocate. The raw caller
+            /// deliberately materializes even an identity gather rather than adding an
+            /// identity-detection scan to its single indexing pass. An index past the leaf reads
+            /// zero. (A clamped read and a select, with no branch, measured 10–18% slower on pointer
+            /// chasing than this bounds test, whose branch is predicted when indices are in range.)
+            pub(crate) fn gather_positions_owned(self, hay: &Prim) -> Prim {
+                match (self, hay) {
+                    (Prim::I64(xs), Prim::I64(v)) => {
+                        let mut idx = Arc::unwrap_or_clone(xs);
+                        for x in &mut idx {
+                            *x = v.get(*x as usize).copied().unwrap_or(0);
+                        }
+                        Prim::I64(Arc::new(idx))
+                    }
+                    $( (Prim::$V(xs), hay) => hay.gather_positions(&xs), )+
                 }
             }
 
@@ -948,25 +972,6 @@ impl Prim {
         if int { Prim::I64(Arc::new(Vec::new())) } else { Prim::F64(Arc::new(Vec::new())) }
     }
 
-    /// A leaf whose positions are the owned `idx` (each a word: a negative position is past every
-    /// row). An `i64` haystack rewrites that buffer in place into the result; other storages
-    /// allocate their own. The raw caller deliberately materializes even an identity gather
-    /// rather than adding an identity-detection scan to its single indexing pass. An index past
-    /// the leaf reads zero. (A clamped read and a select, with no branch, measured 10–18% slower
-    /// on pointer chasing than this bounds test, whose branch is predicted when indices are in
-    /// range.)
-    pub(crate) fn gather_words_owned(&self, mut idx: Vec<u64>) -> Prim {
-        if let Prim::I64(v) = self {
-            for x in idx.iter_mut() {
-                *x = v.get(*x as usize).copied().unwrap_or(0) as u64;
-            }
-            Prim::I64(Arc::new(i64s_of_words(idx)))
-        } else {
-            let idx: Vec<usize> = idx.into_iter().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).collect();
-            self.gather_or_zero(&idx)
-        }
-    }
-
     fn show(&self) -> String {
         match self {
             Prim::U8(xs) => format!("{xs:?}"),
@@ -1247,11 +1252,6 @@ impl Value {
             Value::Prim(Prim::U8(xs)) => Ok(xs.iter().map(|&x| x as i64).collect()),
             other => Err(wrong(who, "Int", &other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
         }
-    }
-
-    /// [`Value::as_words`], owned: the `i64` buffer itself when uniquely held.
-    pub(crate) fn into_words(self, who: &str) -> Result<Vec<u64>, String> {
-        Ok(words_of_i64s(self.into_i64(who)?))
     }
 
     /// an integer leaf as a mask: a byte per row, nonzero where the row is. A byte leaf (what

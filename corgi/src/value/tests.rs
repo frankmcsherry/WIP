@@ -40,13 +40,14 @@ fn meet_widens_bytes() {
     assert!(matches!(a, Prim::U8(v) if Arc::ptr_eq(&v, &xs)), "one storage meets without a copy");
 }
 
-/// The `i64` words a position reader sees are the integers' two's complement, in the same buffer.
+/// Hash words read back as their two's complement integers, in the same buffer.
 #[test]
-fn words_round_trip() {
-    let xs = vec![-1i64, 0, 5, i64::MIN];
-    let w = words_of_i64s(xs.clone());
-    assert_eq!(w, vec![u64::MAX, 0, 5, 1 << 63]);
-    assert_eq!(i64s_of_words(w), xs);
+fn integers_of_words_reuse_the_buffer() {
+    let words = vec![u64::MAX, 0, 5, 1 << 63];
+    let allocation = words.as_ptr().cast::<i64>();
+    let ints = i64s_of_words(words);
+    assert_eq!(ints, vec![-1i64, 0, 5, i64::MIN]);
+    assert_eq!(ints.as_ptr(), allocation);
 }
 
 /// A `Value` clone must be a refcount bump, not a column copy: `eval_graph` clones at every
@@ -122,4 +123,15 @@ fn copy_spans_reads_mixed_storages_in_place() {
     let (bytes, wide) = (Prim::U8(Arc::new(vec![1, 2, 255])), Prim::I64(Arc::new(vec![-1, 300, 7])));
     let out = Prim::copy_spans(&[&bytes, &wide], &[(1, 1, 3), (0, 0, 2), (0, 3, 3), (1, 0, 1)]);
     assert!(matches!(&out, Prim::I64(v) if **v == vec![300, 7, 1, 2, -1]));
+}
+
+#[test]
+fn gather_owned_positions_reuses_i64_buffer() {
+    let positions = vec![2i64, -1, 0, i64::MIN, i64::MAX];
+    let allocation = positions.as_ptr();
+    let index = Prim::I64(Arc::new(positions));
+    let hay = Prim::I64(Arc::new(vec![-11, 22, 333]));
+    let Prim::I64(out) = index.gather_positions_owned(&hay) else { unreachable!() };
+    assert_eq!(&**out, &[333, 0, -11, 0, 0]);
+    assert_eq!(out.as_ptr(), allocation);
 }

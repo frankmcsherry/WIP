@@ -15,6 +15,6 @@ fn the_hash_op_is_the_hash_function() {
     ];
     for v in shapes {
         let op = crate::ops::Op::<crate::NumOp>::Hash.eval(v.clone()).unwrap();
-        assert_eq!(crate::hash::hash(&v), op.into_words("hash op").unwrap());
+        assert_eq!(crate::hash::hash(&v), op.into_i64("hash op").unwrap().into_iter().map(|x| x as u64).collect::<Vec<_>>());
     }
 }
