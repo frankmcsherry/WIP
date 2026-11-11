@@ -292,7 +292,6 @@ enum Apply {
     MapVariant(usize, Pat, Box<E>),
     Match(Vec<(usize, Pat, E)>), // arms (tag, binding, body) -> MapSum + Unwrap
     Inject(usize, Vec<Option<Shape>>), // tag + the declared lane shapes (the filled one may be open) -> Op::Inject
-    Head, // `head`: sugar for `(0, list) get` — the first element (an empty row errs)
     Call(Graph<NumOp>), // `call name`: the graph the scope binds to `name`, grafted onto the value
     Check(Pattern), // `: S`: the value has this shape (`_` a hole); typing fails otherwise
 }
@@ -720,8 +719,6 @@ impl<'a> P<'a> {
                 let Some(e) = e else { return Err("inject needs a declared variant name".into()) };
                 Ok(Apply::Inject(tag, self.enums.lanes(&e, tag)?))
             }
-            // head: first element, sugar for `get 0` — checked (an empty row errs, carried in the err-mask).
-            "head" => Ok(Apply::Head),
             // call: a word the host bound in the scope (`Scope::word`). Only `call` reaches the
             // scope's words, so they and corgi's own never collide.
             "call" => {
@@ -1067,13 +1064,14 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
         E::Pipe(e, ap) => {
             let id = lower(e, env, b)?;
             match ap {
-                Apply::Op(name, _) if name == "slices" => Ok(slices_word(b, id)),
+
                 Apply::Op(name, arg) if name.starts_with("try_") => {
                     let arity = match &**e { E::Tuple(es) => Some(es.len()), _ => None };
                     try_word(b, id, name, *arg, arity)
                 }
-                Apply::Op(name, _) if matches!(name.as_str(), "sort" | "dedup" | "group") => Ok(sort_word(b, id, name)),
-                Apply::Op(name, _) if name == "hash_group" => Ok(b.graft(&parse_ml(HASH_GROUP)?, id)),
+                Apply::Op(name, None) if word(name).is_some() => {
+                    Ok(b.graft(&parse_ml(word(name).expect("a word, by the guard"))?, id))
+                }
                 Apply::Op(name, arg) => Ok(b.add(resolve(name, *arg)?, vec![id])),
                 Apply::Field(i) => Ok(b.add(Op::Field(*i), vec![id])),
                 Apply::Map(x, body) => Ok(b.add(Op::MapList(Box::new(lower_body(x, body)?)), vec![id])),
@@ -1100,36 +1098,12 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                     Ok(b.add(Op::Unwrap, vec![ms]))
                 }
                 Apply::Inject(tag, shapes) => Ok(b.add(Op::Inject(*tag, shapes.clone()), vec![id])),
-                // first element = index 0 of the row: build the (0, list) pair and gather it. An empty
-                // row reads the zero of the element's shape, as `get` does.
-                Apply::Head => {
-                    let zero = b.add(Op::Lit(Value::int([0])), vec![id]);
-                    let pair = b.tuple(vec![zero, id]);
-                    Ok(b.add(Op::Gather, vec![pair]))
-                }
                 Apply::Call(g) => Ok(b.graft(g, id)),
                 Apply::Check(Pattern::Any) => Ok(id),
                 Apply::Check(p) => Ok(b.add(Op::Pattern(p.clone()), vec![id])),
             }
         }
     }
-}
-
-/// `(ranges, list) slices`: each `(lo, hi)` range of row r becomes the sub-list `list[r][lo..hi)`.
-/// The word `map(range); gather`: the ranges become nested position lists, and `gather` keeps their
-/// structure. A range with `lo >= hi` is empty; a position past the row reads the zero of its shape.
-fn slices_word(b: &mut Builder<NumOp>, pair: usize) -> usize {
-    let ranges = b.add(Op::Field(0), vec![pair]);
-    let list = b.add(Op::Field(1), vec![pair]);
-    let range = {
-        let mut rb = Builder::default();
-        let r = rb.input();
-        let out = rb.add(Op::Range, vec![r]);
-        rb.finish(out)
-    };
-    let positions = b.add(Op::MapList(Box::new(range)), vec![ranges]);
-    let args = b.tuple(vec![positions, list]);
-    b.add(Op::Gather, vec![args])
 }
 
 /// the checked ops, as words over the lossy ones: mark each row the op would lose something on,
@@ -1218,12 +1192,50 @@ fn try_word(b: &mut Builder<NumOp>, mut x: usize, name: &str, arg: Option<u64>, 
     Ok(b.add(Op::MapSum(vec![(0, arm(op)), (1, arm(Op::Unit.into()))]), vec![routed]))
 }
 
-/// `kvs hash_group`: `group` by hashing, the word written in corgi. Each row's `(key, value)`
-/// pairs, grouped by key: the groups in the order of their keys' hashes, not of the keys, and each
-/// key a reference into the row's keys (`clone` it to copy it out). Sorting the 64-bit hashes is
-/// much cheaper than sorting keys such as strings. The groups are exact: a group of equal hashes
-/// holds one key unless two keys share a hash, and its keys then change inside it. A row where
-/// that happens is grouped by sorting the keys themselves.
+/// The words written in corgi: each is source text whose `input` is the value the word applies to,
+/// parsed and grafted where the program names it, so the optimizer sees through it.
+fn word(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "sort" => SORT,
+        "dedup" => DEDUP,
+        "group" => GROUP,
+        "hash_group" => HASH_GROUP,
+        "slices" => SLICES,
+        "head" => HEAD,
+        _ => return None,
+    })
+}
+
+/// `sort`, `dedup` and `group` are words over `sort_by` (stable by key, a payload carried along, and
+/// each element's run of equal keys), `adjacent`, `filter` and `cut`. `dedup` and `group` sort a
+/// list key by reference, so that only the keys they keep are copied out.
+///
+/// `xs sort`: `sort_by` with a unit payload.
+const SORT: &str = "
+    let t = (input, input map (x -> x unit)) zip sort_by transpose in
+    t.0
+";
+
+/// `xs dedup`: the sorted elements that start a run.
+const DEDUP: &str = "
+    let t = (input map (x -> x ref), input map (x -> x unit)) zip sort_by transpose in
+    (t.2 adjacent, t.0) zip filter map (x -> x clone)
+";
+
+/// `kvs group`: the keys that start a run, and the values cut where a run starts.
+const GROUP: &str = "
+    let kv = input transpose in
+    let t = (kv.0 map (x -> x ref), kv.1) zip sort_by transpose in
+    let starts = t.2 adjacent in
+    ((starts, t.0) zip filter map (x -> x clone), (starts, t.1) zip cut) zip
+";
+
+/// `kvs hash_group`: `group` by hashing. Each row's `(key, value)` pairs, grouped by key: the groups
+/// in the order of their keys' hashes, not of the keys, and each key a reference into the row's keys
+/// (`clone` it to copy it out). Sorting the 64-bit hashes is much cheaper than sorting keys such as
+/// strings. The groups are exact: a group of equal hashes holds one key unless two keys share a hash,
+/// and its keys then change inside it. A row where that happens is grouped by sorting the keys
+/// themselves.
 const HASH_GROUP: &str = "
     let (k, v) = input transpose in
     let refs = k map (x -> x ref) in
@@ -1239,64 +1251,18 @@ const HASH_GROUP: &str = "
             ((starts, keys) zip filter, (starts, kvs map ((_, x) -> x)) zip cut) zip))
 ";
 
-/// `sort`, `dedup` and `group` as words over `sort_by` (stable by key, a payload carried along, and
-/// each element's run of equal keys), `adjacent`, `filter` and `cut`. `dedup` and `group` sort a
-/// list key by reference, so that only the keys they keep are copied out:
-/// - `xs sort` = `sort_by` with a unit payload;
-/// - `xs dedup` = the sorted elements that start a run;
-/// - `kvs group` = the keys that start a run, and the values cut where a run starts.
-fn sort_word(b: &mut Builder<NumOp>, xs: usize, name: &str) -> usize {
-    let pair_up = |b: &mut Builder<NumOp>, l: usize, r: usize| {
-        let pair = b.tuple(vec![l, r]);
-        b.add(Op::Zip, vec![pair])
-    };
-    // an op on each element: `ref` makes a list element a reference (a leaf stays itself)
-    let each = |b: &mut Builder<NumOp>, op: NumOp, xs: usize| {
-        let mut bb = Builder::default();
-        let i = bb.input();
-        let u = bb.add(op, vec![i]);
-        b.add(Op::MapList(Box::new(bb.finish(u))), vec![xs])
-    };
-    // (k, v) -> the sorted keys, the values carried along, and a mark where each run starts (its
-    // run number changes, or a row starts)
-    let sort_by = |b: &mut Builder<NumOp>, k: usize, v: usize, marks: bool| {
-        let kv = pair_up(b, k, v);
-        let s = b.add(CmpOp::SortBy, vec![kv]);
-        let t = b.add(Op::Transpose, vec![s]);
-        let (sk, sv) = (b.add(Op::Field(0), vec![t]), b.add(Op::Field(1), vec![t]));
-        let mark = marks.then(|| {
-            let runs = b.add(Op::Field(2), vec![t]);
-            b.add(CmpOp::Adjacent, vec![runs])
-        });
-        (sk, sv, mark.unwrap_or(t))
-    };
-    match name {
-        "sort" => {
-            let units = each(b, Op::Unit.into(), xs);
-            sort_by(b, xs, units, false).0
-        }
-        "dedup" => {
-            let r = each(b, Op::Ref.into(), xs);
-            let units = each(b, Op::Unit.into(), xs);
-            let (sk, _, mark) = sort_by(b, r, units, true);
-            let marked = pair_up(b, mark, sk);
-            let kept = b.add(Op::Filter, vec![marked]);
-            each(b, Op::Clone.into(), kept)
-        }
-        _ => {
-            let kv = b.add(Op::Transpose, vec![xs]);
-            let (k, v) = (b.add(Op::Field(0), vec![kv]), b.add(Op::Field(1), vec![kv]));
-            let kr = each(b, Op::Ref.into(), k);
-            let (sk, sv, mark) = sort_by(b, kr, v, true);
-            let mk = pair_up(b, mark, sk);
-            let kept = b.add(Op::Filter, vec![mk]);
-            let keys = each(b, Op::Clone.into(), kept);
-            let mv = pair_up(b, mark, sv);
-            let pieces = b.add(Op::Cut, vec![mv]);
-            pair_up(b, keys, pieces)
-        }
-    }
-}
+/// `(ranges, list) slices`: each `(lo, hi)` range of row r becomes the sub-list `list[r][lo..hi)`.
+/// The ranges become nested position lists, and `gather` keeps their structure. A range with
+/// `lo >= hi` is empty; a position past the row reads the zero of its shape.
+const SLICES: &str = "
+    (input.0 map (r -> r range), input.1) gather
+";
+
+/// `xs head`: the first element, `(0, xs) get`. An empty row reads the zero of the element's shape,
+/// as `get` does.
+const HEAD: &str = "
+    (0, input) get
+";
 
 /// What a program may name without defining it, as it names `input`: words the host binds, which
 /// `call` reaches, and enums declared once for every program parsed in the scope. Both resolve at

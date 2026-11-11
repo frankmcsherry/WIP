@@ -89,7 +89,7 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
 Each row's elements in stable order by `K` alone, `V` carried along, and each element's run of
 equal keys: the refined labels, numbered densely over the column (a run never spans two rows). A
 unit `V` carries nothing, and then the sort carries no index. It is the sort's own output, and
-`sort`, `dedup` and `group` are words over it (`frontend/ml.rs::sort_word`):
+`sort`, `dedup` and `group` are words over it, written in corgi (`frontend/ml.rs`, `word`):
 
 - `xs sort` is `sort_by` with a unit payload.
 - `xs dedup` takes a reference to each element, sorts, keeps the elements whose run number differs

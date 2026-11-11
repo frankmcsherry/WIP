@@ -178,7 +178,7 @@ src/
                Vec<(tag,body)>, unlisted variants pass through, disjoint tags so arms commute.)
     cmp.rs     CmpOp: Rel(Pred) + SortBy/SortLimit/Find/Adjacent. Comparisons by value. SortBy is
                the sort's own output (stable by key, payload carried, runs numbered;
-               dev/indexed-sort.md); `sort`/`dedup`/`group` are words over it (ml.rs::sort_word).
+               dev/indexed-sort.md); `sort`/`dedup`/`group` are words over it (ml.rs, `word`).
                SortLimit sorts the order's levels one at a time, keeping per row the first k and the
                ties at the k-th after each; it is not a word yet (dev/indexed-sort.md says why).
                Adjacent marks where runs of equal elements start (a structural compare of each
@@ -202,9 +202,10 @@ src/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches, apart from the
                words a host binds in a `Scope`).
     ml.rs      the one surface: ML-flavoured (let / enum / juxtaposed stages / match / inject), lowering to Graph<NumOp>.
-               The words are built here: sort/dedup/group over sort_by, hash_group (written in
-               corgi itself, as source grafted in), all/any over a written tuple, slices, head, and the
-               checked ops try_get/try_gather/try_zip/try_chunk (check, branch, lossy op on lane 0).
+               The words are built here. sort/dedup/group over sort_by, hash_group, slices and head
+               are written in corgi, as source grafted in (`word`); all/any over a written tuple and the
+               checked ops try_get/try_gather/try_zip/try_chunk (check, branch, lossy op on lane 0) are
+               built by the lowering, since they depend on a written tuple or a numeric argument.
                `Scope`: what a program names without defining it — the host's words (graphs, a host
                kernel being one node), grafted by `x call name`, and enums declared once for every
                program parsed in it (`parse_ml_in`).
