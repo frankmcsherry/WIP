@@ -980,15 +980,15 @@ impl<L: OpLike> Op<L> {
                 // the one-row leaf fast path indexes the payload directly, so row 0 must BE the
                 // payload (a partition); a referenced haystack takes the general path below.
                 if let (Value::List(ib, ivals), Value::Prim(p), Rows::Part(_)) = (&idx, hvals, hb) {
-                    if ib.len() == 1 && matches!(**ivals, Value::Prim(Prim::I64(_))) {
+                    if ib.len() == 1 && matches!(&**ivals, Value::Prim(p) if p.is_int()) {
                         // Raw Gather reads zero out of range, not an all-or-nothing error row: a
                         // clamped read and a select, no separate scan. This is the one path that
                         // CONSUMES the indices — it rewrites that buffer into the result — so it is
                         // also the only one that takes ownership.
                         let p = p.clone();
                         let Value::List(ib, ivals) = idx else { unreachable!() };
-                        let idxs = ivals.into_words("Gather indices")?;
-                        return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_words_owned(idxs)))));
+                        let Value::Prim(idxs) = *ivals else { unreachable!() };
+                        return Ok(Value::List(ib, Box::new(Value::Prim(idxs.gather_positions_owned(&p)))));
                     }
                 }
                 let mut ok = vec![true; idx.len()];

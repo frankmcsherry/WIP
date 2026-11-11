@@ -1,6 +1,69 @@
 use super::*;
 use crate::value::Value;
 
+fn check_positions(index: Value, hay: Value, expected: Value, flags: &[bool]) {
+    let (rows, values) = hay.rows_of("test").unwrap();
+    let mut ok = vec![true; index.len()];
+    let plan = index_plan(&index, &Owners::Identity, rows, &mut ok).unwrap();
+    assert_eq!(ok, flags);
+    assert_eq!(plan.fill_or_zero(values).unwrap(), expected);
+    let program = crate::Program::compile_ml("input gather").unwrap();
+    assert_eq!(program.run(Value::Prod(vec![index, hay])), expected);
+}
+
+#[test]
+fn gather_position_storage_and_row_bounds() {
+    let list = |ends: Vec<usize>, v| Value::List(ends.into(), Box::new(v));
+    // Master's leaf zero is zero storage bits, including for a float's total-order key.
+    let float_zero = f64::from_bits(u64::MAX);
+    // Each expected column includes the element shape's zero for a miss.
+    for (hay, one, many) in [
+        (Value::u8(vec![11, 22, 33, 44]), Value::u8(vec![44, 11, 0, 0, 22]), Value::u8(vec![22, 0, 11, 0, 0])),
+        (Value::i64(vec![-11, 2222, 33, 44]), Value::i64(vec![44, -11, 0, 0, 2222]), Value::i64(vec![2222, 0, -11, 0, 0])),
+        (Value::f64(vec![-1.5, 2.5, 3.5, 4.5]), Value::f64(vec![4.5, -1.5, float_zero, float_zero, 2.5]), Value::f64(vec![2.5, float_zero, -1.5, float_zero, float_zero])),
+        (list(vec![1, 3, 3, 4], Value::u8(b"abcd".to_vec())),
+         list(vec![1, 2, 2, 2, 4], Value::u8(b"dabc".to_vec())),
+         list(vec![2, 2, 3, 3, 3], Value::u8(b"bca".to_vec()))),
+    ] {
+        for narrow in [true, false] {
+            let positions = |xs: Vec<u8>| if narrow { Value::u8(xs) } else { Value::i64(xs.into_iter().map(i64::from).collect()) };
+            check_positions(list(vec![5], positions(vec![3, 0, 4, 255, 1])), list(vec![4], hay.clone()), list(vec![5], one.clone()), &[false]);
+            // Row 0's position 2 must not read row 2's first element; rows 1 and 3 are empty.
+            check_positions(list(vec![3, 4, 4, 5], positions(vec![1, 2, 0, 0, 255])), list(vec![2, 2, 4, 4], hay.clone()), list(vec![3, 4, 4, 5], many.clone()), &[false, false, true, false]);
+            let empty = gather(&hay, &[]);
+            check_positions(list(vec![0], positions(vec![])), list(vec![0], empty.clone()), list(vec![0], empty.clone()), &[true]);
+            let zeros = match &hay {
+                Value::Prim(Prim::F64(_)) => Value::f64(vec![float_zero; 2]),
+                Value::List(..) => list(vec![0, 0], Value::u8(vec![])),
+                _ => Value::i64(vec![0; 2]),
+            };
+            check_positions(list(vec![2], positions(vec![0, 255])), list(vec![0], empty.clone()), list(vec![2], zeros), &[false]);
+            check_positions(list(vec![], positions(vec![])), list(vec![], empty.clone()), list(vec![], empty), &[]);
+        }
+    }
+}
+
+#[test]
+fn gather_positions_in_products_sums_and_referenced_rows() {
+    let list = |ends: Vec<usize>, v| Value::List(ends.into(), Box::new(v));
+    let arena = Arc::new(list(vec![2, 2, 4], Value::u8(vec![11, 22, 33, 44])));
+    // Even a single referenced row must use its named span rather than the whole payload.
+    let one = Value::Ref(arena.clone(), Arc::new(vec![2]));
+    check_positions(list(vec![3], Value::u8(vec![0, 1, 2])), one,
+        list(vec![3], Value::u8(vec![33, 44, 0])), &[false]);
+    let hay = Value::Ref(arena, Arc::new(vec![2, 0, 1]));
+    let index = list(vec![3, 4, 5], Value::u8(vec![1, 2, 0, 1, 0]));
+    let expected = list(vec![3, 4, 5], Value::u8(vec![44, 0, 33, 22, 0]));
+    check_positions(index.clone(), hay.clone(), expected.clone(), &[false, true, false]);
+    // A product combines misses from its fields in each owner's ok flag.
+    check_positions(Value::Prod(vec![Value::u8(vec![0, 2, 0]), index]), hay.clone(),
+        Value::Prod(vec![Value::u8(vec![33, 0, 0]), expected]), &[false, false, false]);
+    // Lane 0's two rows belong to haystack rows 0 and 2, not rows 0 and 1.
+    let index = Value::sum(vec![0, 1, 0], vec![list(vec![1, 2], Value::u8(vec![1, 0])), Value::u8(vec![0])]);
+    let expected = Value::sum(vec![0, 1, 0], vec![list(vec![1, 2], Value::u8(vec![44, 0])), Value::u8(vec![11])]);
+    check_positions(index, hay, expected, &[true, true, false]);
+}
+
 /// integers from their 64-bit words (so the full range, negatives included, is easy to write).
 fn u(xs: &[u64]) -> Value {
     Value::i64(xs.iter().map(|&x| x as i64).collect())

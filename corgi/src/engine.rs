@@ -4,7 +4,7 @@
 
 use crate::shape::shape_of_value;
 use std::sync::Arc;
-use crate::value::{with_empty_row, Bounds, Prim, Rows, Tags, Value};
+use crate::value::{with_empty_row, Bounds, Elem, Prim, Rows, Tags, Value};
 
 pub(crate) use generators::*;
 
@@ -122,22 +122,26 @@ mod generators {
             ok[r] &= inside;
             pos.push(if inside { hs + x as usize } else { usize::MAX });
         }
-        Ok(match index {
-            Value::Prim(p) => {
-                let mut pos = Vec::with_capacity(p.len());
-                match p {
-                    Prim::I64(xs) => xs.iter().enumerate().for_each(|(j, &x)| {
-                        let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), x as u64, &mut pos)
-                    }),
-                    Prim::U8(_) => (0..p.len()).for_each(|j| {
-                        let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), p.word_at(j), &mut pos)
-                    }),
-                    Prim::F64(_) => return Err("gather: positions are integers, not floats".into()),
+        // Dispatch once per leaf; read each row's span once, without an owner per position.
+        fn leaf(p: &Prim, bounds: &Bounds, owners: &Owners, hay: Rows, ok: &mut [bool]) -> Result<IndexPlan, String> {
+            fn positions<T: Elem>(xs: &[T], bounds: &Bounds, owners: &Owners, hay: Rows, ok: &mut [bool]) -> Vec<usize> {
+                let mut pos = Vec::with_capacity(xs.len());
+                for i in 0..bounds.len() {
+                    let r = owners.get(i);
+                    let (s, e) = bounds.span(i);
+                    let span = hay.span(r);
+                    xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x.word(), &mut pos));
                 }
-                IndexPlan::Leaf(pos)
+                pos
             }
+            Ok(IndexPlan::Leaf(match p {
+                Prim::U8(xs) => positions(xs, bounds, owners, hay, ok),
+                Prim::I64(xs) => positions(xs, bounds, owners, hay, ok),
+                Prim::F64(_) => return Err("gather: positions are integers, not floats".into()),
+            }))
+        }
+        Ok(match index {
+            Value::Prim(p) => leaf(p, &Bounds::Stride(1, p.len()), owners, hay, ok)?,
             Value::Unit(n) => IndexPlan::Unit(*n),
             Value::Prod(fields) => {
                 IndexPlan::Prod(fields.iter().map(|f| index_plan(f, owners, hay, ok)).collect::<Result<_, _>>()?)
@@ -145,17 +149,7 @@ mod generators {
             // a list of positions (the common case) resolves row by row with no owner column; a list
             // of anything else hands its elements their rows.
             Value::List(bounds, vals) => match &**vals {
-                Value::Prim(Prim::I64(xs)) => {
-                    let mut pos = Vec::with_capacity(xs.len());
-                    // one owner per row of positions, so its span is read once per row.
-                    for i in 0..bounds.len() {
-                        let r = owners.get(i);
-                        let (s, e) = bounds.span(i);
-                        let span = hay.span(r);
-                        xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x as u64, &mut pos));
-                    }
-                    IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(pos)))
-                }
+                Value::Prim(p) => IndexPlan::List(bounds.clone(), Box::new(leaf(p, bounds, owners, hay, ok)?)),
                 inner => {
                     let mut rows = Vec::with_capacity(inner.len());
                     for i in 0..bounds.len() {
