@@ -597,6 +597,23 @@ macro_rules! prim {
                 }
             }
 
+            /// the inverse of [`Prim::gather_lanes`]: row `i` written to lane `tags[i]`, at position
+            /// `off[i]` there, lane `t` holding `sizes[t]` rows. One pass, every row read in order.
+            pub(crate) fn partition<T: Copy>(&self, tags: &[T], off: &[usize], sizes: &[usize]) -> Vec<Prim>
+            where
+                usize: From<T>,
+            {
+                match self {
+                    $( Prim::$V(v) => {
+                        let mut lanes: Vec<Vec<$t>> = sizes.iter().map(|&n| vec![<$t>::default(); n]).collect();
+                        for ((&x, &t), &o) in v.iter().zip(tags).zip(off) {
+                            lanes[usize::from(t)][o] = x;
+                        }
+                        lanes.into_iter().map(|l| Prim::$V(Arc::new(l))).collect()
+                    } )+
+                }
+            }
+
             /// `gather` with every position past the leaf reading zero (zero bits).
             pub(crate) fn gather_or_zero(&self, idx: &[usize]) -> Prim {
                 match self {

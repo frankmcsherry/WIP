@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, take_ref, Owners,
+    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, partition, take_ref, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
@@ -672,22 +672,11 @@ impl<L: OpLike> Op<L> {
                     return Err(format!("CapSum expects (X, Sum), got (.., {})", shape_of_value(&s)));
                 };
                 assert_eq!(x.len(), tags.len(), "CapSum: context/sum length");
-                // every row in one lane, in row order: that lane pairs with the whole context.
-                if let Some(t) = tags.const_tag() {
-                    let mut ctx: Vec<Value> = (0..lanes.len()).map(|_| gather(&x, &[])).collect();
-                    ctx[t] = x;
-                    let new = ctx.into_iter().zip(lanes).map(|(c, lane)| Value::Prod(vec![c, lane])).collect();
-                    return Ok(Value::Sum(tags, new));
-                }
-                let mut per = vec![Vec::new(); lanes.len()];
-                for (i, t) in tags.tags_iter().enumerate() {
-                    per[t].push(i);
-                }
-                let new = lanes
-                    .into_iter()
-                    .zip(&per)
-                    .map(|(lane, rows)| Value::Prod(vec![gather(&x, rows), lane]))
-                    .collect();
+                // the context split as the sum's rows are: each lane's rows pair with theirs (every
+                // row in one lane, in row order, pairs that lane with the whole context).
+                let sizes: Vec<usize> = lanes.iter().map(Value::len).collect();
+                let ctx = partition(x, &tags, &sizes);
+                let new = ctx.into_iter().zip(lanes).map(|(c, lane)| Value::Prod(vec![c, lane])).collect();
                 // the assignment is unchanged: each lane keeps its rows, now paired.
                 Value::Sum(tags, new)
             }
@@ -810,8 +799,8 @@ impl<L: OpLike> Op<L> {
             }
 
             // N-way partition: the discriminant `tags` routes each row of `data` to its variant. The
-            // tags ARE the sum's tag column; each variant gathers its rows in order (so the implicit
-            // within-variant offset matches `Value::sum`).
+            // tags ARE the sum's tag column; each row is written to its variant at its offset there,
+            // the variant's rows staying in order (so the within-variant offset matches `Value::sum`).
             Op::Branch(n) => {
                 let (data, tags_v) = input.into_pair("Branch")?;
                 assert_eq!(data.len(), tags_v.len(), "Branch: payload/discriminant length");
@@ -836,13 +825,14 @@ impl<L: OpLike> Op<L> {
                     return Ok(Value::sum_tagged(Tags::Const(t, rows), variants));
                 }
                 // the tags read where they are stored
-                let (tag8, off, groups) = match &tags_v {
+                let (tag8, off, sizes) = match &tags_v {
                     Value::Prim(Prim::U8(t)) => route(t, |x| x as u64, *n),
                     Value::Prim(Prim::I64(t)) => route(t, |x| x as u64, *n),
                     other => return Err(format!("Branch tags: expected Int, got {}", shape_of_value(other))),
                 };
-                let variants = groups.iter().map(|idx| gather(&data, idx)).collect();
-                Value::sum_tagged(Tags::column(Prim::U8(Arc::new(tag8)), off), variants)
+                let tags = Tags::column(Prim::U8(Arc::new(tag8)), off);
+                let variants = partition(data, &tags, &sizes);
+                Value::sum_tagged(tags, variants)
             }
 
             Op::Unwrap => {
@@ -1173,19 +1163,19 @@ fn one_lane<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, last: u64) -> Option<u
 }
 
 /// `Branch`'s routing, in one pass: each row's lane (a tag past the last lane goes to the last), its
-/// offset in that lane (the lane's size when the row arrives), and each lane's rows.
-fn route<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, n: usize) -> (Vec<u8>, Vec<usize>, Vec<Vec<usize>>) {
+/// offset in that lane (the lane's size when the row arrives), and each lane's size.
+fn route<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, n: usize) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
     let last = n.saturating_sub(1) as u64;
-    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut sizes = vec![0usize; n];
     let mut tag8 = Vec::with_capacity(tags.len());
     let mut off = Vec::with_capacity(tags.len());
-    for (i, &t) in tags.iter().enumerate() {
+    for &t in tags {
         let t = word(t).min(last) as usize;
         tag8.push(t as u8);
-        off.push(groups[t].len());
-        groups[t].push(i);
+        off.push(sizes[t]);
+        sizes[t] += 1;
     }
-    (tag8, off, groups)
+    (tag8, off, sizes)
 }
 
 /// `Chunk(k)`'s values when some row doesn't divide by `k`: each row's first `len / k * k` elements.
