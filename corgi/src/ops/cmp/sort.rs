@@ -3,7 +3,7 @@
 //! [`sort_indexed`] orders the rows `index[..]` of a column within the blocks `labels` describes,
 //! by structural order: a leaf by its order keys (an integer's value, a float's total order), `Prod` lexicographically by field,
 //! `Sum` by tag then payload, `List` lexicographically (a proper prefix first), `Unit` all equal.
-//! Nothing is gathered before a level sorts. A leaf pulls its keys through the index once and
+//! Nothing is gathered before a level sorts. A single leaf pulls its keys through the index once and
 //! radixes them with the index's rows alongside, every pass sequential, and the sorted keys are
 //! the output column. The index is the only positional state: it is the rows in their current
 //! order, a later level reads its data through it, and from an identity start it is the
@@ -217,13 +217,13 @@ fn sort_prod(
             continue;
         }
         compared = true;
-        let (out, next) = match packable_bits(&cols[f]) {
-            Some(_) => sort_packed(cols, f, labels, index, emit, scratch),
-            None => {
-                // only the last segment may leave the index behind
-                let mode = if f + 1 == cols.len() { emit } else { emit.keeping_index() };
-                (sort_indexed(&cols[f], labels, index, mode, scratch).into_iter().collect(), f + 1)
-            }
+        let (out, next) = sort_packed(cols, f, labels, index, emit, scratch);
+        let (out, next) = if next == f {
+            // only the last segment may leave the index behind
+            let mode = if f + 1 == cols.len() { emit } else { emit.keeping_index() };
+            (sort_indexed(&cols[f], labels, index, mode, scratch).into_iter().collect(), f + 1)
+        } else {
+            (out, next)
         };
         outs.extend(out);
         settled = fully_discriminated(labels);
@@ -277,13 +277,13 @@ fn sort_fields(fields: &[&Value], labels: &mut Vec<u64>, index: &mut [usize], sc
                 }
             }
         }
-        f = match packable_bits(fields[f]) {
-            Some(_) => sort_packed(fields, f, labels, index, Emit::Index, scratch).1,
-            None => {
-                sort_indexed(fields[f], labels, index, Emit::Index, scratch);
-                f + 1
-            }
-        };
+        let next = sort_packed(fields, f, labels, index, Emit::Index, scratch).1;
+        if next == f {
+            sort_indexed(fields[f], labels, index, Emit::Index, scratch);
+            f += 1;
+        } else {
+            f = next;
+        }
     }
 }
 
@@ -340,55 +340,98 @@ fn sort_tied(fields: &[&Value], labels: &mut [u64], index: &mut [usize], live: &
     }
 }
 
+/// The storage width of primitive leaves; structure alone, with no column reads.
 fn packable_bits(v: &Value) -> Option<u32> {
     match v {
         Value::Unit(_) => Some(0),
         Value::Prim(p) => Some(p.bits()),
-        Value::Prod(cols) => cols.iter().try_fold(0u32, |used, col| {
-            let bits = packable_bits(col)?;
-            (used + bits <= 64).then_some(used + bits)
-        }),
+        Value::Prod(cols) => cols.iter().try_fold(0, |used, col| Some(used + packable_bits(col)?)),
         _ => None,
     }
 }
 
-fn pack_value(v: &Value, index: &[usize], keys: &mut Vec<u64>, first: &mut bool) {
+/// Only read a further leaf while this key cannot distinguish all the indexed rows.
+fn pack_more(bits: u32, rows: usize) -> bool {
+    1usize.checked_shl(bits).is_some_and(|values| values < rows)
+}
+
+/// Append the leaves of `v` to the packed `keys`, recording each leaf's (least key, packed bits,
+/// shared low bits) in `ranges`; false when a leaf does not fit or [`pack_more`] stops it. Each
+/// leaf is gathered once. The first leaf stays raw until another fits: a lone leaf then sorts
+/// and emits exactly its keys.
+fn pack_value(
+    v: &Value, index: &[usize], keys: &mut Vec<u64>, ranges: &mut Vec<(u64, u32, u32)>,
+    used: &mut u32, measured: bool, temp: &mut Vec<u64>,
+) -> bool {
     match v {
-        Value::Unit(_) => (),
+        Value::Unit(_) => true,
         Value::Prim(p) => {
-            if *first {
-                p.pull_keys(index, keys);
-                *first = false;
+            if !ranges.is_empty() && !pack_more(*used, index.len()) {
+                return false;
+            }
+            let first = ranges.is_empty();
+            let out = if first { &mut *keys } else { &mut *temp };
+            if first || measured {
+                out.clear();
+                p.pull_keys(index, out);
+            }
+            let (lo, bits, low) = if measured {
+                // Reducing the sequential buffer keeps the indirect gather fast.
+                let (lo, hi, all, any) = out.iter().fold((u64::MAX, 0, u64::MAX, 0), |(lo, hi, a, o), &k| {
+                    (lo.min(k), hi.max(k), a & k, o | k)
+                });
+                let lo = lo.min(hi);
+                let bits = 64 - (hi - lo).leading_zeros();
+                let low = (all ^ any).trailing_zeros().min(bits);
+                (lo, bits - low, low)
             } else {
-                p.pack_keys(index, keys);
+                (0, p.bits(), 0)
+            };
+            if *used + bits > 64 {
+                return false;
             }
-        }
-        Value::Prod(cols) => {
-            for col in cols {
-                pack_value(col, index, keys, first);
+            if !first {
+                if measured {
+                    let (base, _, shift) = if ranges.len() == 1 { ranges[0] } else { (0, 0, 0) };
+                    for (k, &next) in keys.iter_mut().zip(temp.iter()) {
+                        *k = ((*k - base) >> shift).checked_shl(bits).unwrap_or(0) | ((next - lo) >> low);
+                    }
+                } else {
+                    p.pack_keys(index, keys);
+                }
             }
+            ranges.push((lo, bits, low));
+            *used += bits;
+            true
         }
-        _ => unreachable!("sort_packed: a packable field"),
+        Value::Prod(cols) => cols.iter().all(|col| pack_value(col, index, keys, ranges, used, measured, temp)),
+        _ => false,
     }
 }
 
-fn unpack_value(v: &Value, keys: &[u64], shift: &mut u32) -> Value {
+fn unpack_value(v: &Value, keys: &[u64], shift: &mut u32, ranges: &mut impl Iterator<Item = (u64, u32, u32)>, single: bool) -> Value {
     match v {
         Value::Unit(_) => Value::Unit(keys.len()),
+        Value::Prim(p) if single => Value::Prim(p.like_keys(keys)),
         Value::Prim(p) => {
-            *shift -= p.bits();
-            let mask = if p.bits() == 64 { u64::MAX } else { (1u64 << p.bits()) - 1 };
-            Value::Prim(p.like_keys_iter(keys.iter().map(|&k| (k >> *shift) & mask)))
+            let (lo, bits, low) = ranges.next().unwrap();
+            *shift -= bits;
+            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            Value::Prim(p.like_keys_iter(keys.iter().map(|&k| ((k.checked_shr(*shift).unwrap_or(0) & mask) << low) + lo)))
         }
-        Value::Prod(cols) => Value::Prod(cols.iter().map(|col| unpack_value(col, keys, shift)).collect()),
+        Value::Prod(cols) => Value::Prod(cols.iter().map(|col| unpack_value(col, keys, shift, ranges, single)).collect()),
         _ => unreachable!("sort_packed: a packable field"),
     }
 }
 
-/// The primitive leaves of `cols` from `f` on, as many as fit one `u64` by their declared widths,
-/// sorted as one key, most significant leaf first: one set of passes and one refinement for
-/// the run. Unit and product structure occupy no key bits. Returns one column per field with
-/// `emit`, and the index of the first field not taken.
+/// The primitive leaves of `cols` from `f` on, sorted as one key, most significant leaf first:
+/// one set of passes and one refinement for the run. Unit and product structure occupy no key
+/// bits. The key takes leaves while they fit one `u64` and the key so far has fewer possible
+/// values than the indexed rows ([`pack_more`]): by their storage widths when those fit, with no
+/// range read; otherwise by each leaf's observed range, its keys gathered once, then reduced and
+/// packed sequentially. Only whole fields are taken: a field whose leaves do not all fit has any
+/// packed prefix undone and is left to its own sort. Returns one column per field with `emit`,
+/// and the index of the first field not taken (`f` when none was).
 fn sort_packed<C: Borrow<Value>>(
     cols: &[C],
     f: usize,
@@ -397,23 +440,33 @@ fn sort_packed<C: Borrow<Value>>(
     emit: Emit,
     scratch: &mut SortScratch,
 ) -> (Vec<Value>, usize) {
+    let measured = cols[f..].iter().map_while(|c| packable_bits(c.borrow()))
+        .try_fold(0, |used, bits| (used + bits <= 64).then_some(used + bits)).is_none();
     let mut g = f;
-    let mut used = 0u32;
-    while g < cols.len() {
-        let Some(bits) = packable_bits(cols[g].borrow()) else { break };
-        if used + bits > 64 {
-            break;
-        }
-        used += bits;
-        g += 1;
-    }
+    let mut used = 0;
+    let mut ranges = Vec::new();
     let mut keys = std::mem::take(&mut scratch.keys);
     keys.clear();
-    let mut first = true;
-    for c in &cols[f..g] {
-        pack_value(c.borrow(), index, &mut keys, &mut first);
+    while g < cols.len() && packable_bits(cols[g].borrow()).is_some() {
+        let (before, width) = (ranges.len(), used);
+        if !pack_value(cols[g].borrow(), index, &mut keys, &mut ranges, &mut used, measured, &mut scratch.keys_alt) {
+            // Only complete fields can be emitted. Undo any leaves of this field that fit, and
+            // return a lone first leaf to its raw keys.
+            if before > 0 && ranges.len() > before {
+                let (base, _, low) = if measured && before == 1 { ranges[0] } else { (0, 0, 0) };
+                for k in keys.iter_mut() {
+                    *k = (k.checked_shr(used - width).unwrap_or(0) << low) + base;
+                }
+            }
+            ranges.truncate(before);
+            break;
+        }
+        g += 1;
     }
-    debug_assert!(!first);
+    if g == f {
+        scratch.keys = keys;
+        return (Vec::new(), f);
+    }
     if emit == Emit::Values && g == cols.len() {
         sort_keys_only(&mut keys, labels, scratch);
     } else {
@@ -421,9 +474,10 @@ fn sort_packed<C: Borrow<Value>>(
     }
     let mut outs = Vec::new();
     if emit.values() {
-        let mut shift = used;
+        let mut shift = ranges.iter().map(|r| r.1).sum();
+        let mut rs = ranges.iter().copied();
         for c in &cols[f..g] {
-            outs.push(unpack_value(c.borrow(), &keys, &mut shift));
+            outs.push(unpack_value(c.borrow(), &keys, &mut shift, &mut rs, ranges.len() == 1));
         }
     }
     scratch.keys = keys;

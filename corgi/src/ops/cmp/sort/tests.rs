@@ -178,7 +178,7 @@ fn packed_sort_crosses_nested_products_and_unit_fields() {
     check(&nested, &[], &index);
     let Value::Prod(fields) = &nested else { unreachable!() };
     let (_, next) = sort_packed(fields, 1, &mut labels.clone(), &mut index.clone(), Emit::Index, &mut SortScratch::default());
-    assert_eq!(next, fields.len());
+    assert_eq!(next, 1); // the first nested field cannot finish under the row-count rule
 }
 
 #[test]
@@ -390,4 +390,142 @@ fn byte_lists_sort_a_window_at_a_time() {
         }
         check(&list, &[], &subset);
     }
+}
+
+#[test]
+fn packed_ranges_cross_zero_and_nested_fields() {
+    let n = 24;
+    let fields = vec![
+        Value::i64((0..n).map(|i| [-1002, -1003][i % 2]).collect()),
+        Value::Prod(vec![Value::Unit(n), Value::i64((0..n).map(|i| [-1, 1, 0][i % 3]).collect())]),
+        Value::i64((0..n).map(|i| [9001, 9000][i % 2]).collect()),
+    ];
+    let index: Vec<usize> = (0..n).rev().collect();
+    let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut index.clone(), Emit::Both, &mut SortScratch::default());
+    assert_eq!(next, fields.len());
+    check(&Value::Prod(fields), &[], &index);
+}
+
+#[test]
+fn packed_full_width_and_zero_bit_leaves() {
+    // A zero-bit leaf before a full-width one must unpack at shift 64; one after it must
+    // preserve all 64 bits. Constants still have nonzero order keys to restore.
+    for middle in [vec![i64::MAX, i64::MIN, 0, -1, 0], vec![-17; 5]] {
+        let fields = vec![Value::i64(vec![-9; 5]), Value::i64(middle), Value::u8(vec![231; 5])];
+        let full = fields[1] != Value::i64(vec![-17; 5]);
+        let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut [0, 1, 2, 3, 4], Emit::Both, &mut SortScratch::default());
+        assert_eq!(next, if full { 2 } else { fields.len() });
+        check(&Value::Prod(fields), &[], &[0, 1, 2, 3, 4]);
+    }
+    let fields = vec![Value::i64(vec![i64::MIN, i64::MAX]), Value::u8(vec![0, 1])];
+    let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut [1, 0], Emit::Both, &mut SortScratch::default());
+    assert_eq!(next, 1); // 64 + 1 does not fit
+    check(&Value::Prod(fields), &[], &[1, 0]);
+}
+
+#[test]
+fn packed_float_ranges_keep_total_order_bits() {
+    let special = vec![f64::NAN, -0.0, f64::NEG_INFINITY, 0.0, f64::INFINITY,
+        f64::from_bits(0xfff8_0000_0000_0001), f64::from_bits(0x7ff8_0000_0000_0001)];
+    let n = special.len();
+    check(&Value::Prod(vec![Value::i64(vec![-5; n]), Value::f64(special), Value::u8(vec![7; n])]), &[], &(0..n).rev().collect::<Vec<_>>());
+    // Signed zeros have adjacent keys and can share a key with varying integer fields.
+    let fields = vec![Value::f64(vec![0.0, -0.0, 0.0, -0.0]), Value::i64(vec![-1, 1, 1, -1])];
+    let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut [0, 1, 2, 3], Emit::Both, &mut SortScratch::default());
+    assert_eq!(next, 2);
+    check(&Value::Prod(fields), &[], &[0, 1, 2, 3]);
+}
+
+#[test]
+fn packed_ranges_empty_and_one_row() {
+    let v = Value::Prod(vec![Value::i64(vec![-3]), Value::f64(vec![-0.0]), Value::u8(vec![255])]);
+    for rows in [vec![], vec![0]] {
+        check(&v, &[], &rows);
+        let empty = gather(&v, &rows);
+        check(&empty, &[], &(0..rows.len()).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn packed_ranges_use_only_tied_rows() {
+    let first = Value::i64(vec![i64::MIN, 0, 0, 1, 2, 3, 4, i64::MAX]);
+    let later = vec![
+        Value::i64(vec![i64::MIN, 1, -1, 1000, 2000, 3000, 4000, i64::MAX]),
+        Value::i64(vec![i64::MAX, -2, 2, 1000, 2000, 3000, 4000, i64::MIN]),
+    ];
+    let (_, next) = sort_packed(&later, 0, &mut vec![1, 1], &mut [2, 1], Emit::Both, &mut SortScratch::default());
+    assert_eq!(next, 1); // two possible first values for two tied rows: do not read the next leaf
+    // The first field uses 64 bits, then leaves six singleton runs and one pair. sort_fields
+    // enters sort_tied for that pair; values outside it must not widen the later leaves.
+    let mut fields = vec![first];
+    fields.extend(later);
+    check(&Value::Prod(fields), &[], &[7, 6, 5, 4, 3, 2, 1, 0]);
+}
+
+#[test]
+fn packing_rejects_a_leaf_before_reading_it() {
+    for rows in [8usize, 9] {
+        let fields = vec![
+            Value::i64((0..rows).map(|i| (i % 8) as i64).collect()),
+            Value::i64(Vec::new()), // deliberately unreadable: the rule must reject it first
+        ];
+        if rows == 8 {
+            let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut (0..rows).collect::<Vec<_>>(), Emit::Both, &mut SortScratch::default());
+            assert_eq!(next, 1); // 2^3 == rows, so a further leaf need not be read
+        } else {
+            assert!(pack_more(3, rows)); // the boundary is strict
+        }
+    }
+    assert!(!pack_more(64, usize::MAX));
+}
+
+#[test]
+fn packing_removes_shared_low_bits() {
+    for low in [3u32, 10] {
+        let step = 1i64 << low;
+        let fields = vec![
+            Value::i64((0..32).map(|i| ((i * 5 % 16) - 7) * step).collect()),
+            Value::i64((0..32).map(|i| ((i % 4) - 3) * step).collect()),
+        ];
+        let index: Vec<usize> = (0..32).rev().collect();
+        let (mut keys, mut ranges, mut used, mut temp) = (Vec::new(), Vec::new(), 0, Vec::new());
+        let v = Value::Prod(fields.clone());
+        assert!(pack_value(&v, &index, &mut keys, &mut ranges, &mut used, true, &mut temp));
+        assert_eq!(ranges.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>(), [(4, low), (2, low)]);
+        assert_eq!(used, 6);
+        assert_eq!(unpack_value(&v, &keys, &mut used, &mut ranges.iter().copied(), false), gather(&v, &index));
+        let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut index.clone(), Emit::Both, &mut SortScratch::default());
+        assert_eq!(next, 2);
+        check(&v, &[], &index);
+    }
+}
+
+#[test]
+fn field_sorting_continues_after_packing_stops() {
+    let fields = vec![
+        Value::i64(vec![-4, 3, -4, 3, 0, 0, 1, 1]),
+        Value::i64(vec![8, -8, -8, 8, 1, -1, 0, 0]),
+        Value::i64(vec![9, 8, 7, 6, 5, 4, 3, 2]),
+    ];
+    let index = [7, 6, 5, 4, 3, 2, 1, 0];
+    let (_, next) = sort_packed(&fields, 0, &mut Vec::new(), &mut index.clone(), Emit::Both, &mut SortScratch::default());
+    assert_eq!(next, 1); // three first-key bits permit eight values, but ties remain
+    check(&Value::Prod(fields), &[], &index);
+}
+
+#[test]
+fn rejected_nested_fields_restore_the_raw_prefix() {
+    let n = 32;
+    let v = Value::Prod(vec![
+        Value::i64((0..n).map(|i| (i as i64 % 16 - 7) * 8).collect()),
+        Value::Prod(vec![
+            Value::i64(vec![1000; n]), // zero bits, but appending it normalizes the first leaf
+            Value::i64((0..n).map(|i| if i % 2 == 0 { i64::MIN } else { i64::MAX }).collect()),
+        ]),
+    ]);
+    check(&v, &[], &(0..n).rev().collect::<Vec<_>>());
+    // The storage path must also undo a partial nested field when the row bound stops it.
+    let n = 1024;
+    let byte = |k| Value::u8((0..n).map(|i| (i * k) as u8).collect());
+    check(&Value::Prod(vec![byte(1), Value::Prod(vec![byte(3), byte(5), byte(7)])]), &[], &(0..n).rev().collect::<Vec<_>>());
 }
