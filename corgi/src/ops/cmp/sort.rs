@@ -514,7 +514,7 @@ fn sort_list(
     let m = index.len();
     // every row holds one element: a row sorts as its element does, and row r is element r, so the
     // elements are sorted under the rows' labels and index
-    if bounds.strided() == Some(1) && !matches!(vals, Value::Prim(Prim::U8(_))) {
+    if bounds.strided() == Some(1) {
         return sort_indexed(vals, labels, index, emit, scratch).map(|sorted| Value::List(Bounds::Stride(1, m), Box::new(sorted)));
     }
     if let (Some(k), Value::Prim(Prim::U8(bytes))) = (bounds.strided(), vals) {

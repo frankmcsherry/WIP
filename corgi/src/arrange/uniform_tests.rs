@@ -26,7 +26,7 @@ fn loose(v: &Value) -> Value {
     }
 }
 
-/// `rows` lists of `k` elements each, one column for each shape an element takes: a leaf, a
+/// `rows` lists of `k` elements each, one column for each shape an element takes: a leaf, a byte, a
 /// product, a ragged list, a list of one, a list of two, a sum, a sum whose rows all hold the
 /// same tags in the same order, and a sum of one tag. Then a sum of one tag outside any list. The
 /// integers are small, so rows tie, and `salt` varies them.
@@ -42,6 +42,7 @@ fn values(k: usize, rows: usize, salt: u64) -> Vec<Value> {
     let one_tag = |m: usize| Value::Sum(Tags::Const(1, m), vec![ints(0, 7), ints(m, 3)]);
     let elems = vec![
         ints(n, 7),
+        Value::u8((0..n as u64).map(|i| ((i * 7 + salt) % 5) as u8).collect()),
         Value::Prod(vec![ints(n, 3), ints(n, 11)]),
         Value::List(Bounds::offsets(ragged), Box::new(ints(total, 7))),
         Value::List(Bounds::Stride(1, n), Box::new(ints(n, 7))),
