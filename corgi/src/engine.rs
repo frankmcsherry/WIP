@@ -3,6 +3,7 @@
 //! index currency). The structural comparator lives in the `cmp` op bucket's `order` submodule.
 
 use crate::shape::shape_of_value;
+use std::borrow::Cow;
 use std::sync::Arc;
 use crate::value::{with_empty_row, Bounds, Prim, Rows, Tags, Value};
 
@@ -211,6 +212,17 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
     gather_impl::<true>(v, idx)
 }
 
+/// the element positions of rows `rows` of a list whose rows are all `k` long: row `r` is elements
+/// `r*k .. (r+1)*k`. Rows of one element are their elements, so `rows` is borrowed as it is.
+fn spread(rows: &[usize], k: usize) -> Cow<'_, [usize]> {
+    if k == 1 { Cow::Borrowed(rows) } else { Cow::Owned(rows.iter().flat_map(|&r| r * k..(r + 1) * k).collect()) }
+}
+
+/// each of `xs` `k` times: a row's tag or mask, for each of its `k` elements.
+fn repeat_each<T: Copy>(xs: &[T], k: usize) -> Cow<'_, [T]> {
+    if k == 1 { Cow::Borrowed(xs) } else { Cow::Owned(xs.iter().flat_map(|&x| std::iter::repeat_n(x, k)).collect()) }
+}
+
 /// [`gather`], and with `ZERO` [`gather_or_zero`]: one walk, so the two move rows alike.
 fn gather_impl<const ZERO: bool>(v: &Value, idx: &[usize]) -> Result<Value, String> {
     let inside = |n: usize| !ZERO || idx.iter().all(|&i| i < n);
@@ -226,8 +238,7 @@ fn gather_impl<const ZERO: bool>(v: &Value, idx: &[usize]) -> Result<Value, Stri
         // gathered at those positions and the rows keep their length. Rows of one element are their
         // elements, at the same positions.
         Value::List(Bounds::Stride(k, _), vals) if inside(v.len()) => {
-            let elems = if *k == 1 { gather(vals, idx) } else { gather(vals, &idx.iter().flat_map(|&i| i * k..(i + 1) * k).collect::<Vec<_>>()) };
-            Value::List(Bounds::Stride(*k, idx.len()), Box::new(elems))
+            Value::List(Bounds::Stride(*k, idx.len()), Box::new(gather(vals, &spread(idx, *k))))
         }
         // rows as ranges of elements; a position past the rows names the one empty row of a second list
         Value::List(bounds, vals) => {
@@ -503,13 +514,7 @@ where
             let mut strides = lists.iter().filter(|(b, _)| !b.is_empty()).map(|(b, _)| b.strided());
             if let Some(Some(k)) = strides.next().filter(|k| strides.all(|other| other == *k)) {
                 let elems: Vec<Option<&Value>> = lists.iter().map(|(_, vals)| Some(*vals)).collect();
-                let gathered = if k == 1 {
-                    gather_lanes(&elems, tags, off)
-                } else {
-                    let wide_tags: Vec<T> = tags.iter().flat_map(|&t| std::iter::repeat_n(t, k)).collect();
-                    let wide_off: Vec<usize> = off.iter().flat_map(|&o| o * k..(o + 1) * k).collect();
-                    gather_lanes(&elems, &wide_tags, &wide_off)
-                };
+                let gathered = gather_lanes(&elems, &repeat_each(tags, k), &spread(off, k));
                 return Value::List(Bounds::Stride(k, tags.len()), Box::new(gathered));
             }
             list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (usize::from(t), o, o + 1)))
@@ -681,12 +686,7 @@ pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
             // both sides' rows are one length, the same on each: a row has a fixed slot after all, so
             // the elements blend in place, each under its row's mask
             if let (Some(k), true) = (tb.strided(), tb.strided() == eb.strided()) {
-                let elems = if k == 1 {
-                    blend(mask, *tv, *ev)
-                } else {
-                    blend(&mask.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect::<Vec<_>>(), *tv, *ev)
-                };
-                return Value::List(Bounds::Stride(k, mask.len()), Box::new(elems));
+                return Value::List(Bounds::Stride(k, mask.len()), Box::new(blend(&repeat_each(mask, k), *tv, *ev)));
             }
             list_rows(&[(&eb, &ev), (&tb, &tv)], mask.iter().enumerate().map(|(i, &m)| ((m != 0) as usize, i, i + 1)))
         }
