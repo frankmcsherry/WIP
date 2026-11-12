@@ -333,3 +333,24 @@ fn labels_mark_runs() {
     assert_eq!(labels, vec![0, 0, 1, 2, 3]);
 }
 
+/// Lists of one length compare as the same lists held as offsets do, and as the scalar reference
+/// does: row against row, at named pairs, and each row against the next, for order and for equality.
+#[test]
+fn uniform_lists_compare_as_offsets_do() {
+    let signs = |ord: Vec<i8>| ord.into_iter().map(i8::signum).collect::<Vec<_>>();
+    let equal = |ord: Vec<i8>| ord.into_iter().map(|o| o == 0).collect::<Vec<_>>();
+    let (ia, ib) = ([5usize, 0, 3, 3, 1], [0usize, 0, 2, 3, 4]);
+    for k in 0..=3 {
+        for (a, b) in Value::uniform_lists(k, 6, 0).into_iter().zip(Value::uniform_lists(k, 6, 1)) {
+            // against other rows, and against its own rows with some repeated, so that some pairs tie
+            for other in [b, gather(&a, &[0, 2, 2, 3, 5, 5])] {
+                agree_cmp(&a, &other);
+                let (la, lo) = (a.loose(), other.loose());
+                assert_eq!(signs(compare_cols(&a, &other)), signs(compare_cols(&la, &lo)), "k {k}");
+                assert_eq!(signs(compare_idx(&a, &other, &ia, &ib)), signs(compare_idx(&la, &lo, &ia, &ib)), "k {k}, pairs");
+                assert_eq!(equal(equal_idx(&a, &other, &ia, &ib)), equal(equal_idx(&la, &lo, &ia, &ib)), "k {k}, equal pairs");
+                assert_eq!(equal(compare_adjacent(&other)), equal(compare_adjacent(&lo)), "k {k}, adjacent");
+            }
+        }
+    }
+}

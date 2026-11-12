@@ -222,6 +222,13 @@ fn gather_impl<const ZERO: bool>(v: &Value, idx: &[usize]) -> Result<Value, Stri
             let Value::Prim(p) = &**vals else { unreachable!() };
             Value::List(Bounds::Stride(*k, idx.len()), Box::new(Value::Prim(p.gather_blocks(idx, *k))))
         }
+        // rows of one length of anything else: row i is elements i*k .. (i+1)*k, so the elements are
+        // gathered at those positions and the rows keep their length. Rows of one element are their
+        // elements, at the same positions.
+        Value::List(Bounds::Stride(k, _), vals) if inside(v.len()) => {
+            let elems = if *k == 1 { gather(vals, idx) } else { gather(vals, &idx.iter().flat_map(|&i| i * k..(i + 1) * k).collect::<Vec<_>>()) };
+            Value::List(Bounds::Stride(*k, idx.len()), Box::new(elems))
+        }
         // rows as ranges of elements; a position past the rows names the one empty row of a second list
         Value::List(bounds, vals) => {
             let n = bounds.len();
@@ -490,6 +497,21 @@ where
                 Value::List(b, vals) => (b, &**vals),
                 _ => panic!("gather_lanes: shape mismatch"),
             }).collect();
+            // every source's rows are one length, the same in each: a row is a fixed run of its
+            // source's elements, so the elements are gathered from the sources as the rows are. A
+            // source with no rows has no length to disagree by.
+            let mut strides = lists.iter().filter(|(b, _)| !b.is_empty()).map(|(b, _)| b.strided());
+            if let Some(Some(k)) = strides.next().filter(|k| strides.all(|other| other == *k)) {
+                let elems: Vec<Option<&Value>> = lists.iter().map(|(_, vals)| Some(*vals)).collect();
+                let gathered = if k == 1 {
+                    gather_lanes(&elems, tags, off)
+                } else {
+                    let wide_tags: Vec<T> = tags.iter().flat_map(|&t| std::iter::repeat_n(t, k)).collect();
+                    let wide_off: Vec<usize> = off.iter().flat_map(|&o| o * k..(o + 1) * k).collect();
+                    gather_lanes(&elems, &wide_tags, &wide_off)
+                };
+                return Value::List(Bounds::Stride(k, tags.len()), Box::new(gathered));
+            }
             list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (usize::from(t), o, o + 1)))
         }
         Value::Sum(..) => {
@@ -656,6 +678,16 @@ pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
         (Value::Unit(_), Value::Unit(_)) => Value::Unit(mask.len()),
         // lists: each row from the side the mask picks, consecutive rows from one side a range
         (Value::List(tb, tv), Value::List(eb, ev)) => {
+            // both sides' rows are one length, the same on each: a row has a fixed slot after all, so
+            // the elements blend in place, each under its row's mask
+            if let (Some(k), true) = (tb.strided(), tb.strided() == eb.strided()) {
+                let elems = if k == 1 {
+                    blend(mask, *tv, *ev)
+                } else {
+                    blend(&mask.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect::<Vec<_>>(), *tv, *ev)
+                };
+                return Value::List(Bounds::Stride(k, mask.len()), Box::new(elems));
+            }
             list_rows(&[(&eb, &ev), (&tb, &tv)], mask.iter().enumerate().map(|(i, &m)| ((m != 0) as usize, i, i + 1)))
         }
         // row `i` from lane `mask[i] != 0`, at its own position — the offsets are the identity.

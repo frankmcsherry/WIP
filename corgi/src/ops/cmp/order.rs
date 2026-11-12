@@ -208,6 +208,27 @@ mod compare {
             // is decided by length, a proper prefix first.
             // A referenced list compares as the rows it names, read through its arena.
             (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
+                // both sides' rows are one length, the same on each: a pair of rows is k pairs of
+                // elements at fixed positions, compared as they lie, and the pair takes the first
+                // that differ. Rows of one element are their elements, at the same pairs.
+                if let (Value::List(sa, ea), Value::List(sb, eb)) = (a, b) {
+                    if let (Some(k), true) = (sa.strided(), sa.strided() == sb.strided()) {
+                        match k {
+                            0 => return vec![0i8; m],
+                            1 => return compare_in(ea, eb, pairs, eq),
+                            _ => {
+                                let sub = if let Pairs::Diagonal(n) = pairs {
+                                    compare_in(ea, eb, Pairs::Diagonal(n * k), eq)
+                                } else {
+                                    let ia: Vec<usize> = (0..m).flat_map(|p| { let r = pairs.left(p); r * k..(r + 1) * k }).collect();
+                                    let ib: Vec<usize> = (0..m).flat_map(|p| { let r = pairs.right(p); r * k..(r + 1) * k }).collect();
+                                    compare_in(ea, eb, Pairs::Explicit(&ia, &ib), eq)
+                                };
+                                return sub.chunks(k).map(|row| row.iter().copied().find(|&o| o != 0).unwrap_or(0)).collect();
+                            }
+                        }
+                    }
+                }
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
                 // Lists of equal payload-free elements compare by length alone.

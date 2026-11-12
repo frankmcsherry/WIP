@@ -391,3 +391,23 @@ fn byte_lists_sort_a_window_at_a_time() {
         check(&list, &[], &subset);
     }
 }
+
+/// A list of one element sorts as its element does: every element shape, a list of one list of
+/// one, whole and sparse and repeated rows, under every label pattern.
+#[test]
+fn lists_of_one_sort_as_their_elements() {
+    let mut rng = Rng(23);
+    let rows = 40;
+    for v in Value::uniform_lists(1, rows, 0) {
+        let nested = Value::List(Bounds::Stride(1, rows), Box::new(v.clone()));
+        for v in [v, nested] {
+            let whole: Vec<usize> = (0..rows).collect();
+            let sparse: Vec<usize> = (0..25).map(|_| rng.below(rows)).collect();
+            for index in [whole, sparse] {
+                for labels in label_patterns(&mut rng, index.len()) {
+                    check(&v, &labels, &index);
+                }
+            }
+        }
+    }
+}

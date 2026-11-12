@@ -85,3 +85,24 @@ fn unweave_counts_each_rows_elements_per_lane() {
         }
     }
 }
+
+/// Rows of one length that all hold the same tags in the same order unweave as the same rows held
+/// as offsets do, and so do rows of one length whose tags do not repeat.
+#[test]
+fn unweave_of_uniform_rows_matches_offsets() {
+    for lanes in 1..=3usize {
+        for (k, rows) in [(1usize, 5usize), (3, 4), (4, 1), (2, 0), (3, 7)] {
+            let repeating: Vec<usize> = (0..k * rows).map(|i| (i % k) % lanes).collect();
+            let shifting: Vec<usize> = (0..k * rows).map(|i| (i % k + i / k) % lanes).collect();
+            for tags in [repeating, shifting] {
+                let variants = (0..lanes)
+                    .map(|l| Value::i64(tags.iter().enumerate().filter(|&(_, &t)| t == l).map(|(i, _)| i as i64).collect()))
+                    .collect::<Vec<_>>();
+                let inner = Value::sum(tags.clone(), variants);
+                let uniform = Value::List(Bounds::Stride(k, rows), Box::new(inner.clone()));
+                let offsets = Value::List(Bounds::offsets((1..=rows).map(|r| r * k).collect()), Box::new(inner));
+                assert_eq!(run("input unweave", uniform), run("input unweave", offsets), "lanes {lanes}, k {k}, rows {rows}, tags {tags:?}");
+            }
+        }
+    }
+}

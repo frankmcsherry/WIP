@@ -238,3 +238,49 @@ fn range_copies_match_element_positions() {
     let picks: Vec<usize> = mask.iter().enumerate().map(|(i, &m)| if m != 0 { 6 + i } else { i }).collect();
     same(blend(&mask, words.clone(), strings.clone()), by_positions(&concat(&[strings, words]), &picks));
 }
+
+/// Lists of one length gather as the same lists held as offsets do: every length from none, every
+/// element shape, positions repeated and left out, and positions past the rows.
+#[test]
+fn uniform_lists_gather_as_offsets_do() {
+    for k in 0..=3 {
+        for v in Value::uniform_lists(k, 6, 0) {
+            for idx in [vec![], vec![5, 0, 0, 3, 2, 5, 1], (0..6).collect()] {
+                assert_eq!(gather(&v, &idx), gather(&v.loose(), &idx), "k {k}\n{}", crate::value::show(&v));
+                let past = [idx, vec![9, 6]].concat();
+                assert_eq!(gather_or_zero(&v, &past), gather_or_zero(&v.loose(), &past), "k {k}, past the rows");
+            }
+        }
+    }
+}
+
+/// Sources whose rows are all one length gather as the same sources held as offsets do, and as
+/// the concatenation does. A source with no rows does not decide the length; sources of different
+/// lengths take the general path.
+#[test]
+fn uniform_lists_gather_lanes_as_offsets_do() {
+    let (tags, off) = ([0usize, 2, 2, 0, 0, 2, 0], [3usize, 0, 2, 0, 1, 1, 2]);
+    for k in 0..=3 {
+        let longer = Value::uniform_lists(k + 1, 3, 2);
+        for ((x, y), z) in Value::uniform_lists(k, 4, 0).into_iter().zip(Value::uniform_lists(k, 3, 1)).zip(longer) {
+            let none = gather(&x, &[]);
+            for srcs in [[&x, &none, &y], [&x, &none, &z]] {
+                let got = gather_lanes(&srcs.map(Some), &tags, &off);
+                let loose = srcs.map(Value::loose);
+                assert_eq!(got, gather_lanes(&[Some(&loose[0]), Some(&loose[1]), Some(&loose[2])], &tags, &off), "k {k}");
+                assert_eq!(got, oracle(&srcs.map(Value::clone), &tags, &off), "k {k}");
+            }
+        }
+    }
+}
+
+/// A select between lists of one length is the select between the same lists held as offsets.
+#[test]
+fn uniform_lists_blend_as_offsets_do() {
+    let mask = [1u8, 0, 0, 1, 1];
+    for k in 0..=3 {
+        for (then, els) in Value::uniform_lists(k, 5, 0).into_iter().zip(Value::uniform_lists(k, 5, 1)) {
+            assert_eq!(blend(&mask, then.clone(), els.clone()), blend(&mask, then.loose(), els.loose()), "k {k}");
+        }
+    }
+}

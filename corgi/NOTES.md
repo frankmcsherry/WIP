@@ -305,8 +305,15 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   That lets uniform data recover dense / array-language kernels as a special case — `sort` of an
   equal-width byte list packs each record to a u64 key and radixes once (measured ~7×→~1.3× of the
   dense leaf sort at 1M/8M; `tests/kernel.rs::stride_sort_matches_offsets` pins the fast path to the
-  structural result). `enlist` emits `Stride(1)`; `eq`/`hash`/`show` are by the partition, so a
-  `Stride` and the equivalent `Offsets` are interchangeable. Array languages are the all-uniform case.
+  structural result). The kernels that move, compare and order rows read the stride too: a list
+  whose rows are one length is its elements at fixed positions, so `gather`, `gather_lanes`,
+  `Select`'s blend and the row comparison recurse into the elements with no row spans, and a list
+  of one element sorts as its element — `[[T; 1]; 1]` costs what `T` does. `Unweave` gives uniform
+  lanes when its rows are one length and all hold the same tags in the same order. Each path is
+  checked against the same lists held as offsets (`Value::loose`, test-only). `enlist` emits
+  `Stride(1)`; `eq`/`hash`/`show` are by the partition, so a `Stride` and the equivalent `Offsets`
+  are interchangeable, and no rows is one partition whatever the stride. Array languages are the
+  all-uniform case.
 - **Sum rows carry a uniformity-aware `Tags`.** `Value::Sum` holds `Tags { Const(tag, rows) |
   Column(u8 tags, Arc<Vec<usize>> within-lane offsets) }` — the `Sum`-side twin of `Bounds`, and the
   dynamic mirror of `columnar`'s `Discriminant` (whose "homogeneous" state stores `[tag, count]` and
@@ -335,7 +342,8 @@ reasons. Adding a structural op means either filling a hole (and writing its law
   round's states are the previous round's output as it stands, less the rows that just finished,
   which are its last rows. Those are copied out once, and the state is cut in place (a prefix of
   rows is a prefix of every buffer, a list's ends and a sum's tags included). One `gather_lanes`
-  puts the finished rows back in row order. A stride needs no ranking: every row runs every round.
+  puts the finished rows back in row order. A stride needs no ranking: every row runs every round,
+  and a stride of one is one round over the elements as they lie, with nothing gathered.
 - **`FoldScan` (mapAccumL) is the scan kernel; `Fold` is its R=Unit specialization, kept for cost.**
   `FoldScan : (T,List<A>)->(T,List<R>)` by `(T,A)->(T,R)` threads a state and emits an output stream;
   `scan` lowers to it (body `(a,x)->(b,b)`, take field 1) — measured identical to a dedicated scan.
