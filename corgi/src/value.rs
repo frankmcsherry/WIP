@@ -1335,39 +1335,4 @@ impl<'a> Ints<'a> {
 }
 
 #[cfg(test)]
-impl Value {
-    /// this value with every list's bounds written out as offsets: the form that no path for
-    /// uniform lists takes, and so what each such path is checked against.
-    pub(crate) fn loose(&self) -> Value {
-        match self {
-            Value::Prod(fields) => Value::Prod(fields.iter().map(Value::loose).collect()),
-            Value::Sum(tags, lanes) => Value::Sum(tags.clone(), lanes.iter().map(Value::loose).collect()),
-            Value::List(bounds, vals) => Value::List(Bounds::offsets(bounds.ends().collect()), Box::new(vals.loose())),
-            other => other.clone(),
-        }
-    }
-
-    /// `rows` lists of `k` elements each, one column for each shape an element takes: a leaf, a
-    /// product, a ragged list, a list of one, a list of two, a sum. The integers are small, so
-    /// rows tie, and `salt` varies them.
-    pub(crate) fn uniform_lists(k: usize, rows: usize, salt: u64) -> Vec<Value> {
-        let n = k * rows;
-        let ints = |m: usize, mul: u64| Value::i64((0..m as u64).map(|i| ((i * mul + salt) % 5) as i64 - 2).collect());
-        let ragged: Vec<usize> = (0..n).scan(0, |end, i| { *end += (i + salt as usize) % 3; Some(*end) }).collect();
-        let total = ragged.last().copied().unwrap_or(0);
-        let tags: Vec<usize> = (0..n).map(|i| (i + salt as usize) % 3 % 2).collect();
-        let ones = tags.iter().filter(|&&t| t == 1).count();
-        let elems = vec![
-            ints(n, 7),
-            Value::Prod(vec![ints(n, 3), ints(n, 11)]),
-            Value::List(Bounds::offsets(ragged), Box::new(ints(total, 7))),
-            Value::List(Bounds::Stride(1, n), Box::new(ints(n, 7))),
-            Value::List(Bounds::Stride(2, n), Box::new(ints(2 * n, 3))),
-            Value::sum(tags, vec![ints(n - ones, 7), ints(ones, 3)]),
-        ];
-        elems.into_iter().map(|e| Value::List(Bounds::Stride(k, rows), Box::new(e))).collect()
-    }
-}
-
-#[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::gather;
-use crate::value::{Bounds, Tags};
+use crate::value::Bounds;
 use crate::ops::cmp::order::compare_at;
 use crate::ops::cmp::sort::sort_values;
 use std::cmp::Ordering;
@@ -266,40 +266,5 @@ fn referenced_lists_survey_as_the_rows_they_name() {
     for other in [b.clone(), crate::engine::clone_ref(b)] {
         assert_eq!(survey_groups(&a, &other), naive_groups(&a, &other));
         assert_eq!(survey_groups(&other, &a), naive_groups(&other, &a));
-    }
-}
-
-/// rows of one length survey as the same rows held as offsets do, at lengths 0 to 3, over the
-/// element shapes `Value::uniform_lists` makes (lengths 0 and 1 take their own paths).
-#[test]
-fn uniform_lists_survey_as_offsets_do() {
-    for k in 0..4 {
-        for (x, y) in Value::uniform_lists(k, 9, 0).into_iter().zip(Value::uniform_lists(k, 7, 3)) {
-            let (_, _, a) = sort_values(&[], &x);
-            let (_, _, b) = sort_values(&[], &y);
-            assert_eq!(survey_groups(&a, &b), survey_groups(&a.loose(), &b.loose()), "k {k}\n{}", crate::value::show(&a));
-            assert_eq!(survey_groups(&b, &a), survey_groups(&b.loose(), &a.loose()), "k {k}, sides swapped");
-        }
-    }
-}
-
-/// a sum with one tag throughout surveys as the same rows with that tag written out per row do,
-/// and two sums with different single tags order by the tag.
-#[test]
-fn one_tag_sums_survey_as_written_out_tags_do() {
-    let lanes = |t: usize, xs: Vec<i64>| -> Vec<Value> {
-        (0..3).map(|l| if l == t { Value::i64(xs.clone()) } else { Value::i64(Vec::new()) }).collect()
-    };
-    let written = |t: usize, n: usize| Tags::Column(Prim::U8(std::sync::Arc::new(vec![t as u8; n])), std::sync::Arc::new((0..n).collect()));
-    for (t, u) in [(1, 1), (0, 2), (2, 0)] {
-        let (xs, ys) = (vec![-2, -2, 0, 1, 1, 1, 4], vec![-3, 0, 0, 1, 5]);
-        let a = Value::Sum(Tags::Const(t, xs.len()), lanes(t, xs.clone()));
-        let b = Value::Sum(Tags::Const(u, ys.len()), lanes(u, ys.clone()));
-        let wa = Value::Sum(written(t, xs.len()), lanes(t, xs));
-        let wb = Value::Sum(written(u, ys.len()), lanes(u, ys));
-        assert_eq!(survey_groups(&a, &b), survey_groups(&wa, &wb), "tags {t} and {u}");
-        // nested under a list of one element, as a frontier of one optional time is
-        let one = |v: Value| Value::List(Bounds::Stride(1, v.len()), Box::new(v));
-        assert_eq!(survey_groups(&one(a), &one(b)), survey_groups(&one(wa).loose(), &one(wb).loose()), "tags {t} and {u}, in lists of one");
     }
 }

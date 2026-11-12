@@ -160,4 +160,7 @@ pub mod arrange {
 
     #[cfg(test)]
     mod order_tests;
+
+    #[cfg(test)]
+    mod uniform_tests;
 }

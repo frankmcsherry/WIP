@@ -123,11 +123,3 @@ fn copy_spans_reads_mixed_storages_in_place() {
     let out = Prim::copy_spans(&[&bytes, &wide], &[(1, 1, 3), (0, 0, 2), (0, 3, 3), (1, 0, 1)]);
     assert!(matches!(&out, Prim::I64(v) if **v == vec![300, 7, 1, 2, -1]));
 }
-
-/// Bounds with no rows are one partition, whatever stride they were built with.
-#[test]
-fn bounds_with_no_rows_are_equal() {
-    assert_eq!(Bounds::Stride(4, 0), Bounds::Stride(5, 0));
-    assert_eq!(Bounds::Stride(4, 0), Bounds::offsets(vec![]));
-    assert_ne!(Bounds::Stride(4, 1), Bounds::Stride(5, 1));
-}
