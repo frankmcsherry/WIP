@@ -36,6 +36,8 @@ fn patterns(next: &mut impl FnMut() -> u64) -> Vec<(&'static str, Bounds)> {
         ("one row, long", Bounds::offsets(vec![37])),
         ("uniform, offsets", Bounds::offsets(ends(&[4; 7]))),
         ("uniform, stride", Bounds::Stride(4, 7)),
+        ("one each, offsets", Bounds::offsets(ends(&[1; 9]))),
+        ("one each, stride", Bounds::Stride(1, 9)),
         ("longest first", Bounds::offsets(ends(&descending))),
         ("longest first, then empty rows", Bounds::offsets(ends(&[5, 3, 3, 1, 0, 0]))),
         ("uniform, then empty rows", Bounds::offsets(ends(&[4, 4, 4, 0, 0]))),

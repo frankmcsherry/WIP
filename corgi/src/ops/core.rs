@@ -161,6 +161,13 @@ fn fold_rounds<L: OpLike>(
     // every row the same length, as a stride says: every row runs every round, in row order, so the
     // rounds need no schedule, and row r's t-th output is row r of round t's
     if let Some(k) = bounds.strided() {
+        // every row holds one element: one round, over the elements as they lie, and its outputs
+        // are the list's
+        if k == 1 {
+            let (state, outs) = split(try_eval_graph(body, Value::Prod(vec![seed, vals]))?)?;
+            check(&state)?;
+            return Ok((state, outs));
+        }
         let n = bounds.len();
         let (mut acc, mut chunks) = (seed, Vec::new());
         for t in 0..k {
@@ -570,11 +577,18 @@ impl<L: OpLike> Op<L> {
                 // one tag throughout gives that lane every row's elements and the others none.
                 // A sum's tag column is always one byte per row (every constructor and the codec
                 // make it so).
-                let lane_bounds: Vec<Vec<usize>> = match &tags {
-                    _ if bounds.len() == 1 => lanes.iter().map(|l| vec![l.len()]).collect(),
+                let lane_bounds: Vec<Bounds> = match &tags {
+                    _ if bounds.len() == 1 => lanes.iter().map(|l| vec![l.len()].into()).collect(),
                     Tags::Const(t, _) => (0..lanes.len())
-                        .map(|l| if l == *t { bounds.ends().collect() } else { vec![0; bounds.len()] })
+                        .map(|l| if l == *t { bounds.ends().collect::<Vec<_>>().into() } else { vec![0; bounds.len()].into() })
                         .collect(),
+                    // rows of one length that all hold the same tags in the same order (the tags
+                    // repeat with the rows' period): each lane's rows are as uniform as the rows
+                    // are, the first row's count of that tag each, and nothing is counted per row
+                    Tags::Column(Prim::U8(ts), _) if bounds.strided().is_some_and(|r| r > 0 && ts.len() >= r && ts[r..] == ts[..ts.len() - r]) => {
+                        let first = &ts[..bounds.strided().unwrap()];
+                        (0..lanes.len()).map(|l| Bounds::Stride(first.iter().filter(|&&t| t as usize == l).count(), bounds.len())).collect()
+                    }
                     Tags::Column(Prim::U8(ts), _) => {
                         let mut lane_bounds = vec![Vec::with_capacity(bounds.len()); lanes.len()];
                         let mut counts = vec![0usize; lanes.len()];
@@ -588,7 +602,7 @@ impl<L: OpLike> Op<L> {
                             }
                             start = end;
                         }
-                        lane_bounds
+                        lane_bounds.into_iter().map(Bounds::from).collect()
                     }
                     Tags::Column(..) => unreachable!("a sum's tags are one byte per row"),
                 };
@@ -602,7 +616,7 @@ impl<L: OpLike> Op<L> {
                 let tag_list = Value::List(bounds, Box::new(Value::Prim(narrow)));
                 let mut out = vec![tag_list];
                 for (lane, lb) in lanes.into_iter().zip(lane_bounds) {
-                    out.push(Value::List(lb.into(), Box::new(lane)));
+                    out.push(Value::List(lb, Box::new(lane)));
                 }
                 Value::Prod(out)
             }

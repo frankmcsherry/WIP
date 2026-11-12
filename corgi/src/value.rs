@@ -188,7 +188,8 @@ impl PartialEq for Bounds {
             // one buffer is one partition: the common case where two columns descend from the
             // same list, which is exactly what `Zip` asserts about its operands.
             (Bounds::Offsets(a), Bounds::Offsets(b)) => Arc::ptr_eq(a, b) || a == b,
-            (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => k0 == k1 && n0 == n1,
+            // no rows is one partition whatever the stride: there is no row for the strides to differ on
+            (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => n0 == n1 && (*n0 == 0 || k0 == k1),
             _ => self.len() == other.len() && self.ends().eq(other.ends()),
         }
     }
