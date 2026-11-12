@@ -100,6 +100,11 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
         }
         (Value::Sum(ta, va), Value::Sum(tb, vb)) => {
             assert_eq!(va.len(), vb.len(), "survey: sum arity");
+            // one tag throughout, the same on both sides: the tag decides nothing, and row r is
+            // row r of that lane, so the lane is surveyed at the same positions.
+            if let (Some(t), true) = (ta.const_tag(), ta.const_tag() == tb.const_tag()) {
+                return level(&va[t], &vb[t], ia, ib, open, tree);
+            }
             // the tag first, then each lane over its classes at the carried offsets.
             merge(|j| ta.tag_at(ia.row(j)), |j| tb.tag_at(ib.row(j)), open, tree);
             let (cur, ra, rb) = tree.refined(open, ia, ib);
@@ -122,9 +127,13 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
                 level(&va[t], &vb[t], &la[..], &lb[..], cs, tree);
             }
         }
-        (Value::List(ba, va), Value::List(bb, vb)) => {
-            lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree);
-        }
+        // rows of one length, the same on both sides: rows of no elements are all equal, and a row
+        // of one element is that element, at the same positions.
+        (Value::List(ba, va), Value::List(bb, vb)) => match (ba.strided(), bb.strided()) {
+            (Some(0), Some(0)) => {}
+            (Some(1), Some(1)) => level(va, vb, ia, ib, open, tree),
+            _ => lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree),
+        },
         // a referenced list surveys as the rows it names, read through its arena.
         (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
             let (ba, va) = a.rows_of("survey").expect("a list");
