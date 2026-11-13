@@ -327,8 +327,19 @@ struct Enums {
     aliases: HashMap<String, Shape>,                      // alias -> its erased shape
 }
 
+/// A name the shape grammar reads before any declaration (`shape_pattern`), so a declared enum
+/// or alias of that name would be silently ignored where it is used.
+fn built_in_free(name: &str) -> Result<(), String> {
+    match name {
+        "_" | "int" | "float" | "List" | "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" =>
+            Err(format!("'{name}' is a built-in shape and cannot be declared")),
+        _ => Ok(()),
+    }
+}
+
 impl Enums {
     fn declare(&mut self, name: String, vs: Vec<(String, Option<Shape>)>) -> Result<(), String> {
+        built_in_free(&name)?;
         if self.decls.contains_key(&name) || self.aliases.contains_key(&name) {
             return Err(format!("duplicate enum '{name}'"));
         }
@@ -485,6 +496,7 @@ impl<'a> P<'a> {
         if !self.is_kw("type") { return self.enum_decl(); }
         self.bump();
         let name = self.ident()?;
+        built_in_free(&name)?;
         if self.enums.decls.contains_key(&name) || self.enums.aliases.contains_key(&name) {
             return Err(format!("duplicate type '{name}'"));
         }
