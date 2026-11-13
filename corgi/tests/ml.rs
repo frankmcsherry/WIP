@@ -619,6 +619,16 @@ fn alias_declarations_keep_names_unique_and_fail_atomically() {
     assert!(parse_ml_in("type Text = int in input", &scope).is_err());
 }
 
+#[test]
+fn built_in_shapes_cannot_be_declared() {
+    for src in ["type int = float", "enum float = F", "type List = int", "enum u8 = Byte int"] {
+        let error = Scope::default().declare(src).unwrap_err();
+        assert!(error.contains("is a built-in shape and cannot be declared"), "{error}");
+    }
+    let error = parse_ml("type int = float in input").unwrap_err();
+    assert!(error.contains("is a built-in shape and cannot be declared"), "{error}");
+}
+
 /// `append` takes one or more lists, so a list of computed values is one append of enlisted
 /// columns, as long as each row has its elements.
 #[test]
