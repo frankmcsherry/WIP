@@ -78,6 +78,7 @@
 //!       enum Size = Lo | Hi in … match (Lo (l -> l), Hi (h -> (h, 100) add))
 //!       enum Opt = None () | Some int in xs inject Some  -- tag xs into Some; None is an empty unit lane
 //!       enum Option = None () | Some in (3 inject Some, "dog" inject Some)  -- Some takes its payload's shape
+//!       type Text = List(int) in let x : Text = input in x  -- an erased shape alias
 
 use super::{resolve, retired, str_value, takes_num};
 use crate::graph::{Builder, Graph, Node, NodeKind};
@@ -323,11 +324,12 @@ enum E {
 struct Enums {
     decls: HashMap<String, Vec<(String, Option<Shape>)>>, // enum -> its variants and payload shapes (if declared), in tag order
     owners: HashMap<String, Vec<String>>,                 // variant -> the enums declaring it, in order
+    aliases: HashMap<String, Shape>,                      // alias -> its erased shape
 }
 
 impl Enums {
     fn declare(&mut self, name: String, vs: Vec<(String, Option<Shape>)>) -> Result<(), String> {
-        if self.decls.contains_key(&name) {
+        if self.decls.contains_key(&name) || self.aliases.contains_key(&name) {
             return Err(format!("duplicate enum '{name}'"));
         }
         for (k, (v, _)) in vs.iter().enumerate() {
@@ -359,9 +361,9 @@ impl Enums {
         Ok((tag, e.as_str()))
     }
 
-    /// enum `e` as a pattern: a sum of its lanes, where a variant declared without a payload shape
-    /// is a hole.
+    /// A named shape as a pattern. An enum variant without a payload shape is a hole.
     fn pattern(&self, e: &str) -> Result<Pattern, String> {
+        if let Some(shape) = self.aliases.get(e) { return Ok(Pattern::from(shape)); }
         let vs = self.decls.get(e).ok_or_else(|| format!("unknown enum '{e}'"))?;
         Ok(Pattern::Sum(vs.iter().map(|(_, s)| s.as_ref().map_or(Pattern::Any, Pattern::from)).collect()))
     }
@@ -467,15 +469,29 @@ impl<'a> P<'a> {
             self.kw_in()?;
             let body = self.expr()?;
             Ok(E::Let(pat, Box::new(bound), Box::new(body)))
-        } else if self.is_kw("enum") {
-            // `enum Name = V0 shape? | V1 shape? | … in body` — a declaration, not a value: it fills
+        } else if self.is_kw("enum") || self.is_kw("type") {
+            // An enum or alias declaration fills
             // the tables and parses on into the body, leaving no AST node behind.
-            self.enum_decl()?;
+            self.declaration()?;
             self.kw_in()?;
             self.expr()
         } else {
             self.pipe()
         }
+    }
+
+    /// An alias names a fully resolved shape; like enums, it can use earlier declarations.
+    fn declaration(&mut self) -> Result<(), String> {
+        if !self.is_kw("type") { return self.enum_decl(); }
+        self.bump();
+        let name = self.ident()?;
+        if self.enums.decls.contains_key(&name) || self.enums.aliases.contains_key(&name) {
+            return Err(format!("duplicate type '{name}'"));
+        }
+        self.eat(&Tok::Eq)?;
+        let shape = self.shape()?;
+        self.enums.aliases.insert(name, shape);
+        Ok(())
     }
 
     /// `enum Name = V0 shape? | V1 shape? | …`, into the tables. A payload shape is needed only
@@ -560,7 +576,7 @@ impl<'a> P<'a> {
     }
 
     /// a payload shape in an `enum` declaration: a shape with no holes, where an ENUM names an
-    /// earlier, fully-shaped enum (so sums nest, but never recursively).
+    /// earlier, fully-shaped enum or alias (so sums nest, but never recursively).
     fn shape(&mut self) -> Result<Shape, String> {
         let p = self.shape_pattern()?;
         p.whole().ok_or_else(|| {
@@ -570,7 +586,7 @@ impl<'a> P<'a> {
 
     /// a shape, perhaps with holes, as an ascription writes it:
     ///   shape = 'int' | 'float' | '()' | '(' shape (',' shape)* ')' | 'List' '(' shape ')' | ENUM | '_'
-    /// where ENUM names an enum, a variant declared without a payload shape being a hole.
+    /// where ENUM names an enum or alias, a variant without a payload shape being a hole.
     fn shape_pattern(&mut self) -> Result<Pattern, String> {
         match self.bump() {
             Some(Tok::LParen) => {
@@ -1325,13 +1341,13 @@ impl Scope {
         Ok(())
     }
 
-    /// Declare an enum for every program parsed in this scope: `enum Name = V0 shape? | …`, as a
-    /// program writes it but without the `in`. Enum names are unique across the scope and every
+    /// Declare an enum (`enum Name = V0 shape? | …`) or alias (`type Name = shape`) for every
+    /// program parsed in this scope, without the `in`. Type names are unique across the scope and every
     /// program parsed in it, as within one program; a variant name two enums share is written
     /// `Foo::Bar` where it is used. On an error the scope is unchanged.
     pub fn declare(&mut self, src: &str) -> Result<(), String> {
         let mut p = P::new(src, self)?;
-        p.whole(P::enum_decl)?;
+        p.whole(P::declaration)?;
         let P { enums, .. } = p;
         self.enums = enums;
         Ok(())

@@ -587,6 +587,38 @@ fn ascriptions_check_shapes() {
     assert_eq!(shape_err("enum Opt = None | Some | Many in (input.0, input.0) branch 2 : Opt", &shape), "the pattern {_ | _ | _} wants a sum of 3 lanes, not {Int | Int}");
 }
 
+#[test]
+fn aliases_resolve_in_scope_and_inline_ascriptions() {
+    let mut scope = Scope::default();
+    scope.declare("type Text = List(int)").unwrap();
+    scope.declare("type Words = Text").unwrap();
+    scope.declare("enum Entry = Value Words | Empty ()").unwrap();
+    scope.declare("type Named = Entry").unwrap();
+    let src = "let x : Words = input in x inject Value : Named";
+    let graph = parse_ml_in(src, &scope).unwrap();
+    let inline = "type Text = List(int) in type Words = Text in enum Entry = Value Words | Empty () in type Named = Entry in let x : Words = input in x inject Value : Named";
+    assert_eq!(graph, parse_ml(inline).unwrap());
+    assert_eq!(Program::from_graph(graph).shape(&Shape::List(Box::new(Shape::Int))).unwrap(),
+        Shape::Sum(vec![Shape::List(Box::new(Shape::Int)), Shape::Unit]));
+    assert_eq!(run_ml("type Scalar = int in let x : Scalar = input in (x, 1) add", &int(&[1, 2])), "[2, 3]");
+}
+
+#[test]
+fn alias_declarations_keep_names_unique_and_fail_atomically() {
+    let mut scope = Scope::default();
+    scope.declare("type Text = List(int)").unwrap();
+    assert!(scope.declare("type Text = int").is_err());
+    assert!(scope.declare("enum Text = Value int").is_err());
+    scope.declare("enum E = Value int").unwrap();
+    assert!(scope.declare("type E = int").is_err());
+    assert!(scope.declare("type Other = Missing").is_err());
+    assert!(scope.declare("type Other = _").is_err());
+    assert!(scope.declare("type Other = int in input").is_err());
+    scope.declare("type Other = Text").unwrap();
+    assert!(parse_ml("type A = A in input").is_err());
+    assert!(parse_ml_in("type Text = int in input", &scope).is_err());
+}
+
 /// `append` takes one or more lists, so a list of computed values is one append of enlisted
 /// columns, as long as each row has its elements.
 #[test]
