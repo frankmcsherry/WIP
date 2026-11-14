@@ -248,6 +248,7 @@ pub(crate) fn movement_demand(op: &Op<NumOp>, input: &Shape, demand: Demand) -> 
             let demand = keep_references(&fields[1], demand);
             Demand::Prod(vec![Demand::All, demand.clone(), demand])
         }
+        Op::FlattenValues => Demand::List(Box::new(demand)),
         Op::Flatten => {
             // Ranges depend only on the two levels of bounds. The flat values
             // retain exactly the demanded payload, regardless of ranges demand.
@@ -282,7 +283,7 @@ impl DemandAnalysis {
 /// call `compile` first to remove them and expose narrower requests.
 ///
 /// Rules pass a request through tuples, `field`, `unit`, literals, `enlist`, `ref`, `len`,
-/// list and sum maps, `gather`, `filter`, `cap_list`, `select` and `flatten`. Every other
+/// list and sum maps, `gather`, `filter`, `cap_list`, `select`, `flatten` and `flatten_values`. Every other
 /// operator requests all of its input. That is exact for operators that read everything
 /// they are given (arithmetic, comparisons, text, host calls, `hash`, `range`, `iota`,
 /// reductions and sorts that order by the whole element). It is wider than needed for
@@ -376,7 +377,7 @@ fn analyze(
                 }
                 demands[node.inputs[0]].merge_unchecked(Demand::Sum(needs));
             }
-            NodeKind::Op(NumOp::Core(op)) if matches!(op, Op::Gather | Op::Filter | Op::CapList | Op::Select | Op::Flatten) => {
+            NodeKind::Op(NumOp::Core(op)) if matches!(op, Op::Gather | Op::Filter | Op::CapList | Op::Select | Op::Flatten | Op::FlattenValues) => {
                 let source = node.inputs[0];
                 demands[source].merge_unchecked(movement_demand(op, &shapes[source], demand).unwrap());
             }

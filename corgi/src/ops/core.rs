@@ -432,6 +432,7 @@ pub enum Op<L> {
                     // `try_zip` puts such a row in a lane of its own instead.
     Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values (its
                     // inverse is the word `slices`: map(range); gather)
+    FlattenValues, // List<List<X>> -> List<X>; Flatten without its unread range columns
     Unweave,        // List<Sum{A|B|..}> -> (tags:List<U8>, List<A>, List<B>, ..)  destructure a
                     // sum column: the tag list plus each lane re-sliced per outer row. Lanes are
                     // already stored packed in row order, so only bounds are computed.
@@ -1013,11 +1014,14 @@ impl<L: OpLike> Op<L> {
             // each top row's flattened span) AND the one-level-flattened values. Both
             // outputs are lists at the SAME top stratum, so they bundle as a Prod, and the
             // word `slices` is the exact inverse — hence MapList(MapList(b)) == Flatten; b; slices.
-            Op::Flatten => {
+            Op::Flatten | Op::FlattenValues => {
                 let (ob, inner) = input.into_list("Flatten")?;
                 let (ib, vals) = inner.into_list("Flatten inner")?;
                 let new_ob: Vec<usize> =
                     ob.ends().map(|e| if e == 0 { 0 } else { ib.end(e - 1) }).collect();
+                if matches!(self, Op::FlattenValues) {
+                    return Ok(Value::List(new_ob.into(), Box::new(vals)));
+                }
                 let mut lo_c = Vec::with_capacity(ib.len());
                 let mut hi_c = Vec::with_capacity(ib.len());
                 let mut prev = 0;

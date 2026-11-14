@@ -10,8 +10,8 @@ use crate::value::{Scalar, Value};
 use std::collections::HashMap;
 
 /// Move closed bodies through a pass, retaining their enclosing op and allocation.
-fn map_kind(kind: &mut NodeKind<NumOp>, f: fn(Graph<NumOp>) -> Graph<NumOp>) {
-    let rewrite = |body: &mut Graph<NumOp>| {
+fn map_kind(kind: &mut NodeKind<NumOp>, mut f: impl FnMut(Graph<NumOp>) -> Graph<NumOp>) {
+    let mut rewrite = |body: &mut Graph<NumOp>| {
         let graph = Graph { nodes: std::mem::take(&mut body.nodes), output: body.output };
         *body = f(graph);
     };
@@ -71,7 +71,10 @@ pub(super) fn strip_patterns(graph: Graph<NumOp>) -> Graph<NumOp> {
 /// frees any node that only anchored one. Nodes are then numbered in one order, the input first and
 /// the rest as a walk from the output reaches them.
 pub(super) fn canonical(g: Graph<NumOp>) -> Graph<NumOp> {
-    ordered(cse(anchor_to_input(g)))
+    let graph = cse(anchor_to_input(g));
+    let (graph, changed) = flatten_values(graph);
+    // New values-only operations (including in bodies) may now be shared.
+    ordered(if changed { cse(graph) } else { graph })
 }
 
 /// Count every constant's and unit's rows from the graph's input, in closed bodies too.
@@ -274,6 +277,36 @@ pub(super) fn fuse_range_gather(g: Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
+/// Keep only Flatten's values when its sole live reader discards the ranges.
+/// Run on a checked graph, after anchors and sharing have exposed its readers.
+pub(super) fn flatten_values(mut g: Graph<NumOp>) -> (Graph<NumOp>, bool) {
+    let mut live = vec![false; g.nodes.len()];
+    let mut uses = vec![0usize; g.nodes.len()];
+    live[g.output] = true;
+    uses[g.output] = 1;
+    for i in (0..g.nodes.len()).rev() {
+        if live[i] { for &e in &g.nodes[i].inputs { live[e] = true; uses[e] += 1; } }
+    }
+    let mut changed = false;
+    for i in 0..g.nodes.len() {
+        if !live[i] { continue; }
+        map_kind(&mut g.nodes[i].kind, |body| {
+            let (body, inner_changed) = flatten_values(body);
+            changed |= inner_changed;
+            body
+        });
+        if matches!(g.nodes[i].kind, NodeKind::Op(NumOp::Core(Op::Field(1)))) {
+            let source = g.nodes[i].inputs[0];
+            if uses[source] == 1 && matches!(g.nodes[source].kind, NodeKind::Op(NumOp::Core(Op::Flatten))) {
+                g.nodes[i].kind = NodeKind::Op(NumOp::Core(Op::FlattenValues));
+                g.nodes[i].inputs[0] = g.nodes[source].inputs[0];
+                changed = true;
+            }
+        }
+    }
+    (g, changed)
+}
+
 /// Adjacent structural isos that are exact inverses (`Zip∘Transpose`, `Weave∘Unweave`, and
 /// `Unweave∘Weave`) cancel: `outer(inner(x)) = x`, so the consumer reads `inner`'s input directly.
 /// Sound regardless of fan-out — only this edge is redirected; a still-shared `inner` survives for
@@ -426,3 +459,6 @@ fn fold_literal(op: &NumOp, input: usize, built: &[Node<NumOp>]) -> Option<Node<
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod flatten_values_tests;

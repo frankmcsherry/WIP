@@ -209,6 +209,10 @@ fn movement(
             let Shape::List(element) = haystack else { unreachable!() };
             gather_result(b, value, &shapes[0], element, &list.list_element(), need)
         }
+        Op::FlattenValues => {
+            let (source, d) = project(b, source, input, have, &wanted)?;
+            Ok((b.add(Op::FlattenValues, vec![source]), d.list_element()))
+        }
         Op::Flatten => {
             let (source, ds) = project(b, source, input, have, &wanted)?;
             let value = b.add(Op::Flatten, vec![source]);
@@ -302,7 +306,7 @@ pub(crate) fn rewrite_demand(
                         }
                         (b.add(Op::MapSum(new_arms), vec![value]), Demand::Sum(ds))
                     }
-                    NumOp::Core(op @ (Op::Filter | Op::CapList | Op::Select | Op::Gather | Op::Flatten)) => {
+                    NumOp::Core(op @ (Op::Filter | Op::CapList | Op::Select | Op::Gather | Op::Flatten | Op::FlattenValues)) => {
                         movement(&mut b, op, source, shape, &analysis.shapes[id], have, need)?
                     }
                     op => {
