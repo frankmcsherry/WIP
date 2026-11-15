@@ -1,3 +1,4 @@
 # n = 4
 # = [1]
-let data = input iota map (x -> x iota) in let a = data map (row -> row map (y -> (y, 100) add)) in let b = let f = data flatten in (f.0, f.1 map (y -> (y, 100) add)) slices in (a, b) eq
+# Mapping both list layers then flattening agrees with mapping the flat items.
+let data = input iota map (x -> x iota) in let a = data map (row -> row map (y -> (y, 100) add)) flatten in let b = data flatten map (y -> (y, 100) add) in (a, b) eq

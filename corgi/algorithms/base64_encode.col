@@ -16,7 +16,7 @@ let text = (input, zeros) append chunk 3 map (g ->
     let s3 = c and 63 in
     let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" in
     (((s0, alphabet) get enlist, (s1, alphabet) get enlist) append,
-     ((s2, alphabet) get enlist, (s3, alphabet) get enlist) append) append) flatten .1 in
+     ((s2, alphabet) get enlist, (s3, alphabet) get enlist) append) append) flatten in
 # The characters made from padding become '='.
 let cut = (text len, pad) sub in
 (cut, (text len iota, text) zip) cap_list map ((cut, (k, ch)) -> ((k, cut) ge, 61, ch) select)

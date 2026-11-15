@@ -210,18 +210,8 @@ fn movement(
             gather_result(b, value, &shapes[0], element, &list.list_element(), need)
         }
         Op::Flatten => {
-            let (source, ds) = project(b, source, input, have, &wanted)?;
-            let value = b.add(Op::Flatten, vec![source]);
-            let element = ds.list_element().list_element();
-            let Shape::Prod(shapes) = output else { unreachable!() };
-            let values = List(Box::new(element));
-            let kernel_shape = Shape::Prod(vec![shapes[0].clone(), values.projected_shape(&shapes[1])?]);
-            let needs = need.clone().fields(2);
-            let local = Prod(vec![needs[0].clone(), if needs[1] == Unread { Unread } else { All }]);
-            let (value, projected) = project(b, value, &kernel_shape, &All, &local)?;
-            let mut actual = projected.fields(2);
-            if actual[1] != Unread { actual[1] = values; }
-            Ok((value, Prod(actual)))
+            let (source, d) = project(b, source, input, have, &wanted)?;
+            Ok((b.add(Op::Flatten, vec![source]), d.list_element()))
         }
         _ => unreachable!("movement rule"),
     }

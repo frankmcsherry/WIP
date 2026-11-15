@@ -65,8 +65,8 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // (`try_word`): a `Sum{T | ()}` whose lane 1 holds the rows that would have lost something.
         "zip" => Op::Zip.into(),         // per row: as long as the shorter list
         "unweave" => Op::Unweave.into(), // sum column -> (tags, lane lists)
-        // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike the other
-        // iso-inverses (Zip pairs any two columns; `slices` materializes any ranges, incl. Find's),
+        // NOTE: `weave` (Unweave's inverse) is intentionally NOT on the surface. Unlike `zip` and
+        // `slices` (which materializes any ranges, incl. Find's),
         // Weave's input — a tag stream whose per-row counts match a set of lane lengths — arises ONLY
         // from Unweave; a free-standing Weave is either provably the Unweave-inverse or a bug, and its
         // precondition is a histogram relation no static analysis cheaply proves. So `Op::Weave` stays
