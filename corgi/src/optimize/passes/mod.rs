@@ -3,6 +3,8 @@
 //! matches core `Field`/`Tuple`, so it reaches through `NumOp::Core`.
 
 pub(crate) mod narrow;
+mod wiring;
+pub(super) use wiring::typed_wiring;
 
 use crate::graph::{Builder, Graph, Node, NodeKind, OpLike};
 use crate::ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred};
@@ -55,14 +57,6 @@ fn rewrite_graph(
         };
     }
     Graph { nodes: built, output: remap[g.output] }
-}
-
-/// Erase pattern assertions after the complete graph has been checked.
-pub(super) fn strip_patterns(graph: Graph<NumOp>) -> Graph<NumOp> {
-    rewrite_graph(graph, strip_patterns, |kind, inputs, _, _| {
-        matches!(kind, NodeKind::Op(NumOp::Core(Op::Pattern(_))))
-            .then(|| Rewrite::Redirect(inputs[0]))
-    })
 }
 
 /// A checked graph's canonical form, so graphs that compute the same thing in the same way compare
@@ -426,3 +420,6 @@ fn fold_literal(op: &NumOp, input: usize, built: &[Node<NumOp>]) -> Option<Node<
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wiring_tests;
