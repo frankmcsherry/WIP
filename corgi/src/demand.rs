@@ -248,12 +248,7 @@ pub(crate) fn movement_demand(op: &Op<NumOp>, input: &Shape, demand: Demand) -> 
             let demand = keep_references(&fields[1], demand);
             Demand::Prod(vec![Demand::All, demand.clone(), demand])
         }
-        Op::Flatten => {
-            // Ranges depend only on the two levels of bounds. The flat values
-            // retain exactly the demanded payload, regardless of ranges demand.
-            let values = demand.fields(2).pop().unwrap().list_element();
-            Demand::List(Box::new(Demand::List(Box::new(values))))
-        }
+        Op::Flatten => Demand::List(Box::new(demand)),
         _ => return None,
     })
 }

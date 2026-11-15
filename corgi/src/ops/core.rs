@@ -422,16 +422,15 @@ pub enum Op<L> {
     Clone,          // T -> T'           every Ref<List<X>> in T becomes List<X> (the ONLY copy of
                     //                   referenced rows; `clone` undoes `ref`)
 
-    // ---- structural isos: de-/re-structure between nestings the layout already stores; linear
-    // bounds work at most, no per-element compute. Pairs: List⊗Prod (Transpose/Zip), List⊗Sum
-    // (Unweave/Weave); List⊗List's inverse of Flatten is the word `slices` (map(range); gather).
+    // ---- structural operations: reshape nestings the layout already stores; linear bounds work
+    // at most, no per-element compute. Isos: List⊗Prod (Transpose/Zip), List⊗Sum (Unweave/Weave).
+    // Flatten joins two list layers, forgetting the inner partition.
     Transpose,      // List<(X,Y,..)> -> (List<X>, List<Y>, ..)
     Zip,            // (List<X>, List<Y>, ..) -> List<(X,Y,..)>  Transpose's inverse. With agreeing
                     // bounds a pure rewrap — no data moves. Total but lossy: a row whose columns
                     // differ in length keeps the shortest (only then is data copied). The word
                     // `try_zip` puts such a row in a lane of its own instead.
-    Flatten,        // List<List<X>> -> (List<(lo,hi)>, List<X>)  destructure: ranges + flat values (its
-                    // inverse is the word `slices`: map(range); gather)
+    Flatten,        // List<List<X>> -> List<X>: keep the items under new outer bounds
     Unweave,        // List<Sum{A|B|..}> -> (tags:List<U8>, List<A>, List<B>, ..)  destructure a
                     // sum column: the tag list plus each lane re-sliced per outer row. Lanes are
                     // already stored packed in row order, so only bounds are computed.
@@ -1009,33 +1008,13 @@ impl<L: OpLike> Op<L> {
                 index_plan(&idx, &Owners::Identity, hb, &mut ok)?.fill_or_zero(hvals)?
             }
 
-            // DESTRUCTURE one list layer: return the per-inner-list ranges (relative to
-            // each top row's flattened span) AND the one-level-flattened values. Both
-            // outputs are lists at the SAME top stratum, so they bundle as a Prod, and the
-            // word `slices` is the exact inverse — hence MapList(MapList(b)) == Flatten; b; slices.
+            // Join two list layers, retaining the items and computing only the outer bounds.
             Op::Flatten => {
                 let (ob, inner) = input.into_list("Flatten")?;
                 let (ib, vals) = inner.into_list("Flatten inner")?;
                 let new_ob: Vec<usize> =
                     ob.ends().map(|e| if e == 0 { 0 } else { ib.end(e - 1) }).collect();
-                let mut lo_c = Vec::with_capacity(ib.len());
-                let mut hi_c = Vec::with_capacity(ib.len());
-                let mut prev = 0;
-                for e in ob.ends() {
-                    let base = if prev == 0 { 0 } else { ib.end(prev - 1) }; // top row's flat start
-                    for kk in prev..e {
-                        let g_lo = if kk == 0 { 0 } else { ib.end(kk - 1) };
-                        lo_c.push((g_lo - base) as i64);
-                        hi_c.push((ib.end(kk) - base) as i64);
-                    }
-                    prev = e;
-                }
-                let ranges = Value::List(
-                    ob,
-                    Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])),
-                );
-                let flat = Value::List(new_ob.into(), Box::new(vals));
-                Value::Prod(vec![ranges, flat])
+                Value::List(new_ob.into(), Box::new(vals))
             }
 
             // wrap each element in its own length-1 list (the list-monad unit). Values

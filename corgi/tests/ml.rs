@@ -335,12 +335,6 @@ fn nested_patterns_and_wildcards() {
 }
 
 #[test]
-fn projection_after_any_stage() {
-    // `flatten` returns (ranges, values); `.1` after the stage takes the values.
-    assert_eq!(run_ml("input iota map (x -> x iota) flatten .1", &int(&[4])), "List ends=[6] <[0, 0, 1, 0, 1, 2]>");
-}
-
-#[test]
 fn comments_and_error_positions() {
     let src = "# the identity\ninput # stays as it is\n";
     assert_eq!(run_ml(src, &int(&[3])), "[3]");

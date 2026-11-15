@@ -169,8 +169,8 @@ src/
                FoldScan with body (a,x)->(b,b), field 1). Gather (positions per row, nested or flat;
                the result keeps their structure) is the one fetch kernel; `slices` = map(range); gather. Plus Unit
                (X -> Unit) and the arithmetic + named reductions in `numeric`.
-               plus the structural isos — all three pairs present: List⊗Prod (Transpose/Zip),
-               List⊗List (Flatten / the word `slices`), List⊗Sum (Unweave/Weave) — and the fused forms/producers
+               plus the structural isos List⊗Prod (Transpose/Zip), List⊗Sum (Unweave/Weave),
+               and Flatten (List<List<X>> -> List<X>, forgetting the inner partition), and the fused forms/producers
                (Lit/Filter/Gather/Iota/Range), each reducible to kernel+isos (the `law` corpus
                programs witness it), kept for the execution strategy the expansion loses. The
                boolean mask split is the idiom `Branch(2)`; a dedicated Partition op was removed. Body-generic over L; inherent
@@ -232,7 +232,10 @@ reason. The combinators are the **distributive laws** (functor-through-functor) 
 |-------|---|---------------|-----|-----|
 | `List<(X,Y)>` | ↔ | `(List<X>, List<Y>)` | Transpose / Zip | programs/32 |
 | `List<Sum{A\|B}>` | ↔ | `(tags, List<A>, List<B>)` | Unweave / Weave | programs/33 |
-| `List<List<X>>` | ↔ | `(ranges, flat)` | Flatten / `slices` (a word) | programs/17, 31 |
+
+Flatten joins `List<List<X>>` into `List<X>`, forgetting the inner partition (programs/15).
+It keeps the items and computes new outer bounds, without constructing ranges.
+The word `slices` materializes supplied ranges, including Find's and moving windows; it is not Flatten's inverse.
 
 Note `List<Sum{A|B}>` is **not** `Sum{List<A>|List<B>}` — a list mixes variants, so the SoA form is the
 *shredded* `(tag-list, per-variant payload columns)` (Dremel/Parquet record shredding). That is exactly

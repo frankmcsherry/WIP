@@ -180,8 +180,7 @@ fn random_graph(
             let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
             let (list, element) = as_list(builder, payload, payload_shape);
             let nested = builder.add(Op::Enlist, vec![list]);
-            let ranges = Shape::List(Box::new(Shape::Prod(vec![Shape::Int, Shape::Int])));
-            (builder.add(Op::Flatten, vec![nested]), Shape::Prod(vec![ranges, Shape::List(Box::new(element))]))
+            (builder.add(Op::Flatten, vec![nested]), Shape::List(Box::new(element)))
         }
         14 => {
             let (payload, payload_shape) = random_graph(builder, input, shape, rng, depth - 1);
@@ -433,11 +432,10 @@ fn movement_preserves_witnesses_and_projects_shared_payloads() {
 
     let nested = Value::List(vec![0, 2].into(), Box::new(Value::List(vec![0, 3].into(), Box::new(pair))));
     let flatten = parse_ml("input flatten").unwrap();
-    let ranges_only = Demand::Prod(vec![Demand::All, Demand::None]);
-    check(&flatten, nested.clone(), &ranges_only);
-    check(&flatten, Value::empty(&shape_of_value(&nested)), &ranges_only);
-    let values_only = Demand::Prod(vec![Demand::None, second_payload]);
-    check(&flatten, nested, &values_only);
+    check(&flatten, nested.clone(), &bounds_only);
+    check(&flatten, Value::empty(&shape_of_value(&nested)), &bounds_only);
+    let (_, need) = check(&flatten, nested, &second_payload);
+    assert_eq!(need, Demand::List(Box::new(second_payload)));
 
     let shared = parse_ml("let f = input filter in (input, f map (x -> x.1))").unwrap();
     check(&shared, filtered_input, &Demand::All);
