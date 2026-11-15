@@ -138,6 +138,7 @@ impl Rounds {
 /// and the outputs, if any, in the list's order. `who` names the op in errors.
 fn fold_rounds<L: OpLike>(
     body: &Graph<L>,
+    eval_body: &mut impl FnMut(&Graph<L>, Value) -> Result<Value, String>,
     seed: Value,
     bounds: &Bounds,
     vals: Value,
@@ -150,7 +151,7 @@ fn fold_rounds<L: OpLike>(
     let check = |state: &Value| {
         same(&seed_shape, &shape_of_value(state)).map(drop).map_err(|e| format!("{who} body: {e}"))
     };
-    let round = |acc: Value, at: &[usize]| split(try_eval_graph(body, Value::Prod(vec![acc, gather(&vals, at)]))?);
+    let mut round = |acc: Value, at: &[usize]| split(eval_body(body, Value::Prod(vec![acc, gather(&vals, at)]))?);
     // no rounds: an empty output column, obtained by running the body on zero rows (an output may
     // differ from the state, so the seed can't stand in for it).
     if bounds.total() == 0 {
@@ -164,7 +165,7 @@ fn fold_rounds<L: OpLike>(
         // every row holds one element: one round, over the elements as they lie, and its outputs
         // are the list's
         if k == 1 {
-            let (state, outs) = split(try_eval_graph(body, Value::Prod(vec![seed, vals]))?)?;
+            let (state, outs) = split(eval_body(body, Value::Prod(vec![seed, vals]))?)?;
             check(&state)?;
             return Ok((state, outs));
         }
@@ -506,6 +507,14 @@ impl<L: OpLike> Op<L> {
     /// which is what makes this the typer when run on zero rows (see `graph::shape_of`). No op fails
     /// on data: a value of the right shape always has a result.
     pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
+        self.eval_with(input, &mut try_eval_graph)
+    }
+
+    /// The compiler reuses each checked body's empty result; evaluation runs the body normally.
+    pub(crate) fn eval_with(
+        &self, input: Value,
+        eval_body: &mut impl FnMut(&Graph<L>, Value) -> Result<Value, String>,
+    ) -> Result<Value, String> {
         Ok(match self {
             Op::Lit(v) => fill(v, input.len()),
 
@@ -905,7 +914,7 @@ impl<L: OpLike> Op<L> {
 
             Op::MapList(body) => {
                 let (bounds, inner) = input.into_list("MapList")?;
-                Value::List(bounds, Box::new(try_eval_graph(body, inner)?))
+                Value::List(bounds, Box::new(eval_body(body, inner)?))
             }
 
             // seeded left fold, vectorized across rows: round t runs the body once over every row
@@ -914,7 +923,7 @@ impl<L: OpLike> Op<L> {
             Op::Fold(body) => {
                 let (seed, list) = input.into_pair("Fold")?;
                 let (bounds, vals) = list.into_list("Fold list")?;
-                fold_rounds(body, seed, &bounds, vals, "Fold", |state| Ok((state, None)))?.0
+                fold_rounds(body, eval_body, seed, &bounds, vals, "Fold", |state| Ok((state, None)))?.0
             }
 
             // mapAccumL: the body returns a PAIR (new state, output R). The state is threaded as in
@@ -924,7 +933,7 @@ impl<L: OpLike> Op<L> {
                 let (seed, list) = input.into_pair("FoldScan")?;
                 let (bounds, vals) = list.into_list("FoldScan list")?;
                 let pair = |out: Value| out.into_pair("FoldScan body").map(|(state, r)| (state, Some(r)));
-                let (state, outs) = fold_rounds(body, seed, &bounds, vals, "FoldScan", pair)?;
+                let (state, outs) = fold_rounds(body, eval_body, seed, &bounds, vals, "FoldScan", pair)?;
                 let outs = outs.expect("a FoldScan body emits an output every round");
                 Value::Prod(vec![state, Value::List(bounds, Box::new(outs))])
             }
@@ -946,7 +955,7 @@ impl<L: OpLike> Op<L> {
                     // take the lane so the body's `Input` owns it (refcount 1 ⇒ in-place).
                     let lane = std::mem::replace(&mut variants[*k], Value::Unit(0));
                     let lane_len = lane.len();
-                    let res = try_eval_graph(body, lane)?;
+                    let res = eval_body(body, lane)?;
                     assert_eq!(res.len(), lane_len, "MapSum changed a variant's length");
                     variants[*k] = res;
                 }

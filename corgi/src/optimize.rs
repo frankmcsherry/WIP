@@ -34,12 +34,12 @@ impl Compiled {
     pub fn input(&self) -> &crate::Shape { &self.input }
 }
 
-/// Compile at `input`: check the whole graph, strip the patterns typing proved,
+/// Compile at `input`: check the whole graph and simplify its typed wiring,
 /// including in closed bodies, run the usual normalization once, and put the result in
 /// canonical form, so graphs that compute the same thing the same way compare equal.
 pub fn compile(graph: Graph<NumOp>, input: &crate::Shape) -> Result<Compiled, String> {
-    crate::graph::node_shapes(&graph, input)?;
-    let graph = passes::canonical(normalize(passes::strip_patterns(graph)));
+    let graph = passes::typed_wiring(graph, input)?;
+    let graph = passes::canonical(normalize(graph));
     Ok(Compiled { graph, input: input.clone() })
 }
 
