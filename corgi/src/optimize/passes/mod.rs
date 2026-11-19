@@ -239,40 +239,37 @@ pub fn fuse_maps(g: Graph<NumOp>) -> Graph<NumOp> {
     })
 }
 
-/// Fuse a private producer into the consumer that can read its positions directly.
+/// Let a sole consumer read ranges, positions, or a mask directly after common subexpressions are shared.
 pub(super) fn fuse_private_inputs(g: Graph<NumOp>) -> Graph<NumOp> {
     let mut uses = vec![0usize; g.nodes.len()];
     for n in &g.nodes { for &e in &n.inputs { uses[e] += 1; } }
     uses[g.output] += 1;
 
-    let eligible: Vec<_> = g.nodes.iter().map(|n| match &n.kind {
-        NodeKind::Op(NumOp::Core(Op::Gather)) => {
-            let p = n.inputs[0];
-            let pair = &g.nodes[p];
-            matches!(pair.kind, NodeKind::Tuple) && pair.inputs.len() == 2
-                && uses[p] == 1 && uses[pair.inputs[0]] == 1
-                && matches!(g.nodes[pair.inputs[0]].kind, NodeKind::Op(NumOp::Core(Op::Range)))
-        }
-        NodeKind::Op(NumOp::Cmp(CmpOp::SortLimit(_))) => {
-            let p = n.inputs[0];
-            uses[p] == 1 && matches!(g.nodes[p].kind, NodeKind::Op(NumOp::Core(Op::Filter)))
-        }
-        _ => false,
-    }).collect();
+    // Count uses in the original graph. Match the operators below on the remapped edges.
+    let private: Vec<_> = g.nodes.iter().map(|n| n.inputs.first().is_some_and(|&p| {
+        let producer = &g.nodes[p];
+        uses[p] == 1 && (!matches!(producer.kind, NodeKind::Tuple)
+            || producer.inputs.first().is_some_and(|&first| uses[first] == 1))
+    })).collect();
     rewrite_graph(g, fuse_private_inputs, |kind, inputs, built, old| {
-        if !eligible[old] { return None; }
+        if !private[old] { return None; }
         let producer = &built[inputs[0]];
-        if let NodeKind::Op(NumOp::Cmp(CmpOp::SortLimit(k))) = kind {
-            return Some(Rewrite::Replace(Node {
-                kind: NodeKind::Op(CmpOp::FilterSortLimit(*k).into()), inputs: producer.inputs.clone(),
-            }));
-        }
-        let (range, haystack) = (producer.inputs[0], producer.inputs[1]);
-        let ranges = built[range].inputs[0];
-        built.push(Node { kind: NodeKind::Tuple, inputs: vec![ranges, haystack] });
-        Some(Rewrite::Replace(Node {
-            kind: NodeKind::Op(Op::GatherRange.into()), inputs: vec![built.len() - 1],
-        }))
+        let filter = matches!(producer.kind, NodeKind::Op(NumOp::Core(Op::Filter)));
+        let (op, inputs) = match kind {
+            NodeKind::Op(NumOp::Cmp(CmpOp::SortLimit(k))) if filter =>
+                (CmpOp::FilterSortLimit(*k).into(), producer.inputs.clone()),
+            NodeKind::Op(NumOp::Arith(ArithOp::Reduce(crate::Red::Add))) if filter =>
+                (ArithOp::FilterSum.into(), producer.inputs.clone()),
+            NodeKind::Op(NumOp::Core(Op::Gather)) if matches!(producer.kind, NodeKind::Tuple) => {
+                let &[range, haystack] = producer.inputs.as_slice() else { return None };
+                if !matches!(built[range].kind, NodeKind::Op(NumOp::Core(Op::Range))) { return None; }
+                let ranges = built[range].inputs[0];
+                built.push(Node { kind: NodeKind::Tuple, inputs: vec![ranges, haystack] });
+                (Op::GatherRange.into(), vec![built.len() - 1])
+            }
+            _ => return None,
+        };
+        Some(Rewrite::Replace(Node { kind: NodeKind::Op(op), inputs }))
     })
 }
 

@@ -86,6 +86,7 @@ pub enum ArithOp {
     Shift(ShiftOp, u32),   // Int -> Int
     Neg,                   // X -> X   negate an Int (wrapping at the edge) or a Float
     ToFloat,               // Int -> Float   the nearest `f64`
+    FilterSum,             // filter followed by fold_add, reading the mask and values together
     Reduce(Red),           // List<X> -> X          per-row monoid reduction (sum/prod/min/max/all/any), X Int or Float
     Scan(Red),             // List<X> -> List<X>    per-row inclusive monoid PREFIX scan. The monoid
                            // fast path for `scan` with a monoid body: one in-place pass, where the
@@ -412,6 +413,36 @@ fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: 
     }
 }
 
+/// Sum directly over the mask. Rejected integers contribute the additive identity, so the
+/// inner loop can vectorize. Rejected floats are skipped to preserve the exact ordered fold.
+fn masked_sum(bounds: &crate::Bounds, mask: &[u8], values: Prim) -> Value {
+    fn rows<T, R>(bounds: &crate::Bounds, mask: &[u8], values: &[T], sum: impl Fn(&[T], &[u8]) -> R) -> Vec<R> {
+        let mut start = 0;
+        bounds.ends().map(|end| {
+            let result = sum(&values[start..end], &mask[start..end]);
+            start = end;
+            result
+        }).collect()
+    }
+    fn integers<T: Copy + Into<i64>>(values: &[T], mask: &[u8]) -> i64 {
+        values.iter().zip(mask).fold(0i64, |acc, (&x, &m)| {
+            acc.wrapping_add(if m != 0 { x.into() } else { 0 })
+        })
+    }
+    match values {
+        Prim::I64(v) => Value::i64(rows(bounds, mask, &v, integers)),
+        Prim::U8(v) => Value::i64(rows(bounds, mask, &v, integers)),
+        Prim::F64(v) => {
+            let sums = rows(bounds, mask, &v, |keys, mask| {
+                f64_result_key(keys.iter().zip(mask).fold(0.0, |acc, (&key, &m)| {
+                    if m != 0 { acc + f64_of_key(key) } else { acc }
+                }))
+            });
+            Value::Prim(Prim::F64(Arc::new(sums)))
+        }
+    }
+}
+
 /// `f` of each row's slice of `xs`; a stride's rows are its fixed-size chunks.
 fn per_row<T, R>(bounds: &crate::value::Bounds, xs: &[T], f: impl FnMut(&[T]) -> R) -> Vec<R> {
     match bounds {
@@ -488,6 +519,11 @@ impl ArithOp {
                 let xs = input.as_i64("to_float")?;
                 // An integer-to-float conversion cannot produce a NaN.
                 Value::f64(xs.iter().map(|&x| x as f64).collect())
+            }
+            ArithOp::FilterSum => {
+                let (bounds, pairs) = input.into_list("Filter")?;
+                let (mask, vals) = pairs.into_pair("Filter element")?;
+                masked_sum(&bounds, &mask.as_mask("Filter mask")?, vals.into_prim("reduce values")?)
             }
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;

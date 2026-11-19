@@ -267,3 +267,22 @@ fn storage_is_invisible() {
     assert_eq!(find(true, false), find(false, false));
     assert_eq!(find(false, true), find(false, false));
 }
+
+#[test]
+fn masked_sum_preserves_order_overflow_and_empty_rows() {
+    let graph = parse_ml("input filter fold_add").unwrap();
+    let optimized = corgi::optimize(&graph);
+    assert!(corgi::explain::explain(&optimized).contains("FilterSum"));
+    let shared = corgi::optimize(&parse_ml("let xs = input filter in (xs, xs fold_add)").unwrap());
+    assert!(!corgi::explain::explain(&shared).contains("FilterSum"));
+    for masks in [Value::u8(vec![2, 1, 0, 255, 3, 1, 1, 0]), int(&[-1, 2, 0, 1, 7, -2, 8, 0])] {
+        for values in [
+            int(&[i64::MAX, 1, -2, 7, 1, i64::MIN, -1, 10]),
+            Value::u8(vec![255; 8]),
+            Value::f64(vec![1e16, 1.0, f64::NAN, -1e16, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY]),
+        ] {
+            let input = Value::List(vec![0, 4, 4, 7, 8].into(), Box::new(Value::Prod(vec![masks.clone(), values])));
+            assert_eq!(eval_graph(&optimized, input.clone()), eval_graph(&graph, input));
+        }
+    }
+}
