@@ -12,7 +12,7 @@
 
 use std::borrow::Borrow;
 
-use crate::engine::gather;
+use crate::engine::{gather, push_span, take_spans};
 use crate::value::{Bounds, Prim, Tags, Value};
 
 /// Buffers reused across every block and level of one call, so that a refinement pass producing
@@ -501,7 +501,7 @@ fn sort_sum(
 
 /// A list, lexicographically: one refining pass per element position over the rows still tied,
 /// a row that ends there first in its block and leaf elements read straight into keys, then one
-/// gather of the elements in final order, the only gather this sort makes. Equal-width byte records up to 8 wide pack into one `u64` key
+/// copy of each row's elements in final order, a range per row, the only copy this sort makes. Equal-width byte records up to 8 wide pack into one `u64` key
 /// and unpack from the sorted keys.
 fn sort_list(
     bounds: &Bounds,
@@ -626,14 +626,14 @@ fn sort_list(
     scratch.slot = slot;
     refine(labels, |_| false);
     emit.values().then(|| {
-        let mut elems = Vec::new();
-        let mut ends = Vec::with_capacity(m);
+        let (mut spans, mut ends, mut acc) = (Vec::new(), Vec::with_capacity(m), 0);
         for &r in index.iter() {
             let (s, e) = bounds.span(r);
-            elems.extend(s..e);
-            ends.push(elems.len());
+            push_span(&mut spans, 0, s, e);
+            acc += e - s;
+            ends.push(acc);
         }
-        Value::List(ends.into(), Box::new(gather(vals, &elems)))
+        Value::List(ends.into(), Box::new(take_spans(&[vals], &spans)))
     })
 }
 
