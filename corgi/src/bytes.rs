@@ -35,7 +35,8 @@
 //!         | 3, 1, stride, rows, Value                `Stride` form: the uniform partition
 //!   Unit  = 4, n
 //!   Ref   = 5, n, u64*n, Value                     row numbers into the list that follows (the
-//!                                                    arena), u64::MAX for none: the arena goes once,
+//!                                                    arena), each inside it (a miss names an empty
+//!                                                    row of the arena): the arena goes once,
 //!                                                    however many rows reference it
 //! ```
 //!
