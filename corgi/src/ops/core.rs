@@ -454,8 +454,9 @@ pub enum Op<L> {
     Gather,         // (idx:P, haystack:List<T>) -> P[T]  P any shape whose leaves are integers (one
                     // position, a list of them, nested lists, products, sums), each a position in its
                     // top-level row; the result has P's structure with every leaf replaced by its
-                    // element. Chains compose in-language — gather(gather(v,i),j) = gather(v,
-                    // gather(i,j)), so index math stays index math.
+                    // element. Chains compose in-language wherever the outer positions are in
+                    // range — gather(gather(v,i),j) = gather(v, gather(i,j)), so index math stays
+                    // index math. (Out of range, the composed index reads 0, a real position.)
                     // Total but lossy: a position outside its row reads the ZERO of the element's
                     // shape (zero bits, the empty list, a sum's lane 0). The words `try_get` and
                     // `try_gather` put such a row in a lane of its own instead.

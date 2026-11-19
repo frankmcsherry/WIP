@@ -273,3 +273,19 @@ fn fold_state_across_arenas_holds_only_live_rows() {
     assert!(held.len() <= 6, "the state's arena holds {} elements for 2 rows of 3", held.len());
     assert_eq!(show(&run("input clone", out)), "List ends=[3, 6] <[0, 1, 2, 0, 1, 2]>");
 }
+
+/// gathering a column of references twice composes their row numbers, and a miss in the second
+/// gather names the arena's empty row: the result reads as the empty list, as gathering the lists
+/// themselves twice does, not as row 0, which composing the positions first would read.
+#[test]
+fn a_miss_survives_gathering_references_twice() {
+    let at = |n: i64| Value::List(vec![1].into(), Box::new(Value::i64(vec![n])));
+    // one row holding the lists [7] and [9]
+    let h = Value::List(vec![2].into(), Box::new(Value::List(vec![1, 2].into(), Box::new(Value::i64(vec![7, 9])))));
+    let input = Value::Prod(vec![at(1), at(1), h]);
+    let by_ref = run("let (p, q, h) = input in (q, (p, h map (x -> x ref)) gather) gather clone", input.clone());
+    let by_val = run("let (p, q, h) = input in (q, (p, h) gather) gather", input);
+    let empty = Value::List(vec![1].into(), Box::new(Value::List(vec![0].into(), Box::new(Value::i64(vec![])))));
+    assert_eq!(by_ref, by_val);
+    assert_eq!(by_ref, empty);
+}
