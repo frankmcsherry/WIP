@@ -34,7 +34,10 @@ pub enum GroupRun {
 /// a `Both` class on either side is structurally equal to every other, and the class is maximal;
 /// adjacent reports never share a side.
 pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
-    let mut tree = Tree { nodes: vec![Node::Class { alo: 0, ahi: a.len(), blo: 0, bhi: b.len(), la: 0, lb: 0, kids: None }] };
+    // The first level reports at most two runs for each row of the shorter side, and one more.
+    let mut nodes = Vec::with_capacity(2 * a.len().min(b.len()) + 2);
+    nodes.push(Node::Class { alo: 0, ahi: a.len(), blo: 0, bhi: b.len(), la: 0, lb: 0, kids: None });
+    let mut tree = Tree { nodes };
     level(a, b, Identity, Identity, &[0], &mut tree);
     tree.flatten()
 }
@@ -309,6 +312,36 @@ fn wide<'a>(lanes: &[(&'a Prim, &'a Prim)]) -> Option<Vec<(&'a [i64], &'a [i64])
         .collect()
 }
 
+/// A row's key over several `i64` lanes, ordered as their tuple: the first lane's value, and the
+/// row to read the other lanes at when the first ties.
+#[derive(Copy, Clone)]
+struct Tied<'a> {
+    first: i64,
+    row: usize,
+    rest: &'a [&'a [i64]],
+}
+impl Ord for Tied<'_> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.first.cmp(&other.first).then_with(|| {
+            self.rest.iter().zip(other.rest).map(|(x, y)| x[self.row].cmp(&y[other.row])).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+impl PartialOrd for Tied<'_> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Tied<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Tied<'_> {}
+
 fn lanes_level<IA: Rows, IB: Rows>(lanes: &[(&Prim, &Prim)], ia: IA, ib: IB, open: &[usize], tree: &mut Tree) {
     // a lane whose two sides are held at different storages meets first, so that each lane's keys
     // read alike on both sides.
@@ -318,12 +351,18 @@ fn lanes_level<IA: Rows, IB: Rows>(lanes: &[(&Prim, &Prim)], ia: IA, ib: IB, ope
         return lanes_level(&refs, ia, ib, open, tree);
     }
     if let Some(w) = wide(lanes) {
-        return match w.len() {
-            1 => merge(|j| w[0].0[ia.row(j)], |j| w[0].1[ib.row(j)], open, tree),
-            2 => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r]) }, open, tree),
-            3 => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r], w[2].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r], w[2].1[r]) }, open, tree),
-            _ => merge(|j| { let r = ia.row(j); (w[0].0[r], w[1].0[r], w[2].0[r], w[3].0[r]) }, |j| { let r = ib.row(j); (w[0].1[r], w[1].1[r], w[2].1[r], w[3].1[r]) }, open, tree),
-        };
+        if w.len() == 1 {
+            return merge(|j| w[0].0[ia.row(j)], |j| w[0].1[ib.row(j)], open, tree);
+        }
+        // The first lane is read with the key, the rest only where two first lanes tie: a leading
+        // lane that decides most pairs, as a hash does, leaves the others unread.
+        let (ra, rb): (Vec<&[i64]>, Vec<&[i64]>) = w[1..].iter().copied().unzip();
+        return merge(
+            |j| { let row = ia.row(j); Tied { first: w[0].0[row], row, rest: &ra } },
+            |j| { let row = ib.row(j); Tied { first: w[0].1[row], row, rest: &rb } },
+            open,
+            tree,
+        );
     }
     let at = |x: usize, j: usize| lanes[x].0.key_at(ia.row(j));
     let bt = |x: usize, j: usize| lanes[x].1.key_at(ib.row(j));
@@ -351,15 +390,15 @@ fn merge<T: Ord + Copy>(ka: impl Fn(usize) -> T, kb: impl Fn(usize) -> T, open: 
         while i < ea && j < eb {
             match ka(i).cmp(&kb(j)) {
                 std::cmp::Ordering::Less => {
-                    let s = i;
+                    let (s, key) = (i, kb(j));
                     i += 1;
-                    gallop(&mut i, ea, |k| ka(k) < kb(j));
+                    gallop(&mut i, ea, |k| ka(k) < key);
                     tree.push(Node::A(top_a(s), top_a(i)));
                 }
                 std::cmp::Ordering::Greater => {
-                    let s = j;
+                    let (s, key) = (j, ka(i));
                     j += 1;
-                    gallop(&mut j, eb, |k| kb(k) < ka(i));
+                    gallop(&mut j, eb, |k| kb(k) < key);
                     tree.push(Node::B(top_b(s), top_b(j)));
                 }
                 std::cmp::Ordering::Equal => {
@@ -478,15 +517,22 @@ impl Tree {
     /// The returned classes' offsets now name their places in the lists returned.
     fn refined<IA: Rows, IB: Rows>(&mut self, open: &[usize], ia: IA, ib: IB) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
         let (mut cur, mut sa, mut sb) = (Vec::new(), Vec::new(), Vec::new());
-        let mut stack = Vec::new();
+        // Ranges of nodes still to read, the next on top. A class's children are one range, read
+        // in place: most nodes are exclusive runs, and stacking each one costs more than reading it.
+        let mut stack: Vec<(usize, usize)> = Vec::new();
         for &p in open {
             let (top, la, lb) = self.class(p);
-            stack.push(p);
-            while let Some(n) = stack.pop() {
-                if let Node::Class { alo, ahi, blo, bhi, kids, .. } = &self.nodes[n] {
-                    if let Some((s, e)) = *kids {
-                        stack.extend((s..e).rev());
-                    } else {
+            stack.push((p, p + 1));
+            while let Some((mut n, end)) = stack.pop() {
+                while n < end {
+                    if let Node::Class { alo, ahi, blo, bhi, kids, .. } = self.nodes[n] {
+                        if let Some((s, e)) = kids {
+                            if n + 1 < end {
+                                stack.push((n + 1, end));
+                            }
+                            stack.push((s, e));
+                            break;
+                        }
                         let (oa, ob) = (la + alo - top.alo, lb + blo - top.blo);
                         let (na, nb) = (ahi - alo, bhi - blo);
                         cur.push(n);
@@ -495,6 +541,7 @@ impl Tree {
                         sb.extend((ob..ob + nb).map(|j| ib.row(j)));
                         self.set_offsets(n, at.0, at.1);
                     }
+                    n += 1;
                 }
             }
         }
@@ -502,22 +549,32 @@ impl Tree {
     }
     /// the reports in merged order, adjacent runs of one side joined.
     fn flatten(&self) -> Vec<GroupRun> {
-        let mut out: Vec<GroupRun> = Vec::new();
-        let mut stack = vec![0usize];
-        while let Some(n) = stack.pop() {
-            match &self.nodes[n] {
-                Node::A(lo, hi) => match out.last_mut() {
-                    Some(GroupRun::A(_, end)) if *end == *lo => *end = *hi,
-                    _ => out.push(GroupRun::A(*lo, *hi)),
-                },
-                Node::B(lo, hi) => match out.last_mut() {
-                    Some(GroupRun::B(_, end)) if *end == *lo => *end = *hi,
-                    _ => out.push(GroupRun::B(*lo, *hi)),
-                },
-                Node::Class { alo, ahi, blo, bhi, kids, .. } => match *kids {
-                    Some((s, e)) => stack.extend((s..e).rev()),
-                    None => out.push(GroupRun::Both(*alo, *ahi, *blo, *bhi)),
-                },
+        let mut out: Vec<GroupRun> = Vec::with_capacity(self.nodes.len());
+        // Ranges of nodes still to read, the next on top; a class's children are read in place.
+        let mut stack = vec![(0usize, 1usize)];
+        while let Some((mut n, end)) = stack.pop() {
+            while n < end {
+                match &self.nodes[n] {
+                    Node::A(lo, hi) => match out.last_mut() {
+                        Some(GroupRun::A(_, last)) if *last == *lo => *last = *hi,
+                        _ => out.push(GroupRun::A(*lo, *hi)),
+                    },
+                    Node::B(lo, hi) => match out.last_mut() {
+                        Some(GroupRun::B(_, last)) if *last == *lo => *last = *hi,
+                        _ => out.push(GroupRun::B(*lo, *hi)),
+                    },
+                    Node::Class { alo, ahi, blo, bhi, kids, .. } => match *kids {
+                        Some((s, e)) => {
+                            if n + 1 < end {
+                                stack.push((n + 1, end));
+                            }
+                            stack.push((s, e));
+                            break;
+                        }
+                        None => out.push(GroupRun::Both(*alo, *ahi, *blo, *bhi)),
+                    },
+                }
+                n += 1;
             }
         }
         out
