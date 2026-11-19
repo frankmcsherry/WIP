@@ -113,8 +113,7 @@ pub fn hash(v: &Value) -> Vec<u64> {
         // equivalent `Offsets` hash identically (matching `Bounds` equality, which is by the
         // partition, not its representation). A list of leaves uses a single row hash.
         Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
-            let ends: Vec<usize> = bounds.ends().collect();
-            leaf_list_rows(vals, ends.len(), |r| (if r == 0 { 0 } else { ends[r - 1] }, ends[r]))
+            leaf_list_rows(vals, bounds.len(), |r| bounds.span(r))
         }
         Value::List(bounds, vals) => {
             let ch = hash(vals);
