@@ -156,6 +156,9 @@ impl CmpOp {
                 let (bounds, pairs) = input.into_list("Filter")?;
                 let (mask, vals) = pairs.into_pair("Filter element")?;
                 let mask = mask.as_mask("Filter mask")?;
+                if !mask.contains(&0) {
+                    return Ok(sort_limit(&bounds, &vals, *k, None));
+                }
                 let mut positions = Vec::new();
                 let mut ends = Vec::with_capacity(bounds.len());
                 let mut start = 0;
