@@ -97,7 +97,7 @@ pub(crate) fn sort_indexed(
         Value::List(bounds, vals) => sort_list(bounds, vals, labels, index, emit.keeping_index(), scratch),
         // a reference sorts as what it names, read through its arena: the arena's rows are sorted
         // in place of the references, and mapped back to positions; the sorted column is still
-        // references. (An arena row named twice falls back to a scratch clone.)
+        // references. Repeated arena rows are sorted through a scratch column of the selected values.
         Value::Ref(list, rows) => {
             // When the selected rows already name themselves in the arena, sort at
             // those coordinates directly. Unselected references do not affect the order.
@@ -114,8 +114,13 @@ pub(crate) fn sort_indexed(
                     *slot = back[r];
                 }
             } else {
-                let owned = crate::engine::clone_ref(v.clone());
-                sort_indexed(&owned, labels, index, emit.keeping_index(), scratch);
+                // An arena coordinate alone cannot recover which reference named it. Sort
+                // selected occurrences by slot, so even equal references keep their source IDs.
+                let selected = gather(list, &at);
+                for (slot, row) in at.iter_mut().enumerate() { *row = slot; }
+                sort_indexed(&selected, labels, &mut at, Emit::Index, scratch);
+                for slot in &mut at { *slot = index[*slot]; }
+                index.copy_from_slice(&at);
             }
             emit.values().then(|| gather(v, index))
         }

@@ -122,6 +122,8 @@ fn sorting_refs_can_use_identity_on_just_the_selected_rows() {
     let refs = Value::Ref(arena.into(), vec![0, 3, 2, 3, 0].into());
     check(&refs, &[], &[3, 0, 2, 0]);
     check(&refs, &[], &[4, 1, 2, 0]);
+    // Distinct references to the same row, a repeated input slot, and multiple blocks.
+    check(&refs, &[0, 0, 0, 5, 5, 5, 5], &[3, 1, 2, 0, 4, 1, 1]);
 }
 
 #[test]
