@@ -1013,8 +1013,7 @@ impl<L: OpLike> Op<L> {
                         return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_words_owned(idxs)))));
                     }
                 }
-                let mut ok = vec![true; idx.len()];
-                index_plan(&idx, &Owners::Identity, hb, &mut ok)?.fill_or_zero(hvals)?
+                index_plan(&idx, &Owners::Identity, hb)?.fill_or_zero(hvals)?
             }
 
             // Join two list layers, retaining the items and computing only the outer bounds.
