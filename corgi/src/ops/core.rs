@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, partition, take_ref, take_spans, Owners,
+    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, partition, push_span, take_ref, take_spans, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
@@ -725,8 +725,8 @@ impl<L: OpLike> Op<L> {
                 Value::List(nb.into(), Box::new(compress(&vals, m, acc)))
             }
 
-            // row-wise append: row r's output is each list's row r elements in turn. A multi-source
-            // gather over the value columns reuses the engine's `gather_lanes`, so it works for any
+            // row-wise append: row r's output is each list's row r elements in turn. Each is one range
+            // of its list's values, copied by the engine's `take_spans`, so it works for any
             // element shape X (leaf / product / list / sum). A list of computed values is this over
             // enlisted columns: `(a enlist, b enlist, c enlist) append`, one pass.
             Op::Append => {
@@ -767,20 +767,19 @@ impl<L: OpLike> Op<L> {
                     };
                     return Ok(Value::List(bounds, Box::new(Value::Prim(vals))));
                 }
-                let cap = parts.iter().map(|(_, v)| v.len()).sum();
-                let mut nb = Vec::with_capacity(rows);
-                let (mut tags, mut off) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
+                let (mut nb, mut spans, mut acc) = (Vec::with_capacity(rows), Vec::new(), 0);
                 let mut starts = vec![0usize; parts.len()];
                 for r in 0..rows {
                     for (k, (b, _)) in parts.iter().enumerate() {
                         let e = b.end(r);
-                        for p in starts[k]..e { tags.push(k); off.push(p); } // list k's row-r elements
+                        push_span(&mut spans, k, starts[k], e); // list k's row-r elements
+                        acc += e - starts[k];
                         starts[k] = e;
                     }
-                    nb.push(tags.len());
+                    nb.push(acc);
                 }
-                let srcs: Vec<Option<&Value>> = parts.iter().map(|(_, v)| Some(v)).collect();
-                Value::List(nb.into(), Box::new(gather_lanes(&srcs, &tags, &off)))
+                let srcs: Vec<&Value> = parts.iter().map(|(_, v)| v).collect();
+                Value::List(nb.into(), Box::new(take_spans(&srcs, &spans)))
             }
 
             // each row's length, read off the bounds in one pass (no per-element work).
@@ -1184,9 +1183,7 @@ fn route<T: Copy>(tags: &[T], word: impl Fn(T) -> u64, n: usize) -> (Vec<u8>, Ve
 #[cold]
 #[inline(never)]
 fn chunk_kept(bounds: &Bounds, vals: &Value, k: usize) -> Value {
-    let idx: Vec<usize> = (0..bounds.len())
-        .flat_map(|r| { let (s, e) = bounds.span(r); s..s + (e - s) / k * k })
-        .collect();
-    gather(vals, &idx)
+    let spans: Vec<_> = (0..bounds.len()).map(|r| { let (s, e) = bounds.span(r); (0, s, s + (e - s) / k * k) }).collect();
+    take_spans(&[vals], &spans)
 }
 
