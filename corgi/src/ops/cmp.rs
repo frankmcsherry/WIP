@@ -13,7 +13,7 @@ pub(crate) mod survey;
 
 use crate::engine::gather;
 use order::{compare_adjacent, compare_cols, compare_idx, equal_cols, segment_labels};
-use sort::{sort_blocks, sort_values, sort_values_only, window_key, WINDOW};
+use sort::{sort_indexed, sort_values, sort_values_only, window_key, Emit, SortScratch, WINDOW};
 use crate::shape::{same, shape_of_value};
 use crate::value::{Bounds, Prim, Scalar, Value};
 use search::find_leaf;
@@ -60,6 +60,7 @@ pub enum CmpOp {
                // V carries nothing), and each element's run of equal keys (numbered densely)
     SortLimit(usize), // List<X> -> List<X>   the first k of each row in structural order (`sort`,
                // then take k), sorting only what can reach the first k: see `sort_limit`
+    FilterSortLimit(usize), // Filter feeding only SortLimit: sort surviving source positions.
     Adjacent,  // List<X> -> List<Int>   1 where an element differs from the one before it in its
                // row, and at each row's first element: where runs of equal elements start
     Find,      // (needle:List<X>, haystack:List<X>) -> List<(lo,hi)>  equal_range / needle elem
@@ -148,7 +149,22 @@ impl CmpOp {
 
             CmpOp::SortLimit(k) => {
                 let (bounds, vals) = input.into_list("SortLimit")?;
-                sort_limit(&bounds, &vals, *k)
+                sort_limit(&bounds, &vals, *k, None)
+            }
+
+            CmpOp::FilterSortLimit(k) => {
+                let (bounds, pairs) = input.into_list("Filter")?;
+                let (mask, vals) = pairs.into_pair("Filter element")?;
+                let mask = mask.as_mask("Filter mask")?;
+                let mut positions = Vec::new();
+                let mut ends = Vec::with_capacity(bounds.len());
+                let mut start = 0;
+                for end in bounds.ends() {
+                    positions.extend((start..end).filter(|&i| mask[i] != 0));
+                    ends.push(positions.len());
+                    start = end;
+                }
+                sort_limit(&ends.into(), &vals, *k, Some(positions))
             }
 
             // one structural compare of each element with the next, over the whole column; a row's
@@ -225,6 +241,7 @@ impl CmpOp {
 enum Level {
     Col(Value),
     Elems(Value),
+    Length(Bounds),
 }
 
 /// the levels whose lexicographic order is the structural order of `v`'s rows, most significant
@@ -240,10 +257,7 @@ fn order_levels(v: &Value, out: &mut Vec<Level>) {
             if !elements.unit_only() {
                 out.push(Level::Elems(v.clone()));
             }
-            out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
-                let (s, e) = inner.span(i);
-                (e - s) as i64
-            }).collect())));
+            out.push(Level::Length(inner.clone()));
         }
         other if other.unit_only() => {}
         other => out.push(Level::Col(other.clone())),
@@ -256,27 +270,42 @@ struct InPlay {
     idx: Vec<usize>,
     labels: Vec<u64>,
     ends: Vec<usize>,
+    scratch: SortScratch,
 }
 
 impl InPlay {
-    /// sort the rows in play by `col` (one value per row in play) within their ties, then keep each
-    /// row's first `k` and the whole run of ties at the `k`-th.
-    fn level(&mut self, col: &Value, k: usize) {
-        let (perm, refined) = sort_blocks(&self.labels, col);
-        let sorted: Vec<usize> = perm.iter().map(|&p| self.idx[p]).collect();
-        let (mut keep, mut lab, mut ends) = (Vec::new(), Vec::new(), Vec::with_capacity(self.ends.len()));
-        let mut s = 0usize;
-        for &e in &self.ends {
-            let mut stop = e.min(s.saturating_add(k));
-            while stop > s && stop < e && refined[stop] == refined[stop - 1] {
-                stop += 1; // the run of ties at the k-th position comes whole
+    /// Read the next key from its original column, through the surviving source positions.
+    fn source_level(&mut self, col: &Value, k: usize) {
+        sort_indexed(col, &mut self.labels, &mut self.idx, Emit::Index, &mut self.scratch);
+        self.retain_prefix(k);
+    }
+
+    /// Synthesized keys (e.g. the next byte window) are already in candidate order.
+    /// Sort their slots, then carry the source positions along that permutation.
+    fn aligned_level(&mut self, col: &Value, k: usize) {
+        let mut slots: Vec<_> = (0..self.idx.len()).collect();
+        sort_indexed(col, &mut self.labels, &mut slots, Emit::Index, &mut self.scratch);
+        for slot in &mut slots { *slot = self.idx[*slot]; }
+        self.idx = slots;
+        self.retain_prefix(k);
+    }
+
+    /// Keep each row's first k and all peers of its k-th item. Compact both aligned columns.
+    fn retain_prefix(&mut self, k: usize) {
+        let (mut start, mut write) = (0usize, 0usize);
+        for end in &mut self.ends {
+            let mut stop = (*end).min(start.saturating_add(k));
+            while stop > start && stop < *end && self.labels[stop] == self.labels[stop - 1] {
+                stop += 1;
             }
-            keep.extend_from_slice(&sorted[s..stop]);
-            lab.extend_from_slice(&refined[s..stop]);
-            ends.push(keep.len());
-            s = e;
+            self.idx.copy_within(start..stop, write);
+            self.labels.copy_within(start..stop, write);
+            write += stop - start;
+            start = *end;
+            *end = write;
         }
-        (self.idx, self.labels, self.ends) = (keep, lab, ends);
+        self.idx.truncate(write);
+        self.labels.truncate(write);
     }
     /// no ties left: later levels cannot change the order.
     fn settled(&self) -> bool {
@@ -298,17 +327,26 @@ impl InPlay {
 /// A list's elements are levels position by position, an MSD radix sort that stops where the rows in
 /// play stop tying. Not a word over `sort_by` yet: the levels come from the key's type, which the
 /// lowering does not know, and a list key's levels are data (dev/indexed-sort.md).
-fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
+/// `bounds` partitions the supplied absolute positions (or the whole column in source order).
+fn sort_limit(bounds: &Bounds, vals: &Value, k: usize, positions: Option<Vec<usize>>) -> Value {
     let mut levels = Vec::new();
     order_levels(vals, &mut levels);
-    let mut play = InPlay { idx: (0..vals.len()).collect(), labels: row_labels(bounds), ends: bounds.ends().collect() };
+    let mut play = InPlay {
+        idx: positions.unwrap_or_else(|| (0..vals.len()).collect()),
+        labels: row_labels(bounds),
+        ends: bounds.ends().collect(),
+        scratch: SortScratch::default(),
+    };
     for (l, level) in levels.iter().enumerate() {
         if l > 0 && play.settled() {
             break;
         }
         match level {
-            Level::Col(c) if l == 0 => play.level(c, k),
-            Level::Col(c) => play.level(&gather(c, &play.idx), k),
+            Level::Col(c) => play.source_level(c, k),
+            Level::Length(bounds) => {
+                let lengths = play.idx.iter().map(|&r| { let (s, e) = bounds.span(r); (e - s) as i64 }).collect();
+                play.aligned_level(&Value::i64(lengths), k);
+            }
             Level::Elems(list) => {
                 let Value::List(inner, elems) = list else { unreachable!("a list level is a List") };
                 // bytes go `WINDOW` at a time, as the sort reads them: one u64 level per window
@@ -331,7 +369,7 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                         let splits = (1..col.len()).any(|p| play.tied(p) && col[p] != col[p - 1]);
                         if splits {
                             // the keys order unsigned: as `i64`s, each with its top bit flipped
-                            play.level(&Value::i64(col.iter().map(|&w| (w ^ (1 << 63)) as i64).collect()), k);
+                            play.aligned_level(&Value::i64(col.iter().map(|&w| (w ^ (1 << 63)) as i64).collect()), k);
                         }
                     }
                     continue;
@@ -352,7 +390,7 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                         break;
                     }
                     if ended {
-                        play.level(&Value::u8(at.iter().map(|&p| (p != usize::MAX) as u8).collect()), k);
+                        play.aligned_level(&Value::u8(at.iter().map(|&p| (p != usize::MAX) as u8).collect()), k);
                         // that level reordered (and may have cut) the rows in play: read them again
                         at = play.idx.iter().map(|&r| {
                             let (s, e) = inner.span(r);
@@ -360,7 +398,7 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
                         }).collect();
                     }
                     let col = crate::engine::gather_or_zero(elems, &at).expect("a list's elements have a zero");
-                    play.level(&col, k);
+                    play.aligned_level(&col, k);
                 }
             }
         }
@@ -435,4 +473,26 @@ fn equal_to<T: Copy, U: Copy>(bounds: &Bounds, xs: &[T], c: &[U], ne: bool, same
         out[k] = (equal != ne) as u8;
     }
     out
+}
+
+#[cfg(test)]
+mod indexed_limit_tests {
+    use super::*;
+
+    #[test]
+    fn sorts_selected_slots_including_repeats_and_nonmonotone_sources() {
+        let (bytes, lengths) = (Value::u8(vec![9, 1, 4, 3, 7, 2, 1, 0]), vec![2, 2, 3, 6, 8]);
+        let lists = Value::List(lengths.into(), Box::new(bytes));
+        let refs = crate::engine::take_ref(lists.clone());
+        for vals in [lists, refs, Value::i64(vec![6, -4, 3, 1, 0]), Value::Unit(5)] {
+            let positions = vec![4, 0, 4, 1, 2, 3, 3, 2];
+            let bounds = Bounds::offsets(vec![0, 3, 3, 8]);
+            for k in [0, 1, 4, usize::MAX] {
+                assert_eq!(
+                    sort_limit(&bounds, &vals, k, Some(positions.clone())),
+                    sort_limit(&bounds, &gather(&vals, &positions), k, None)
+                );
+            }
+        }
+    }
 }

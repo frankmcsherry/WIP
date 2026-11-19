@@ -117,6 +117,14 @@ fn label_patterns(rng: &mut Rng, n: usize) -> Vec<Vec<u64>> {
 }
 
 #[test]
+fn sorting_refs_can_use_identity_on_just_the_selected_rows() {
+    let arena = Value::List(vec![1, 2, 3, 4].into(), Box::new(Value::u8(vec![4, 1, 3, 2])));
+    let refs = Value::Ref(arena.into(), vec![0, 3, 2, 3, 0].into());
+    check(&refs, &[], &[3, 0, 2, 0]);
+    check(&refs, &[], &[4, 1, 2, 0]);
+}
+
+#[test]
 fn ordered_refinements_preserve_labels_and_stable_positions() {
     // Each label class is ordered, but keys decrease across class boundaries.
     // Non-identity source coordinates must stay in their original tie order.

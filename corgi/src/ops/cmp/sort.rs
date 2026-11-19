@@ -99,8 +99,9 @@ pub(crate) fn sort_indexed(
         // in place of the references, and mapped back to positions; the sorted column is still
         // references. (An arena row named twice falls back to a scratch clone.)
         Value::Ref(list, rows) => {
-            // references to every arena row in order (as `ref` makes them) name the arena itself
-            if rows.len() == list.len() && rows.iter().enumerate().all(|(i, &r)| i == r) {
+            // When the selected rows already name themselves in the arena, sort at
+            // those coordinates directly. Unselected references do not affect the order.
+            if index.iter().all(|&i| rows[i] == i) {
                 sort_indexed(list, labels, index, Emit::Index, scratch);
                 return emit.values().then(|| gather(v, index));
             }

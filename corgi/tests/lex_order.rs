@@ -156,3 +156,30 @@ fn sort_limit_ignores_payload_free_key_fields() {
     );
     assert_eq!(got, expected);
 }
+
+#[test]
+fn filtered_top_k_preserves_row_boundaries_and_source_positions() {
+    use corgi::{explain::explain, optimize, parse_ml};
+    let data = |v| Program::compile_ml("input ref").unwrap().run(v);
+    let strings = Value::List(vec![1, 1, 3, 4, 4, 6, 7, 8].into(),
+        Box::new(Value::u8(vec![1, 2, 1, 1, 2, 1, 9, 1])));
+    let sum = Value::sum(vec![0, 1, 0, 1, 0, 1, 1, 0],
+        vec![Value::int([0, -2, 7, -2]), Value::int([5, 3, 5, 8])]);
+    let keys = Value::int([0, 0, 2, 0, 3, 2, 0, 0]);
+    for v in [Value::Unit(8), keys.clone(), strings.clone(), data(strings.clone()),
+              sum.clone(), Value::Prod(vec![keys, sum, strings])] {
+        for m in [[0; 8], [-2; 8], [0, 4, 0, -1, 0, 0, 3, -7]] {
+            let input = Value::List(vec![0, 3, 3, 4, 8].into(), Box::new(Value::Prod(vec![Value::int(m), v.clone()])));
+            for k in [0, 1, 3, 15] {
+                let g = parse_ml(&format!("input filter sort_limit {k}")).unwrap();
+                let fused = optimize(&g);
+                assert!(explain(&fused).contains("FilterSortLimit"));
+                let expected = Program::from_graph(g).run(input.clone());
+                assert_eq!(Program::from_graph(fused).run(input.clone()), expected);
+            }
+        }
+    }
+
+    let shared = optimize(&parse_ml("let xs = input filter in (xs, xs sort_limit 2)").unwrap());
+    assert!(!explain(&shared).contains("FilterSortLimit"));
+}
