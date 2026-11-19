@@ -102,7 +102,7 @@ mod generators {
 
     /// an index value with every integer leaf resolved to absolute haystack positions: the same
     /// structure (bounds and tags kept), each leaf column replaced by the positions it names.
-    /// [`IndexPlan::fill`] gathers them.
+    /// [`IndexPlan::fill_or_zero`] gathers them.
     pub(crate) enum IndexPlan {
         Leaf(Vec<usize>),
         Unit(usize),
@@ -112,15 +112,13 @@ mod generators {
     }
 
     /// resolve an index value of any shape (`gather`'s positions): every integer leaf is a position
-    /// relative to its element's TOP-level row of the haystack (`hay`). Clears `ok[r]` when top-level
-    /// row `r` names a position outside its row; such a position is recorded as `usize::MAX`, which
-    /// [`IndexPlan::fill_or_zero`] reads as zero and [`IndexPlan::fill`] must never see.
-    pub(crate) fn index_plan(index: &Value, owners: &Owners, hay: Rows, ok: &mut [bool]) -> Result<IndexPlan, String> {
+    /// relative to its element's TOP-level row of the haystack (`hay`). A position outside its row becomes
+    /// `usize::MAX`, which [`IndexPlan::fill_or_zero`] reads as zero.
+    pub(crate) fn index_plan(index: &Value, owners: &Owners, hay: Rows) -> Result<IndexPlan, String> {
         // a position `x` in owner row `r`, whose span is `(hs, he)`: its place in the payload, or
-        // `usize::MAX` (and `r` marked) when it lies outside the row.
-        fn resolve(ok: &mut [bool], r: usize, (hs, he): (usize, usize), x: u64, pos: &mut Vec<usize>) {
+        // `usize::MAX` when it lies outside the row.
+        fn resolve((hs, he): (usize, usize), x: u64, pos: &mut Vec<usize>) {
             let inside = x < (he - hs) as u64;
-            ok[r] &= inside;
             pos.push(if inside { hs + x as usize } else { usize::MAX });
         }
         Ok(match index {
@@ -129,11 +127,11 @@ mod generators {
                 match p {
                     Prim::I64(xs) => xs.iter().enumerate().for_each(|(j, &x)| {
                         let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), x as u64, &mut pos)
+                        resolve(hay.span(r), x as u64, &mut pos)
                     }),
                     Prim::U8(_) => (0..p.len()).for_each(|j| {
                         let r = owners.get(j);
-                        resolve(ok, r, hay.span(r), p.word_at(j), &mut pos)
+                        resolve(hay.span(r), p.word_at(j), &mut pos)
                     }),
                     Prim::F64(_) => return Err("gather: positions are integers, not floats".into()),
                 }
@@ -141,7 +139,7 @@ mod generators {
             }
             Value::Unit(n) => IndexPlan::Unit(*n),
             Value::Prod(fields) => {
-                IndexPlan::Prod(fields.iter().map(|f| index_plan(f, owners, hay, ok)).collect::<Result<_, _>>()?)
+                IndexPlan::Prod(fields.iter().map(|f| index_plan(f, owners, hay)).collect::<Result<_, _>>()?)
             }
             // a list of positions (the common case) resolves row by row with no owner column; a list
             // of anything else hands its elements their rows.
@@ -153,7 +151,7 @@ mod generators {
                         let r = owners.get(i);
                         let (s, e) = bounds.span(i);
                         let span = hay.span(r);
-                        xs[s..e].iter().for_each(|&x| resolve(ok, r, span, x as u64, &mut pos));
+                        xs[s..e].iter().for_each(|&x| resolve(span, x as u64, &mut pos));
                     }
                     IndexPlan::List(bounds.clone(), Box::new(IndexPlan::Leaf(pos)))
                 }
@@ -163,7 +161,7 @@ mod generators {
                         let (s, e) = bounds.span(i);
                         rows.extend(std::iter::repeat_n(owners.get(i), e - s));
                     }
-                    IndexPlan::List(bounds.clone(), Box::new(index_plan(inner, &Owners::Rows(rows), hay, ok)?))
+                    IndexPlan::List(bounds.clone(), Box::new(index_plan(inner, &Owners::Rows(rows), hay)?))
                 }
             },
             // a lane's elements are its rows in row order, so each lane takes its rows' owners.
@@ -175,7 +173,7 @@ mod generators {
                 let lanes = lanes
                     .iter()
                     .zip(rows)
-                    .map(|(lane, rows)| index_plan(lane, &Owners::Rows(rows), hay, ok))
+                    .map(|(lane, rows)| index_plan(lane, &Owners::Rows(rows), hay))
                     .collect::<Result<_, _>>()?;
                 IndexPlan::Sum(tags.clone(), lanes)
             }
