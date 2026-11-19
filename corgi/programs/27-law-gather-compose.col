@@ -1,7 +1,10 @@
 # the gather-composition law: gathering twice equals gathering once through composed indices —
-# gather(gather(v,i), j) = gather(v, gather(i,j)). This is the rewrite that lets an optimizer
+# gather(gather(v,i), j) = gather(v, gather(i,j)) — wherever the outer positions j are in range.
+# Out of range the two sides differ: the left reads the zero of v's element, but the composed
+# index reads the zero of an Int, position 0, which names a real element (with v = [7, 9] and
+# i = j = [1], the left reads [0] and the right [7]). This is the rewrite that lets an optimizer
 # turn a CHAIN of gathers into index manipulation and a single final gather (collie's lesson,
-# restated as an in-language equivalence rather than a representation).
+# restated as an in-language equivalence rather than a representation); every j here is in range.
 # n = 8
 # = [1]
 let xs = input iota in
