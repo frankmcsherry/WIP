@@ -3,7 +3,7 @@
 //! structural nodes (`Input`, `Tuple`) are handled by the evaluator, not here.
 
 use crate::engine::{
-    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, partition, take_ref, Owners,
+    blend, clone_ref, compress, fill, gather, gather_lanes, index_plan, owner_ids, partition, take_ref, take_spans, Owners,
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
@@ -1111,8 +1111,8 @@ fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
         .iter()
         .zip(&cols)
         .map(|(b, v)| {
-            let idx: Vec<usize> = (0..rows).flat_map(|r| { let s = b.span(r).0; s..s + keep[r] }).collect();
-            gather(v, &idx)
+            let spans: Vec<_> = (0..rows).map(|r| { let s = b.span(r).0; (0, s, s + keep[r]) }).collect();
+            take_spans(&[v], &spans)
         })
         .collect();
     Value::List(ends.into(), Box::new(Value::Prod(inner)))
