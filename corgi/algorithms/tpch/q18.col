@@ -1,0 +1,19 @@
+# TPC-H Q18, in integers: the hundred most expensive orders whose line items total more than 300
+# units. Every order's quantity is summed by `group`: 6M line items into 1.5M orders at scale factor 1.
+# (The customer table only names each order's customer, which `o_custkey` already does.)
+# sql: SELECT c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) FROM customer, orders, lineitem
+# sql:   WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300)
+# sql:   AND c_custkey = o_custkey AND o_orderkey = l_orderkey
+# sql:   GROUP BY c_custkey, o_orderkey, o_orderdate, o_totalprice ORDER BY o_totalprice DESC, o_orderdate, o_orderkey LIMIT 100
+# columns: o_orderkey o_custkey o_orderdate o_totalprice l_orderkey l_quantity
+# output: [u,u,u,u,u]
+let (okey, ocust, odate, oprice, lkey, qty) = input in
+# The orders of more than 300 units, (key, units), sorted by key.
+let big = (lkey, qty) zip group map ((k, qs) -> let q = qs fold_add in ((q, 300) gt, (k, q))) filter sort in
+# Each order looked up among them.
+let found = (okey, big map ((k, _) -> k)) find in
+let orders = (found, ((okey, ocust) zip, (odate, oprice) zip) zip) zip
+    map (((lo, hi), ((k, c), (dt, p))) -> ((hi, lo) gt, (lo, k, c, dt, p))) filter in
+let units = (orders map ((lo, _, _, _, _) -> lo), big) gather map ((_, q) -> q) in
+(orders, units) zip map (((_, k, c, dt, p), q) -> (p neg, dt, k, c, p, q)) sort_limit 100
+    map ((_, dt, k, c, p, q) -> (c, k, dt, p, q))

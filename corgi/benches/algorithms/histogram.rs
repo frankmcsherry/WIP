@@ -18,5 +18,6 @@ pub fn run(cfg: &Cfg) {
     let rust = || rows.iter().map(|r| reference(r)).collect::<Vec<_>>();
     let what = "0-32 values below 1000 into 8 buckets";
     run_case(cfg, "histogram", what, include_str!("../../algorithms/histogram.col"), input.clone(), expected.clone(), rust);
-    run_case(cfg, "histogram_sorted", what, include_str!("../../algorithms/histogram_sorted.col"), input, expected, rust);
+    run_case(cfg, "histogram_sorted", what, include_str!("../../algorithms/histogram_sorted.col"), input.clone(), expected.clone(), rust);
+    run_case(cfg, "histogram_scatter", what, include_str!("../../algorithms/histogram_scatter.col"), input, expected, rust);
 }
