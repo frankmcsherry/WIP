@@ -35,7 +35,7 @@ pub(crate) mod optimize;
 pub(crate) mod shape;
 pub(crate) mod value;
 
-pub use demand::{analyze_demand, Demand, DemandAnalysis};
+pub use demand::{analyze_demand, analyze_demands, Demand, DemandAnalysis};
 pub use frontend::{parse_ml, parse_ml_in, Program, Scope};
 pub use graph::{eval_graph, shape_of, Builder, Graph, NodeRef, OpLike};
 pub use hash::hash;
