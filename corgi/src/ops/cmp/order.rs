@@ -216,6 +216,9 @@ mod compare {
                         match k {
                             0 => return vec![0i8; m],
                             1 => return compare_in(ea, eb, pairs, eq),
+                            // rows of leaves at pairs that are not row against row: a pair is one
+                            // slice comparison, below, with no position written per element.
+                            _ if !matches!(pairs, Pairs::Diagonal(_)) && matches!((&**ea, &**eb), (Value::Prim(_), Value::Prim(_))) => {}
                             _ => {
                                 let sub = if let Pairs::Diagonal(n) = pairs {
                                     compare_in(ea, eb, Pairs::Diagonal(n * k), eq)
@@ -289,6 +292,24 @@ mod compare {
                     };
                 }
                 slices!(U8, I64, F64);
+                // integer elements at two storages: still one comparison per pair of spans, the
+                // bytes widened as it reads them.
+                let spans = |k: usize| (ba.span(pairs.left(k)), bb.span(pairs.right(k)));
+                let mixed = |bytes: &[u8], bytes_at: (usize, usize), words: &[i64], words_at: (usize, usize)| {
+                    if eq && bytes_at.1 - bytes_at.0 != words_at.1 - words_at.0 {
+                        return Ordering::Less;
+                    }
+                    bytes[bytes_at.0..bytes_at.1].iter().map(|&v| v as i64).cmp(words[words_at.0..words_at.1].iter().copied())
+                };
+                match (va, vb) {
+                    (Value::Prim(Prim::U8(x)), Value::Prim(Prim::I64(y))) => {
+                        return (0..m).map(|k| { let (at_a, at_b) = spans(k); mixed(x, at_a, y, at_b) as i8 }).collect();
+                    }
+                    (Value::Prim(Prim::I64(x)), Value::Prim(Prim::U8(y))) => {
+                        return (0..m).map(|k| { let (at_a, at_b) = spans(k); mixed(y, at_b, x, at_a).reverse() as i8 }).collect();
+                    }
+                    _ => {}
+                }
                 let mut ord = vec![0i8; m];
                 let (mut sia, mut sib) = (Vec::new(), Vec::new());
                 let mut seg: Vec<(usize, usize, usize)> = Vec::new(); // (pair k, start in batch, len)

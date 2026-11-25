@@ -500,7 +500,8 @@ fn sort_sum(
 }
 
 /// A list, lexicographically: one refining pass per element position over the rows still tied,
-/// a row that ends there first in its block and leaf elements read straight into keys, then one
+/// a row that ends there first in its block and leaf elements read straight into keys, the elements
+/// a block's rows all share passed over as spans; then one
 /// copy of each row's elements in final order, a range per row, the only copy this sort makes. Equal-width byte records up to 8 wide pack into one `u64` key
 /// and unpack from the sorted keys.
 fn sort_list(
@@ -540,8 +541,8 @@ fn sort_list(
         labels.resize(m, 0);
     }
     run_starts(labels);
-    // Lexicographic: position by position over the rows still tied. In each tied block the rows
-    // that end at `pos` go first, as one class (each is a proper prefix of the rest), and the
+    // Lexicographic: position by position over the rows still tied, each block at its own position
+    // `pos`. In each tied block the rows that end at `pos` go first, as one class (each is a proper prefix of the rest), and the
     // rows that go on sort by their element at `pos`: a leaf's read straight into keys, anything
     // else's through its positions. Bytes go `WINDOW` positions at a time ([`window_key`]).
     let leaf = match vals {
@@ -554,7 +555,9 @@ fn sort_list(
     };
     let step = if bytes.is_some() { WINDOW } else { 1 };
     let mut live: Vec<usize> = (0..m).filter(|&q| in_tie(labels, q)).collect();
-    let mut pos = 0;
+    // how many leading elements the row at each position is known to share with its block: a
+    // block's rows agree on it, and the blocks it splits into start from it.
+    let mut depth = vec![0usize; m];
     let (mut going, mut rows, mut keys, mut labels_j, mut elem) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut slot = std::mem::take(&mut scratch.slot);
     while !live.is_empty() {
@@ -565,6 +568,7 @@ fn sort_list(
         rows.clear();
         keys.clear();
         labels_j.clear();
+        elem.clear();
         let mut b = 0;
         while b < live.len() {
             let q0 = live[b];
@@ -573,6 +577,13 @@ fn sort_list(
                 e += 1;
             }
             let q1 = q0 + (e - b);
+            let mut pos = depth[q0];
+            // leaf elements: the elements the block's rows all share from here are read as spans
+            // and passed over, so the keys are read where the rows first differ or one ends, and
+            // equal rows are done in this one read.
+            if let Some(p) = leaf {
+                pos += shared(p, bounds, &index[q0..q1], pos);
+            }
             let mut ends = 0;
             for q in q0..q1 {
                 let r = index[q];
@@ -586,10 +597,13 @@ fn sort_list(
                         keys.push(window_key(&b[s + pos..t]));
                     } else if let Some(p) = leaf {
                         keys.push(p.key_at(s + pos));
+                    } else {
+                        elem.push(s + pos);
                     }
                     rows.push(r);
                 }
             }
+            depth[q0 + ends..q1].fill(pos + step);
             labels_j.resize(rows.len(), (q0 + ends) as u64);
             going.extend(q0 + ends..q1);
             b = e;
@@ -600,8 +614,6 @@ fn sort_list(
         if leaf.is_some() {
             sort_keys(&mut keys, &mut labels_j, &mut rows, scratch);
         } else {
-            elem.clear();
-            elem.extend(rows.iter().map(|&r| bounds.span(r).0 + pos));
             if let Some(stride) = bounds.strided() {
                 // The partition already supplies the inverse. In particular, a sparse sort
                 // need not allocate a map as large as the entire element column.
@@ -619,7 +631,6 @@ fn sort_list(
             index[q] = r;
         }
         write_starts(labels, &going, &labels_j);
-        pos += step;
         live.clear();
         live.extend(going.iter().copied().filter(|&q| in_tie(labels, q)));
     }
@@ -635,6 +646,41 @@ fn sort_list(
         }
         Value::List(ends.into(), Box::new(take_spans(&[vals], &spans)))
     })
+}
+
+/// How many elements from `from` on the rows `rows` of a list of leaves all share: the length of
+/// the longest common prefix of what remains of each. A row that has ended shares nothing.
+fn shared(p: &Prim, bounds: &Bounds, rows: &[usize], from: usize) -> usize {
+    fn among<T: Eq>(v: &[T], bounds: &Bounds, rows: &[usize], from: usize) -> usize {
+        let rest = |r: usize| {
+            let (s, t) = bounds.span(r);
+            &v[(s + from).min(t)..t]
+        };
+        let first = rest(rows[0]);
+        let mut n = first.len();
+        for &r in &rows[1..] {
+            if n == 0 {
+                break;
+            }
+            let row = rest(r);
+            let most = n.min(row.len());
+            // a block of elements at a time while they agree, then the elements of the last block
+            let mut i = 0;
+            while i + 16 <= most && first[i..i + 16] == row[i..i + 16] {
+                i += 16;
+            }
+            while i < most && first[i] == row[i] {
+                i += 1;
+            }
+            n = i;
+        }
+        n
+    }
+    match p {
+        Prim::U8(v) => among(v, bounds, rows, from),
+        Prim::I64(v) => among(v, bounds, rows, from),
+        Prim::F64(v) => among(v, bounds, rows, from),
+    }
 }
 
 /// How many bytes of a byte list one pass of [`sort_list`] reads.

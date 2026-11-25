@@ -28,6 +28,10 @@ name = "idioms"
 harness = false   # idiomatic corgi against idiomatic Rust; the rows of performance.md gaps.rs does not measure
 
 [[bench]]
+name = "list_spans"
+harness = false   # lists of leaves through the kernels that order and move rows, ragged and fixed, bytes and words
+
+[[bench]]
 name = "algorithms"
 path = "benches/algorithms/main.rs"
 harness = false   # algorithms written as a user would, checked and timed against plain Rust

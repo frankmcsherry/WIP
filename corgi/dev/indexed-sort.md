@@ -49,7 +49,10 @@ so a leaf sorts its keys without carrying positions), or `Both`. `sort_blocks(la
   emitted by the sort; otherwise it is read once at its final offsets.
 - **List.** One refining pass per element position over the rows still tied. In each tied block
   the rows that end at that position move to the front as one class (each is a proper prefix of
-  the rest), and the others refine by their element. Then one gather of the elements in final
+  the rest), and the others refine by their element. Over leaf elements a block first reads, as
+  spans, how many elements its rows all share from where it stands and passes over them, so each
+  pass splits the block or finishes it and equal rows cost one read; each block keeps its own
+  position. Then one gather of the elements in final
   order, the only gather in the file. Byte records up to 8 wide pack into one `u64` key.
 - **Packed leaf runs.** Consecutive leaf fields of a `Prod` whose declared widths fit one `u64`
   sort as one key (`sort_packed`), most significant field first: one set of passes and one

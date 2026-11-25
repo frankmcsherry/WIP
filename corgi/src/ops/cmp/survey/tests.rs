@@ -120,20 +120,20 @@ fn unit_list_survey_groups_by_length() {
 }
 
 #[test]
-fn singleton_list_spans_compare_mixed_integer_storage() {
-    let bytes = Value::u8(vec![1, 2, 9, 1, 3, 9, 2, 4, 9]);
-    let ints = Value::i64(vec![1, 2, 7, 1, 256, 7, 2, -1, 7]);
-    for (a, b) in [(&bytes, &ints), (&ints, &bytes), (&bytes, &bytes), (&ints, &ints)] {
-        for (left, right) in [((0, 3), (0, 3)), ((3, 6), (3, 6)), ((6, 9), (6, 9)), ((0, 2), (0, 3))] {
-            let want = (left.0 + 1..left.1).map(|i| a.as_i64("test").unwrap()[i])
-                .cmp((right.0 + 1..right.1).map(|i| b.as_i64("test").unwrap()[i]));
-            assert_eq!(cmp_spans(a, b, left, right, 1), Some(want));
-        }
+fn list_spans_compare_mixed_integer_storage() {
+    let bytes = [1u8, 2, 9, 1, 3, 9, 2, 4, 9];
+    let ints = [1i64, 2, 7, 1, 256, 7, 2, -1, 7];
+    let wide: Vec<i64> = bytes.iter().map(|&x| x as i64).collect();
+    for (left, right) in [((0, 3), (0, 3)), ((3, 6), (3, 6)), ((6, 9), (6, 9)), ((0, 2), (0, 3))] {
+        let (x, y) = (Ints::U8(&bytes[left.0..left.1]), Ints::I64(&ints[right.0..right.1]));
+        assert_eq!(x.cmp(&y), wide[left.0..left.1].cmp(&ints[right.0..right.1]));
+        assert_eq!(y.cmp(&x), ints[right.0..right.1].cmp(&wide[left.0..left.1]));
+        assert_eq!(x.cmp(&Ints::U8(&bytes[right.0..right.1])), wide[left.0..left.1].cmp(&wide[right.0..right.1]));
     }
-    // All first elements agree across inputs, but singleton equal-prefix classes leave
-    // differently sized suffixes to decide. Both surveys must match the scalar oracle.
-    let a = Value::List(Bounds::Stride(3, 3), Box::new(bytes));
-    let b = Value::List(Bounds::Stride(3, 3), Box::new(ints));
+    // All first elements agree across inputs, and the rest of each row decides. Both surveys
+    // must match the scalar oracle.
+    let a = Value::List(Bounds::Stride(3, 3), Box::new(Value::u8(bytes.to_vec())));
+    let b = Value::List(Bounds::Stride(3, 3), Box::new(Value::i64(ints.to_vec())));
     let (_, _, a) = sort_values(&[], &a);
     let (_, _, b) = sort_values(&[], &b);
     assert_eq!(survey_groups(&a, &b), naive_groups(&a, &b));
@@ -142,8 +142,10 @@ fn singleton_list_spans_compare_mixed_integer_storage() {
 
 #[test]
 #[should_panic(expected = "an integer leaf meets a float leaf")]
-fn singleton_list_spans_reject_integer_float_mix() {
-    cmp_spans(&Value::u8(vec![1]), &Value::f64(vec![1.0]), (0, 1), (0, 1), 0);
+fn list_spans_reject_integer_float_mix() {
+    let a = Value::List(Bounds::Stride(2, 1), Box::new(Value::u8(vec![1, 2])));
+    let b = Value::List(Bounds::Stride(2, 1), Box::new(Value::f64(vec![1.0, 2.0])));
+    survey_groups(&a, &b);
 }
 
 #[test]
