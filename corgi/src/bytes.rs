@@ -204,6 +204,7 @@ fn bounds_rows(bounds: &Bounds) -> usize {
     match bounds {
         Bounds::Offsets(v) => v.len(),
         Bounds::Stride(_, rows) => *rows,
+        other => other.len(),
     }
 }
 
@@ -213,6 +214,7 @@ fn bounds_total(bounds: &Bounds) -> u64 {
     match bounds {
         Bounds::Offsets(v) => v.last().copied().unwrap_or(0) as u64,
         Bounds::Stride(k, rows) => (*k as u64).saturating_mul(*rows as u64),
+        other => other.total() as u64,
     }
 }
 
@@ -289,6 +291,8 @@ fn bounds_len(bounds: &Bounds) -> usize {
     match bounds {
         Bounds::Offsets(v) => 16 + 8 * v.len(),
         Bounds::Stride(..) => 24,
+        // SPIKE: the compact forms travel as offsets
+        other => 16 + 8 * other.len(),
     }
 }
 
@@ -301,6 +305,12 @@ fn write_bounds<W: std::io::Write>(bounds: &Bounds, writer: &mut W) -> std::io::
             word(writer, 0)?;
             word(writer, v.len() as u64)?;
             for &e in v.iter() { word(writer, e as u64)?; }
+            Ok(())
+        }
+        other @ (Bounds::Lens(_) | Bounds::Unary(_)) => {
+            word(writer, 0)?;
+            word(writer, other.len() as u64)?;
+            for e in other.ends() { word(writer, e as u64)?; }
             Ok(())
         }
         Bounds::Stride(k, rows) => {
@@ -557,6 +567,8 @@ fn check_list(bounds: &Bounds, values: &Value) -> Result<(), String> {
                 return Err(format!("corgi::bytes: list stride {k} x {n} rows reaches {total} over {rows} values"));
             }
         }
+        // built here from checked ends, never decoded
+        Bounds::Lens(_) | Bounds::Unary(_) => {}
     }
     Ok(())
 }

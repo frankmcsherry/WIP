@@ -132,12 +132,17 @@ fn level<IA: Rows, IB: Rows>(a: &Value, b: &Value, ia: IA, ib: IB, open: &[usize
         (Value::List(ba, va), Value::List(bb, vb)) => match (ba.strided(), bb.strided()) {
             (Some(0), Some(0)) => {}
             (Some(1), Some(1)) => level(va, vb, ia, ib, open, tree),
-            _ => lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree),
+            _ => {
+                let (ba, bb) = (ba.random_access(usize::MAX), bb.random_access(usize::MAX));
+                lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree)
+            }
         },
         // a referenced list surveys as the rows it names, read through its arena.
         (Value::List(..) | Value::Ref(..), Value::List(..) | Value::Ref(..)) => {
             let (ba, va) = a.rows_of("survey").expect("a list");
             let (bb, vb) = b.rows_of("survey").expect("a list");
+            let ((ra_a, na), (ra_b, nb)) = (ba.random_access(usize::MAX), bb.random_access(usize::MAX));
+            let (ba, bb) = (crate::value::Rows::over(&ra_a, na), crate::value::Rows::over(&ra_b, nb));
             lists((va, |r| ba.span(r)), (vb, |r| bb.span(r)), ia, ib, open, tree);
         }
         _ => panic!("survey: shape mismatch"),

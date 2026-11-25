@@ -159,8 +159,7 @@ impl CmpOp {
                 for (k, s) in compare_adjacent(&vals).into_iter().enumerate() {
                     mask[k + 1] = (s != 0) as u8;
                 }
-                for r in 0..bounds.len() {
-                    let (s, e) = bounds.span(r);
+                for (s, e) in bounds.spans() {
                     if s < e {
                         mask[s] = 1;
                     }
@@ -189,9 +188,7 @@ impl CmpOp {
                 // row base the answer is relative to; the search moves `lo`, so the base is rewalked
                 // off the bounds at the end rather than kept as a third copy of the same column.
                 let (mut lo, mut hi) = (vec![0usize; n], vec![0usize; n]);
-                for r in 0..nb.len() {
-                    let (ns, ne) = nb.span(r);
-                    let (hs, he) = hb.span(r);
+                for ((ns, ne), (hs, he)) in nb.spans().zip(hb.spans()) {
                     for k in ns..ne {
                         lo[k] = hs;
                         hi[k] = he;
@@ -205,9 +202,7 @@ impl CmpOp {
                 batched_bound(hvals, &nvals, &mut upper.0, &mut upper.1, |o| o <= 0);
                 // row-relative: subtract each element's haystack row start, rewalked here.
                 let (mut lo_c, mut hi_c) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                for r in 0..nb.len() {
-                    let (ns, ne) = nb.span(r);
-                    let (hs, _) = hb.span(r);
+                for ((ns, ne), (hs, _)) in nb.spans().zip(hb.spans()) {
                     for k in ns..ne {
                         lo_c.push((lower.0[k] - hs) as i64);
                         hi_c.push((upper.0[k] - hs) as i64);
@@ -240,10 +235,7 @@ fn order_levels(v: &Value, out: &mut Vec<Level>) {
             if !elements.unit_only() {
                 out.push(Level::Elems(v.clone()));
             }
-            out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
-                let (s, e) = inner.span(i);
-                (e - s) as i64
-            }).collect())));
+            out.push(Level::Col(Value::i64(inner.spans().map(|(s, e)| (e - s) as i64).collect())));
         }
         other if other.unit_only() => {}
         other => out.push(Level::Col(other.clone())),
@@ -311,6 +303,8 @@ fn sort_limit(bounds: &Bounds, vals: &Value, k: usize) -> Value {
             Level::Col(c) => play.level(&gather(c, &play.idx), k),
             Level::Elems(list) => {
                 let Value::List(inner, elems) = list else { unreachable!("a list level is a List") };
+                let ra = inner.random_access(play.idx.len());
+                let inner: &Bounds = &ra;
                 // bytes go `WINDOW` at a time, as the sort reads them: one u64 level per window
                 // (`window_key`), which also puts a row that ends first ahead of the rows it is a
                 // prefix of. A window every tied run agrees on (a shared prefix) changes nothing: no sort.

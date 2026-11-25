@@ -231,6 +231,13 @@ mod compare {
                 }
                 let (ba, va) = a.rows_of("compare_idx").expect("a list");
                 let (bb, vb) = b.rows_of("compare_idx").expect("a list");
+                // one decode when both sides are one partition (`Adjacent`, a self-compare)
+                let (ra_a, na) = ba.random_access(m);
+                let (ra_b, nb) = match (&ba, &bb) {
+                    (Rows::Part(x), Rows::Part(y)) if std::ptr::eq(*x, *y) => (ra_a.clone(), None),
+                    _ => bb.random_access(m),
+                };
+                let (ba, bb) = (Rows::over(&ra_a, na), Rows::over(&ra_b, nb));
                 // Lists of equal payload-free elements compare by length alone.
                 if va.same_unit_only_shape(vb) {
                     return (0..m).map(|k| {

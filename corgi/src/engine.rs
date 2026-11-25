@@ -147,9 +147,8 @@ mod generators {
                 Value::Prim(Prim::I64(xs)) => {
                     let mut pos = Vec::with_capacity(xs.len());
                     // one owner per row of positions, so its span is read once per row.
-                    for i in 0..bounds.len() {
+                    for (i, (s, e)) in bounds.spans().enumerate() {
                         let r = owners.get(i);
-                        let (s, e) = bounds.span(i);
                         let span = hay.span(r);
                         xs[s..e].iter().for_each(|&x| resolve(span, x as u64, &mut pos));
                     }
@@ -157,8 +156,7 @@ mod generators {
                 }
                 inner => {
                     let mut rows = Vec::with_capacity(inner.len());
-                    for i in 0..bounds.len() {
-                        let (s, e) = bounds.span(i);
+                    for (i, (s, e)) in bounds.spans().enumerate() {
                         rows.extend(std::iter::repeat_n(owners.get(i), e - s));
                     }
                     IndexPlan::List(bounds.clone(), Box::new(index_plan(inner, &Owners::Rows(rows), hay)?))
@@ -241,6 +239,12 @@ fn gather_impl<const ZERO: bool>(v: &Value, idx: &[usize]) -> Result<Value, Stri
         // rows as ranges of elements; a position past the rows names the one empty row of a second list
         Value::List(bounds, vals) => {
             let n = bounds.len();
+            // a compact partition read at ascending positions (a filter's): one forward pass, no decode
+            if matches!(bounds, Bounds::Lens(_) | Bounds::Unary(_)) && inside(n) && idx.windows(2).all(|w| w[0] <= w[1]) {
+                return Ok(sorted_rows(bounds, vals, idx));
+            }
+            let ra = bounds.random_access(idx.len());
+            let bounds: &Bounds = &ra;
             if inside(n) {
                 list_rows(&[(bounds, vals)], idx.iter().map(|&i| (0, i, i + 1)))
             } else {
@@ -326,18 +330,45 @@ pub(crate) fn compress(v: &Value, mask: &[u8], kept: usize) -> Value {
     dense(v, mask, kept, &at)
 }
 
+/// rows `idx` (ascending) of a list, its spans read in one forward pass (SPIKE).
+fn sorted_rows(b: &Bounds, vals: &Value, idx: &[usize]) -> Value {
+    let (mut out, mut spans) = (crate::value::lists::Builder::new(idx.len()), Vec::new());
+    // lengths: the gap to the next kept row is a sum of lengths, and the row its own length
+    if let Bounds::Lens(l) = b {
+        let (mut at, mut start) = (0, 0);
+        for &i in idx {
+            start += l.lens.sum(at, i);
+            at = i;
+            let len = l.lens.get(i);
+            out.push(len);
+            push_span(&mut spans, 0, start, start + len);
+        }
+        return Value::List(out.finish(), Box::new(take_spans(&[vals], &spans)));
+    }
+    let (mut it, mut at, mut cur) = (b.spans(), 0, (0, 0));
+    for &i in idx {
+        if i + 1 != at {
+            cur = it.nth(i - at).expect("a row in range");
+            at = i + 1;
+        }
+        out.push(cur.1 - cur.0);
+        push_span(&mut spans, 0, cur.0, cur.1);
+    }
+    Value::List(out.finish(), Box::new(take_spans(&[vals], &spans)))
+}
+
 /// rows of lists, each pick `(t, s, e)` naming rows `s..e` of `lists[t]`, as one list. Rows in a
 /// range are a range of their list's elements, and consecutive picks of one list make one longer
 /// range, copied whole.
 fn list_rows(lists: &[(&Bounds, &Value)], picks: impl Iterator<Item = (usize, usize, usize)>) -> Value {
-    let (mut ends, mut acc, mut spans) = (Vec::new(), 0, Vec::new());
+    let (mut out, mut spans) = (crate::value::lists::Builder::new(picks.size_hint().0), Vec::new());
     for (t, s, e) in picks {
         let (a, z) = elems(lists[t].0, s, e);
-        extend_ends(&mut ends, &mut acc, lists[t].0, s, e, a, z);
+        if e == s + 1 { out.push(z - a) } else { out.extend_rows(lists[t].0, s, e) }
         push_span(&mut spans, t, a, z);
     }
     let vals: Vec<&Value> = lists.iter().map(|l| l.1).collect();
-    Value::List(ends.into(), Box::new(take_spans(&vals, &spans)))
+    Value::List(out.finish(), Box::new(take_spans(&vals, &spans)))
 }
 
 /// the elements of rows `s..e` of a list, as a range.
@@ -348,21 +379,6 @@ fn elems(b: &Bounds, s: usize, e: usize) -> (usize, usize) {
         1 => row_span(b, s),
         _ => (row_span(b, s).0, row_span(b, e - 1).1),
     }
-}
-
-/// the ends of rows `s..e` of `b`, whose elements are `a..z`, moved to follow the `acc` elements
-/// already taken; `acc` then counts these too.
-#[inline]
-fn extend_ends(ends: &mut Vec<usize>, acc: &mut usize, b: &Bounds, s: usize, e: usize, a: usize, z: usize) {
-    if e == s + 1 {
-        ends.push(*acc + z - a);
-    } else {
-        match b {
-            Bounds::Offsets(src) => ends.extend(src[s..e].iter().map(|&x| x - a + *acc)),
-            Bounds::Stride(k, _) => ends.extend((1..=e - s).map(|i| *acc + i * k)),
-        }
-    }
-    *acc += z - a;
 }
 
 /// the rows of each span as one position per row, prepared once for whichever fields of a product
