@@ -169,7 +169,11 @@ fn leaf_rows<T: Copy>(n: usize, span: impl Fn(usize) -> (usize, usize), xs: &[T]
             if is_bytes {
                 bytes.extend(row.iter().map(|&x| word(x) as u8));
             } else {
-                bytes.extend(row.iter().flat_map(|&x| word(x).to_le_bytes()));
+                // the row's words laid end to end, written a word at a time into place
+                bytes.resize(row.len() * 8, 0);
+                for (slot, &x) in bytes.chunks_exact_mut(8).zip(row) {
+                    slot.copy_from_slice(&word(x).to_le_bytes());
+                }
             }
             foldhash::hash(&bytes, if is_bytes { LIST } else { WORDS })
         })
