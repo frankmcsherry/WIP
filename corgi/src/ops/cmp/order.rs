@@ -216,6 +216,9 @@ mod compare {
                         match k {
                             0 => return vec![0i8; m],
                             1 => return compare_in(ea, eb, pairs, eq),
+                            // rows of leaves at pairs that are not row against row: a pair is one
+                            // slice comparison, below, with no position written per element.
+                            _ if !matches!(pairs, Pairs::Diagonal(_)) && matches!((&**ea, &**eb), (Value::Prim(_), Value::Prim(_))) => {}
                             _ => {
                                 let sub = if let Pairs::Diagonal(n) = pairs {
                                     compare_in(ea, eb, Pairs::Diagonal(n * k), eq)
