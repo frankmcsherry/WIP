@@ -8,8 +8,8 @@ All tests pass under all three forms.
 - `Lens`: each row's length at the narrowest width that holds the longest row (u8/u16/u32/u64), plus the start of every 64th row as a `usize`.
 - `Unary`: per row, its length in one bits then a zero (rows + elements bits), plus zeros-before per 512-bit block and the block of every 256th zero.
 
-Data: ClickBench `hits_0.parquet` (1M rows), prepared into `~/Projects/datasets/clickbench/data`.
-Machine: mini-03 (M4), one thread.
+Data: ClickBench `hits_0.parquet` (1M rows), prepared with `python3 benches/clickbench/prepare.py DIR hits_0.parquet`; set `CORGI_CLICKBENCH=DIR`.
+Machine: an M4 Mac mini, one thread.
 
 ## Size
 
@@ -99,7 +99,7 @@ Switches (all read once): `CORGI_LENS_LAYOUT=fixed|width|inline`, `CORGI_LENS_SU
 - `masked`: sum the whole block under a mask, with no branch on the row's place in it.
 - `touch`: a batch read first does a pass of plain loads over 256 queries, then the sums.
 
-Random span reads, ns per read, lower is better (`synth*.txt`; "batch" is `Lens::spans_at`, with the width and layout decided once per batch):
+Random span reads, ns per read, lower is better (`SYNTH=rows,longest` in the example; "batch" is `Lens::spans_at`, with the width and layout decided once per batch):
 
 | rows, longest | offsets | fixed | width, masked | inline, masked | width, touch | inline, touch |
 |---|---:|---:|---:|---:|---:|---:|
@@ -115,7 +115,7 @@ What the numbers say:
    A first pass of plain loads per 256 queries restores the overlap: 29.8 to 12.4 ns (width), 29.2 to 10.3 ns (inline).
 3. Inline starts help only once reads are batched with that pass, by about 17% (one line per read instead of two); one read at a time they are slower, because assembling the start from the line is more work.
 4. Lengths stay 1.5x-1.8x slower than offsets per random read at best.
-   The kernels still decode before random reads, so none of this moves them: with `CORGI_DECODE=never` sort runs 1.2x-1.8x slower (`layout2.txt`), because the kernels read one span at a time, not in batches.
+   The kernels still decode before random reads, so none of this moves them: with `CORGI_DECODE=never` sort runs 1.2x-1.8x slower, because the kernels read one span at a time, not in batches.
 
 `len` on a list of byte lengths is now the lengths themselves, shared (`Narrow::U8` is behind an `Arc`): MobilePhoneModel `len` 0.33 to 0.00 ns/row.
 The u16 columns still widen to i64 (0.28 ns/row), since corgi has no u16 leaf.

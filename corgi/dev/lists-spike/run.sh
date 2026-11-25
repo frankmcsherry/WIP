@@ -3,7 +3,8 @@
 # usage: dev/lists-spike/run.sh TAG [queries...]
 set -e
 cd "$(dirname "$0")/../.."
-export PATH="$HOME/.cargo/bin:$PATH" CORGI_CLICKBENCH=$HOME/Projects/datasets/clickbench/data
+export PATH="$HOME/.cargo/bin:$PATH"
+: "${CORGI_CLICKBENCH:?set CORGI_CLICKBENCH to a directory made by benches/clickbench/prepare.py}"
 tag=$1; shift
 cargo bench -q --bench clickbench --no-run 2>/dev/null
 for f in offsets lens unary; do
