@@ -28,7 +28,10 @@ fn int_picks_the_narrowest_storage() {
         (vec![0, 256, 3], IntWidth::U16),
         (vec![65536], IntWidth::U32),
         (vec![u32::MAX as i64 + 1], IntWidth::I64),
-        (vec![-1, 3], IntWidth::I64),
+        (vec![-1, 3], IntWidth::I8),
+        (vec![-1, 200], IntWidth::I16),
+        (vec![-1, 40000], IntWidth::I32),
+        (vec![i32::MIN as i64 - 1], IntWidth::I64),
     ] {
         let v = Value::int(xs.clone());
         assert_eq!(width(&v), Some(w), "{xs:?}");
@@ -37,7 +40,7 @@ fn int_picks_the_narrowest_storage() {
     }
 }
 
-/// Two narrow storages meet at the wider, with no detour through `i64`.
+/// Two integer storages meet at the narrowest storage holding both, with no detour through `i64`.
 #[test]
 fn narrow_storages_meet_at_the_wider() {
     let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![1, 2])), Prim::ints_at(IntWidth::U16, [300, 4].into_iter()));
@@ -45,6 +48,21 @@ fn narrow_storages_meet_at_the_wider() {
     assert_eq!(a, Prim::U8(Arc::new(vec![1, 2])));
     let (a, b) = Prim::meet(Prim::ints_at(IntWidth::U32, [70000].into_iter()), Prim::I64(Arc::new(vec![-1])));
     assert_eq!((a.int_width(), b.int_width()), (Some(IntWidth::I64), Some(IntWidth::I64)));
+    // unsigned meets signed at the narrowest storage holding both ranges
+    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![200])), Prim::ints_at(IntWidth::I8, [-1].into_iter()));
+    assert_eq!((a.int_width(), b.int_width()), (Some(IntWidth::I16), Some(IntWidth::I16)));
+    assert_eq!(IntWidth::U32.join(IntWidth::I8), IntWidth::I64);
+    assert_eq!(IntWidth::U16.join(IntWidth::I32), IntWidth::I32);
+}
+
+/// Signed narrow keys sort in value order, and pack at their width.
+#[test]
+fn signed_keys_order_by_value() {
+    let xs = [-128i64, -1, 0, 1, 127];
+    let p = Prim::ints_at(IntWidth::I8, xs.into_iter());
+    let keys: Vec<u64> = (0..xs.len()).map(|i| p.key_at(i)).collect();
+    assert!(keys.windows(2).all(|w| w[0] < w[1]) && keys.iter().all(|&k| k < 256), "{keys:?}");
+    assert_eq!(p.like_keys(&keys), p);
 }
 
 /// Two integer leaves at different storages meet at `i64`; one storage meets as it is.

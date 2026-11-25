@@ -23,6 +23,9 @@ fn corpus() -> Vec<Value> {
         Value::i64(vec![-1, 0, 12345, i64::MIN]),
         Value::Prim(Prim::ints_at(IntWidth::U16, [1, 65535, 3].into_iter())), // 6 payload bytes, padded
         Value::Prim(Prim::ints_at(IntWidth::U32, [7, u32::MAX as i64, 0].into_iter())),
+        Value::Prim(Prim::ints_at(IntWidth::I8, [-1, 127, -128].into_iter())),
+        Value::Prim(Prim::ints_at(IntWidth::I16, [-300, 5].into_iter())),
+        Value::Prim(Prim::ints_at(IntWidth::I32, [i32::MIN as i64, 70000, -1].into_iter())),
         Value::Prod(vec![]),
         Value::Prod(vec![Value::i64(vec![1, 2]), Value::u8(vec![3, 4])]),
         Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::f64(vec![9.0, 8.0, 7.0, 6.0]))),

@@ -7,7 +7,7 @@ use crate::engine::{
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
-use crate::value::{Bounds, Prim, Rows, Tags, Value};
+use crate::value::{Bounds, IntWidth, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
 /// the rounds of a `Fold` or `FoldScan`. Round `t` runs the body once, over every row that has a
@@ -753,8 +753,8 @@ impl<L: OpLike> Op<L> {
                 let leaves: Option<Vec<&Prim>> =
                     parts.iter().map(|(_, v)| if let Value::Prim(p) = v { Some(p) } else { None }).collect();
                 if let Some(leaves) = leaves {
-                    let mixed = leaves.iter().any(|p| p.bits() != leaves[0].bits());
-                    let join = leaves.iter().filter_map(|p| p.int_width()).max();
+                    let mixed = leaves.iter().any(|p| !p.same_storage(leaves[0]));
+                    let join = leaves.iter().filter_map(|p| p.int_width()).reduce(IntWidth::join);
                     let prims: Vec<Prim> = leaves.iter().map(|p| match join {
                         Some(w) if mixed => p.cast(w),
                         _ => (*p).clone(),
@@ -843,6 +843,9 @@ impl<L: OpLike> Op<L> {
                     Value::Prim(Prim::U8(t)) => one_lane(t, |x| x as u64, last),
                     Value::Prim(Prim::U16(t)) => one_lane(t, |x| x as u64, last),
                     Value::Prim(Prim::U32(t)) => one_lane(t, |x| x as u64, last),
+                    Value::Prim(Prim::I8(t)) => one_lane(t, |x| x as i64 as u64, last),
+                    Value::Prim(Prim::I16(t)) => one_lane(t, |x| x as i64 as u64, last),
+                    Value::Prim(Prim::I32(t)) => one_lane(t, |x| x as i64 as u64, last),
                     Value::Prim(Prim::I64(t)) => one_lane(t, |x| x as u64, last),
                     _ => None,
                 };
@@ -857,6 +860,9 @@ impl<L: OpLike> Op<L> {
                     Value::Prim(Prim::U8(t)) => route(t, |x| x as u64, *n),
                     Value::Prim(Prim::U16(t)) => route(t, |x| x as u64, *n),
                     Value::Prim(Prim::U32(t)) => route(t, |x| x as u64, *n),
+                    Value::Prim(Prim::I8(t)) => route(t, |x| x as i64 as u64, *n),
+                    Value::Prim(Prim::I16(t)) => route(t, |x| x as i64 as u64, *n),
+                    Value::Prim(Prim::I32(t)) => route(t, |x| x as i64 as u64, *n),
                     Value::Prim(Prim::I64(t)) => route(t, |x| x as u64, *n),
                     other => return Err(format!("Branch tags: expected Int, got {}", shape_of_value(other))),
                 };
