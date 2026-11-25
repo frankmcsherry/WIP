@@ -292,6 +292,30 @@ fn list_of_sum_fully_discriminated() {
 }
 
 #[test]
+fn lists_sharing_long_prefixes() {
+    // rows that share spans of many elements, some equal and some a prefix of others, alone and
+    // under a field that ties them into blocks, at each integer storage: the shared spans are
+    // passed over a block at a time, and the order must be the reference's all the same.
+    let m = 300u64;
+    let (mut bounds, mut vals, mut keys) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..m {
+        let h = i.wrapping_mul(2654435761) >> 7;
+        // a prefix shared by the rows of one of four families, then a tail from a few
+        let shared = [0, 5, 17, 40][(h % 4) as usize];
+        vals.extend((0..shared).map(|j| (h % 4) * 3 + j % 3));
+        vals.extend((0..(h >> 2) % 20).map(|j| ((h >> 6) % 3 + j) % 4));
+        bounds.push(vals.len());
+        keys.push((h >> 9) % 6);
+    }
+    let bounds: Bounds = bounds.into();
+    for leaf in [u(&vals), Value::u8(vals.iter().map(|&x| x as u8).collect())] {
+        let list = Value::List(bounds.clone(), Box::new(leaf));
+        agree(&list);
+        agree(&Value::Prod(vec![u(&keys), list.clone(), u(&(0..m).rev().collect::<Vec<_>>())]));
+    }
+}
+
+#[test]
 fn variable_length_lists_at_scale() {
     // many u64-list rows of differing length — exercises the list arm and its position recursion, rows
     // ending at every position; must agree with the compare2 reference.
