@@ -41,11 +41,11 @@ and the excess joins the run that follows, which is what a two-pointer walk repo
   open: a leading field that leaves most rows tied costs a full pass over both inputs per level,
   and one that separates them costs nothing after. It is never proportional to the reports
   already made; the tree is flattened once at the end with adjacent runs of one side joined.
-- **Long lists.** Each element position is a level, so a column of a few rows holding long
-  lists would pay a level's fixed cost, five vectors and a walk, per element. A class down to
-  one row a side over leaf elements compares the rest of its two spans as slices at once
-  instead, which covers the two-rows-of-a-million case; a class of several rows sharing a long
-  prefix still pays per position, linear in the elements but with that constant. A class keeps its offsets in the index lists of the
+- **Long lists.** Over leaf elements a list level is one merge keyed by each row's span, a
+  slice of the leaf, since slices order as the rows do: no level per element position, and an
+  equal class of long rows costs the comparisons of its gallop. Over any other elements each
+  position is still a level, which pays a level's fixed cost, five vectors and a walk, per
+  element. A class keeps its offsets in the index lists of the
   level that made it, and a level that descends rewrites them to the lists it builds, so a
   sub-class's rows are always a sub-range of an ancestor's segment.
 
