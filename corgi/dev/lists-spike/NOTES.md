@@ -119,3 +119,12 @@ What the numbers say:
 
 `len` on a list of byte lengths is now the lengths themselves, shared (`Narrow::U8` is behind an `Arc`): MobilePhoneModel `len` 0.33 to 0.00 ns/row.
 The u16 columns still widen to i64 (0.28 ns/row), since corgi has no u16 leaf.
+
+## Decisions (2026-11-24)
+
+This spike is for learning, not for adoption.
+Variable-width integers in corgi come first; lengths would then be an ordinary leaf, and `len` free at every width.
+
+- Keep: blocks sized by width (64 bytes of lengths) and the branch-free masked block sum.
+- Think about: two-pass batched reads; they pay only past the caches and only for kernels that read spans in batches.
+- Drop: starts inline with their lengths.
