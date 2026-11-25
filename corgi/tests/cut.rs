@@ -84,4 +84,10 @@ fn cut_edges() {
     let mut mask = vec![0u8; 4000];
     mask[2000..2040].fill(7);
     check(vec![2000, 2040, 4000], mask, "one dense row in a sparse column");
+    // few marks, each on a row's first element or its last, with empty rows between
+    let mut mask = vec![0u8; 1000];
+    for k in [0, 99, 100, 300, 999] {
+        mask[k] = 1;
+    }
+    check(vec![100, 100, 300, 300, 300, 1000], mask, "sparse marks on rows' first and last elements");
 }

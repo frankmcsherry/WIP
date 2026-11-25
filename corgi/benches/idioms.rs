@@ -371,7 +371,7 @@ fn main() {
         if runs("sum_wide") { sum_wide(rows, 50, "50%"); sum_wide(rows, 5, "5%"); }
         if runs("list") { for m in [4, 16, 64] { list_reduce(lists, m); } }
         if runs("cut") { for one_in in [1, 2, 6, 64, 4096] { cut(rows, one_in); } }
-        if runs("cut_rows") { for below in [500, 150, 10] { cut_rows(lists, below); } }
+        if runs("cut_rows") { for below in [500, 150, 10, 1] { cut_rows(lists, below); } }
         if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(lists, m); } }
         if runs("sort_results") { sort_results(rows); }
         if runs("distinct_pairs") { distinct_pairs(rows); }
