@@ -141,7 +141,17 @@ fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
         (Prim::U8(x), Prim::U8(y)) => {
             Prim::I64(Arc::new(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)).collect()))
         }
-        _ => unreachable!("int_pairs: integer leaves, checked by the caller"),
+        // `u16` and `u32` operands widen first, one pass each, so that the lane loop above is the
+        // only one, and the dispatch stays at the two storages it has
+        (a, b) => int_pairs(widen_wide(a), widen_wide(b), f),
+    }
+}
+
+/// a `u16` or `u32` leaf at `i64`; bytes and `i64`s as they are.
+fn widen_wide(p: Prim) -> Prim {
+    match p {
+        Prim::U16(_) | Prim::U32(_) => p.widen(),
+        p => p,
     }
 }
 
@@ -151,6 +161,8 @@ fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
     match a {
         Prim::I64(x) => Prim::I64(map_into(x, f)),
         Prim::U8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
+        Prim::U16(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
+        Prim::U32(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
         Prim::F64(_) => unreachable!("int_map: an integer leaf, checked by the caller"),
     }
 }
@@ -493,6 +505,8 @@ impl ArithOp {
                 let (bounds, vals) = input.into_list("reduce")?;
                 match vals.into_prim("reduce values")? {
                     Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::U16(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::U32(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::F64(ks) => reduce_floats(&bounds, &ks, *r)?,
                 }

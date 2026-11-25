@@ -221,12 +221,14 @@ fn bounds_total(bounds: &Bounds) -> u64 {
 fn prim_len(p: &Prim) -> usize {
     match p {
         Prim::U8(v) => v.len(),
+        Prim::U16(v) => v.len(),
+        Prim::U32(v) => v.len(),
         Prim::I64(v) => v.len(),
         Prim::F64(v) => v.len(),
     }
 }
 
-/// the storage word of a float leaf (an integer leaf's is its width in bits).
+/// the storage word of a float leaf (an integer leaf's is its width in bits: 8, 16, 32 or 64).
 const FLOAT: u64 = 0xF64;
 
 // --- encoding helpers ---------------------------------------------------------------------------
@@ -241,6 +243,8 @@ fn word<W: std::io::Write>(writer: &mut W, x: u64) -> std::io::Result<()> {
 fn prim_payload_len(p: &Prim) -> usize {
     match p {
         Prim::U8(v) => v.len(),
+        Prim::U16(v) => 2 * v.len(),
+        Prim::U32(v) => 4 * v.len(),
         Prim::I64(v) => 8 * v.len(),
         Prim::F64(v) => 8 * v.len(),
     }
@@ -252,6 +256,8 @@ fn prim_payload_len(p: &Prim) -> usize {
 fn write_prim<W: std::io::Write>(p: &Prim, writer: &mut W) -> std::io::Result<()> {
     let (storage, len) = match p {
         Prim::U8(v) => (8u64, v.len()),
+        Prim::U16(v) => (16, v.len()),
+        Prim::U32(v) => (32, v.len()),
         Prim::I64(v) => (64, v.len()),
         Prim::F64(v) => (FLOAT, v.len()),
     };
@@ -262,6 +268,8 @@ fn write_prim<W: std::io::Write>(p: &Prim, writer: &mut W) -> std::io::Result<()
     // still a linear scan of the column with no per-row allocation or dispatch.
     match p {
         Prim::U8(v) => writer.write_all(v)?,
+        Prim::U16(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
+        Prim::U32(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
         Prim::I64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
         Prim::F64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
     }
@@ -570,6 +578,8 @@ fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     // that walks off the buffer.
     let payload = match storage {
         8 => r.count(1, "byte leaf")?,
+        16 => 2 * r.count(2, "u16 leaf")?,
+        32 => 4 * r.count(4, "u32 leaf")?,
         64 => 8 * r.count(8, "i64 leaf")?,
         FLOAT => 8 * r.count(8, "f64 leaf")?,
         other => return Err(format!("corgi::bytes: bad leaf storage {other}")),
@@ -577,6 +587,8 @@ fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     let bytes = r.payload(payload)?;
     Ok(match storage {
         8 => Prim::U8(Arc::new(bytes.to_vec())),
+        16 => Prim::U16(Arc::new(read_le(bytes, u16::from_le_bytes))),
+        32 => Prim::U32(Arc::new(read_le(bytes, u32::from_le_bytes))),
         64 => Prim::I64(Arc::new(read_le(bytes, i64::from_le_bytes))),
         _ => Prim::F64(Arc::new(read_le(bytes, u64::from_le_bytes))),
     })

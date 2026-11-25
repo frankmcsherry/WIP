@@ -12,7 +12,7 @@
 //! gathered, and the shape is walked once per level rather than once per comparison. Layout, top
 //! down: the reports, the entry point, the level walk, the leaf merges, the report tree.
 
-use crate::value::{Prim, Value};
+use crate::value::{Ints, Prim, Value};
 
 /// One report from [`survey_groups`]: a maximal range from one side that comes next in merged
 /// order, or an equal class as the maximal ranges on both sides.
@@ -234,11 +234,15 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
                 $( (Prim::$V(va), Prim::$V(vb)) => merge(|j| va[ia.row(j)], |j| vb[ib.row(j)], open, tree), )*
                 (Prim::U8(a), Prim::I64(b)) => merge(|j| a[ia.row(j)] as i64, |j| b[ib.row(j)], open, tree),
                 (Prim::I64(a), Prim::U8(b)) => merge(|j| a[ia.row(j)], |j| b[ib.row(j)] as i64, open, tree),
+                (a, b) if a.is_int() && b.is_int() => {
+                    let (a, b) = (Ints::of(a, "survey"), Ints::of(b, "survey"));
+                    merge(|j| a.at(ia.row(j)), |j| b.at(ib.row(j)), open, tree)
+                }
                 _ => panic!("an integer leaf meets a float leaf"),
             }
         };
     }
-    go!(U8, I64, F64)
+    go!(U8, U16, U32, I64, F64)
 }
 
 /// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
@@ -252,6 +256,10 @@ fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize,
     match (pa, pb) {
         (Prim::U8(x), Prim::I64(y)) => return Some(x[sa + from..ea].iter().map(|&v| v as i64).cmp(y[sb + from..eb].iter().copied())),
         (Prim::I64(x), Prim::U8(y)) => return Some(x[sa + from..ea].iter().copied().cmp(y[sb + from..eb].iter().map(|&v| v as i64))),
+        (a, b) if a.is_int() && b.is_int() && a.bits() != b.bits() => {
+            let (x, y) = (Ints::of(a, "survey"), Ints::of(b, "survey"));
+            return Some((sa + from..ea).map(|i| x.at(i)).cmp((sb + from..eb).map(|i| y.at(i))));
+        }
         _ => {}
     }
     macro_rules! go {
@@ -262,7 +270,7 @@ fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize,
             }
         };
     }
-    go!(U8, I64, F64)
+    go!(U8, U16, U32, I64, F64)
 }
 
 /// The leaf lanes of `a` and `b`, in structural order, when the shape is nothing but leaves,

@@ -115,6 +115,11 @@ impl CmpOp {
                     (Value::Prim(Prim::U8(x)), Prim::I64(c)) => equal_to(bounds, x, c, ne, |a, b| a as i64 == b),
                     (Value::Prim(Prim::I64(x)), Prim::U8(c)) => equal_to(bounds, x, c, ne, |a, b| a == b as i64),
                     (Value::Prim(Prim::F64(x)), Prim::F64(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
+                    // the wider narrow storages: both sides read at `i64`
+                    (Value::Prim(x), c) if x.is_int() && c.is_int() => {
+                        let (x, c) = (x.to_i64_vec(), c.to_i64_vec());
+                        equal_to(bounds, &x, &c, ne, |a, b| a == b)
+                    }
                     (other, _) => {
                         return Err(format!("compare with a constant list: List<{}> against {:?}", shape_of_value(other), c));
                     }

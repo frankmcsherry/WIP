@@ -753,8 +753,12 @@ impl<L: OpLike> Op<L> {
                 let leaves: Option<Vec<&Prim>> =
                     parts.iter().map(|(_, v)| if let Value::Prim(p) = v { Some(p) } else { None }).collect();
                 if let Some(leaves) = leaves {
-                    let wide = leaves.iter().any(|p| p.bits() != leaves[0].bits());
-                    let prims: Vec<Prim> = leaves.iter().map(|p| if wide { p.widen() } else { (*p).clone() }).collect();
+                    let mixed = leaves.iter().any(|p| p.bits() != leaves[0].bits());
+                    let join = leaves.iter().filter_map(|p| p.int_width()).max();
+                    let prims: Vec<Prim> = leaves.iter().map(|p| match join {
+                        Some(w) if mixed => p.cast(w),
+                        _ => (*p).clone(),
+                    }).collect();
                     let (vals, bounds) = match &prims[..] {
                         [a, b] => {
                             let (vals, ends) = a.append_rows(&parts[0].0, b, &parts[1].0);
@@ -837,6 +841,8 @@ impl<L: OpLike> Op<L> {
                 // every row to one lane: the payload IS that lane, and the others are empty.
                 let one = match &tags_v {
                     Value::Prim(Prim::U8(t)) => one_lane(t, |x| x as u64, last),
+                    Value::Prim(Prim::U16(t)) => one_lane(t, |x| x as u64, last),
+                    Value::Prim(Prim::U32(t)) => one_lane(t, |x| x as u64, last),
                     Value::Prim(Prim::I64(t)) => one_lane(t, |x| x as u64, last),
                     _ => None,
                 };
@@ -849,6 +855,8 @@ impl<L: OpLike> Op<L> {
                 // the tags read where they are stored
                 let (tag8, off, sizes) = match &tags_v {
                     Value::Prim(Prim::U8(t)) => route(t, |x| x as u64, *n),
+                    Value::Prim(Prim::U16(t)) => route(t, |x| x as u64, *n),
+                    Value::Prim(Prim::U32(t)) => route(t, |x| x as u64, *n),
                     Value::Prim(Prim::I64(t)) => route(t, |x| x as u64, *n),
                     other => return Err(format!("Branch tags: expected Int, got {}", shape_of_value(other))),
                 };

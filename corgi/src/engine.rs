@@ -129,7 +129,7 @@ mod generators {
                         let r = owners.get(j);
                         resolve(hay.span(r), x as u64, &mut pos)
                     }),
-                    Prim::U8(_) => (0..p.len()).for_each(|j| {
+                    Prim::U8(_) | Prim::U16(_) | Prim::U32(_) => (0..p.len()).for_each(|j| {
                         let r = owners.get(j);
                         resolve(hay.span(r), p.word_at(j), &mut pos)
                     }),

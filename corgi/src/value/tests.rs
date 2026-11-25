@@ -17,16 +17,34 @@ fn integers_are_equal_across_storages() {
     assert_ne!(Value::i64(vec![0]), Value::f64(vec![0.0]));
 }
 
-/// `Value::int` holds integers as bytes when every one fits (an empty column too), else as `i64`s,
-/// and either is the value `Value::i64` of the same integers is.
+/// `Value::int` holds integers at the narrowest storage that holds every one (an empty column as
+/// bytes), and each is the value `Value::i64` of the same integers is.
 #[test]
 fn int_picks_the_narrowest_storage() {
-    let bytes = |v: &Value| matches!(v, Value::Prim(Prim::U8(_)));
-    for (xs, narrow) in [(vec![0, 7, 255], true), (vec![], true), (vec![0, 256, 3], false), (vec![-1, 3], false)] {
+    let width = |v: &Value| match v { Value::Prim(p) => p.int_width(), _ => None };
+    for (xs, w) in [
+        (vec![0, 7, 255], IntWidth::U8),
+        (vec![], IntWidth::U8),
+        (vec![0, 256, 3], IntWidth::U16),
+        (vec![65536], IntWidth::U32),
+        (vec![u32::MAX as i64 + 1], IntWidth::I64),
+        (vec![-1, 3], IntWidth::I64),
+    ] {
         let v = Value::int(xs.clone());
-        assert_eq!(bytes(&v), narrow, "{xs:?}");
-        assert_eq!(v, Value::i64(xs));
+        assert_eq!(width(&v), Some(w), "{xs:?}");
+        assert_eq!(v, Value::i64(xs.clone()));
+        assert_eq!(crate::hash::hash(&v), crate::hash::hash(&Value::i64(xs)));
     }
+}
+
+/// Two narrow storages meet at the wider, with no detour through `i64`.
+#[test]
+fn narrow_storages_meet_at_the_wider() {
+    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![1, 2])), Prim::ints_at(IntWidth::U16, [300, 4].into_iter()));
+    assert_eq!((a.int_width(), b.int_width()), (Some(IntWidth::U16), Some(IntWidth::U16)));
+    assert_eq!(a, Prim::U8(Arc::new(vec![1, 2])));
+    let (a, b) = Prim::meet(Prim::ints_at(IntWidth::U32, [70000].into_iter()), Prim::I64(Arc::new(vec![-1])));
+    assert_eq!((a.int_width(), b.int_width()), (Some(IntWidth::I64), Some(IntWidth::I64)));
 }
 
 /// Two integer leaves at different storages meet at `i64`; one storage meets as it is.

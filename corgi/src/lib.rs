@@ -43,7 +43,7 @@ pub use ops::host::{HostKernel, HostOp};
 pub use ops::{ArithOp, BinOp, BitOp, CmpOp, NumOp, Op, Pattern, Pred, Red, ShiftOp, TextOp};
 pub use optimize::{cancel_isos, compile, Compiled, cse, dce, fuse_maps, immediates, narrow, optimize, peephole, Narrowed};
 pub use shape::{shape_of_value, Shape};
-pub use value::{show, Bounds, Scalar, Tags, Value};
+pub use value::{show, Bounds, IntWidth, Scalar, Tags, Value};
 
 /// Arrangement-substrate support: row-level primitives for using corgi columns directly as a
 /// differential-dataflow batch (merge/sort/gather/compare over flat columns), without decoding
