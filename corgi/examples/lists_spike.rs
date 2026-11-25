@@ -22,7 +22,9 @@ fn best(mut f: impl FnMut()) -> Duration {
     best
 }
 
-const KERNELS: [(&str, &str); 6] = [
+const KERNELS: [(&str, &str); 8] = [
+    ("cut_mask", "input map (s -> s map (c -> ((c, 47) eq, c)))"),
+    ("cut", "input map (s -> s map (c -> ((c, 47) eq, c)) cut)"),
     ("len", "input map (s -> s len)"),
     ("filter", "input map (s -> ((s len, 0) gt, s)) filter"),
     ("hash_group", "input map (s -> (s, ())) hash_group len"),

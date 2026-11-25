@@ -69,3 +69,23 @@ q29 reads no strings and flips between 18 and 36 ms from run to run; ignore it.
 - Wire format: compact forms are written as offsets (`bytes.rs`).
 
 The earlier standalone study (`~/Projects/widths-spike`, 2026-10-31) measured Elias-Fano at 6-14 bits/row; it is the fix for unary's long-row size, not tried here.
+
+## Follow-up: `cut` writing lengths
+
+`cut_lens` in `src/ops/core.rs` (on top of PR #161's branch-free `cut`) writes both levels as lengths, at the width of the longest input row, which bounds every piece and every piece count.
+Each position writes itself relative to its row, a mark keeps it, and the row's ends become lengths with one subtraction per piece.
+
+Cutting ClickBench strings at `/` (`KERNELS=cut`, ns/row, lower is better):
+
+| column | pieces/row | offsets | lens | output bounds, offsets → lens |
+|---|---:|---:|---:|---:|
+| SearchPhrase | 0.07 | 3.40 | 2.92 (0.86x) | 8.6 → 2.3 MB |
+| MobilePhoneModel | 0.02 | 2.30 | 1.59 (0.69x) | 8.2 → 1.1 MB |
+| URL | 5.64 | 45.9 | 51.5 (1.12x) | 53.1 → 14.1 MB |
+| Title | 1.06 | 36.6 | 37.7 (1.03x) | 16.5 → 4.4 MB |
+| Referer | 5.76 | 42.0 | 47.4 (1.13x) | 54.1 → 14.4 MB |
+
+The output is 3.8x smaller, but `cut` alone gets no faster on long strings.
+82% of the URL time is the per-byte mask loop (about 0.4 ns/byte); every position writes the same slot until a mark moves it on, so the output stores stay in cache whatever their width.
+Forcing u32 or u64 lengths does not move URL (52.1, 53.7), so the 12% loss is not the store width; I have not found its cause.
+`benches/idioms -- cut cut_rows` (i64 lists) shows lens at 0.95x-1.21x of offsets.

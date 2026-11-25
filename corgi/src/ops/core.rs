@@ -1136,6 +1136,10 @@ fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
 /// remainder, and then the kept elements are no longer contiguous, so they are gathered (cold).
 /// `Cut`: each row's pieces end where the next marked element starts one, and at the row's end.
 fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
+    // SPIKE: under `CORGI_LISTS=lens`, the pieces are written as lengths
+    if crate::value::lists::form() == crate::value::lists::Form::Lens {
+        return cut_lens(bounds, mask, vals);
+    }
     // Each position after a row's first is written as a piece's end, and the next write lands on
     // it unless it was marked: no branch on the mask, so the cost does not depend on how the marks
     // fall (as `compress` finds its kept positions). The marks are counted first, for the size:
@@ -1175,6 +1179,71 @@ fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
     }
     inner.truncate(n);
     Value::List(outer.into(), Box::new(Value::List(inner.into(), Box::new(vals))))
+}
+
+/// `cut` writing lengths (SPIKE): a piece is no longer than its row, and a row holds no more pieces
+/// than elements, so both levels fit the width of the longest row. A list of lengths knows that
+/// width already; offsets are scanned for it.
+fn cut_lens(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
+    use crate::value::lists::{Lens, Narrow};
+    let longest = match bounds {
+        Bounds::Lens(l) => match l.lens { Narrow::U8(_) => 255, Narrow::U16(_) => 65535, Narrow::U32(_) => u32::MAX as usize, Narrow::U64(_) => usize::MAX },
+        Bounds::Stride(k, _) => *k,
+        _ => bounds.spans().map(|(s, e)| e - s).max().unwrap_or(0),
+    };
+    let marks = mask.iter().map(|&m| (m != 0) as usize).sum::<usize>();
+    let sparse = marks * CUT_SPARSE <= mask.len();
+    macro_rules! at {
+        ($T:ty, $V:ident) => {{
+            let mut outer: Vec<$T> = Vec::with_capacity(bounds.len());
+            let mut inner: Vec<$T> = vec![0; marks + bounds.len() + 1];
+            let mut n = 0usize;
+            for (start, end) in bounds.spans() {
+                let n0 = n;
+                if end > start {
+                    // each position writes itself, relative to the row, as the end of the piece
+                    // that would end there, and a mark keeps it (as `cut` does); the row's ends
+                    // become lengths afterwards, one subtraction per piece
+                    let mut k = 1;
+                    let mut rest = &mask[start + 1..end];
+                    let len = end - start;
+                    if sparse && rest.len() >= 16 {
+                        let mut words = rest.chunks_exact(8);
+                        for word in &mut words {
+                            if u64::from_le_bytes(word.try_into().expect("eight bytes")) != 0 {
+                                for (j, &m) in word.iter().enumerate() {
+                                    inner[n] = (k + j) as $T;
+                                    n += (m != 0) as usize;
+                                }
+                            }
+                            k += 8;
+                        }
+                        rest = words.remainder();
+                    }
+                    for (j, &m) in rest.iter().enumerate() {
+                        inner[n] = (k + j) as $T;
+                        n += (m != 0) as usize;
+                    }
+                    inner[n] = len as $T;
+                    n += 1;
+                    for p in (n0 + 1..n).rev() {
+                        inner[p] -= inner[p - 1];
+                    }
+                }
+                outer.push((n - n0) as $T);
+            }
+            inner.truncate(n);
+            let lens = |v: Vec<$T>| {
+                let l = Lens::from_lens(Narrow::$V(v));
+                Bounds::uniform_lens(&l).unwrap_or_else(|| Bounds::Lens(Arc::new(l)))
+            };
+            Value::List(lens(outer), Box::new(Value::List(lens(inner), Box::new(vals))))
+        }};
+    }
+    if longest <= u8::MAX as usize { at!(u8, U8) }
+    else if longest <= u16::MAX as usize { at!(u16, U16) }
+    else if longest <= u32::MAX as usize { at!(u32, U32) }
+    else { at!(u64, U64) }
 }
 
 /// A column with at most one mark per this many elements is cut by skipping its unmarked words.
