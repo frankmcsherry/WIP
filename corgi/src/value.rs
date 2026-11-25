@@ -338,19 +338,14 @@ pub(crate) trait Elem: Copy + Ord + Default + std::fmt::Debug {
 
 const SIGN: u64 = 1 << 63;
 
-// the unsigned storages: the key is the value, and so is the word.
-macro_rules! elem_unsigned {
-    ($($t:ty),*) => { $(
-        impl Elem for $t {
-            const BITS: u32 = <$t>::BITS;
-            #[inline] fn key(self) -> u64 { self as u64 }
-            #[inline] fn from_key(k: u64) -> Self { k as $t }
-            #[inline] fn word(self) -> u64 { self as u64 }
-            #[inline] fn from_int(x: i64) -> Self { x as $t }
-        }
-    )* };
+// bytes: the key is the value, and so is the word.
+impl Elem for u8 {
+    const BITS: u32 = 8;
+    #[inline] fn key(self) -> u64 { self as u64 }
+    #[inline] fn from_key(k: u64) -> Self { k as u8 }
+    #[inline] fn word(self) -> u64 { self as u64 }
+    #[inline] fn from_int(x: i64) -> Self { x as u8 }
 }
-elem_unsigned!(u8, u16, u32);
 
 // the narrow signed storages: the key flips the sign bit AT THE STORAGE'S WIDTH, so keys order
 // within one storage and pack at its width; the word is the sign-extended two's complement.
@@ -443,8 +438,8 @@ impl Scalar {
 
 /// a leaf column: one storage per variant, each a naturally aligned `Vec` behind an `Arc` (leaves
 /// are write-once read-many; `eval` clones freely for shared edges, so a leaf clone must be a
-/// refcount bump, not a buffer copy). The integer storages (unsigned and signed at 8, 16 and 32
-/// bits, and `I64`) all hold integers, the same values at different widths: a kernel reading two
+/// refcount bump, not a buffer copy). The integer storages (`U8`, and signed `I8`, `I16`, `I32`
+/// and `I64`) all hold integers, the same values at different widths: a kernel reading two
 /// integer leaves at different storages brings both to the narrowest storage holding both
 /// ([`Prim::meet`], [`IntWidth::join`]). `F64` holds floats, as their total-order keys. The `prim!` macro lists the
 /// storages ONCE and generates the enum and every per-storage method.
@@ -914,39 +909,34 @@ macro_rules! prim {
 prim! {
     U8 => u8,
     I8 => i8,
-    U16 => u16,
     I16 => i16,
-    U32 => u32,
     I32 => i32,
     I64 => i64,
     F64 => u64,
 }
 
-/// the integer storages: unsigned and signed at 8, 16 and 32 bits, and `i64`. Two storages meet
-/// at the narrowest storage holding both ranges, so `u8` and `i8` meet at `i16`, and a value fits
-/// the narrowest storage that holds it (an unsigned one before the signed one of the same width).
+/// the integer storages: bytes (`u8`, for text, masks and tags) and signed integers at 8, 16, 32
+/// and 64 bits. Two storages meet at the narrowest storage holding both ranges, which is the
+/// wider of the two except that `u8` and `i8` meet at `i16`; a value fits the narrowest storage
+/// that holds it, `u8` before `i8`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntWidth {
     U8,
     I8,
-    U16,
     I16,
-    U32,
     I32,
     I64,
 }
 
 impl IntWidth {
     /// every integer storage, narrowest first.
-    pub const ALL: [IntWidth; 7] = [IntWidth::U8, IntWidth::I8, IntWidth::U16, IntWidth::I16, IntWidth::U32, IntWidth::I32, IntWidth::I64];
+    pub const ALL: [IntWidth; 5] = [IntWidth::U8, IntWidth::I8, IntWidth::I16, IntWidth::I32, IntWidth::I64];
     /// the least and greatest integers this storage holds.
     pub fn range(self) -> (i64, i64) {
         match self {
             IntWidth::U8 => (0, u8::MAX as i64),
             IntWidth::I8 => (i8::MIN as i64, i8::MAX as i64),
-            IntWidth::U16 => (0, u16::MAX as i64),
             IntWidth::I16 => (i16::MIN as i64, i16::MAX as i64),
-            IntWidth::U32 => (0, u32::MAX as i64),
             IntWidth::I32 => (i32::MIN as i64, i32::MAX as i64),
             IntWidth::I64 => (i64::MIN, i64::MAX),
         }
@@ -985,7 +975,7 @@ impl Prim {
         }
     }
 
-    /// one storage (not merely one width: `U16` and `I16` differ)?
+    /// one storage (not merely one width: `U8` and `I8` differ)?
     pub(crate) fn same_storage(&self, other: &Prim) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
@@ -995,9 +985,7 @@ impl Prim {
         Some(match self {
             Prim::U8(_) => IntWidth::U8,
             Prim::I8(_) => IntWidth::I8,
-            Prim::U16(_) => IntWidth::U16,
             Prim::I16(_) => IntWidth::I16,
-            Prim::U32(_) => IntWidth::U32,
             Prim::I32(_) => IntWidth::I32,
             Prim::I64(_) => IntWidth::I64,
             Prim::F64(_) => return None,
@@ -1009,9 +997,7 @@ impl Prim {
         match w {
             IntWidth::U8 => Prim::U8(Arc::default()),
             IntWidth::I8 => Prim::I8(Arc::default()),
-            IntWidth::U16 => Prim::U16(Arc::default()),
             IntWidth::I16 => Prim::I16(Arc::default()),
-            IntWidth::U32 => Prim::U32(Arc::default()),
             IntWidth::I32 => Prim::I32(Arc::default()),
             IntWidth::I64 => Prim::I64(Arc::default()),
         }
@@ -1066,9 +1052,7 @@ impl Prim {
             match cols[t] {
                 Ints::U8(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
                 Ints::I8(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
-                Ints::U16(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
                 Ints::I16(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
-                Ints::U32(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
                 Ints::I32(v) => out.extend(v[s..e].iter().map(|&x| x as i64)),
                 Ints::I64(v) => out.extend_from_slice(&v[s..e]),
             }
@@ -1143,9 +1127,7 @@ impl PartialEq for Prim {
         match (self, other) {
             (Prim::U8(a), Prim::U8(b)) => a == b,
             (Prim::I8(a), Prim::I8(b)) => a == b,
-            (Prim::U16(a), Prim::U16(b)) => a == b,
             (Prim::I16(a), Prim::I16(b)) => a == b,
-            (Prim::U32(a), Prim::U32(b)) => a == b,
             (Prim::I32(a), Prim::I32(b)) => a == b,
             (Prim::I64(a), Prim::I64(b)) => a == b,
             (Prim::F64(a), Prim::F64(b)) => a == b,
@@ -1177,9 +1159,9 @@ fn within_offsets(tags: impl Iterator<Item = usize>, k: usize) -> Vec<usize> {
 
 impl Value {
     /// leaf-column constructors — the funnel results pass through, so the representation lives in one place.
-    /// Integers at the narrowest storage that holds them all: `u8`, `u16` or `u32` when every value
-    /// is non-negative and fits (an empty column is bytes, so it never widens a column it meets),
-    /// else `i64`s. The constructor for integers from outside a program (constants, parsed text,
+    /// Integers at the narrowest storage that holds them all: `u8` when every value is from 0 to 255
+    /// (an empty column included, so it never widens a column it meets), else the narrowest of
+    /// `i8`, `i16`, `i32` and `i64`. The constructor for integers from outside a program (constants, parsed text,
     /// fed rows), whose caller has no reason to pick a storage: storage is not type, and an integer
     /// is equal and hashes alike at every width. One pass finds the range, and one writes the leaf.
     pub fn int(xs: impl IntoIterator<Item = i64>) -> Value {
@@ -1462,9 +1444,7 @@ pub fn show(v: &Value) -> String {
 pub(crate) enum Ints<'a> {
     U8(&'a [u8]),
     I8(&'a [i8]),
-    U16(&'a [u16]),
     I16(&'a [i16]),
-    U32(&'a [u32]),
     I32(&'a [i32]),
     I64(&'a [i64]),
 }
@@ -1475,9 +1455,7 @@ impl<'a> Ints<'a> {
         match p {
             Prim::U8(v) => Ints::U8(v),
             Prim::I8(v) => Ints::I8(v),
-            Prim::U16(v) => Ints::U16(v),
             Prim::I16(v) => Ints::I16(v),
-            Prim::U32(v) => Ints::U32(v),
             Prim::I32(v) => Ints::I32(v),
             Prim::I64(v) => Ints::I64(v),
             Prim::F64(_) => panic!("{op}: an integer meets a float"),
@@ -1490,9 +1468,7 @@ impl<'a> Ints<'a> {
         match self {
             Ints::U8(v) => v[i] as i64,
             Ints::I8(v) => v[i] as i64,
-            Ints::U16(v) => v[i] as i64,
             Ints::I16(v) => v[i] as i64,
-            Ints::U32(v) => v[i] as i64,
             Ints::I32(v) => v[i] as i64,
             Ints::I64(v) => v[i],
         }

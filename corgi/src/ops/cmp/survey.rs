@@ -242,7 +242,7 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
             }
         };
     }
-    go!(U8, I8, U16, I16, U32, I32, I64, F64)
+    go!(U8, I8, I16, I32, I64, F64)
 }
 
 /// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
@@ -270,7 +270,7 @@ fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize,
             }
         };
     }
-    go!(U8, I8, U16, I16, U32, I32, I64, F64)
+    go!(U8, I8, I16, I32, I64, F64)
 }
 
 /// The leaf lanes of `a` and `b`, in structural order, when the shape is nothing but leaves,

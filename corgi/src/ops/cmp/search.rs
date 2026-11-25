@@ -43,8 +43,6 @@ pub(crate) fn find_leaf(nb: &Bounds, needles: &Value, hb: Rows, hay: &Value) -> 
     match (&*np, &*hp) {
         (Prim::U8(nv), Prim::U8(hv)) => Some(find_rows(nb, hb, nv, hv)),
         (Prim::I64(nv), Prim::I64(hv)) => Some(find_rows(nb, hb, nv, hv)),
-        (Prim::U16(nv), Prim::U16(hv)) => Some(find_rows(nb, hb, nv, hv)),
-        (Prim::U32(nv), Prim::U32(hv)) => Some(find_rows(nb, hb, nv, hv)),
         (Prim::I8(nv), Prim::I8(hv)) => Some(find_rows(nb, hb, nv, hv)),
         (Prim::I16(nv), Prim::I16(hv)) => Some(find_rows(nb, hb, nv, hv)),
         (Prim::I32(nv), Prim::I32(hv)) => Some(find_rows(nb, hb, nv, hv)),

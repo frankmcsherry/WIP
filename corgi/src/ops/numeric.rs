@@ -161,8 +161,6 @@ fn int_map(a: Prim, f: impl Fn(i64) -> i64) -> Prim {
     match a {
         Prim::I64(x) => Prim::I64(map_into(x, f)),
         Prim::U8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
-        Prim::U16(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
-        Prim::U32(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
         Prim::I8(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
         Prim::I16(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
         Prim::I32(x) => Prim::I64(Arc::new(x.iter().map(|&p| f(p as i64)).collect())),
@@ -508,8 +506,6 @@ impl ArithOp {
                 let (bounds, vals) = input.into_list("reduce")?;
                 match vals.into_prim("reduce values")? {
                     Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::U16(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::U32(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I8(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I16(xs) => reduce_rows(&bounds, &xs, *r),
                     Prim::I32(xs) => reduce_rows(&bounds, &xs, *r),

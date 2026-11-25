@@ -841,8 +841,6 @@ impl<L: OpLike> Op<L> {
                 // every row to one lane: the payload IS that lane, and the others are empty.
                 let one = match &tags_v {
                     Value::Prim(Prim::U8(t)) => one_lane(t, |x| x as u64, last),
-                    Value::Prim(Prim::U16(t)) => one_lane(t, |x| x as u64, last),
-                    Value::Prim(Prim::U32(t)) => one_lane(t, |x| x as u64, last),
                     Value::Prim(Prim::I8(t)) => one_lane(t, |x| x as i64 as u64, last),
                     Value::Prim(Prim::I16(t)) => one_lane(t, |x| x as i64 as u64, last),
                     Value::Prim(Prim::I32(t)) => one_lane(t, |x| x as i64 as u64, last),
@@ -858,8 +856,6 @@ impl<L: OpLike> Op<L> {
                 // the tags read where they are stored
                 let (tag8, off, sizes) = match &tags_v {
                     Value::Prim(Prim::U8(t)) => route(t, |x| x as u64, *n),
-                    Value::Prim(Prim::U16(t)) => route(t, |x| x as u64, *n),
-                    Value::Prim(Prim::U32(t)) => route(t, |x| x as u64, *n),
                     Value::Prim(Prim::I8(t)) => route(t, |x| x as i64 as u64, *n),
                     Value::Prim(Prim::I16(t)) => route(t, |x| x as i64 as u64, *n),
                     Value::Prim(Prim::I32(t)) => route(t, |x| x as i64 as u64, *n),
