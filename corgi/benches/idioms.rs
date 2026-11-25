@@ -243,6 +243,32 @@ fn list_reduce(rows: usize, max: i64) {
     report("list_count", rows, &param, r, corgi_t(rows, &p, &input), "each row's elements above a threshold, counted");
 }
 
+/// one long list cut into pieces, a piece starting at each zero: values are random below `one_in`,
+/// so about one element in `one_in` starts a piece. Rust borrows each piece as a slice of the list;
+/// corgi writes each piece's end and leaves the values where they are.
+fn cut(rows: usize, one_in: i64) {
+    let mut rng = Rng(0x5eed);
+    let xs: Vec<i64> = (0..rows).map(|_| rng.next() % one_in).collect();
+    let input = one_row(rows, Value::i64(xs.clone()));
+    let p = corgi("input map (x -> ((x, 0) eq, x)) cut");
+    let r = best(rows, || {
+        black_box(black_box(&xs).chunk_by(|_, &b| b != 0).collect::<Vec<&[i64]>>());
+    });
+    report("cut", rows, &format!("1 in {one_in}"), r, corgi_t(rows, &p, &input), "a list cut into pieces at marked elements");
+}
+
+/// the same over many short rows: lists of up to 16 values below 1000, a piece starting at each
+/// value below `below`.
+fn cut_rows(rows: usize, below: i64) {
+    let mut rng = Rng(0x5eed);
+    let (ls, input) = lists(rows, 16, &mut rng);
+    let p = corgi(&format!("input map (x -> ((x, {below}) lt, x)) cut"));
+    let r = best(rows, || {
+        black_box(black_box(&ls).iter().map(|l| l.chunk_by(|_, &b| b >= below).collect::<Vec<&[i64]>>()).collect::<Vec<_>>());
+    });
+    report("cut_rows", rows, &format!("<{below}"), r, corgi_t(rows, &p, &input), "each row's list cut into pieces at marked elements");
+}
+
 /// sort a column of lists (structural order: length, then elements). Rust sorts its own copy in
 /// place; the copy is made outside the timer.
 fn sort_lists(rows: usize, max: i64) {
@@ -344,6 +370,8 @@ fn main() {
         if runs("field_sum") { field_sum(rows); }
         if runs("sum_wide") { sum_wide(rows, 50, "50%"); sum_wide(rows, 5, "5%"); }
         if runs("list") { for m in [4, 16, 64] { list_reduce(lists, m); } }
+        if runs("cut") { for one_in in [1, 2, 6, 64, 4096] { cut(rows, one_in); } }
+        if runs("cut_rows") { for below in [500, 150, 10, 1] { cut_rows(lists, below); } }
         if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(lists, m); } }
         if runs("sort_results") { sort_results(rows); }
         if runs("distinct_pairs") { distinct_pairs(rows); }

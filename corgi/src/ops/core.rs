@@ -1121,23 +1121,74 @@ fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
 /// remainder, and then the kept elements are no longer contiguous, so they are gathered (cold).
 /// `Cut`: each row's pieces end where the next marked element starts one, and at the row's end.
 fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
+    // The marks are counted first, for the size and for how to go on: a piece ends at a mark or at
+    // its row's end, so there are at most one per mark and per row.
+    let marks = mask.iter().map(|&m| (m != 0) as usize).sum::<usize>();
     let mut outer = Vec::with_capacity(bounds.len());
-    let mut inner = Vec::new();
-    let mut start = 0usize;
-    for end in bounds.ends() {
-        for (k, &m) in mask.iter().enumerate().take(end).skip(start + 1) {
-            if m != 0 {
-                inner.push(k);
+    let mut inner = vec![0usize; marks + bounds.len() + 1];
+    let (mut n, mut start) = (0usize, 0usize);
+    if marks * CUT_SPARSE <= mask.len() {
+        // Few marks: find them over the whole column, skipping each eight positions that hold
+        // none, whatever rows those lie in. Then each row takes the marks past its first element,
+        // and its own end. A row with no marks costs one test, however short the rows are.
+        let mut at = vec![0usize; marks + 1];
+        let (mut found, mut k) = (0usize, 0usize);
+        let mut words = mask.chunks_exact(8);
+        for word in &mut words {
+            if u64::from_le_bytes(word.try_into().expect("eight bytes")) != 0 {
+                for (j, &m) in word.iter().enumerate() {
+                    at[found] = k + j;
+                    found += (m != 0) as usize;
+                }
             }
+            k += 8;
         }
-        if end > start {
-            inner.push(end);
+        for (j, &m) in words.remainder().iter().enumerate() {
+            at[found] = k + j;
+            found += (m != 0) as usize;
         }
-        outer.push(inner.len());
-        start = end;
+        at[marks] = usize::MAX; // past every row, so the walk below needs no other stop
+        let mut next = 0;
+        for end in bounds.ends() {
+            if end > start {
+                // a mark on a row's first element starts no new piece
+                next += (at[next] == start) as usize;
+                while at[next] < end {
+                    inner[n] = at[next];
+                    n += 1;
+                    next += 1;
+                }
+                inner[n] = end;
+                n += 1;
+            }
+            outer.push(n);
+            start = end;
+        }
+    } else {
+        // Each position after a row's first is written as a piece's end, and the next write lands
+        // on it unless it was marked: no branch on the mask, so the cost does not depend on how
+        // the marks fall (as `compress` finds its kept positions).
+        for end in bounds.ends() {
+            if end > start {
+                for (k, &m) in (start + 1..end).zip(&mask[start + 1..end]) {
+                    inner[n] = k;
+                    n += (m != 0) as usize;
+                }
+                inner[n] = end;
+                n += 1;
+            }
+            outer.push(n);
+            start = end;
+        }
     }
+    inner.truncate(n);
     Value::List(outer.into(), Box::new(Value::List(inner.into(), Box::new(vals))))
 }
+
+/// A column with at most one mark per this many elements is cut by finding its marks first,
+/// skipping its unmarked words. With more marks than that, the test of each word costs more than
+/// the skips save (`cargo bench --bench idioms -- cut` is the measure).
+const CUT_SPARSE: usize = 32;
 
 fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
     let mut outer = Vec::with_capacity(bounds.len());
