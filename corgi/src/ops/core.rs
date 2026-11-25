@@ -1215,10 +1215,8 @@ fn split(bounds: &Bounds, mask: &[u8], vals: &Value) -> Value {
 }
 
 /// A column with at most one mark per this many elements is split by skipping its unmarked words
-/// and copying the runs between marks. Measured (`cargo bench --bench idioms -- split`, strings of
-/// up to 1000 bytes, ns per string): the plain pass takes 382 to 398 at every density; this takes
-/// 334 to 364 at one mark per 32, 214 to 239 at one per 64 and 116 to 137 at one per 256, but
-/// 568 to 601 at one per 16.
+/// and copying the runs between marks. With more marks than that, a copy per run costs more than
+/// one pass over every element (`cargo bench --bench idioms -- split` is the measure).
 const SPLIT_SPARSE: usize = 32;
 
 fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
