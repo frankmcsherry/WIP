@@ -4,7 +4,8 @@
 //! [`survey_groups`] walks the two columns together by the same descent the sort makes: the
 //! leading leaf decides most of the interleaving with one gallop, and every class it leaves equal
 //! is refined by the next level at once — a product's next field, a sum's lane at the carried
-//! offsets, a list's next element position — never one pair at a time. A level reads its keys
+//! offsets, a list's next element position (a list of leaves by its rows' spans, in one level)
+//! — never one pair at a time. A level reads its keys
 //! through index lists into the two columns; the reports form a tree, an equal class holding its
 //! refinement as children, flattened once at the end. A level's work is proportional to the rows
 //! of the classes it refines — a full pass over both inputs while a leading field leaves most
@@ -161,6 +162,11 @@ fn lists<IA: Rows, IB: Rows>(
         );
         return;
     }
+    // leaf elements: a row is a slice of the leaf, and slices order as the rows do, so the rows
+    // merge on their spans as one key rather than at a level per element position.
+    if let (Value::Prim(pa), Value::Prim(pb)) = (va, vb) {
+        return leaf_lists(pa, pb, |j| span_a(ia.row(j)), |j| span_b(ib.row(j)), open, tree);
+    }
     // lexicographically: element by element over the classes still equal, the rows that
     // end at a position first in their class (each a proper prefix of the rest).
     let len_a = |r: usize| { let (s, e) = span_a(r); e - s };
@@ -177,30 +183,6 @@ fn lists<IA: Rows, IB: Rows>(
         for &c in &cur {
             let (cl, _, _) = tree.class(c);
             let (na, nb) = (cl.ahi - cl.alo, cl.bhi - cl.blo);
-            // one row a side over leaf elements: the rest of the two spans decide at
-            // once, rather than a level per remaining position.
-            if na == 1 && nb == 1 {
-                if let Some(ord) = cmp_spans(va, vb, span_a(ra[oa]), span_b(rb[ob]), pos) {
-                    let first = tree.nodes.len();
-                    match ord {
-                        std::cmp::Ordering::Less => {
-                            tree.push(Node::A(cl.alo, cl.ahi));
-                            tree.push(Node::B(cl.blo, cl.bhi));
-                        }
-                        std::cmp::Ordering::Greater => {
-                            tree.push(Node::B(cl.blo, cl.bhi));
-                            tree.push(Node::A(cl.alo, cl.ahi));
-                        }
-                        std::cmp::Ordering::Equal => {}
-                    }
-                    if ord != std::cmp::Ordering::Equal {
-                        tree.set_kids(c, first, tree.nodes.len());
-                    }
-                    oa += na;
-                    ob += nb;
-                    continue;
-                }
-            }
             if len_a(ra[oa]) > pos {
                 live.push(c);
                 tree.set_offsets(c, la.len(), lb.len());
@@ -241,29 +223,65 @@ fn leaf<IA: Rows, IB: Rows>(pa: &Prim, pb: &Prim, ia: IA, ib: IB, open: &[usize]
     go!(U8, I64, F64)
 }
 
-/// The order of the elements `sa + from..ea` of `va` against `sb + from..eb` of `vb`, when both
-/// are leaves: one slice comparison. `None` for any other element shape.
-fn cmp_spans(va: &Value, vb: &Value, (sa, ea): (usize, usize), (sb, eb): (usize, usize), from: usize) -> Option<std::cmp::Ordering> {
-    let (Value::Prim(pa), Value::Prim(pb)) = (va, vb) else { return None };
-    assert_eq!(pa.is_int(), pb.is_int(), "an integer leaf meets a float leaf");
-    // This helper runs once per singleton class, not once per column. Meeting mixed integer
-    // storage here copied the entire byte column for every pair of list rows. Widen only the
-    // bytes of the two spans as the slice comparison reads them.
-    match (pa, pb) {
-        (Prim::U8(x), Prim::I64(y)) => return Some(x[sa + from..ea].iter().map(|&v| v as i64).cmp(y[sb + from..eb].iter().copied())),
-        (Prim::I64(x), Prim::U8(y)) => return Some(x[sa + from..ea].iter().copied().cmp(y[sb + from..eb].iter().map(|&v| v as i64))),
-        _ => {}
-    }
+/// A list level over leaf elements: the merge over every open class, the key of a row the slice
+/// of its elements. `span_a(j)` and `span_b(j)` are the spans of the rows at local position `j`.
+fn leaf_lists(
+    pa: &Prim, pb: &Prim,
+    span_a: impl Fn(usize) -> (usize, usize), span_b: impl Fn(usize) -> (usize, usize),
+    open: &[usize], tree: &mut Tree,
+) {
     macro_rules! go {
         ($($V:ident),*) => {
             match (pa, pb) {
-                $( (Prim::$V(x), Prim::$V(y)) => Some(x[sa + from..ea].cmp(&y[sb + from..eb])), )*
-                _ => unreachable!("integer storage dispatched above; floats match"),
+                $( (Prim::$V(x), Prim::$V(y)) => merge(
+                    |j| { let (s, e) = span_a(j); &x[s..e] },
+                    |j| { let (s, e) = span_b(j); &y[s..e] },
+                    open, tree), )*
+                // integers at two storages: each span stays as it is held, and the bytes widen as
+                // a comparison reads them.
+                (Prim::U8(x), Prim::I64(y)) => merge(
+                    |j| { let (s, e) = span_a(j); Ints::U8(&x[s..e]) },
+                    |j| { let (s, e) = span_b(j); Ints::I64(&y[s..e]) },
+                    open, tree),
+                (Prim::I64(x), Prim::U8(y)) => merge(
+                    |j| { let (s, e) = span_a(j); Ints::I64(&x[s..e]) },
+                    |j| { let (s, e) = span_b(j); Ints::U8(&y[s..e]) },
+                    open, tree),
+                _ => panic!("an integer leaf meets a float leaf"),
             }
         };
     }
     go!(U8, I64, F64)
 }
+
+/// A span of integers at either storage, ordered as the integers are.
+#[derive(Copy, Clone)]
+enum Ints<'a> {
+    U8(&'a [u8]),
+    I64(&'a [i64]),
+}
+
+impl Ord for Ints<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (*self, *other) {
+            (Ints::U8(x), Ints::U8(y)) => x.cmp(y),
+            (Ints::I64(x), Ints::I64(y)) => x.cmp(y),
+            (Ints::U8(x), Ints::I64(y)) => x.iter().map(|&v| v as i64).cmp(y.iter().copied()),
+            (Ints::I64(x), Ints::U8(y)) => x.iter().copied().cmp(y.iter().map(|&v| v as i64)),
+        }
+    }
+}
+impl PartialOrd for Ints<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Ints<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Ints<'_> {}
 
 /// The leaf lanes of `a` and `b`, in structural order, when the shape is nothing but leaves,
 /// units and products of those; `false` otherwise.
