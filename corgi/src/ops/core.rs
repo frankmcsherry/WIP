@@ -1186,10 +1186,8 @@ fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
 }
 
 /// A column with at most one mark per this many elements is cut by finding its marks first,
-/// skipping its unmarked words.
-/// Measured (`cargo bench --bench idioms -- cut`, one long row, ns per element for the program):
-/// at one mark per 32 the skip takes 0.29 against 0.45 at 64K elements and 0.42 against 0.49 at
-/// 8M, and it gains from there; at one per 8 to 16 it is up to 10% behind at 8M.
+/// skipping its unmarked words. With more marks than that, the test of each word costs more than
+/// the skips save (`cargo bench --bench idioms -- cut` is the measure).
 const CUT_SPARSE: usize = 32;
 
 fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
