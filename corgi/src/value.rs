@@ -568,6 +568,15 @@ macro_rules! prim {
                 match self { $( Prim::$V(_) => Prim::$V(Arc::new(it.map(<$t>::from_int).collect())), )+ }
             }
 
+            /// this integer leaf at storage `w`, which must hold every value: itself if already
+            /// there, else one typed pass.
+            pub(crate) fn cast(&self, w: IntWidth) -> Prim {
+                if self.int_width() == Some(w) {
+                    return self.clone();
+                }
+                match self { $( Prim::$V(v) => Prim::ints_at(w, v.iter().map(|x| x.word() as i64)), )+ }
+            }
+
             /// an integer leaf's values as `i64`s (one pass; an `i64` leaf is copied).
             pub(crate) fn to_i64_vec(&self) -> Vec<i64> {
                 match self { $( Prim::$V(v) => v.iter().map(|x| x.word() as i64).collect(), )+ }
@@ -732,7 +741,8 @@ macro_rules! prim {
             #[cfg(test)]
             pub(crate) fn concat(parts: &[&Prim]) -> Prim {
                 if parts.iter().any(|s| !s.same_storage(parts[0])) {
-                    let wide: Vec<Prim> = parts.iter().map(|s| s.widen()).collect();
+                    let w = parts.iter().filter_map(|s| s.int_width()).reduce(IntWidth::join).expect("integer leaves");
+                    let wide: Vec<Prim> = parts.iter().map(|s| s.cast(w)).collect();
                     return Prim::concat(&wide.iter().collect::<Vec<_>>());
                 }
                 match parts[0] {
@@ -967,14 +977,6 @@ impl Prim {
         !matches!(self, Prim::F64(_))
     }
 
-    /// the leaf with integers at `i64`: a narrow leaf widens (one pass), any other is itself.
-    pub(crate) fn widen(&self) -> Prim {
-        match self {
-            Prim::I64(_) | Prim::F64(_) => self.clone(),
-            int => Prim::I64(Arc::new(int.to_i64_vec())),
-        }
-    }
-
     /// one storage (not merely one width: `U8` and `I8` differ)?
     pub(crate) fn same_storage(&self, other: &Prim) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -1017,13 +1019,6 @@ impl Prim {
         }
     }
 
-    /// this integer leaf at storage `w`, which must hold every value: itself if already there.
-    pub(crate) fn cast(&self, w: IntWidth) -> Prim {
-        if self.int_width() == Some(w) {
-            return self.clone();
-        }
-        Prim::ints_at(w, (0..self.len()).map(|i| self.i64_at(i)))
-    }
 
     /// row `i` of an integer leaf.
     #[inline]
@@ -1166,6 +1161,16 @@ impl Value {
     /// is equal and hashes alike at every width. One pass finds the range, and one writes the leaf.
     pub fn int(xs: impl IntoIterator<Item = i64>) -> Value {
         Value::Prim(Prim::narrowed(xs.into_iter().collect()))
+    }
+    /// Integers from 0 to `max`, at the narrowest storage that holds `max`: how an op that knows
+    /// its bound (a length, a count, a position) writes, with no pass to find the range.
+    pub(crate) fn int_upto(max: usize, xs: impl Iterator<Item = i64>) -> Value {
+        Value::Prim(Prim::ints_at(IntWidth::fit(i64::try_from(max).unwrap_or(i64::MAX)), xs))
+    }
+    /// Integers at storage `w`, which must hold each: for a caller that knows the storage it wants
+    /// (a bench, or a test that every storage gives one result).
+    pub fn ints_at(w: IntWidth, xs: impl Iterator<Item = i64>) -> Value {
+        Value::Prim(Prim::ints_at(w, xs))
     }
     /// Integers held as bytes (each from 0 to 255): text, masks, tags.
     pub fn u8(xs: Vec<u8>) -> Value { Value::Prim(Prim::U8(Arc::new(xs))) }
@@ -1368,6 +1373,14 @@ impl Value {
         match self {
             Value::Prim(Prim::I64(xs)) => Ok(Cow::Borrowed(&xs[..])),
             Value::Prim(p) if p.is_int() => Ok(Cow::Owned(p.to_i64_vec())),
+            other => Err(wrong(who, "Int", other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
+        }
+    }
+
+    /// an integer leaf's storage.
+    pub(crate) fn int_width(&self, who: &str) -> Result<IntWidth, String> {
+        match self {
+            Value::Prim(p) if p.is_int() => Ok(p.int_width().unwrap()),
             other => Err(wrong(who, "Int", other, |v| matches!(v, Value::Prim(p) if p.is_int()))),
         }
     }

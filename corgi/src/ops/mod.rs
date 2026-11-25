@@ -7,6 +7,7 @@ pub(crate) mod core;
 pub(crate) mod host;
 pub(crate) mod numeric;
 pub(crate) mod text;
+pub(crate) mod widths;
 
 pub use self::cmp::{CmpOp, Pred};
 pub use self::core::{Op, Pattern};

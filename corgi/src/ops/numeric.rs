@@ -16,7 +16,8 @@ use super::cmp::CmpOp;
 use super::core::Op;
 use super::text::TextOp;
 use crate::graph::{Graph, OpLike};
-use crate::value::{f64_key, f64_of_key, f64_result_key, Prim, Scalar, Value};
+use super::widths;
+use crate::value::{f64_key, f64_of_key, f64_result_key, IntWidth, Prim, Scalar, Value};
 use std::sync::Arc;
 
 /// the named monoid reductions — `List<Int> -> Int` or `List<Float> -> Float` per row, each a
@@ -141,17 +142,20 @@ fn int_pairs(a: Prim, b: Prim, f: impl Fn(i64, i64) -> i64) -> Prim {
         (Prim::U8(x), Prim::U8(y)) => {
             Prim::I64(Arc::new(x.iter().zip(y.iter()).map(|(&p, &q)| f(p as i64, q as i64)).collect()))
         }
-        // operands at the other narrow storages widen first, one pass each, so that the lane loops
-        // above are the only ones, and the dispatch stays at the two storages it has
-        (a, b) => int_pairs(widen_wide(a), widen_wide(b), f),
-    }
-}
-
-/// a leaf at a storage other than bytes and `i64`, at `i64`; bytes and `i64`s as they are.
-fn widen_wide(p: Prim) -> Prim {
-    match p {
-        Prim::U8(_) | Prim::I64(_) => p,
-        p => p.widen(),
+        // an `i64` against a narrow signed leaf: the narrow one read where it lies
+        (Prim::I64(x), Prim::I8(y)) => Prim::I64(zip_into(x, &y, |p, q: i8| f(p, q as i64))),
+        (Prim::I64(x), Prim::I16(y)) => Prim::I64(zip_into(x, &y, |p, q: i16| f(p, q as i64))),
+        (Prim::I64(x), Prim::I32(y)) => Prim::I64(zip_into(x, &y, |p, q: i32| f(p, q as i64))),
+        (Prim::I8(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: i8| f(p as i64, q))),
+        (Prim::I16(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: i16| f(p as i64, q))),
+        (Prim::I32(x), Prim::I64(y)) => Prim::I64(zip_into(y, &x, |q, p: i32| f(p as i64, q))),
+        // two narrow leaves (which the width rules saw first): at the storage holding both, read
+        // there and written at `i64`
+        (a, b) => {
+            let w = a.int_width().unwrap().join(b.int_width().unwrap());
+            let (x, y) = (a.cast(w), b.cast(w));
+            widths::zip(&x, &y, w, IntWidth::I64, f).expect("two narrow storages meet below i64")
+        }
     }
 }
 
@@ -240,9 +244,27 @@ fn mixed(op: impl std::fmt::Debug, a: &Prim, b: &Prim) -> String {
 fn bin_eval(op: BinOp, a: Prim, b: Prim) -> Result<Prim, String> {
     Ok(match (a, b) {
         (Prim::F64(x), Prim::F64(y)) => Prim::F64(float_body!(op, bin_into(x, y))),
-        (a, b) if a.is_int() && b.is_int() => int_body!(op, int_pairs(a, b)),
+        (a, b) if a.is_int() && b.is_int() => match widths::met(&a, &b) {
+            // narrow operands: the result at the storage the rule gives (bytes keep their own
+            // `i64` kernels, which read them in place)
+            Some((w, x, y)) if w != IntWidth::U8 || widths::bin_out(op, w) != IntWidth::I64 => {
+                let out = widths::bin_out(op, w);
+                int_body!(op, narrow_pairs(&x, &y, w, out))
+            }
+            _ => int_body!(op, int_pairs(a, b)),
+        },
         (a, b) => return Err(mixed(op, &a, &b)),
     })
+}
+
+/// [`widths::zip`], for the pairs the width rules reach.
+fn narrow_pairs(a: &Prim, b: &Prim, w: IntWidth, out: IntWidth, f: impl Fn(i64, i64) -> i64) -> Prim {
+    widths::zip(a, b, w, out, f).expect("a pair the width rules reach")
+}
+
+/// [`widths::map`], for the pairs the width rules reach.
+fn narrow_map(a: &Prim, w: IntWidth, out: IntWidth, f: impl Fn(i64) -> i64) -> Prim {
+    widths::map(a, w, out, f).expect("a pair the width rules reach")
 }
 
 /// division of an `i64` by a constant `d` with no divide: the multiplier `m` and shift `s` that make
@@ -335,6 +357,21 @@ fn imm_eval(op: BinOp, a: Prim, c: Scalar, left: bool) -> Result<Prim, String> {
     fn float_imm_left(a: Arc<Vec<u64>>, k: u64, f: impl Fn(u64, u64) -> u64) -> Prim {
         Prim::F64(map_into(a, move |x| f(k, x)))
     }
+    fn narrow_imm(a: &Prim, w: IntWidth, out: IntWidth, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+        narrow_map(a, w, out, move |x| f(x, c))
+    }
+    fn narrow_imm_left(a: &Prim, w: IntWidth, out: IntWidth, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+        narrow_map(a, w, out, move |x| f(c, x))
+    }
+    // a narrow leaf and a constant: the result at the storage the rule gives for the storage that
+    // holds both, when that is narrow. (Division and remainder by a constant keep their
+    // multiply-high and shift forms below, which write `i64`s.)
+    if let (Scalar::Int(k), false) = (c, matches!(op, BinOp::Div | BinOp::Rem)) {
+        if let Some((w, x)) = widths::met_imm(&a, k).filter(|&(w, _)| w != IntWidth::U8 || widths::bin_out(op, w) != IntWidth::I64) {
+            let out = widths::bin_out(op, w);
+            return Ok(if left { int_body!(op, narrow_imm_left(&x, w, out, k)) } else { int_body!(op, narrow_imm(&x, w, out, k)) });
+        }
+    }
     Ok(match (a, c) {
         (Prim::F64(x), Scalar::Float(k)) if left => float_body!(op, float_imm_left(x, k)),
         (a, Scalar::Int(c)) if left && a.is_int() => int_body!(op, int_imm_left(a, c)),
@@ -368,6 +405,13 @@ fn bits_eval(op: BitOp, a: Prim, b: Prim) -> Result<Prim, String> {
         }
         ab => ab,
     };
+    // `and`, `or` and `xor` of values of one storage are values of that storage: each bit of the
+    // sign-extended word is a bit of the stored one or a copy of its sign
+    if matches!(op, BitOp::And | BitOp::Or | BitOp::Xor) {
+        if let Some((w, x, y)) = widths::met(&a, &b) {
+            return Ok(bit_body!(op, narrow_pairs(&x, &y, w, w)));
+        }
+    }
     Ok(bit_body!(op, int_pairs(a, b)))
 }
 
@@ -393,7 +437,17 @@ fn bits_imm(op: BitOp, a: Prim, c: i64, left: bool) -> Result<Prim, String> {
         }
         a => a,
     };
+    if matches!(op, BitOp::And | BitOp::Or | BitOp::Xor) {
+        if let Some((w, x)) = widths::met_imm(&a, c) {
+            return Ok(bit_body!(op, narrow_bits_imm(&x, w, c)));
+        }
+    }
     Ok(bit_body!(op, int_imm(a, c)))
+}
+
+/// `x op c` for a narrow leaf and a constant both held at `w`, written at `w`.
+fn narrow_bits_imm(a: &Prim, w: IntWidth, c: i64, f: impl Fn(i64, i64) -> i64) -> Prim {
+    narrow_map(a, w, w, move |x| f(x, c))
 }
 
 /// a shift by `k` of an integer leaf, the op matched once above the loop.
@@ -411,15 +465,22 @@ fn shift_eval(op: ShiftOp, a: Prim, k: u32) -> Result<Prim, String> {
     })
 }
 
-/// each row's reduction, reading the values at their storage (a byte leaf is not widened first).
-/// Sums and products wrap at the `i64` edge, as `add` and `mul` do. An empty row's sum is 0, its
-/// product 1, its minimum and maximum 0.
-fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], r: Red) -> Value {
+/// each row's reduction, reading the values at their storage `w` (a narrow leaf is not widened
+/// first). Sums and products wrap at the `i64` edge, as `add` and `mul` do. An empty row's sum is
+/// 0, its product 1, its minimum and maximum 0. A sum is held at the storage that holds the sum of
+/// every element (no row is longer), and a minimum or maximum at `w`, which holds every element and 0.
+fn reduce_rows<T: Copy + Into<i64>>(bounds: &crate::value::Bounds, xs: &[T], w: IntWidth, r: Red) -> Value {
+    let at = |out: IntWidth, v: Vec<i64>| if out == IntWidth::I64 { Value::i64(v) } else { Value::Prim(Prim::ints_at(out, v.into_iter())) };
     match r {
-        Red::Add => Value::i64(per_row(bounds, xs, |s| s.iter().fold(0i64, |a, &x| a.wrapping_add(x.into())))),
+        Red::Add => {
+            let (lo, hi) = w.range();
+            let n = xs.len() as i128;
+            let out = widths::fit_range(n * lo as i128, n * hi as i128);
+            at(out, per_row(bounds, xs, |s| s.iter().fold(0i64, |a, &x| a.wrapping_add(x.into()))))
+        }
         Red::Mul => Value::i64(per_row(bounds, xs, |s| s.iter().fold(1i64, |a, &x| a.wrapping_mul(x.into())))),
-        Red::Min => Value::i64(per_row(bounds, xs, |s| s.iter().map(|&x| x.into()).min().unwrap_or(0))),
-        Red::Max => Value::i64(per_row(bounds, xs, |s| s.iter().map(|&x| x.into()).max().unwrap_or(0))),
+        Red::Min => at(w, per_row(bounds, xs, |s| s.iter().map(|&x| x.into()).min().unwrap_or(0))),
+        Red::Max => at(w, per_row(bounds, xs, |s| s.iter().map(|&x| x.into()).max().unwrap_or(0))),
         Red::All => Value::u8(per_row(bounds, xs, |s| s.iter().all(|&x| x.into() != 0) as u8)),
         Red::Any => Value::u8(per_row(bounds, xs, |s| s.iter().any(|&x| x.into() != 0) as u8)),
     }
@@ -495,7 +556,10 @@ impl ArithOp {
             ArithOp::Shift(op, k) => Value::Prim(shift_eval(*op, input.into_prim("shift")?, *k)?),
             ArithOp::Neg => Value::Prim(match input.into_prim("neg")? {
                 Prim::F64(v) => Prim::F64(map_into(v, |k| f64_result_key(-f64_of_key(k)))),
-                p => int_map(p, |x: i64| x.wrapping_neg()),
+                p => match p.int_width().filter(|&w| w != IntWidth::I64) {
+                    Some(w) => narrow_map(&p, w, widths::neg_out(w), |x: i64| x.wrapping_neg()),
+                    None => int_map(p, |x: i64| x.wrapping_neg()),
+                },
             }),
             ArithOp::ToFloat => {
                 let xs = input.as_i64("to_float")?;
@@ -505,11 +569,11 @@ impl ArithOp {
             ArithOp::Reduce(r) => {
                 let (bounds, vals) = input.into_list("reduce")?;
                 match vals.into_prim("reduce values")? {
-                    Prim::U8(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::I8(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::I16(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::I32(xs) => reduce_rows(&bounds, &xs, *r),
-                    Prim::I64(xs) => reduce_rows(&bounds, &xs, *r),
+                    Prim::U8(xs) => reduce_rows(&bounds, &xs, IntWidth::U8, *r),
+                    Prim::I8(xs) => reduce_rows(&bounds, &xs, IntWidth::I8, *r),
+                    Prim::I16(xs) => reduce_rows(&bounds, &xs, IntWidth::I16, *r),
+                    Prim::I32(xs) => reduce_rows(&bounds, &xs, IntWidth::I32, *r),
+                    Prim::I64(xs) => reduce_rows(&bounds, &xs, IntWidth::I64, *r),
                     Prim::F64(ks) => reduce_floats(&bounds, &ks, *r)?,
                 }
             }
@@ -631,4 +695,37 @@ fn nan_results_agree_across_buffer_ownership() {
             assert_eq!(result, Value::f64(vec![f64::from_bits(0x7ff8_0000_0000_0000); 17]));
         }
     }
+}
+
+/// Narrow operands give the `i64` results, held at the storage the width rules give.
+#[cfg(test)]
+#[test]
+fn narrow_arithmetic_is_exact_and_narrow() {
+    let i8s = |xs: &[i64]| Prim::ints_at(IntWidth::I8, xs.iter().copied());
+    let u8s = |xs: &[i64]| Prim::ints_at(IntWidth::U8, xs.iter().copied());
+    let (x, y) = (i8s(&[-128, 127, -1, 5]), i8s(&[-128, 127, -1, 0]));
+    for (op, f, w) in [
+        (BinOp::Add, (|a, b| a + b) as fn(i64, i64) -> i64, IntWidth::I16),
+        (BinOp::Sub, |a, b| a - b, IntWidth::I16),
+        (BinOp::Mul, |a, b| a * b, IntWidth::I16),
+        (BinOp::Div, |a, b| if b == 0 { 0 } else { a / b }, IntWidth::I16),
+        (BinOp::Rem, |a, b| if b == 0 { a } else { a % b }, IntWidth::I8),
+    ] {
+        let out = bin_eval(op, x.clone(), y.clone()).unwrap();
+        assert_eq!(out.int_width(), Some(w), "{op:?}");
+        let want: Vec<i64> = (0..4).map(|i| f(x.i64_at(i), y.i64_at(i))).collect();
+        assert_eq!(out, Prim::I64(Arc::new(want)), "{op:?}");
+    }
+    // bytes times bytes need 32 bits; a byte and a signed byte meet at 16 first
+    assert_eq!(bin_eval(BinOp::Mul, u8s(&[255]), u8s(&[255])).unwrap().int_width(), Some(IntWidth::I32));
+    assert_eq!(bin_eval(BinOp::Add, u8s(&[255]), i8s(&[-1])).unwrap(), Prim::I64(Arc::new(vec![254])));
+    // a constant past the storage widens the storage it is computed at
+    let out = imm_eval(BinOp::Add, i8s(&[100]), Scalar::Int(1000), false).unwrap();
+    assert_eq!((out.int_width(), out.i64_at(0)), (Some(IntWidth::I32), 1100));
+    // `-128` negates to 128, past an `i8`
+    let mut neg = ArithOp::Neg.eval(Value::Prim(i8s(&[-128]))).unwrap();
+    assert_eq!(neg.into_prim("t").unwrap().i64_at(0), 128);
+    neg = ArithOp::Bits(BitOp::Xor).eval(Value::Prod(vec![Value::Prim(i8s(&[-1])), Value::Prim(i8s(&[5]))])).unwrap();
+    let p = neg.into_prim("t").unwrap();
+    assert_eq!((p.int_width(), p.i64_at(0)), (Some(IntWidth::I8), -6));
 }

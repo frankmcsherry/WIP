@@ -23,6 +23,10 @@ name = "gaps"
 harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see benches/gaps.rs
 
 [[bench]]
+name = "widths"
+harness = false   # the same programs over integers held at each storage
+
+[[bench]]
 name = "fold"
 harness = false   # Fold and FoldScan across row-length regimes and state shapes
 
