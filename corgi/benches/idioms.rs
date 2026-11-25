@@ -365,7 +365,7 @@ fn main() {
         if runs("field_sum") { field_sum(rows); }
         if runs("sum_wide") { sum_wide(rows, 50, "50%"); sum_wide(rows, 5, "5%"); }
         if runs("list") { for m in [4, 16, 64] { list_reduce(lists, m); } }
-        if runs("split") { for (max, one_in) in [(15, 6), (100, 6), (100, 64), (1000, 6), (1000, 64)] { split(lists / 8, max, one_in); } }
+        if runs("split") { for (max, one_in) in [(15, 6), (15, 64), (15, 1000), (100, 6), (100, 64), (1000, 6), (1000, 64)] { split(lists / 8, max, one_in); } }
         if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(lists, m); } }
         if runs("sort_results") { sort_results(rows); }
         if runs("distinct_pairs") { distinct_pairs(rows); }
