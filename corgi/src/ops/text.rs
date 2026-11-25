@@ -6,8 +6,10 @@
 //! well-typed program, so it must be a value, not a crash.
 
 
+use crate::ops::host::{HostKernel, HostOp};
+use crate::shape::Shape;
 use crate::value::{Bounds, Prim, Tags, Value};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TextOp {
@@ -120,4 +122,52 @@ impl TextOp {
             }
         })
     }
+}
+
+/// `lower` and `upper`: each ASCII letter of a string to that case, every other integer left as it
+/// is. `List<Int> -> List<Int>`, the row bounds kept.
+///
+/// These are host kernels, not `TextOp` variants: a word that is one loop over a column needs no
+/// arm in the typer, the optimizer or `eval`, and the next such word adds a kernel here and a name
+/// in the front-end's table. One kernel per word is shared by every program, since a host op is
+/// equal only to itself.
+struct Case {
+    name: &'static str,
+    upper: bool,
+    text: Shape,
+}
+
+impl HostKernel for Case {
+    fn name(&self) -> &str { self.name }
+    fn input(&self) -> &Shape { &self.text }
+    fn output(&self) -> &Shape { &self.text }
+    fn eval(&self, input: Value) -> Result<Value, String> {
+        let (bounds, vals) = input.into_list(self.name)?;
+        let out = match vals {
+            // text is bytes: rewritten where it lies when nothing else holds it, else in one pass
+            // into a new column
+            Value::Prim(Prim::U8(bytes)) => Value::u8(match (Arc::try_unwrap(bytes), self.upper) {
+                (Ok(mut own), true) => { own.make_ascii_uppercase(); own }
+                (Ok(mut own), false) => { own.make_ascii_lowercase(); own }
+                (Err(shared), true) => shared.to_ascii_uppercase(),
+                (Err(shared), false) => shared.to_ascii_lowercase(),
+            }),
+            // integers held wider: the letters among them move, by the same rule
+            other => {
+                let (from, by) = if self.upper { (b'a' as i64, -32) } else { (b'A' as i64, 32) };
+                Value::int(other.as_i64(self.name)?.iter().map(|&x| if (from..from + 26).contains(&x) { x + by } else { x }))
+            }
+        };
+        Ok(Value::List(bounds, Box::new(out)))
+    }
+}
+
+/// The host op behind the word `lower` (`upper` when `upper`).
+pub(crate) fn case(upper: bool) -> HostOp {
+    static WORDS: OnceLock<[Arc<dyn HostKernel>; 2]> = OnceLock::new();
+    let words = WORDS.get_or_init(|| {
+        let word = |name, upper| -> Arc<dyn HostKernel> { Arc::new(Case { name, upper, text: Shape::List(Box::new(Shape::Int)) }) };
+        [word("lower", false), word("upper", true)]
+    });
+    HostOp(words[upper as usize].clone())
 }

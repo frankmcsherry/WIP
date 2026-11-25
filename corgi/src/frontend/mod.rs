@@ -155,6 +155,9 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
         "split" => TextOp::Split(n()? as u8).into(),
         "parse_int" => TextOp::ParseInt.into(),
+        // ASCII case, a string at a time: host kernels (see `ops::text`), so no op variant each
+        "lower" => NumOp::Host(crate::ops::text::case(false)),
+        "upper" => NumOp::Host(crate::ops::text::case(true)),
         other => return Err(retired(other).unwrap_or_else(|| format!("unknown op '{other}'"))),
     })
 }

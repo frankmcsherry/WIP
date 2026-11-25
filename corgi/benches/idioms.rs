@@ -243,6 +243,27 @@ fn list_reduce(rows: usize, max: i64) {
     report("list_count", rows, &param, r, corgi_t(rows, &p, &input), "each row's elements above a threshold, counted");
 }
 
+/// lowercase a column of strings of `1..=max` bytes, mixed-case letters with spaces and digits.
+/// Rust maps a `Vec<String>` to a new one; corgi's strings are one column of bytes under row bounds.
+fn lower(rows: usize, max: i64) {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz 0123456789";
+    let mut rng = Rng(0x5eed);
+    let strings: Vec<String> = (0..rows)
+        .map(|_| (0..1 + rng.next() % max).map(|_| ALPHABET[rng.next() as usize % ALPHABET.len()] as char).collect())
+        .collect();
+    let (mut ends, mut flat) = (Vec::with_capacity(rows), Vec::new());
+    for s in &strings {
+        flat.extend_from_slice(s.as_bytes());
+        ends.push(flat.len());
+    }
+    let input = Value::List(Bounds::offsets(ends), Box::new(Value::u8(flat)));
+    let p = corgi("input lower");
+    let r = best(rows, || {
+        black_box(black_box(&strings).iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<String>>());
+    });
+    report("lower", rows, &format!("1..={max}"), r, corgi_t(rows, &p, &input), "a column of strings lowercased");
+}
+
 /// sort a column of lists (structural order: length, then elements). Rust sorts its own copy in
 /// place; the copy is made outside the timer.
 fn sort_lists(rows: usize, max: i64) {
@@ -344,6 +365,7 @@ fn main() {
         if runs("field_sum") { field_sum(rows); }
         if runs("sum_wide") { sum_wide(rows, 50, "50%"); sum_wide(rows, 5, "5%"); }
         if runs("list") { for m in [4, 16, 64] { list_reduce(lists, m); } }
+        if runs("lower") { for max in [3, 15, 100] { lower(lists, max); } }
         if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(lists, m); } }
         if runs("sort_results") { sort_results(rows); }
         if runs("distinct_pairs") { distinct_pairs(rows); }

@@ -1,0 +1,6 @@
+# ASCII case: `lower` and `upper` move the letters of a string and leave every other byte, here
+# the comma, the space and the digits. The row bounds are the input's.
+# n = 1
+# = (List ends=[15] <[104, 101, 108, 108, 111, 44, 32, 119, 111, 114, 108, 100, 32, 52, 50]>, List ends=[15] <[72, 69, 76, 76, 79, 44, 32, 87, 79, 82, 76, 68, 32, 52, 50]>)
+let s = "Hello, World 42" in
+(s lower, s upper)
