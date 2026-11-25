@@ -1,9 +1,10 @@
 //! The text bucket. A string is a list of integers, its bytes (held as bytes) — the `"…"` literal
 //! already constructs one — so there is no string type to add: the core never learns "text", and
-//! the typer sees only `List<Int>` in and shapes out. Both ops are TOTAL over their input shape:
-//! `Split` has no failure case (n delimiters make n+1 pieces), and `ParseInt` returns its failures
-//! as a committed `Sum` lane rather than panicking on data — a malformed row is reachable by some
-//! well-typed program, so it must be a value, not a crash.
+//! the typer sees only `List<Int>` in and shapes out. `ParseInt` is TOTAL over its input shape: it
+//! returns its failures as a committed `Sum` lane rather than panicking on data — a malformed row
+//! is reachable by some well-typed program, so it must be a value, not a crash. (`split` was here
+//! as a text op at one delimiter byte; it is now the core's `Op::Split` at a mask, and
+//! `split ","` is a word over it.)
 
 
 use crate::value::{Bounds, Prim, Tags, Value};
@@ -11,8 +12,6 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TextOp {
-    Split(u8), // List<Int> -> List<List<Int>>   split each row's bytes at the delimiter; adjacent
-               // delimiters and bare ends yield empty pieces, the delimiter byte is dropped.
     ParseInt,  // List<Int> -> Sum{Int | Unit}   parse each row as decimal: lane 0 (Ok) holds the
                // value; lane 1 (Err) counts the rows that are empty, non-digit, or past `i64`.
 }
@@ -69,47 +68,9 @@ fn parse_rows<T: Copy + Into<i64>>(ends: &Bounds, xs: &[T]) -> Value {
     Value::sum_tagged(assignment, vec![Value::i64(oks), Value::Unit(errs)])
 }
 
-/// [`TextOp::Split`] over one storage: `d` is the delimiter at that storage.
-fn split<T: Copy + PartialEq>(ends: &Bounds, bytes: &[T], d: T) -> (Vec<T>, Vec<usize>, Vec<usize>) {
-    // one pass over the flat buffer: non-delimiter bytes copy through, each delimiter (and each
-    // row end) closes a piece, each row end closes the outer row.
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut piece_ends = Vec::new();
-    let mut outer_ends = Vec::with_capacity(ends.len());
-    let mut start = 0;
-    for end in ends.ends() {
-        for &b in &bytes[start..end] {
-            if b == d {
-                piece_ends.push(out.len());
-            } else {
-                out.push(b);
-            }
-        }
-        piece_ends.push(out.len());
-        outer_ends.push(piece_ends.len());
-        start = end;
-    }
-    (out, piece_ends, outer_ends)
-}
-
 impl TextOp {
     pub(crate) fn eval(&self, input: Value) -> Result<Value, String> {
         Ok(match self {
-            TextOp::Split(d) => {
-                let (ends, vals) = input.into_list("Split")?;
-                let (out, piece_ends, outer_ends) = match &vals {
-                    Value::Prim(Prim::U8(bytes)) => {
-                        let (o, p, e) = split(&ends, bytes, *d);
-                        (Value::u8(o), p, e)
-                    }
-                    _ => {
-                        let xs = vals.as_i64("Split bytes")?;
-                        let (o, p, e) = split(&ends, &xs, *d as i64);
-                        (Value::i64(o), p, e)
-                    }
-                };
-                Value::List(outer_ends.into(), Box::new(Value::List(piece_ends.into(), Box::new(out))))
-            }
             TextOp::ParseInt => {
                 let (ends, vals) = input.into_list("ParseInt")?;
                 // text is bytes, read where they are; any other Int column is read as `i64`s

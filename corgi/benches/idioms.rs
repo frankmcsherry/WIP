@@ -243,6 +243,27 @@ fn list_reduce(rows: usize, max: i64) {
     report("list_count", rows, &param, r, corgi_t(rows, &p, &input), "each row's elements above a threshold, counted");
 }
 
+/// split a column of strings of `1..=max` bytes at spaces, about one byte in `one_in` a space.
+/// Rust borrows each piece from its `String`; corgi copies the kept bytes into one column.
+/// `split " "` is the word for `map (c -> ((c, 32) eq, c)) split`, so the mask is in the time.
+fn split(rows: usize, max: i64, one_in: i64) {
+    let mut rng = Rng(0x5eed);
+    let strings: Vec<String> = (0..rows)
+        .map(|_| (0..1 + rng.next() % max).map(|_| if rng.next() % one_in == 0 { ' ' } else { (b'a' + (rng.next() % 26) as u8) as char }).collect())
+        .collect();
+    let (mut ends, mut flat) = (Vec::with_capacity(rows), Vec::new());
+    for s in &strings {
+        flat.extend_from_slice(s.as_bytes());
+        ends.push(flat.len());
+    }
+    let input = Value::List(Bounds::offsets(ends), Box::new(Value::u8(flat)));
+    let p = corgi("input split \" \"");
+    let r = best(rows, || {
+        black_box(black_box(&strings).iter().map(|s| s.split(' ').collect::<Vec<&str>>()).collect::<Vec<_>>());
+    });
+    report("split", rows, &format!("{max}, 1/{one_in}"), r, corgi_t(rows, &p, &input), "a column of strings split at spaces");
+}
+
 /// sort a column of lists (structural order: length, then elements). Rust sorts its own copy in
 /// place; the copy is made outside the timer.
 fn sort_lists(rows: usize, max: i64) {
@@ -344,6 +365,7 @@ fn main() {
         if runs("field_sum") { field_sum(rows); }
         if runs("sum_wide") { sum_wide(rows, 50, "50%"); sum_wide(rows, 5, "5%"); }
         if runs("list") { for m in [4, 16, 64] { list_reduce(lists, m); } }
+        if runs("split") { for (max, one_in) in [(15, 6), (15, 64), (15, 1000), (100, 6), (100, 64), (1000, 6), (1000, 64)] { split(lists / 8, max, one_in); } }
         if runs("sort_lists") { for m in [2, 4, 16] { sort_lists(lists, m); } }
         if runs("sort_results") { sort_results(rows); }
         if runs("distinct_pairs") { distinct_pairs(rows); }

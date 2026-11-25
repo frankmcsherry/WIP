@@ -84,6 +84,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "sort_limit" => CmpOp::SortLimit(n()? as usize).into(), // `sort`, then the first k of each row
         "adjacent" => CmpOp::Adjacent.into(), // List<X> -> List<Int>: 1 where a run of equal elements starts
         "cut" => Op::Cut.into(),              // [(mask, x)] -> [[x]]: a piece starts at each marked x
+        "split" => Op::Split.into(),          // [(mask, x)] -> [[x]]: the marked x dropped, a piece each side of one
         "find" => CmpOp::Find.into(),
         // point access — `gather` (per row, positions of any shape into that row's list, each integer
         // leaf replaced by its element; a position past the row reads the zero of its shape). `get`
@@ -152,8 +153,7 @@ pub(crate) fn resolve(name: &str, arg: Option<u64>) -> Result<NumOp, String> {
         "scan_max" => ArithOp::Scan(Red::Max).into(), // the running maximum
         "scan_all" => ArithOp::Scan(Red::All).into(),
         "scan_any" => ArithOp::Scan(Red::Any).into(),
-        // text: the surface passes split's delimiter as a byte (parsed from a one-byte string).
-        "split" => TextOp::Split(n()? as u8).into(),
+        // text. (`split ","`, at one delimiter byte, is a word over `split`: see ml.rs.)
         "parse_int" => TextOp::ParseInt.into(),
         other => return Err(retired(other).unwrap_or_else(|| format!("unknown op '{other}'"))),
     })
