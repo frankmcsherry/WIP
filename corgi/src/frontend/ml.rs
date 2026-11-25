@@ -754,13 +754,16 @@ impl<'a> P<'a> {
                 let g = self.words.get(&w).ok_or_else(|| format!("no word '{w}' in scope"))?;
                 Ok(Apply::Call(g.clone()))
             }
-            // split: the delimiter is a one-byte string literal (`split ","`), not a bare number —
-            // it names a byte, not a count.
-            "split" => match self.bump() {
+            // split: `split` alone takes (mask, x) pairs. `split ","`, a one-byte string literal
+            // (it names a byte, not a count), is the word for text: the mask is where the byte is.
+            "split" => match self.peek() {
                 Some(Tok::Str(bytes)) if bytes.len() == 1 => {
-                    Ok(Apply::Op(name, Some(bytes[0] as u64)))
+                    let byte = bytes[0] as u64;
+                    self.bump();
+                    Ok(Apply::Op(name, Some(byte)))
                 }
-                other => Err(format!("split expects a one-byte string delimiter, found {other:?}")),
+                Some(Tok::Str(_)) => Err(format!("split expects a one-byte string delimiter, found {:?}", self.bump())),
+                _ => Ok(Apply::Op(name, None)),
             },
             // branch: the lane count is a literal, or an enum name standing for its arity.
             "branch" => {
@@ -1096,6 +1099,10 @@ fn lower(e: &E, env: &Env, b: &mut Builder<NumOp>) -> Result<usize, String> {
                 Apply::Op(name, arg) if name.starts_with("try_") => {
                     let arity = match &**e { E::Tuple(es) => Some(es.len()), _ => None };
                     try_word(b, id, name, *arg, arity)
+                }
+                // `split ","`: mark each element equal to the byte, and split there
+                Apply::Op(name, Some(byte)) if name == "split" => {
+                    Ok(b.graft(&parse_ml(&format!("input map (c -> ((c, {byte}) eq, c)) split"))?, id))
                 }
                 Apply::Op(name, None) if word(name).is_some() => {
                     Ok(b.graft(&parse_ml(word(name).expect("a word, by the guard"))?, id))

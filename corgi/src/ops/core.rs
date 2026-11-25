@@ -480,6 +480,10 @@ pub enum Op<L> {
     Cut,            // List<(Int-mask, X)> -> List<List<X>>  cut each row into pieces: a piece starts
                     // at each marked element and at the row's first. Only bounds are written; the
                     // values don't move. With `adjacent`'s marks, the pieces are runs of equal elements.
+    Split,          // List<(Int-mask, X)> -> List<List<X>>  split each row at its marked elements,
+                    // which are dropped: n marks make n+1 pieces, so adjacent marks and marks at
+                    // a row's ends yield empty pieces, and an empty row is one empty piece. The
+                    // kept values are copied. `split ","` is the word for text at one delimiter.
     Chunk(usize),   // List<X> -> List<List<X>>        partition each row into fixed `k`-wide sub-rows
                     // (the uniform inverse of Flatten): a pure re-partition — values don't move, the
                     // new inner list is a `Stride(k)`. The surface PRODUCER of wide strides, so a
@@ -812,6 +816,12 @@ impl<L: OpLike> Op<L> {
                 cut(&bounds, &mask.as_mask("Cut mask")?, vals)
             }
 
+            Op::Split => {
+                let (bounds, pairs) = input.into_list("Split")?;
+                let (mask, vals) = pairs.into_pair("Split element")?;
+                split(&bounds, &mask.as_mask("Split mask")?, &vals)
+            }
+
             Op::Chunk(k) => {
                 if *k == 0 {
                     return Err("Chunk width must be positive".into());
@@ -1138,6 +1148,78 @@ fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
     }
     Value::List(outer.into(), Box::new(Value::List(inner.into(), Box::new(vals))))
 }
+
+/// `Split`: each row's pieces end where a marked element is dropped, and at the row's end.
+fn split(bounds: &Bounds, mask: &[u8], vals: &Value) -> Value {
+    // The marks are counted first, which sizes the piece ends. Then every position writes the
+    // count of elements kept before it as a piece's end, and the next write lands on it unless
+    // the position was marked: no branch on the mask, so the cost does not depend on where the
+    // marks fall. The pieces closed so far are the marks seen and the rows before this one.
+    let marks = mask.iter().map(|&m| (m != 0) as usize).sum::<usize>();
+    let sparse = marks * SPLIT_SPARSE <= mask.len();
+    let mut piece_ends = vec![0usize; marks + bounds.len() + 1];
+    let mut outer = Vec::with_capacity(bounds.len());
+    let (mut seen, mut start) = (0usize, 0usize);
+    for (row, end) in bounds.ends().enumerate() {
+        let mut rest = &mask[start..end];
+        let mut k = start;
+        // few marks: skip each eight positions that hold none
+        if sparse && rest.len() >= 16 {
+            let mut words = rest.chunks_exact(8);
+            for word in &mut words {
+                if u64::from_le_bytes(word.try_into().expect("eight bytes")) != 0 {
+                    for (j, &m) in word.iter().enumerate() {
+                        piece_ends[seen + row] = k + j - seen;
+                        seen += (m != 0) as usize;
+                    }
+                }
+                k += 8;
+            }
+            rest = words.remainder();
+        }
+        for (j, &m) in rest.iter().enumerate() {
+            piece_ends[seen + row] = k + j - seen;
+            seen += (m != 0) as usize;
+        }
+        // each row end closes a piece
+        piece_ends[seen + row] = end - seen;
+        outer.push(seen + row + 1);
+        start = end;
+    }
+    piece_ends.truncate(marks + bounds.len());
+    // The kept elements, of any shape. With few marks they are the runs between marks, each copied
+    // whole: a piece that a mark closed ends where that mark was, less the marks before it, and
+    // those are the pieces closed so far less the rows. Otherwise they are taken as `filter` does.
+    let kept = if sparse {
+        let mut spans = Vec::with_capacity(marks + 1);
+        let (mut from, mut piece) = (0usize, 0usize);
+        for (row, &through) in outer.iter().enumerate() {
+            for (p, &end) in piece_ends.iter().enumerate().take(through - 1).skip(piece) {
+                let mark = end + p - row;
+                if mark > from {
+                    spans.push((0, from, mark));
+                }
+                from = mark + 1;
+            }
+            piece = through;
+        }
+        if mask.len() > from {
+            spans.push((0, from, mask.len()));
+        }
+        take_spans(&[vals], &spans)
+    } else {
+        let keep: Vec<u8> = mask.iter().map(|&m| (m == 0) as u8).collect();
+        compress(vals, &keep, mask.len() - marks)
+    };
+    Value::List(outer.into(), Box::new(Value::List(piece_ends.into(), Box::new(kept))))
+}
+
+/// A column with at most one mark per this many elements is split by skipping its unmarked words
+/// and copying the runs between marks. Measured (`cargo bench --bench idioms -- split`, strings of
+/// up to 1000 bytes, ns per string): the plain pass takes 382 to 398 at every density; this takes
+/// 334 to 364 at one mark per 32, 214 to 239 at one per 64 and 116 to 137 at one per 256, but
+/// 568 to 601 at one per 16.
+const SPLIT_SPARSE: usize = 32;
 
 fn chunk(bounds: Bounds, vals: Value, k: usize) -> Value {
     let mut outer = Vec::with_capacity(bounds.len());

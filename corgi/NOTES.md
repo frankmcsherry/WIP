@@ -196,8 +196,9 @@ src/
     numeric.rs NumOp { Core(Op<NumOp>), Cmp(CmpOp), Arith(ArithOp), Text(TextOp) } : OpLike. ArithOp =
                arithmetic on two Ints or two Floats (the kind from the operands) + the `_b64` and
                bitwise ops (an Int as its 64-bit word) + shifts + the named reductions and scans.
-    text.rs    TextOp: Split(u8) + ParseInt. A string is a List<Int> of its bytes (held as bytes); both
-               total — ParseInt returns Sum{Ok: Int | Err: ()}, no data-dependent panic.
+    text.rs    TextOp: ParseInt. A string is a List<Int> of its bytes (held as bytes). Total:
+               ParseInt returns Sum{Ok: Int | Err: ()}, no data-dependent panic. (`split` is the
+               core's `Op::Split` at a mask; `split ","` is a word over it.)
   frontend/
     mod.rs     the op-name resolve table (the whole vocabulary the surface reaches, apart from the
                words a host binds in a `Scope`).

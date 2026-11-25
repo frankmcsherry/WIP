@@ -1,0 +1,8 @@
+# split at a mask: the marked elements are dropped and a piece lies each side of one, so n marks
+# make n+1 pieces. Here the marks are the zeros of 0 1 2 0 1 2 0 1: the first piece, before the
+# leading zero, is empty. (`cut`, at the same marks, keeps the zeros: 0 1 2 | 0 1 2 | 0 1.)
+# `s split ","` is this with the mask set where a string's byte is the comma.
+# n = 8
+# = List ends=[4] <List ends=[0, 2, 4, 5] <[1, 2, 1, 2, 1]>>
+let xs = input iota map (x -> (x, 3) rem) in
+xs map (x -> ((x, 0) eq, x)) split
