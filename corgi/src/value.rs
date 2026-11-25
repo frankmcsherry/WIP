@@ -62,7 +62,7 @@ pub(crate) enum Rows<'a> {
     Named(&'a Bounds, &'a [usize]),
 }
 
-impl Rows<'_> {
+impl<'a> Rows<'a> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Rows::Part(b) => b.len(),
@@ -73,6 +73,30 @@ impl Rows<'_> {
         match self {
             Rows::Part(b) => b.span(i),
             Rows::Named(b, rows) => b.span(rows[i]),
+        }
+    }
+    /// the same rows over a partition that answers `span` in constant time, for `queries` reads (SPIKE).
+    pub(crate) fn random_access(&self, queries: usize) -> (std::borrow::Cow<'a, Bounds>, Option<&'a [usize]>) {
+        match self {
+            Rows::Part(b) => (b.random_access(queries), None),
+            Rows::Named(b, rows) => (b.random_access(queries), Some(rows)),
+        }
+    }
+    /// these rows over `b`, as `random_access` returned them.
+    pub(crate) fn over<'b>(b: &'b Bounds, rows: Option<&'b [usize]>) -> Rows<'b> {
+        match rows {
+            None => Rows::Part(b),
+            Some(rows) => Rows::Named(b, rows),
+        }
+    }
+    /// every row's span, in order (SPIKE): a partition in one pass, named rows through `random_access`.
+    pub(crate) fn spans(&self) -> Box<dyn Iterator<Item = (usize, usize)> + '_> {
+        match self {
+            Rows::Part(b) => Box::new(b.spans()),
+            Rows::Named(b, rows) => {
+                let ra = b.random_access(rows.len());
+                Box::new(rows.iter().map(move |&r| ra.span(r)))
+            }
         }
     }
 }
@@ -91,6 +115,10 @@ pub enum Bounds {
     // refcount bump. A bare `Vec` here made cloning a `List<U64>` copy as many bytes as the data.
     Offsets(Arc<Vec<usize>>),
     Stride(usize, usize), // (stride, rows): row i spans [i*stride .. (i+1)*stride), total = stride*rows
+    // SPIKE (`lists.rs`): row lengths at a narrow width plus every 64th row's start.
+    Lens(Arc<lists::Lens>),
+    // SPIKE (`lists.rs`): one bit per element and per row, with a select directory.
+    Unary(Arc<lists::Unary>),
 }
 
 impl Bounds {
@@ -99,6 +127,8 @@ impl Bounds {
         match self {
             Bounds::Offsets(v) => v.len(),
             Bounds::Stride(_, rows) => *rows,
+            Bounds::Lens(l) => l.len(),
+            Bounds::Unary(u) => u.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -109,6 +139,8 @@ impl Bounds {
         match self {
             Bounds::Offsets(v) => v[i],
             Bounds::Stride(k, _) => (i + 1) * k,
+            Bounds::Lens(l) => l.span(i).1,
+            Bounds::Unary(u) => u.end(i),
         }
     }
     /// total flattened element count.
@@ -116,6 +148,8 @@ impl Bounds {
         match self {
             Bounds::Offsets(v) => v.last().copied().unwrap_or(0),
             Bounds::Stride(k, rows) => k * rows,
+            Bounds::Lens(l) => l.total(),
+            Bounds::Unary(u) => u.total(),
         }
     }
     /// row `i`'s `[start, end)` span.
@@ -123,29 +157,87 @@ impl Bounds {
         match self {
             Bounds::Offsets(v) => (if i == 0 { 0 } else { v[i - 1] }, v[i]),
             Bounds::Stride(k, _) => (i * k, (i + 1) * k),
+            Bounds::Lens(l) => l.span(i),
+            Bounds::Unary(u) => u.span(i),
         }
     }
     /// the uniform stride, if this partition is uniform — the O(1) detection that recovers array kernels.
     pub fn strided(&self) -> Option<usize> {
         match self {
             Bounds::Stride(k, _) => Some(*k),
-            Bounds::Offsets(_) => None,
+            Bounds::Offsets(_) | Bounds::Lens(_) | Bounds::Unary(_) => None,
         }
     }
     /// iterate the per-row end offsets (materialized for `Stride`). One iterator type for both
     /// forms, with the form decided once rather than per row: the offsets, or the stride's multiples.
-    pub(crate) fn ends(&self) -> impl Iterator<Item = usize> + '_ {
-        let (offsets, k, rows): (&[usize], usize, usize) = match self {
-            Bounds::Offsets(v) => (v, 0, 0),
-            Bounds::Stride(k, rows) => (&[], *k, *rows),
-        };
-        offsets.iter().copied().chain((1..=rows).map(move |i| i * k))
+    pub(crate) fn ends(&self) -> lists::Ends<'_> {
+        self.ends_from(0)
+    }
+    /// the ends of rows `from..`, in order, in one pass.
+    pub(crate) fn ends_from(&self, from: usize) -> lists::Ends<'_> {
+        match self {
+            Bounds::Offsets(v) => lists::Ends::Slice(v[from..].iter().copied()),
+            Bounds::Stride(k, rows) => lists::Ends::Stride { k: *k, i: from, n: *rows },
+            Bounds::Lens(l) => lists::Ends::lens(l, from),
+            Bounds::Unary(u) => lists::Ends::unary(u, from),
+        }
+    }
+    /// every row's `[start, end)` span, in order, in one pass.
+    pub(crate) fn spans(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let mut prev = 0;
+        self.ends().map(move |e| (std::mem::replace(&mut prev, e), e))
+    }
+    /// a partition that answers `span` in constant time, for `queries` random reads (SPIKE): this one,
+    /// or for a compact form read often enough, its ends decoded once.
+    pub(crate) fn random_access(&self, queries: usize) -> std::borrow::Cow<'_, Bounds> {
+        match self {
+            Bounds::Lens(_) | Bounds::Unary(_) if lists::decode() && queries.saturating_mul(8) >= self.len() => {
+                std::borrow::Cow::Owned(Bounds::Offsets(Arc::new(self.ends().collect())))
+            }
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
+    /// a stride, when every length is one (SPIKE).
+    pub(crate) fn uniform_lens(l: &lists::Lens) -> Option<Bounds> {
+        let n = l.len();
+        if n == 0 { return Some(Bounds::Stride(0, 0)); }
+        let k = l.lens.get(0);
+        (0..n).all(|i| l.lens.get(i) == k).then_some(Bounds::Stride(k, n))
+    }
+    /// the spans of rows `idx` read as one batch, folded to a number (SPIKE).
+    pub fn bench_spans_batch(&self, idx: &[usize], out: &mut Vec<(usize, usize)>) -> usize {
+        match self {
+            Bounds::Lens(l) => l.spans_at(idx, out),
+            _ => { out.clear(); out.extend(idx.iter().map(|&i| self.span(i))); }
+        }
+        out.iter().fold(0, |acc, &(s, e)| acc ^ s.wrapping_add(e))
+    }
+    /// the spans of rows `idx`, one read each, folded to a number (SPIKE: for timing random reads).
+    pub fn bench_spans(&self, idx: &[usize]) -> usize {
+        idx.iter().fold(0, |acc, &i| { let (s, e) = self.span(i); acc ^ s.wrapping_add(e) })
+    }
+    /// the bytes the partition holds (SPIKE: for size reports).
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Bounds::Offsets(v) => 8 * v.len(),
+            Bounds::Stride(..) => 0,
+            Bounds::Lens(l) => l.bytes(),
+            Bounds::Unary(u) => u.bytes(),
+        }
+    }
+    /// the partition with these ends, in the form `CORGI_LISTS` names (SPIKE).
+    fn in_form(ends: Vec<usize>) -> Bounds {
+        match lists::form() {
+            lists::Form::Offsets => Bounds::Offsets(Arc::new(ends)),
+            lists::Form::Lens => Bounds::Lens(Arc::new(lists::Lens::from_ends(&ends))),
+            lists::Form::Unary => Bounds::Unary(Arc::new(lists::Unary::from_ends(&ends))),
+        }
     }
     /// materialize the general end-offset form — for ops not yet stride-aware, and for eq/show.
     pub fn to_vec(&self) -> Vec<usize> {
         match self {
             Bounds::Offsets(v) => (**v).clone(),
-            Bounds::Stride(..) => self.ends().collect(),
+            _ => self.ends().collect(),
         }
     }
 
@@ -176,7 +268,7 @@ impl From<Vec<usize>> for Bounds {
         // is representation-invisible.
         match Bounds::uniform(&v) {
             Some(k) => Bounds::Stride(k, v.len()),
-            None => Bounds::Offsets(Arc::new(v)),
+            None => Bounds::in_form(v),
         }
     }
 }
@@ -190,6 +282,9 @@ impl PartialEq for Bounds {
             (Bounds::Offsets(a), Bounds::Offsets(b)) => Arc::ptr_eq(a, b) || a == b,
             // no rows is one partition whatever the stride: there is no row for the strides to differ on
             (Bounds::Stride(k0, n0), Bounds::Stride(k1, n1)) => n0 == n1 && (*n0 == 0 || k0 == k1),
+            // SPIKE: one buffer, or the same lengths (or bits) as each other
+            (Bounds::Lens(a), Bounds::Lens(b)) => Arc::ptr_eq(a, b) || (a.len() == b.len() && a.lens.same(&b.lens)),
+            (Bounds::Unary(a), Bounds::Unary(b)) => Arc::ptr_eq(a, b) || (a.len() == b.len() && a.words() == b.words()),
             _ => self.len() == other.len() && self.ends().eq(other.ends()),
         }
     }
@@ -482,9 +577,10 @@ macro_rules! prim {
                         }
                         let mut ends = Vec::with_capacity(rows);
                         let mut starts = vec![0; parts.len()];
-                        for r in 0..rows {
-                            for (k, (b, _)) in parts.iter().enumerate() {
-                                let e = b.end(r);
+                        let mut part_ends: Vec<_> = parts.iter().map(|(b, _)| b.ends()).collect();
+                        for _ in 0..rows {
+                            for (k, ends) in part_ends.iter_mut().enumerate() {
+                                let e = ends.next().unwrap();
                                 out.extend_from_slice(&vals[k][starts[k]..e]);
                                 starts[k] = e;
                             }
@@ -1126,6 +1222,7 @@ impl Value {
                 match bounds {
                     Bounds::Offsets(ends) => truncate_arc(ends, n),
                     Bounds::Stride(_, rows) => *rows = n,
+                    other => *other = other.ends().take(n).collect::<Vec<_>>().into(),
                 }
                 vals.truncate(end);
             }
@@ -1336,3 +1433,4 @@ impl<'a> Ints<'a> {
 
 #[cfg(test)]
 mod tests;
+pub mod lists;

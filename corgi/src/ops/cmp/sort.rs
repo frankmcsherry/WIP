@@ -512,6 +512,8 @@ fn sort_list(
     scratch: &mut SortScratch,
 ) -> Option<Value> {
     let m = index.len();
+    let ra = bounds.random_access(m);
+    let bounds: &Bounds = &ra;
     // every row holds one element: a row sorts as its element does, and row r is element r, so the
     // elements are sorted under the rows' labels and index
     if bounds.strided() == Some(1) {
@@ -626,14 +628,13 @@ fn sort_list(
     scratch.slot = slot;
     refine(labels, |_| false);
     emit.values().then(|| {
-        let (mut spans, mut ends, mut acc) = (Vec::new(), Vec::with_capacity(m), 0);
+        let (mut spans, mut out) = (Vec::new(), crate::value::lists::Builder::new(m));
         for &r in index.iter() {
             let (s, e) = bounds.span(r);
             push_span(&mut spans, 0, s, e);
-            acc += e - s;
-            ends.push(acc);
+            out.push(e - s);
         }
-        Value::List(ends.into(), Box::new(take_spans(&[vals], &spans)))
+        Value::List(out.finish(), Box::new(take_spans(&[vals], &spans)))
     })
 }
 

@@ -113,11 +113,11 @@ pub fn hash(v: &Value) -> Vec<u64> {
         // equivalent `Offsets` hash identically (matching `Bounds` equality, which is by the
         // partition, not its representation). A list of leaves uses a single row hash.
         Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
-            leaf_list_rows(vals, bounds.len(), |r| bounds.span(r))
+            leaf_list_rows(vals, bounds.spans())
         }
         Value::List(bounds, vals) => {
             let ch = hash(vals);
-            (0..bounds.len()).map(|r| hash_span(&ch, bounds.span(r))).collect()
+            bounds.spans().map(|sp| hash_span(&ch, sp)).collect()
         }
 
         // unit = no payload; every row hashes to the same constant.
@@ -127,7 +127,8 @@ pub fn hash(v: &Value) -> Vec<u64> {
         // names). A list of leaves hashes just the rows named; any other arena is hashed whole.
         Value::Ref(list, rows) => match &**list {
             Value::List(bounds, vals) if matches!(**vals, Value::Prim(_)) => {
-                leaf_list_rows(vals, rows.len(), |i| bounds.span(rows[i]))
+                let b = bounds.random_access(rows.len());
+                leaf_list_rows(vals, rows.iter().map(|&r| b.span(r)))
             }
             _ => {
                 let rh = hash(list);
@@ -139,30 +140,28 @@ pub fn hash(v: &Value) -> Vec<u64> {
 
 /// `n` rows of a list of leaves, row `i` the elements `span(i)` of `vals`: the hash of each row,
 /// computed in the row's own loop.
-fn leaf_list_rows(vals: &Value, n: usize, span: impl Fn(usize) -> (usize, usize)) -> Vec<u64> {
+fn leaf_list_rows(vals: &Value, spans: impl Iterator<Item = (usize, usize)>) -> Vec<u64> {
     match vals {
-        Value::Prim(Prim::U8(bytes)) => byte_rows(n, span, bytes),
-        Value::Prim(Prim::I64(xs)) => leaf_rows(n, span, xs, |x| x as u64),
-        Value::Prim(Prim::F64(keys)) => leaf_rows(n, span, keys, |k| k),
+        Value::Prim(Prim::U8(bytes)) => byte_rows(spans, bytes),
+        Value::Prim(Prim::I64(xs)) => leaf_rows(spans, xs, |x| x as u64),
+        Value::Prim(Prim::F64(keys)) => leaf_rows(spans, keys, |k| k),
         _ => unreachable!("a list of leaves"),
     }
 }
 
 /// Lists of leaves use foldhash quality, with distinct domains for bytes and words.
-fn byte_rows(n: usize, span: impl Fn(usize) -> (usize, usize), bytes: &[u8]) -> Vec<u64> {
-    (0..n).map(|r| {
-        let (s, e) = span(r);
+fn byte_rows(spans: impl Iterator<Item = (usize, usize)>, bytes: &[u8]) -> Vec<u64> {
+    spans.map(|(s, e)| {
         foldhash::hash(&bytes[s..e], LIST)
     }).collect()
 }
 
 /// Reuse one encoding buffer; byte-valued rows must agree with U8 storage, even in a mixed batch.
-fn leaf_rows<T: Copy>(n: usize, span: impl Fn(usize) -> (usize, usize), xs: &[T], word: impl Fn(T) -> u64) -> Vec<u64> {
+fn leaf_rows<T: Copy>(spans: impl Iterator<Item = (usize, usize)>, xs: &[T], word: impl Fn(T) -> u64) -> Vec<u64> {
     const WORDS: u64 = 0x4528_21e6_38d0_1377;
     let mut bytes = Vec::new();
-    (0..n)
-        .map(|r| {
-            let (s, e) = span(r);
+    spans
+        .map(|(s, e)| {
             let row = &xs[s..e];
             let is_bytes = row.iter().all(|&x| word(x) <= 255);
             bytes.clear();

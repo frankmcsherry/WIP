@@ -663,6 +663,7 @@ impl<L: OpLike> Op<L> {
                 let mut counts = vec![0usize; lanes.len()];
                 let (mut tag8, mut off) = (Vec::with_capacity(tags.len()), Vec::with_capacity(tags.len()));
                 let mut start = 0;
+                let mut lane_ends: Vec<_> = lane_bounds.iter().map(|lb| lb.ends()).collect();
                 for (r, end) in tb.ends().enumerate() {
                     for &t in &tags[start..end] {
                         assert!((t as usize) < lanes.len(), "Weave: tag {t} out of range");
@@ -670,8 +671,8 @@ impl<L: OpLike> Op<L> {
                         off.push(counts[t as usize]);
                         counts[t as usize] += 1;
                     }
-                    for (t, (lb, &c)) in lane_bounds.iter().zip(&counts).enumerate() {
-                        assert_eq!(lb.end(r), c, "Weave: row {r} lane {t} length/tag-count mismatch");
+                    for (t, (lb, &c)) in lane_ends.iter_mut().zip(&counts).enumerate() {
+                        assert_eq!(lb.next(), Some(c), "Weave: row {r} lane {t} length/tag-count mismatch");
                     }
                     start = end;
                 }
@@ -769,9 +770,10 @@ impl<L: OpLike> Op<L> {
                 }
                 let (mut nb, mut spans, mut acc) = (Vec::with_capacity(rows), Vec::new(), 0);
                 let mut starts = vec![0usize; parts.len()];
-                for r in 0..rows {
-                    for (k, (b, _)) in parts.iter().enumerate() {
-                        let e = b.end(r);
+                let mut part_ends: Vec<_> = parts.iter().map(|(b, _)| b.ends()).collect();
+                for _ in 0..rows {
+                    for (k, ends) in part_ends.iter_mut().enumerate() {
+                        let e = ends.next().unwrap();
                         push_span(&mut spans, k, starts[k], e); // list k's row-r elements
                         acc += e - starts[k];
                         starts[k] = e;
@@ -785,6 +787,10 @@ impl<L: OpLike> Op<L> {
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
                 let (rows, _vals) = input.rows_of("Len")?;
+                // SPIKE: a list of byte lengths IS its `len`, shared
+                if let Rows::Part(Bounds::Lens(l)) = &rows {
+                    return Ok(Value::Prim(l.lens.to_prim()));
+                }
                 let lens = match rows {
                     // a partition's lengths are the differences of its ends (a stride's, one number)
                     Rows::Part(Bounds::Offsets(ends)) => {
@@ -800,6 +806,18 @@ impl<L: OpLike> Op<L> {
                         .map(|&r| (ends[r] - if r == 0 { 0 } else { ends[r - 1] }) as i64)
                         .collect(),
                     Rows::Named(Bounds::Stride(k, _), named) => vec![*k as i64; named.len()],
+                    Rows::Part(Bounds::Lens(l)) => l.lens.to_i64(),
+                    Rows::Part(b) => {
+                        // `for_each`, so the form is decided once (`Ends::fold`)
+                        let (mut prev, mut lens) = (0, Vec::with_capacity(b.len()));
+                        b.ends().for_each(|e| lens.push((e - std::mem::replace(&mut prev, e)) as i64));
+                        lens
+                    }
+                    Rows::Named(Bounds::Lens(l), named) => named.iter().map(|&r| l.lens.get(r) as i64).collect(),
+                    Rows::Named(b, named) => {
+                        let b = b.random_access(named.len());
+                        named.iter().map(|&r| { let (s, e) = b.span(r); (e - s) as i64 }).collect()
+                    }
                 };
                 Value::i64(lens)
             }
@@ -972,9 +990,8 @@ impl<L: OpLike> Op<L> {
                 // Check the payload's zero even on empty input, as raw Gather does.
                 let mut zero = crate::engine::gather_or_zero(hvals, &[])?;
                 let (mut spans, mut ends, mut total, mut padding) = (Vec::new(), Vec::new(), 0, 0);
-                for (i, (&a, &z)) in lo.iter().zip(hi.iter()).enumerate() {
+                for ((&a, &z), (s, e)) in lo.iter().zip(hi.iter()).zip(hb.spans()) {
                     let z = z.max(a);
-                    let (s, e) = hb.span(i);
                     let len = (e - s) as i128;
                     let (a, z) = (a as i128, z as i128);
                     let before = (z.min(0) - a.min(0)) as usize;
@@ -1013,13 +1030,15 @@ impl<L: OpLike> Op<L> {
                         return Ok(Value::List(ib, Box::new(Value::Prim(p.gather_words_owned(idxs)))));
                     }
                 }
-                index_plan(&idx, &Owners::Identity, hb)?.fill_or_zero(hvals)?
+                let (ra, named) = hb.random_access(idx.len());
+                index_plan(&idx, &Owners::Identity, Rows::over(&ra, named))?.fill_or_zero(hvals)?
             }
 
             // Join two list layers, retaining the items and computing only the outer bounds.
             Op::Flatten => {
                 let (ob, inner) = input.into_list("Flatten")?;
                 let (ib, vals) = inner.into_list("Flatten inner")?;
+                let ib = ib.random_access(ob.len());
                 let new_ob: Vec<usize> =
                     ob.ends().map(|e| if e == 0 { 0 } else { ib.end(e - 1) }).collect();
                 Value::List(new_ob.into(), Box::new(vals))
@@ -1121,6 +1140,10 @@ fn zip_shortest(bounds: Vec<Bounds>, cols: Vec<Value>) -> Value {
 /// remainder, and then the kept elements are no longer contiguous, so they are gathered (cold).
 /// `Cut`: each row's pieces end where the next marked element starts one, and at the row's end.
 fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
+    // SPIKE: under `CORGI_LISTS=lens`, the pieces are written as lengths
+    if crate::value::lists::form() == crate::value::lists::Form::Lens {
+        return cut_lens(bounds, mask, vals);
+    }
     // Each position after a row's first is written as a piece's end, and the next write lands on
     // it unless it was marked: no branch on the mask, so the cost does not depend on how the marks
     // fall (as `compress` finds its kept positions). The marks are counted first, for the size:
@@ -1160,6 +1183,71 @@ fn cut(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
     }
     inner.truncate(n);
     Value::List(outer.into(), Box::new(Value::List(inner.into(), Box::new(vals))))
+}
+
+/// `cut` writing lengths (SPIKE): a piece is no longer than its row, and a row holds no more pieces
+/// than elements, so both levels fit the width of the longest row. A list of lengths knows that
+/// width already; offsets are scanned for it.
+fn cut_lens(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
+    use crate::value::lists::{Lens, Narrow};
+    let longest = match bounds {
+        Bounds::Lens(l) => match l.lens { Narrow::U8(_) => 255, Narrow::U16(_) => 65535, Narrow::U32(_) => u32::MAX as usize, Narrow::U64(_) => usize::MAX },
+        Bounds::Stride(k, _) => *k,
+        _ => bounds.spans().map(|(s, e)| e - s).max().unwrap_or(0),
+    };
+    let marks = mask.iter().map(|&m| (m != 0) as usize).sum::<usize>();
+    let sparse = marks * CUT_SPARSE <= mask.len();
+    macro_rules! at {
+        ($T:ty, $V:ident) => {{
+            let mut outer: Vec<$T> = Vec::with_capacity(bounds.len());
+            let mut inner: Vec<$T> = vec![0; marks + bounds.len() + 1];
+            let mut n = 0usize;
+            for (start, end) in bounds.spans() {
+                let n0 = n;
+                if end > start {
+                    // each position writes itself, relative to the row, as the end of the piece
+                    // that would end there, and a mark keeps it (as `cut` does); the row's ends
+                    // become lengths afterwards, one subtraction per piece
+                    let mut k = 1;
+                    let mut rest = &mask[start + 1..end];
+                    let len = end - start;
+                    if sparse && rest.len() >= 16 {
+                        let mut words = rest.chunks_exact(8);
+                        for word in &mut words {
+                            if u64::from_le_bytes(word.try_into().expect("eight bytes")) != 0 {
+                                for (j, &m) in word.iter().enumerate() {
+                                    inner[n] = (k + j) as $T;
+                                    n += (m != 0) as usize;
+                                }
+                            }
+                            k += 8;
+                        }
+                        rest = words.remainder();
+                    }
+                    for (j, &m) in rest.iter().enumerate() {
+                        inner[n] = (k + j) as $T;
+                        n += (m != 0) as usize;
+                    }
+                    inner[n] = len as $T;
+                    n += 1;
+                    for p in (n0 + 1..n).rev() {
+                        inner[p] -= inner[p - 1];
+                    }
+                }
+                outer.push((n - n0) as $T);
+            }
+            inner.truncate(n);
+            let lens = |v: Vec<$T>| {
+                let l = Lens::from_lens(Narrow::$V(v.into()));
+                Bounds::uniform_lens(&l).unwrap_or_else(|| Bounds::Lens(Arc::new(l)))
+            };
+            Value::List(lens(outer), Box::new(Value::List(lens(inner), Box::new(vals))))
+        }};
+    }
+    if longest <= u8::MAX as usize { at!(u8, U8) }
+    else if longest <= u16::MAX as usize { at!(u16, U16) }
+    else if longest <= u32::MAX as usize { at!(u32, U32) }
+    else { at!(u64, U64) }
 }
 
 /// A column with at most one mark per this many elements is cut by skipping its unmarked words.
