@@ -191,7 +191,7 @@ impl Bounds {
     /// or for a compact form read often enough, its ends decoded once.
     pub(crate) fn random_access(&self, queries: usize) -> std::borrow::Cow<'_, Bounds> {
         match self {
-            Bounds::Lens(_) | Bounds::Unary(_) if queries.saturating_mul(8) >= self.len() => {
+            Bounds::Lens(_) | Bounds::Unary(_) if lists::decode() && queries.saturating_mul(8) >= self.len() => {
                 std::borrow::Cow::Owned(Bounds::Offsets(Arc::new(self.ends().collect())))
             }
             _ => std::borrow::Cow::Borrowed(self),
@@ -203,6 +203,18 @@ impl Bounds {
         if n == 0 { return Some(Bounds::Stride(0, 0)); }
         let k = l.lens.get(0);
         (0..n).all(|i| l.lens.get(i) == k).then_some(Bounds::Stride(k, n))
+    }
+    /// the spans of rows `idx` read as one batch, folded to a number (SPIKE).
+    pub fn bench_spans_batch(&self, idx: &[usize], out: &mut Vec<(usize, usize)>) -> usize {
+        match self {
+            Bounds::Lens(l) => l.spans_at(idx, out),
+            _ => { out.clear(); out.extend(idx.iter().map(|&i| self.span(i))); }
+        }
+        out.iter().fold(0, |acc, &(s, e)| acc ^ s.wrapping_add(e))
+    }
+    /// the spans of rows `idx`, one read each, folded to a number (SPIKE: for timing random reads).
+    pub fn bench_spans(&self, idx: &[usize]) -> usize {
+        idx.iter().fold(0, |acc, &i| { let (s, e) = self.span(i); acc ^ s.wrapping_add(e) })
     }
     /// the bytes the partition holds (SPIKE: for size reports).
     pub fn heap_bytes(&self) -> usize {

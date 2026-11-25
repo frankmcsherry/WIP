@@ -787,6 +787,10 @@ impl<L: OpLike> Op<L> {
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
                 let (rows, _vals) = input.rows_of("Len")?;
+                // SPIKE: a list of byte lengths IS its `len`, shared
+                if let Rows::Part(Bounds::Lens(l)) = &rows {
+                    return Ok(Value::Prim(l.lens.to_prim()));
+                }
                 let lens = match rows {
                     // a partition's lengths are the differences of its ends (a stride's, one number)
                     Rows::Part(Bounds::Offsets(ends)) => {
@@ -1234,7 +1238,7 @@ fn cut_lens(bounds: &Bounds, mask: &[u8], vals: Value) -> Value {
             }
             inner.truncate(n);
             let lens = |v: Vec<$T>| {
-                let l = Lens::from_lens(Narrow::$V(v));
+                let l = Lens::from_lens(Narrow::$V(v.into()));
                 Bounds::uniform_lens(&l).unwrap_or_else(|| Bounds::Lens(Arc::new(l)))
             };
             Value::List(lens(outer), Box::new(Value::List(lens(inner), Box::new(vals))))

@@ -40,7 +40,8 @@ pub const LENS_BLOCK: usize = 64;
 /// row lengths at one width: the narrowest that holds the longest row.
 #[derive(Clone, Debug)]
 pub enum Narrow {
-    U8(Vec<u8>),
+    // behind an `Arc`, so `len` hands the lengths out as a leaf without a copy
+    U8(std::sync::Arc<Vec<u8>>),
     U16(Vec<u16>),
     U32(Vec<u32>),
     U64(Vec<u64>),
@@ -61,7 +62,7 @@ impl Narrow {
     /// lengths at the narrowest width that holds `max`.
     pub fn with_max(lens: impl ExactSizeIterator<Item = usize>, max: usize) -> Narrow {
         if max <= u8::MAX as usize {
-            Narrow::U8(lens.map(|l| l as u8).collect())
+            Narrow::U8(std::sync::Arc::new(lens.map(|l| l as u8).collect()))
         } else if max <= u16::MAX as usize {
             Narrow::U16(lens.map(|l| l as u16).collect())
         } else if max <= u32::MAX as usize {
@@ -92,6 +93,18 @@ impl Narrow {
     pub fn bytes(&self) -> usize {
         narrow!(self, v => std::mem::size_of_val(&v[..]))
     }
+    /// the lengths as an integer leaf: shared for bytes, widened to i64 otherwise (corgi has no
+    /// u16 or u32 leaf yet).
+    pub fn to_prim(&self) -> crate::value::Prim {
+        match self {
+            Narrow::U8(v) => crate::value::Prim::U8(v.clone()),
+            other => crate::value::Prim::I64(std::sync::Arc::new(other.to_i64())),
+        }
+    }
+    /// bytes per length.
+    pub fn width(&self) -> usize {
+        match self { Narrow::U8(_) => 1, Narrow::U16(_) => 2, Narrow::U32(_) => 4, Narrow::U64(_) => 8 }
+    }
     pub fn to_i64(&self) -> Vec<i64> {
         narrow!(self, v => v.iter().map(|&x| x as i64).collect())
     }
@@ -109,7 +122,7 @@ impl Narrow {
     #[inline]
     pub fn push(&mut self, l: usize) {
         match self {
-            Narrow::U8(v) if l <= u8::MAX as usize => v.push(l as u8),
+            Narrow::U8(v) if l <= u8::MAX as usize => std::sync::Arc::make_mut(v).push(l as u8),
             Narrow::U16(v) if l <= u16::MAX as usize => v.push(l as u16),
             Narrow::U32(v) if l <= u32::MAX as usize => v.push(l as u32),
             Narrow::U64(v) => v.push(l as u64),
@@ -126,7 +139,7 @@ impl Narrow {
     /// append lengths `a..b` of `other`.
     pub fn extend_from(&mut self, other: &Narrow, a: usize, b: usize) {
         match (self, other) {
-            (Narrow::U8(x), Narrow::U8(y)) => x.extend_from_slice(&y[a..b]),
+            (Narrow::U8(x), Narrow::U8(y)) => std::sync::Arc::make_mut(x).extend_from_slice(&y[a..b]),
             (Narrow::U16(x), Narrow::U16(y)) => x.extend_from_slice(&y[a..b]),
             (this, other) => (a..b).for_each(|i| this.push(other.get(i))),
         }
@@ -144,7 +157,7 @@ impl Builder {
     pub fn new(rows: usize) -> Builder {
         match form() {
             Form::Offsets => Builder::Ends(Vec::with_capacity(rows), 0),
-            Form::Lens => Builder::Lens(Narrow::U8(Vec::with_capacity(rows))),
+            Form::Lens => Builder::Lens(Narrow::U8(std::sync::Arc::new(Vec::with_capacity(rows)))),
             Form::Unary => Builder::Unary(Vec::with_capacity(rows / 32 + 1), 0, 0),
         }
     }
@@ -210,11 +223,82 @@ impl Builder {
     }
 }
 
+/// where a lengths partition keeps its block starts (SPIKE, `CORGI_LENS_LAYOUT`): one start per 64
+/// rows whatever the width (`fixed`), one per 64 bytes of lengths (`width`), or each start in the
+/// same 64-byte line as its block's 56 bytes of lengths (`inline`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    Fixed,
+    Width,
+    Inline,
+}
+
+pub fn layout() -> Layout {
+    static LAYOUT: OnceLock<Layout> = OnceLock::new();
+    *LAYOUT.get_or_init(|| match std::env::var("CORGI_LENS_LAYOUT").as_deref() {
+        Ok("width") => Layout::Width,
+        Ok("inline") => Layout::Inline,
+        Ok("fixed") | Err(_) => Layout::Fixed,
+        Ok(other) => panic!("CORGI_LENS_LAYOUT={other}: expected fixed, width or inline"),
+    })
+}
+
+/// whether a block is summed whole under a mask (SPIKE, `CORGI_LENS_SUM=masked`).
+pub fn masked() -> bool {
+    static MASKED: OnceLock<bool> = OnceLock::new();
+    *MASKED.get_or_init(|| std::env::var("CORGI_LENS_SUM").as_deref() == Ok("masked"))
+}
+
+/// the sum of `xs[lo..hi]`, reading all of them.
+#[inline]
+fn masked_sum<T: Copy + Into<u64>, const N: usize>(xs: &[T; N], lo: usize, hi: usize) -> usize {
+    // u16 lanes for bytes (64 x 255 fits), u32 lanes for u16 (32 x 65535 fits): as many lanes per
+    // NEON add as the sum allows
+    if std::mem::size_of::<T>() == 1 && N <= 256 {
+        let mut acc = [0u16; N];
+        for k in 0..N {
+            acc[k] = (xs[k].into() as u16) & (((lo <= k && k < hi) as u16).wrapping_neg());
+        }
+        return acc.iter().sum::<u16>() as usize;
+    }
+    if std::mem::size_of::<T>() == 2 {
+        let mut acc = [0u32; N];
+        for k in 0..N {
+            acc[k] = (xs[k].into() as u32) & (((lo <= k && k < hi) as u32).wrapping_neg());
+        }
+        return acc.iter().sum::<u32>() as usize;
+    }
+    let mut acc = 0u64;
+    for k in 0..N {
+        acc += xs[k].into() & (((lo <= k && k < hi) as u64).wrapping_neg());
+    }
+    acc as usize
+}
+
+/// whether a batch of random reads touches its lines in a first pass (SPIKE, `CORGI_LENS_TOUCH=1`).
+pub fn touch() -> bool {
+    static TOUCH: OnceLock<bool> = OnceLock::new();
+    *TOUCH.get_or_init(|| std::env::var("CORGI_LENS_TOUCH").as_deref() == Ok("1"))
+}
+
+/// whether random reads of a compact partition decode it to offsets first (SPIKE, `CORGI_DECODE=never`).
+pub fn decode() -> bool {
+    static DECODE: OnceLock<bool> = OnceLock::new();
+    *DECODE.get_or_init(|| std::env::var("CORGI_DECODE").as_deref() != Ok("never"))
+}
+
 #[derive(Clone, Debug)]
 pub struct Lens {
     pub lens: Narrow,
-    /// the start of row `b * LENS_BLOCK`, for each block `b`.
+    /// rows per block: a start for each.
+    block: usize,
+    /// the start of row `b * block`, for each block `b` (not kept for `inline`).
     starts: Vec<usize>,
+    /// `inline`: 64-byte lines at the lengths' width, each the block's start (as the first 8 bytes,
+    /// little-endian) and then its `block` lengths; `pad` elements come first, so that the lines lie
+    /// on cache lines.
+    lines: Option<Narrow>,
+    pad: usize,
     total: usize,
 }
 
@@ -227,13 +311,48 @@ impl Lens {
     /// the partition with these row lengths: the block starts are one pass over them.
     pub fn from_lens(lens: Narrow) -> Lens {
         let n = lens.len();
-        let mut starts = Vec::with_capacity(n.div_ceil(LENS_BLOCK));
+        let w = lens.width();
+        let block = match layout() {
+            Layout::Fixed => LENS_BLOCK,
+            Layout::Width => 64 / w,
+            Layout::Inline => 56 / w,
+        };
+        let blocks = n.div_ceil(block);
+        let (mut starts, mut lines, mut pad) = (Vec::new(), None, 0);
         let mut acc = 0;
-        for b in 0..n.div_ceil(LENS_BLOCK) {
-            starts.push(acc);
-            acc += lens.sum(b * LENS_BLOCK, ((b + 1) * LENS_BLOCK).min(n));
+        if layout() == Layout::Inline {
+            fn build<T: Copy + Default, const N: usize>(lens: &Narrow, block: usize, blocks: usize, w: usize, cast: fn(u64) -> T) -> (Vec<T>, usize, usize) {
+                let mut v = vec![T::default(); N * blocks + N];
+                let pad = (64 - v.as_ptr() as usize % 64) % 64 / w;
+                let (n, k0) = (lens.len(), 8 / w);
+                let mut acc = 0;
+                for b in 0..blocks {
+                    let line = &mut v[pad + N * b..pad + N * (b + 1)];
+                    for k in 0..k0 {
+                        line[k] = cast(((acc as u64) >> (8 * w * k)) & (u64::MAX >> (64 - 8 * w)));
+                    }
+                    for (k, r) in (b * block..((b + 1) * block).min(n)).enumerate() {
+                        line[k0 + k] = cast(lens.get(r) as u64);
+                    }
+                    acc += lens.sum(b * block, ((b + 1) * block).min(n));
+                }
+                (v, pad, acc)
+            }
+            let (l, p, a) = match &lens {
+                Narrow::U8(_) => { let (v, p, a) = build::<u8, 64>(&lens, block, blocks, 1, |x| x as u8); (Narrow::U8(std::sync::Arc::new(v)), p, a) }
+                Narrow::U16(_) => { let (v, p, a) = build::<u16, 32>(&lens, block, blocks, 2, |x| x as u16); (Narrow::U16(v), p, a) }
+                Narrow::U32(_) => { let (v, p, a) = build::<u32, 16>(&lens, block, blocks, 4, |x| x as u32); (Narrow::U32(v), p, a) }
+                Narrow::U64(_) => { let (v, p, a) = build::<u64, 8>(&lens, block, blocks, 8, |x| x); (Narrow::U64(v), p, a) }
+            };
+            (lines, pad, acc) = (Some(l), p, a);
+        } else {
+            starts.reserve(blocks);
+            for b in 0..blocks {
+                starts.push(acc);
+                acc += lens.sum(b * block, ((b + 1) * block).min(n));
+            }
         }
-        Lens { lens, starts, total: acc }
+        Lens { lens, block, starts, lines, pad, total: acc }
     }
     pub fn len(&self) -> usize {
         self.lens.len()
@@ -246,16 +365,133 @@ impl Lens {
         if i == self.len() {
             return self.total;
         }
-        let b = i / LENS_BLOCK;
-        self.starts[b] + self.lens.sum(b * LENS_BLOCK, i)
+        let b = i / self.block;
+        if self.lines.is_none() {
+            // a whole block of 64 bytes, summed under a mask: the same work for every row, with no
+            // branch on where in its block the row falls
+            if masked() && self.block * self.lens.width() == 64 && (b + 1) * self.block <= self.len() {
+                let j = i - b * self.block;
+                return self.starts[b] + match &self.lens {
+                    Narrow::U8(v) => masked_sum::<u8, 64>(v[b * 64..][..64].try_into().unwrap(), 0, j),
+                    Narrow::U16(v) => masked_sum::<u16, 32>(v[b * 32..][..32].try_into().unwrap(), 0, j),
+                    Narrow::U32(v) => masked_sum::<u32, 16>(v[b * 16..][..16].try_into().unwrap(), 0, j),
+                    Narrow::U64(v) => masked_sum::<u64, 8>(v[b * 8..][..8].try_into().unwrap(), 0, j),
+                };
+            }
+            return self.starts[b] + self.lens.sum(b * self.block, i);
+        }
+        let j = i - b * self.block;
+        fn line<T: Copy + Into<u64>, const N: usize>(v: &[T], pad: usize, b: usize, j: usize, w: usize) -> usize {
+            let line: &[T; N] = v[pad + N * b..][..N].try_into().unwrap();
+            let k0 = 8 / w;
+            let base = (0..k0).fold(0u64, |acc, k| acc | (line[k].into() << (8 * w * k))) as usize;
+            base + if masked() { masked_sum::<T, N>(line, k0, k0 + j) } else { line[k0..k0 + j].iter().map(|&x| x.into() as usize).sum() }
+        }
+        match self.lines.as_ref().unwrap() {
+            Narrow::U8(v) => line::<u8, 64>(v, self.pad, b, j, 1),
+            Narrow::U16(v) => line::<u16, 32>(v, self.pad, b, j, 2),
+            Narrow::U32(v) => line::<u32, 16>(v, self.pad, b, j, 4),
+            Narrow::U64(v) => line::<u64, 8>(v, self.pad, b, j, 8),
+        }
     }
     #[inline]
     pub fn span(&self, i: usize) -> (usize, usize) {
         let s = self.start(i);
         (s, s + self.lens.get(i))
     }
+    /// the spans of rows `idx`, with the width and layout decided once for the batch (SPIKE: the
+    /// `width` layout, a whole block summed under a mask; the last partial block read row by row).
+    pub fn spans_at(&self, idx: &[usize], out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        // `inline`: the start, the lengths before the row and its own length, all in one line
+        if let Some(lines) = &self.lines {
+            fn go<T: Copy + Into<u64>, const N: usize>(v: &[T], pad: usize, w: usize, idx: &[usize], out: &mut Vec<(usize, usize)>) {
+                let (k0, block) = (8 / w, (64 - 8) / w);
+                if touch() {
+                    let mut seen = 0u64;
+                    for chunk in idx.chunks(256) {
+                        for &i in chunk {
+                            seen ^= v[pad + N * (i / block)].into();
+                        }
+                        out.extend(chunk.iter().map(|&i| {
+                            let (b, j) = (i / block, i % block);
+                            let line: &[T; N] = v[pad + N * b..][..N].try_into().unwrap();
+                            let base = (0..k0).fold(0u64, |acc, k| acc | (line[k].into() << (8 * w * k))) as usize;
+                            let s = base + masked_sum::<T, N>(line, k0, k0 + j);
+                            (s, s + line[k0 + j].into() as usize)
+                        }));
+                    }
+                    std::hint::black_box(seen);
+                    return;
+                }
+                out.extend(idx.iter().map(|&i| {
+                    let (b, j) = (i / block, i % block);
+                    let line: &[T; N] = v[pad + N * b..][..N].try_into().unwrap();
+                    let base = (0..k0).fold(0u64, |acc, k| acc | (line[k].into() << (8 * w * k))) as usize;
+                    let s = base + masked_sum::<T, N>(line, k0, k0 + j);
+                    (s, s + line[k0 + j].into() as usize)
+                }));
+            }
+            match lines {
+                Narrow::U8(v) => go::<u8, 64>(v, self.pad, 1, idx, out),
+                Narrow::U16(v) => go::<u16, 32>(v, self.pad, 2, idx, out),
+                Narrow::U32(v) => go::<u32, 16>(v, self.pad, 4, idx, out),
+                Narrow::U64(v) => go::<u64, 8>(v, self.pad, 8, idx, out),
+            }
+            return;
+        }
+        if self.block * self.lens.width() != 64 {
+            out.extend(idx.iter().map(|&i| self.span(i)));
+            return;
+        }
+        let full = self.len() / self.block * self.block;
+        fn go<T: Copy + Into<u64>, const N: usize>(v: &[T], starts: &[usize], full: usize, idx: &[usize], out: &mut Vec<(usize, usize)>, slow: impl Fn(usize) -> (usize, usize)) {
+            // first a pass of plain loads over a chunk of queries, which the core overlaps, so the
+            // lines the sums read are in cache when the long pass reaches them
+            if touch() {
+                let mut seen = 0u64;
+                for chunk in idx.chunks(256) {
+                    for &i in chunk {
+                        if i < full {
+                            seen ^= v[i / N * N].into() ^ starts[i / N] as u64;
+                        }
+                    }
+                    out.extend(chunk.iter().map(|&i| {
+                        if i >= full {
+                            return slow(i);
+                        }
+                        let b = i / N;
+                        let s = starts[b] + masked_sum::<T, N>(v[b * N..][..N].try_into().unwrap(), 0, i - b * N);
+                        (s, s + v[i].into() as usize)
+                    }));
+                }
+                std::hint::black_box(seen);
+                return;
+            }
+            out.extend(idx.iter().map(|&i| {
+                if i >= full {
+                    return slow(i);
+                }
+                let b = i / N;
+                let s = starts[b] + masked_sum::<T, N>(v[b * N..][..N].try_into().unwrap(), 0, i - b * N);
+                (s, s + v[i].into() as usize)
+            }));
+        }
+        let slow = |i| self.span(i);
+        match &self.lens {
+            Narrow::U8(v) => go::<u8, 64>(v, &self.starts, full, idx, out, slow),
+            Narrow::U16(v) => go::<u16, 32>(v, &self.starts, full, idx, out, slow),
+            Narrow::U32(v) => go::<u32, 16>(v, &self.starts, full, idx, out, slow),
+            Narrow::U64(v) => go::<u64, 8>(v, &self.starts, full, idx, out, slow),
+        }
+    }
+    /// the bytes the partition holds; for `inline`, its lines, which hold the lengths (the
+    /// contiguous copy it also keeps for in-order reads is not counted).
     pub fn bytes(&self) -> usize {
-        self.lens.bytes() + 8 * self.starts.len()
+        match &self.lines {
+            None => self.lens.bytes() + 8 * self.starts.len(),
+            Some(l) => l.bytes() - 64,
+        }
     }
 }
 

@@ -89,3 +89,33 @@ The output is 3.8x smaller, but `cut` alone gets no faster on long strings.
 82% of the URL time is the per-byte mask loop (about 0.4 ns/byte); every position writes the same slot until a mark moves it on, so the output stores stay in cache whatever their width.
 Forcing u32 or u64 lengths does not move URL (52.1, 53.7), so the 12% loss is not the store width; I have not found its cause.
 `benches/idioms -- cut cut_rows` (i64 lists) shows lens at 0.95x-1.21x of offsets.
+
+## Follow-up: block size by width, starts inline, and `len` for free
+
+Switches (all read once): `CORGI_LENS_LAYOUT=fixed|width|inline`, `CORGI_LENS_SUM=plain|masked`, `CORGI_LENS_TOUCH=1`, `CORGI_DECODE=never`.
+
+- `width`: one start per 64 bytes of lengths (64 rows at u8, 32 at u16, 16 at u32, 8 at u64).
+- `inline`: 64-byte lines at the lengths' width, each the block's start in its first 8 bytes and then 56 bytes of lengths, aligned to cache lines.
+- `masked`: sum the whole block under a mask, with no branch on the row's place in it.
+- `touch`: a batch read first does a pass of plain loads over 256 queries, then the sums.
+
+Random span reads, ns per read, lower is better (`synth*.txt`; "batch" is `Lens::spans_at`, with the width and layout decided once per batch):
+
+| rows, longest | offsets | fixed | width, masked | inline, masked | width, touch | inline, touch |
+|---|---:|---:|---:|---:|---:|---:|
+| 1M, 300 (u16; bounds in cache) | 1.3 | 14.9 | 6.0 / 6.5 batch | 8.0 / 6.7 batch | 7.5 batch | 7.2 batch |
+| 100M, 300 (u16) | 7.1 | 24.1 | 25.3 / 29.8 batch | 42.5 / 29.2 batch | 12.4 batch | 10.3 batch |
+| 100M, 200 (u8) | 7.2 | 22.1 | 22.6 / 35.2 batch | 35.8 / 35.2 batch | 14.3 batch | 12.7 batch |
+
+What the numbers say:
+
+1. The variable-length sum was the cost in cache: its trip count depends on the row, so it is mispredicted.
+   A masked sum over the whole block halves a read (14.9 to 6.0 ns), and only together with the width-sized block (64 bytes, not 128).
+2. Past the caches, the long body of each read limits how many reads the core keeps in flight: offsets do about 5 instructions per read and overlap their misses (7 ns per read at 800 MB); lengths do several times more and do not.
+   A first pass of plain loads per 256 queries restores the overlap: 29.8 to 12.4 ns (width), 29.2 to 10.3 ns (inline).
+3. Inline starts help only once reads are batched with that pass, by about 17% (one line per read instead of two); one read at a time they are slower, because assembling the start from the line is more work.
+4. Lengths stay 1.5x-1.8x slower than offsets per random read at best.
+   The kernels still decode before random reads, so none of this moves them: with `CORGI_DECODE=never` sort runs 1.2x-1.8x slower (`layout2.txt`), because the kernels read one span at a time, not in batches.
+
+`len` on a list of byte lengths is now the lengths themselves, shared (`Narrow::U8` is behind an `Arc`): MobilePhoneModel `len` 0.33 to 0.00 ns/row.
+The u16 columns still widen to i64 (0.28 ns/row), since corgi has no u16 leaf.
