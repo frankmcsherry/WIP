@@ -213,6 +213,12 @@ fn range_copies_match_element_positions() {
         Value::List(vec![1, 3, 3, 4, 6, 6].into(), Box::new(Value::Prod(vec![u(&[1, 2, 3, 4, 5, 6]), strings.clone()]))),
         // a stride list of pairs
         Value::List(Bounds::Stride(2, 6), Box::new(Value::Prod(vec![u(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), Value::u8((0..12).collect())]))),
+        // stride lists of leaves, short rows and long, at each storage
+        Value::List(Bounds::Stride(3, 6), Box::new(Value::u8((0..18).collect()))),
+        Value::List(Bounds::Stride(9, 6), Box::new(u(&(0..54).collect::<Vec<_>>()))),
+        // a stride list of long rows of pairs, and one of sums
+        Value::List(Bounds::Stride(8, 6), Box::new(Value::Prod(vec![u(&(0..48).collect::<Vec<_>>()), Value::u8((0..48).collect())]))),
+        Value::List(Bounds::Stride(2, 6), Box::new(Value::sum(vec![0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0], vec![u(&[1, 2, 3, 4, 5, 6]), u(&[7, 8, 9, 10, 11, 12])]))),
         // a list of lists of strings
         Value::List(vec![2, 3, 3, 4, 6, 6].into(), Box::new(strings.clone())),
         // a list of sums with a string lane

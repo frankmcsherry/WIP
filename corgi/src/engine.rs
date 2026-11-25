@@ -210,12 +210,6 @@ pub(crate) fn gather_or_zero(v: &Value, idx: &[usize]) -> Result<Value, String> 
     gather_impl::<true>(v, idx)
 }
 
-/// the element positions of rows `rows` of a list whose rows are all `k` long: row `r` is elements
-/// `r*k .. (r+1)*k`. Rows of one element are their elements, so `rows` is borrowed as it is.
-fn spread(rows: &[usize], k: usize) -> Cow<'_, [usize]> {
-    if k == 1 { Cow::Borrowed(rows) } else { Cow::Owned(rows.iter().flat_map(|&r| r * k..(r + 1) * k).collect()) }
-}
-
 /// each of `xs` `k` times: a row's tag or mask, for each of its `k` elements.
 fn repeat_each<T: Copy>(xs: &[T], k: usize) -> Cow<'_, [T]> {
     if k == 1 { Cow::Borrowed(xs) } else { Cow::Owned(xs.iter().flat_map(|&x| std::iter::repeat_n(x, k)).collect()) }
@@ -233,10 +227,11 @@ fn gather_impl<const ZERO: bool>(v: &Value, idx: &[usize]) -> Result<Value, Stri
             Value::List(Bounds::Stride(*k, idx.len()), Box::new(Value::Prim(p.gather_blocks(idx, *k))))
         }
         // rows of one length of anything else: row i is elements i*k .. (i+1)*k, so the elements are
-        // gathered at those positions and the rows keep their length. Rows of one element are their
+        // taken a row's range at a time and the rows keep their length. Rows of one element are their
         // elements, at the same positions.
         Value::List(Bounds::Stride(k, _), vals) if inside(v.len()) => {
-            Value::List(Bounds::Stride(*k, idx.len()), Box::new(gather(vals, &spread(idx, *k))))
+            let taken = if *k == 1 { gather(vals, idx) } else { stride_rows(&[vals], *k, idx.iter().map(|&i| (0, i))) };
+            Value::List(Bounds::Stride(*k, idx.len()), Box::new(taken))
         }
         // rows as ranges of elements; a position past the rows names the one empty row of a second list
         Value::List(bounds, vals) => {
@@ -338,6 +333,17 @@ fn list_rows(lists: &[(&Bounds, &Value)], picks: impl Iterator<Item = (usize, us
     }
     let vals: Vec<&Value> = lists.iter().map(|l| l.1).collect();
     Value::List(ends.into(), Box::new(take_spans(&vals, &spans)))
+}
+
+/// the elements of rows that are all `k` long, each pick `(t, r)` naming row `r` of the list whose
+/// elements are `elems[t]`: row `r` is elements `r*k .. (r+1)*k`, and consecutive picks of one list
+/// make one longer range, copied whole.
+fn stride_rows(elems: &[&Value], k: usize, picks: impl Iterator<Item = (usize, usize)>) -> Value {
+    let mut spans = Vec::new();
+    for (t, r) in picks {
+        push_span(&mut spans, t, r * k, (r + 1) * k);
+    }
+    take_spans(elems, &spans)
 }
 
 /// the elements of rows `s..e` of a list, as a range.
@@ -507,12 +513,18 @@ where
                 _ => panic!("gather_lanes: shape mismatch"),
             }).collect();
             // every source's rows are one length, the same in each: a row is a fixed run of its
-            // source's elements, so the elements are gathered from the sources as the rows are. A
+            // source's elements, taken a row's range at a time, and the rows keep their length. Rows
+            // of one element are their elements, gathered from the sources as the rows are. A
             // source with no rows has no length to disagree by.
             let mut strides = lists.iter().filter(|(b, _)| !b.is_empty()).map(|(b, _)| b.strided());
             if let Some(Some(k)) = strides.next().filter(|k| strides.all(|other| other == *k)) {
-                let elems: Vec<Option<&Value>> = lists.iter().map(|(_, vals)| Some(*vals)).collect();
-                let gathered = gather_lanes(&elems, &repeat_each(tags, k), &spread(off, k));
+                let gathered = if k == 1 {
+                    let elems: Vec<Option<&Value>> = lists.iter().map(|(_, vals)| Some(*vals)).collect();
+                    gather_lanes(&elems, tags, off)
+                } else {
+                    let elems: Vec<&Value> = lists.iter().map(|(_, vals)| *vals).collect();
+                    stride_rows(&elems, k, tags.iter().zip(off).map(|(&t, &o)| (usize::from(t), o)))
+                };
                 return Value::List(Bounds::Stride(k, tags.len()), Box::new(gathered));
             }
             list_rows(&lists, tags.iter().zip(off).map(|(&t, &o)| (usize::from(t), o, o + 1)))
@@ -663,6 +675,10 @@ where
     }
 }
 
+/// Rows of one length shorter than this blend element by element ([`blend`]); longer rows are
+/// copied as ranges. The blend's cost grows with the row's length and the range copy's does not.
+const BLEND_DENSE: usize = 8;
+
 /// per-row blend: row `i` of the result is row `i` of `then` where `mask[i]` is nonzero, else row
 /// `i` of `els` (both same-shape columns at the mask's stratum) — what [`crate::ops::Op::Select`] is.
 ///
@@ -681,9 +697,11 @@ pub(crate) fn blend(mask: &[u8], then: Value, els: Value) -> Value {
         (Value::Unit(_), Value::Unit(_)) => Value::Unit(mask.len()),
         // lists: each row from the side the mask picks, consecutive rows from one side a range
         (Value::List(tb, tv), Value::List(eb, ev)) => {
-            // both sides' rows are one length, the same on each: a row has a fixed slot after all, so
-            // the elements blend in place, each under its row's mask
-            if let (Some(k), true) = (tb.strided(), tb.strided() == eb.strided()) {
+            // both sides' rows are one short length, the same on each: a row has a fixed slot after
+            // all, so the elements blend in place, each under its row's mask. That reads every
+            // element of both sides, where a range copy reads the picked side's row once, so longer
+            // rows are copied as ranges below.
+            if let (Some(k), true) = (tb.strided().filter(|&k| k < BLEND_DENSE), tb.strided() == eb.strided()) {
                 return Value::List(Bounds::Stride(k, mask.len()), Box::new(blend(&repeat_each(mask, k), *tv, *ev)));
             }
             list_rows(&[(&eb, &ev), (&tb, &tv)], mask.iter().enumerate().map(|(i, &m)| ((m != 0) as usize, i, i + 1)))
