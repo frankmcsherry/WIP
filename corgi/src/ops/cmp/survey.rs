@@ -34,6 +34,15 @@ pub enum GroupRun {
 /// a `Both` class on either side is structurally equal to every other, and the class is maximal;
 /// adjacent reports never share a side.
 pub fn survey_groups(a: &Value, b: &Value) -> Vec<GroupRun> {
+    // A side with no rows makes the other one run. The levels split a class only where some key
+    // differs, and a level that decides nothing (rows of no elements, payload-free fields) leaves
+    // the root class whole, which would report a side with no rows as equal to the other.
+    match (a.len(), b.len()) {
+        (0, 0) => return Vec::new(),
+        (na, 0) => return vec![GroupRun::A(0, na)],
+        (0, nb) => return vec![GroupRun::B(0, nb)],
+        _ => {}
+    }
     let mut tree = Tree { nodes: vec![Node::Class { alo: 0, ahi: a.len(), blo: 0, bhi: b.len(), la: 0, lb: 0, kids: None }] };
     level(a, b, Identity, Identity, &[0], &mut tree);
     tree.flatten()

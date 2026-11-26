@@ -226,6 +226,15 @@ fn one_side_empty_is_one_run() {
     assert_eq!(survey_groups(&a, &e), vec![GroupRun::A(0, 3)]);
     assert_eq!(survey_groups(&e, &a), vec![GroupRun::B(0, 3)]);
     assert!(survey_groups(&e, &e).is_empty());
+    // shapes whose levels decide nothing: rows of no elements, payload-free product fields
+    let lists = |n| Value::List(Bounds::Stride(0, n), Box::new(Value::i64(vec![])));
+    let units = |n| Value::Prod(vec![Value::Unit(n), Value::Unit(n)]);
+    for (a, e) in [(lists(2), lists(0)), (units(2), units(0))] {
+        assert_eq!(survey_groups(&a, &e), vec![GroupRun::A(0, 2)]);
+        assert_eq!(survey_groups(&e, &a), vec![GroupRun::B(0, 2)]);
+        assert!(survey_groups(&e, &e).is_empty());
+        assert_eq!(survey_groups(&a, &a), vec![GroupRun::Both(0, 2, 0, 2)]);
+    }
 }
 
 /// referenced list rows survey as the rows they name: one arena, distinct arenas with equal
