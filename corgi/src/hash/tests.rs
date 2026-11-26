@@ -203,6 +203,7 @@ fn fused_product_hashes_match_scalar_rows() {
                 Prim::U8(v) => v[r] as u64,
                 Prim::I64(v) => v[r] as u64,
                 Prim::F64(v) => v[r],
+                int => int.word_at(r),
             }),
             Value::Prod(cols) => cols.iter().fold(PROD, |a, c| combine(a, row(c, r))),
             Value::Unit(_) => UNIT,

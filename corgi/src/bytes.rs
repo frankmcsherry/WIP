@@ -221,13 +221,21 @@ fn bounds_total(bounds: &Bounds) -> u64 {
 fn prim_len(p: &Prim) -> usize {
     match p {
         Prim::U8(v) => v.len(),
+        Prim::I8(v) => v.len(),
+        Prim::I16(v) => v.len(),
+        Prim::I32(v) => v.len(),
         Prim::I64(v) => v.len(),
         Prim::F64(v) => v.len(),
     }
 }
 
-/// the storage word of a float leaf (an integer leaf's is its width in bits).
+/// the storage word of a float leaf. A byte leaf's is 8 and an `i64` leaf's 64 (their widths in
+/// bits), and a narrow signed leaf's is `SIGNED` with its width.
 const FLOAT: u64 = 0xF64;
+const SIGNED: u64 = 0x100;
+const I8: u64 = SIGNED | 8;
+const I16: u64 = SIGNED | 16;
+const I32: u64 = SIGNED | 32;
 
 // --- encoding helpers ---------------------------------------------------------------------------
 
@@ -241,6 +249,9 @@ fn word<W: std::io::Write>(writer: &mut W, x: u64) -> std::io::Result<()> {
 fn prim_payload_len(p: &Prim) -> usize {
     match p {
         Prim::U8(v) => v.len(),
+        Prim::I8(v) => v.len(),
+        Prim::I16(v) => 2 * v.len(),
+        Prim::I32(v) => 4 * v.len(),
         Prim::I64(v) => 8 * v.len(),
         Prim::F64(v) => 8 * v.len(),
     }
@@ -252,6 +263,9 @@ fn prim_payload_len(p: &Prim) -> usize {
 fn write_prim<W: std::io::Write>(p: &Prim, writer: &mut W) -> std::io::Result<()> {
     let (storage, len) = match p {
         Prim::U8(v) => (8u64, v.len()),
+        Prim::I8(v) => (SIGNED | 8, v.len()),
+        Prim::I16(v) => (SIGNED | 16, v.len()),
+        Prim::I32(v) => (SIGNED | 32, v.len()),
         Prim::I64(v) => (64, v.len()),
         Prim::F64(v) => (FLOAT, v.len()),
     };
@@ -262,6 +276,9 @@ fn write_prim<W: std::io::Write>(p: &Prim, writer: &mut W) -> std::io::Result<()
     // still a linear scan of the column with no per-row allocation or dispatch.
     match p {
         Prim::U8(v) => writer.write_all(v)?,
+        Prim::I8(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
+        Prim::I16(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
+        Prim::I32(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
         Prim::I64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
         Prim::F64(v) => write_le(writer, v.iter().map(|&x| x.to_le_bytes()))?,
     }
@@ -570,6 +587,9 @@ fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     // that walks off the buffer.
     let payload = match storage {
         8 => r.count(1, "byte leaf")?,
+        I8 => r.count(1, "i8 leaf")?,
+        I16 => 2 * r.count(2, "i16 leaf")?,
+        I32 => 4 * r.count(4, "i32 leaf")?,
         64 => 8 * r.count(8, "i64 leaf")?,
         FLOAT => 8 * r.count(8, "f64 leaf")?,
         other => return Err(format!("corgi::bytes: bad leaf storage {other}")),
@@ -577,6 +597,9 @@ fn read_prim(r: &mut Reader) -> Result<Prim, String> {
     let bytes = r.payload(payload)?;
     Ok(match storage {
         8 => Prim::U8(Arc::new(bytes.to_vec())),
+        I8 => Prim::I8(Arc::new(read_le(bytes, i8::from_le_bytes))),
+        I16 => Prim::I16(Arc::new(read_le(bytes, i16::from_le_bytes))),
+        I32 => Prim::I32(Arc::new(read_le(bytes, i32::from_le_bytes))),
         64 => Prim::I64(Arc::new(read_le(bytes, i64::from_le_bytes))),
         _ => Prim::F64(Arc::new(read_le(bytes, u64::from_le_bytes))),
     })

@@ -17,16 +17,50 @@ fn integers_are_equal_across_storages() {
     assert_ne!(Value::i64(vec![0]), Value::f64(vec![0.0]));
 }
 
-/// `Value::int` holds integers as bytes when every one fits (an empty column too), else as `i64`s,
-/// and either is the value `Value::i64` of the same integers is.
+/// `Value::int` holds integers at the narrowest storage that holds every one (an empty column as
+/// bytes), and each is the value `Value::i64` of the same integers is.
 #[test]
 fn int_picks_the_narrowest_storage() {
-    let bytes = |v: &Value| matches!(v, Value::Prim(Prim::U8(_)));
-    for (xs, narrow) in [(vec![0, 7, 255], true), (vec![], true), (vec![0, 256, 3], false), (vec![-1, 3], false)] {
+    let width = |v: &Value| match v { Value::Prim(p) => p.int_width(), _ => None };
+    for (xs, w) in [
+        (vec![0, 7, 255], IntWidth::U8),
+        (vec![], IntWidth::U8),
+        (vec![0, 256, 3], IntWidth::I16),
+        (vec![65536], IntWidth::I32),
+        (vec![i32::MAX as i64 + 1], IntWidth::I64),
+        (vec![-1, 3], IntWidth::I8),
+        (vec![-1, 200], IntWidth::I16),
+        (vec![-1, 40000], IntWidth::I32),
+        (vec![i32::MIN as i64 - 1], IntWidth::I64),
+    ] {
         let v = Value::int(xs.clone());
-        assert_eq!(bytes(&v), narrow, "{xs:?}");
-        assert_eq!(v, Value::i64(xs));
+        assert_eq!(width(&v), Some(w), "{xs:?}");
+        assert_eq!(v, Value::i64(xs.clone()));
+        assert_eq!(crate::hash::hash(&v), crate::hash::hash(&Value::i64(xs)));
     }
+}
+
+/// Two integer storages meet at the narrowest storage holding both, with no detour through `i64`.
+#[test]
+fn storages_meet_at_the_narrowest_holding_both() {
+    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![1, 2])), Prim::ints_at(IntWidth::I16, [300, -4].into_iter()));
+    assert_eq!((a.int_width(), b.int_width()), (Some(IntWidth::I16), Some(IntWidth::I16)));
+    assert_eq!(a, Prim::U8(Arc::new(vec![1, 2])));
+    // `u8` and `i8` hold different ranges, and meet at `i16`
+    let (a, b) = Prim::meet(Prim::U8(Arc::new(vec![200])), Prim::ints_at(IntWidth::I8, [-1].into_iter()));
+    assert_eq!((a.int_width(), b.int_width()), (Some(IntWidth::I16), Some(IntWidth::I16)));
+    assert_eq!(IntWidth::I8.join(IntWidth::I32), IntWidth::I32);
+    assert_eq!(IntWidth::I32.join(IntWidth::I64), IntWidth::I64);
+}
+
+/// Signed narrow keys sort in value order, and pack at their width.
+#[test]
+fn signed_keys_order_by_value() {
+    let xs = [-128i64, -1, 0, 1, 127];
+    let p = Prim::ints_at(IntWidth::I8, xs.into_iter());
+    let keys: Vec<u64> = (0..xs.len()).map(|i| p.key_at(i)).collect();
+    assert!(keys.windows(2).all(|w| w[0] < w[1]) && keys.iter().all(|&k| k < 256), "{keys:?}");
+    assert_eq!(p.like_keys(&keys), p);
 }
 
 /// Two integer leaves at different storages meet at `i64`; one storage meets as it is.

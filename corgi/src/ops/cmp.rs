@@ -115,6 +115,11 @@ impl CmpOp {
                     (Value::Prim(Prim::U8(x)), Prim::I64(c)) => equal_to(bounds, x, c, ne, |a, b| a as i64 == b),
                     (Value::Prim(Prim::I64(x)), Prim::U8(c)) => equal_to(bounds, x, c, ne, |a, b| a == b as i64),
                     (Value::Prim(Prim::F64(x)), Prim::F64(c)) => equal_to(bounds, x, c, ne, |a, b| a == b),
+                    // the wider narrow storages: both sides read at `i64`
+                    (Value::Prim(x), c) if x.is_int() && c.is_int() => {
+                        let (x, c) = (x.to_i64_vec(), c.to_i64_vec());
+                        equal_to(bounds, &x, &c, ne, |a, b| a == b)
+                    }
                     (other, _) => {
                         return Err(format!("compare with a constant list: List<{}> against {:?}", shape_of_value(other), c));
                     }
@@ -143,7 +148,9 @@ impl CmpOp {
                 };
                 // the runs the sort found, as it found them: each element's run, numbered densely
                 // over the whole column (a run never spans two rows)
-                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, Value::i64(refined.into_iter().map(|r| r as i64).collect())])))
+                // (a run number is below the element count)
+                let runs = Value::int_upto(refined.len(), refined.into_iter().map(|r| r as i64));
+                Value::List(bounds, Box::new(Value::Prod(vec![sk, sv, runs])))
             }
 
             CmpOp::SortLimit(k) => {
@@ -181,8 +188,10 @@ impl CmpOp {
                 assert_eq!(nb.len(), hb.len(), "Find: needle/haystack row count");
                 // Leaves: a search per needle (a walk for a dense row of needles in order; a
                 // branch-free binary search, sixteen needles at a time, otherwise). See `search`.
+                // a position in a haystack row is no more than the haystack's elements
+                let at = |xs: Vec<i64>| Value::int_upto(hvals.len(), xs.into_iter());
                 if let Some((lo_c, hi_c)) = find_leaf(&nb, &nvals, hb, hvals) {
-                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)]))));
+                    return Ok(Value::List(nb, Box::new(Value::Prod(vec![at(lo_c), at(hi_c)]))));
                 }
                 let n = nvals.len();
                 // each needle element's haystack-row window [lo,hi). The window's start is also the
@@ -213,7 +222,7 @@ impl CmpOp {
                         hi_c.push((upper.0[k] - hs) as i64);
                     }
                 }
-                Value::List(nb, Box::new(Value::Prod(vec![Value::i64(lo_c), Value::i64(hi_c)])))
+                Value::List(nb, Box::new(Value::Prod(vec![at(lo_c), at(hi_c)])))
             }
         })
     }
@@ -240,10 +249,10 @@ fn order_levels(v: &Value, out: &mut Vec<Level>) {
             if !elements.unit_only() {
                 out.push(Level::Elems(v.clone()));
             }
-            out.push(Level::Col(Value::i64((0..inner.len()).map(|i| {
+            out.push(Level::Col(Value::int_upto(inner.total(), (0..inner.len()).map(|i| {
                 let (s, e) = inner.span(i);
                 (e - s) as i64
-            }).collect())));
+            }))));
         }
         other if other.unit_only() => {}
         other => out.push(Level::Col(other.clone())),

@@ -119,6 +119,8 @@ pub(crate) fn try_eval_graph<O: OpLike>(g: &Graph<O>, arg: Value) -> Result<Valu
             }
             NodeKind::Op(o) => o.eval(take(&mut vals, &mut uses, node.inputs[0]))?,
         };
+        #[cfg(feature = "storage-fuzz")]
+        let v = crate::value::restorage(v);
         vals.push(Some(v));
     }
     Ok(vals[g.output].take().unwrap())

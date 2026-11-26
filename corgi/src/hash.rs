@@ -143,6 +143,9 @@ fn leaf_list_rows(vals: &Value, n: usize, span: impl Fn(usize) -> (usize, usize)
     match vals {
         Value::Prim(Prim::U8(bytes)) => byte_rows(n, span, bytes),
         Value::Prim(Prim::I64(xs)) => leaf_rows(n, span, xs, |x| x as u64),
+        Value::Prim(Prim::I8(xs)) => leaf_rows(n, span, xs, |x| x as i64 as u64),
+        Value::Prim(Prim::I16(xs)) => leaf_rows(n, span, xs, |x| x as i64 as u64),
+        Value::Prim(Prim::I32(xs)) => leaf_rows(n, span, xs, |x| x as i64 as u64),
         Value::Prim(Prim::F64(keys)) => leaf_rows(n, span, keys, |k| k),
         _ => unreachable!("a list of leaves"),
     }

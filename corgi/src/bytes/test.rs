@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::IntWidth;
 
 /// Encode, decode, and check both the value and the promised length.
 fn round_trip(v: &Value) {
@@ -20,6 +21,9 @@ fn corpus() -> Vec<Value> {
         Value::u8(vec![1, 2, 3]),                       // an odd payload length, to exercise padding
         Value::f64(vec![1.5, -0.0, f64::NAN, 4.0, 5.0]),
         Value::i64(vec![-1, 0, 12345, i64::MIN]),
+        Value::Prim(Prim::ints_at(IntWidth::I8, [-1, 127, -128].into_iter())),
+        Value::Prim(Prim::ints_at(IntWidth::I16, [-300, 5].into_iter())),
+        Value::Prim(Prim::ints_at(IntWidth::I32, [i32::MIN as i64, 70000, -1].into_iter())),
         Value::Prod(vec![]),
         Value::Prod(vec![Value::i64(vec![1, 2]), Value::u8(vec![3, 4])]),
         Value::List(Bounds::offsets(vec![1, 1, 4]), Box::new(Value::f64(vec![9.0, 8.0, 7.0, 6.0]))),

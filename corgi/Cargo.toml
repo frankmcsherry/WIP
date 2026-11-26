@@ -10,6 +10,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 [features]
 # time per op kind over a run (`corgi::explain::profile`); off, it costs nothing.
 profile = []
+# testing only: every node's integer leaves are re-stored at a pseudorandom storage that holds
+# them (`value::restorage`), so a test run checks that results do not depend on storage.
+storage-fuzz = []
 
 [[bench]]
 name = "eval"
@@ -18,6 +21,10 @@ harness = false   # plain `fn main()` timing — no framework, no dependency
 [[bench]]
 name = "gaps"
 harness = false   # the perf-gap suite (corgi vs hand-written-Rust ceiling); see benches/gaps.rs
+
+[[bench]]
+name = "widths"
+harness = false   # the same programs over integers held at each storage
 
 [[bench]]
 name = "fold"

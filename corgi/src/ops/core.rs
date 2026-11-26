@@ -7,7 +7,7 @@ use crate::engine::{
 };
 use crate::graph::{try_eval_graph, Graph, OpLike};
 use crate::shape::{one_field_of, same, shape_of_value, Shape, ONE_FIELD};
-use crate::value::{Bounds, Prim, Rows, Tags, Value};
+use crate::value::{Bounds, IntWidth, Prim, Rows, Tags, Value};
 use std::sync::Arc;
 
 /// the rounds of a `Fold` or `FoldScan`. Round `t` runs the body once, over every row that has a
@@ -753,8 +753,12 @@ impl<L: OpLike> Op<L> {
                 let leaves: Option<Vec<&Prim>> =
                     parts.iter().map(|(_, v)| if let Value::Prim(p) = v { Some(p) } else { None }).collect();
                 if let Some(leaves) = leaves {
-                    let wide = leaves.iter().any(|p| p.bits() != leaves[0].bits());
-                    let prims: Vec<Prim> = leaves.iter().map(|p| if wide { p.widen() } else { (*p).clone() }).collect();
+                    let mixed = leaves.iter().any(|p| !p.same_storage(leaves[0]));
+                    let join = leaves.iter().filter_map(|p| p.int_width()).reduce(IntWidth::join);
+                    let prims: Vec<Prim> = leaves.iter().map(|p| match join {
+                        Some(w) if mixed => p.cast(w),
+                        _ => (*p).clone(),
+                    }).collect();
                     let (vals, bounds) = match &prims[..] {
                         [a, b] => {
                             let (vals, ends) = a.append_rows(&parts[0].0, b, &parts[1].0);
@@ -785,23 +789,22 @@ impl<L: OpLike> Op<L> {
             // each row's length, read off the bounds in one pass (no per-element work).
             Op::Len => {
                 let (rows, _vals) = input.rows_of("Len")?;
-                let lens = match rows {
+                // no row is longer than its list's elements, so the lengths are held at the
+                // storage that holds that count
+                match rows {
                     // a partition's lengths are the differences of its ends (a stride's, one number)
-                    Rows::Part(Bounds::Offsets(ends)) => {
-                        let mut lens = Vec::with_capacity(ends.len());
-                        lens.extend(ends.first().map(|&e| e as i64));
-                        lens.extend(ends.windows(2).map(|w| (w[1] - w[0]) as i64));
-                        lens
-                    }
-                    Rows::Part(Bounds::Stride(k, n)) => vec![*k as i64; *n],
+                    Rows::Part(b @ Bounds::Offsets(ends)) => Value::int_upto(
+                        b.total(),
+                        ends.first().map(|&e| e as i64).into_iter().chain(ends.windows(2).map(|w| (w[1] - w[0]) as i64)),
+                    ),
+                    Rows::Part(Bounds::Stride(k, n)) => Value::int_upto(*k, std::iter::repeat_n(*k as i64, *n)),
                     // a referenced row's length, read from its list's ends
-                    Rows::Named(Bounds::Offsets(ends), named) => named
-                        .iter()
-                        .map(|&r| (ends[r] - if r == 0 { 0 } else { ends[r - 1] }) as i64)
-                        .collect(),
-                    Rows::Named(Bounds::Stride(k, _), named) => vec![*k as i64; named.len()],
-                };
-                Value::i64(lens)
+                    Rows::Named(b @ Bounds::Offsets(ends), named) => Value::int_upto(
+                        b.total(),
+                        named.iter().map(|&r| (ends[r] - if r == 0 { 0 } else { ends[r - 1] }) as i64),
+                    ),
+                    Rows::Named(Bounds::Stride(k, _), named) => Value::int_upto(*k, std::iter::repeat_n(*k as i64, named.len())),
+                }
             }
 
             // re-partition each row into k-wide sub-rows. Pure: the values never move — only the bounds
@@ -837,6 +840,9 @@ impl<L: OpLike> Op<L> {
                 // every row to one lane: the payload IS that lane, and the others are empty.
                 let one = match &tags_v {
                     Value::Prim(Prim::U8(t)) => one_lane(t, |x| x as u64, last),
+                    Value::Prim(Prim::I8(t)) => one_lane(t, |x| x as i64 as u64, last),
+                    Value::Prim(Prim::I16(t)) => one_lane(t, |x| x as i64 as u64, last),
+                    Value::Prim(Prim::I32(t)) => one_lane(t, |x| x as i64 as u64, last),
                     Value::Prim(Prim::I64(t)) => one_lane(t, |x| x as u64, last),
                     _ => None,
                 };
@@ -849,6 +855,9 @@ impl<L: OpLike> Op<L> {
                 // the tags read where they are stored
                 let (tag8, off, sizes) = match &tags_v {
                     Value::Prim(Prim::U8(t)) => route(t, |x| x as u64, *n),
+                    Value::Prim(Prim::I8(t)) => route(t, |x| x as i64 as u64, *n),
+                    Value::Prim(Prim::I16(t)) => route(t, |x| x as i64 as u64, *n),
+                    Value::Prim(Prim::I32(t)) => route(t, |x| x as i64 as u64, *n),
                     Value::Prim(Prim::I64(t)) => route(t, |x| x as u64, *n),
                     other => return Err(format!("Branch tags: expected Int, got {}", shape_of_value(other))),
                 };
@@ -1034,20 +1043,25 @@ impl<L: OpLike> Op<L> {
 
             // generate a range per row: element n_i becomes the list [0,1,…,n_i-1]. Cardinality
             // lands inside the new List (SEQ stays 1:1). Lets a program build its own input data.
+            // Each row's values are below its `n`, so they are held at `n`'s storage.
             Op::Iota => {
+                let w = input.int_width("Iota")?;
                 let ns = input.as_i64("Iota")?;
                 let mut bounds = Vec::with_capacity(ns.len());
-                let mut vals = Vec::new();
+                let mut total = 0;
                 for &n in ns.iter() {
-                    vals.extend(0..n); // empty when n <= 0
-                    bounds.push(vals.len());
+                    total += n.max(0) as usize; // empty when n <= 0
+                    bounds.push(total);
                 }
-                Value::List(bounds.into(), Box::new(Value::i64(vals)))
+                let vals = Prim::ints_at(w, ns.iter().flat_map(|&n| 0..n.max(0)));
+                Value::List(bounds.into(), Box::new(Value::Prim(vals)))
             }
 
             // per row [lo, hi): iota with a start, empty when lo >= hi.
             Op::Range => {
                 let (lo, hi) = input.into_pair("Range")?;
+                // every value lies from a `lo` to an `hi`: held at the storage holding both
+                let w = lo.int_width("Range lo")?.join(hi.int_width("Range hi")?);
                 let (lo, hi) = (lo.as_i64("Range lo")?, hi.as_i64("Range hi")?);
                 assert_eq!(lo.len(), hi.len(), "Range: lo/hi row count");
                 let mut bounds = Vec::with_capacity(lo.len());
@@ -1056,7 +1070,7 @@ impl<L: OpLike> Op<L> {
                     vals.extend(a..z.max(a));
                     bounds.push(vals.len());
                 }
-                Value::List(bounds.into(), Box::new(Value::i64(vals)))
+                Value::List(bounds.into(), Box::new(Value::Prim(Prim::ints_at(w, vals.into_iter()))))
             }
 
             // forget the payload, keep the row count — the constructor for unit/`None` columns.
